@@ -19,7 +19,8 @@ function spawnAsync(file: string, args: string[], opts: { env: NodeJS.ProcessEnv
     });
 }
 
-let d: Daemon;let ep: Endpoint;
+let d: Daemon;
+let ep: Endpoint;
 let dir: string;
 
 beforeAll(async () => {
@@ -121,7 +122,10 @@ describe("cli against a real daemon", () => {
         );
         expect(shim.status, shim.stderr).toBe(0);
         expect(shim.stdout).toMatch(/^\d+\.\d+/);
-        const log = await spawnAsync(process.execPath, [cli, "log", "--json", "-r", "build:cli"], { env, encoding: "utf8" });
+        const log = await spawnAsync(process.execPath, [cli, "log", "--json", "-r", "build:cli"], {
+            env,
+            encoding: "utf8",
+        });
         const events = (JSON.parse(log.stdout) as { event: string; exit?: number }[]).map(
             (e) => `${e.event}${e.exit ?? ""}`,
         );
