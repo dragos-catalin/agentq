@@ -1,0 +1,58 @@
+{
+  "name": "@codai/agentq",
+  "version": "0.1.0",
+  "description": "Coordinate builds, installs, commits and deploys between coding agents: FIFO tickets, leases, freeze marks and a hash-chained journal (ACP-Lock reference daemon).",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agentq": "./dist/cli.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "spec",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "prettier --check .",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "agents",
+    "coordination",
+    "lock",
+    "queue",
+    "mcp",
+    "multi-agent",
+    "protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dragos-catalin/agentq.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "prettier": "3.9.9",
+    "tsdown": "0.23.0",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "vitest": "5.0.3"
+  }
+}

@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  schedule:
+    - cron: "29 3 * * 1" # weekly full-history secret scan + fresh CVE data
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    uses: dragos-catalin/workflows/.github/workflows/node-ci.yml@v1
+    with:
+      tasks: lint typecheck test build
+      extra: node dist/cli.mjs --help && pnpm audit --audit-level high
+  security:
+    uses: dragos-catalin/workflows/.github/workflows/security.yml@v1
+    with:
+      full-history: ${{ github.event_name != 'push' && github.event_name != 'pull_request' }}
