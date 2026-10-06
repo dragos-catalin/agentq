@@ -1,6 +1,6 @@
 {
   "name": "@codai/agentq",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Coordinate builds, installs, commits and deploys between coding agents: FIFO tickets, leases, freeze marks and a hash-chained journal (ACP-Lock reference daemon).",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,7 @@
     "dist",
     "spec",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
@@ -37,7 +38,11 @@
     "queue",
     "mcp",
     "multi-agent",
-    "protocol"
+    "protocol",
+    "hooks",
+    "claude-code",
+    "codex",
+    "copilot"
   ],
   "repository": {
     "type": "git",
