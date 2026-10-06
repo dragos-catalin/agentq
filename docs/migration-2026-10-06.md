@@ -23,9 +23,23 @@ bundles: `git clone <bundle>` or `git fetch <bundle> 'refs/*:refs/restored/*'`.
 | afti/e2e-prod, afti/sentry11, caelia/sentry11, money/sentry11 (orphans) | removed | `_bundles/<repo>-orphan-<dir>-*.zip` |
 | notalone/ci (orphan, all files on origin) | removed | none needed |
 | brivio/_broken-deploy-1-202610060357 (empty node_modules only) | removed | none needed |
-| dashy/pairing-crate, dragoscatalin/v3-contact | kept | active < 2 h (another agent); migrate again later |
+| dashy/pairing-crate, dragoscatalin/v3-contact | kept at first pass (active < 2 h); removed 07:35 local by `worktree.ps1 migrate` once idle and clean | none needed (clean, HEAD on origin; branches deleted as integrated) |
 
 Standard slots after migration: brivio `task-1..3`, `release`, `land`; agentq `task-1`; codai `task-1`.
+
+## Rollout (2026-10-06, after the migration)
+
+| Step | Result |
+|---|---|
+| brivio `feat/agentq-release-phases` | `agentq land -Onto dev -Gate 'pnpm release:test'` exit 0 (126/126) -> origin/dev `48a3d5d9b` (v0.346.3) |
+| brivio qa-prod | `build-qa-prod.ps1` + `serve-prod.mjs` lease the pinned slot `E:\gh\.wt\brivio\qa-prod`; serve exits 3 when busy -> origin/dev `3b5762f81` (v0.346.4) |
+| codai `feat/agentq-leases` | landed on main `bb5ab1f2d` (first land exit 7: pre-push `@codai/gateway#test` flaked under full-turbo load, 1869/1869 alone; retry OK) |
+| codai migration 0137 | applied to prod BEFORE the images; `migration-parity` prod: journal=138 applied=138, exit 0 |
+| codai gateway | `codai-gateway-00720-wwm` @ `bb5ab1f2d` via deploy-clean; authed `POST /v1/agentq/sync` 200 from 00720-wwm (Cloud Run request log) |
+| codai hub | `codai-hub-00038-6xg` @ `bb5ab1f2d` via deploy-clean; prod `agentq_leases` / `agentq_releases` hold this host's rows |
+| metu / money commit lock | ported from codai (common git dir, skipped when `AGENTQ_HELD` has `commit:<repo>`, + test) -> metu `896d0e2`, money `25944a6` |
+
+`worktree.ps1 list -All` after the rollout: only `task-N`, `release`, `land` and the pinned `brivio/qa-prod`.
 
 ## Main clones (`repo-migrate.ps1`, report `~/.codai/repo-migrate-report.jsonl`)
 
