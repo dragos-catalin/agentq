@@ -26,7 +26,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 
-$Version = '1'
+$Version = '2'
 $MaxLines = 500
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
 $QDir = Join-Path $Root 'queues'
@@ -99,6 +99,42 @@ function Get-Marks {
 }
 
 # Complete lines appended since $offset (max $MaxLines). Returns lines + the new offset.
+# ADR 0001: slot leases (leases/<repo>/<slot>.json + .hb mtime) and release runs (releases/*.json).
+# Field names match the gateway agentqPushSchema (codai migration 0137); an older gateway strips them.
+function Get-Leases {
+  $out = [Collections.Generic.List[object]]::new()
+  $dir = Join-Path $Root 'leases'
+  foreach ($f in Get-ChildItem $dir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+    try { $l = Get-Content $f.FullName -Raw | ConvertFrom-Json -DateKind String } catch { continue }
+    $hb = "$($f.FullName).hb"
+    $beat = if (Test-Path $hb) { (Get-Item $hb).LastWriteTimeUtc } else { ParseUtc $l.created }
+    $alive = Test-Alive ([pscustomobject]@{ pid = [int]$l.pid; procStart = $l.procStart })
+    $idle = ([DateTime]::UtcNow - $beat).TotalMinutes
+    $stale = ((-not $alive) -and $idle -gt 120) -or $idle -gt 1440
+    $out.Add([ordered]@{
+        repo = "$($l.repo)"; slot = "$($l.slot)"; role = $(if ("$($l.role)" -in 'task', 'release', 'land', 'pinned') { "$($l.role)" } else { 'task' }); path = "$($l.path)"
+        branch = "$($l.branch)"; purpose = "$($l.purpose)"; session = "$($l.session)"; pid = [int]$l.pid
+        created = (Iso (ParseUtc $l.created)); beat = (Iso $beat); state = $(if ($stale) { 'stale' } else { 'leased' }); alive = [bool]$alive
+      })
+  }
+  $out
+}
+function Get-Releases {
+  $out = [Collections.Generic.List[object]]::new()
+  foreach ($f in Get-ChildItem (Join-Path $Root 'releases') -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+    try { $r = Get-Content $f.FullName -Raw | ConvertFrom-Json -DateKind String } catch { continue }
+    if ([DateTime]::UtcNow - (ParseUtc $r.phaseAt) -gt [TimeSpan]::FromDays(2)) { continue }
+    $alive = Test-Alive ([pscustomobject]@{ pid = [int]$r.pid; procStart = $r.procStart })
+    $state = "$($r.state)"; if (-not $alive -and $state -in 'running', 'preempting') { $state = 'failed' }
+    $out.Add([ordered]@{
+        repo = "$($r.repo)"; target = "$($r.target)"; runId = "$($r.runId)"; sha = "$($r.sha)"; ref = "$($r.ref)"; follow = "$($r.follow)"
+        phase = "$($r.phase)".Substring(0, [math]::Min(40, "$($r.phase)".Length)); preemptible = (-not [bool]$r.committed); phaseAt = (Iso (ParseUtc $r.phaseAt)); state = $state
+        supersedeSha = "$($r.supersedeSha)"; pendingSha = "$($r.pendingSha)"; session = "$($r.session)"; pid = [int]$r.pid; started = (Iso (ParseUtc $r.started)); alive = [bool]$alive
+      })
+  }
+  $out
+}
+
 # A journal that shrank (rotated/recreated) restarts from 0; the server dedupes by line hash.
 function Get-NewLines([long]$offset) {
   if (-not (Test-Path $Journal)) { return @{ lines = @(); offset = [long]0 } }
@@ -153,10 +189,10 @@ function Invoke-Push {
   $j = Get-NewLines $state.offset
   $body = [ordered]@{
     host = $env:COMPUTERNAME; root = $Root; agentVersion = $Version
-    tickets = @(Get-Tickets); marks = @(Get-Marks); journal = @($j.lines); ackOps = @($state.ack)
+    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); journal = @($j.lines); ackOps = @($state.ack)
   }
   if ($DryRun) {
-    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
+    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
     return
   }
   $json = $body | ConvertTo-Json -Depth 6 -Compress

@@ -219,6 +219,10 @@ function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$br
 }
 
 function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef) {
+  # Free the agent's branch: a slot left on `feat/x` blocks `git checkout feat/x` everywhere else and
+  # makes deleting the branch impossible. State is already backed up (or clean) at this point.
+  $p = "$(P $l 'path')"
+  if ($event -notin 'lease-failed', 'lease-expire-failed' -and $p -and (Test-Path -LiteralPath (Join-Path $p '.git'))) { & git -C $p checkout -q --detach 2>$null | Out-Null }
   Remove-Item -LiteralPath $l.file, "$($l.file).hb" -Force -ErrorAction SilentlyContinue
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo }
 }

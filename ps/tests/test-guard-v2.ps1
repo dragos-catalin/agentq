@@ -34,6 +34,8 @@ $cases = [ordered]@{
   'raw worktree move'               = @{ cmd = "git worktree move a b"; block = $true; rule = 'raw-remove' }
   'agentq lease allowed'            = @{ cmd = "pwsh -NoProfile -File C:\x\agentq.ps1 lease -Purpose x"; block = $false; rule = '' }
   'read inside leased slot allowed' = @{ cmd = "Get-Content '$slot\a.txt'"; block = $false; rule = '' }
+  'rmdir other dir; list wt root'   = @{ cmd = "cmd /c rmdir /s /q `"$fx\.wt\brivio\task-3`"; Get-ChildItem $fx\.wt -Directory"; block = $false; rule = '' }
+  'list; then rm -r leased slot'    = @{ cmd = "Get-ChildItem $fx\.wt; Remove-Item -Recurse '$slot'"; block = $true; rule = 'lease-delete' }
 }
 foreach ($k in $cases.Keys) { $c = $cases[$k]; Check "guard: $k" ((Blocks $Guard $c.cmd) -eq $c.block) $c.cmd }
 
