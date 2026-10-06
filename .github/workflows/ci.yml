@@ -21,7 +21,10 @@ jobs:
     uses: dragos-catalin/workflows/.github/workflows/node-ci.yml@v1
     with:
       tasks: lint typecheck test build
-      extra: node dist/cli.mjs --help && pnpm audit --audit-level high
+      extra: >-
+        node dist/cli.mjs --help &&
+        echo '{"tool_name":"Bash","tool_input":{"command":"pnpm build"},"cwd":"."}' | node dist/cli.mjs hook claude | tee /dev/stderr | grep -q 'agentq run' &&
+        pnpm audit --audit-level high
   security:
     uses: dragos-catalin/workflows/.github/workflows/security.yml@v1
     with:

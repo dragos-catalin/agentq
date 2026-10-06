@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { isAbsolute, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { call, connect, hold, readEndpoint, RpcError, stateDir } from "./client.ts";
 import type { ResourceStatus } from "./core.ts";
 import { startDaemon } from "./daemon.ts";
+import { HOOK_AGENTS, hookConfig, runHook, type GitInfo, type HookAgent, type HookDeps } from "./hook.ts";
 import type { JournalEntry } from "./journal.ts";
 import { runMcp } from "./mcp.ts";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 const HELP = `agentq ${VERSION} — coordinate builds, installs, commits and deploys between agents
 
@@ -22,6 +25,9 @@ Usage:
   agentq log [--limit N] [-r <resource>]           recent journal entries
   agentq verify-journal                            check the hash chain
   agentq mcp                                       MCP server (stdio) for agents
+    agentq hook <claude|codex|copilot|vscode>        pre-tool hook: reads the payload on stdin, routes
+                                                                                                     build/install/deploy/commit commands through agentq run
+    agentq hook-config <claude|codex|copilot|vscode> print the config snippet that registers the hook
 
 Options:
   -r, --resource   e.g. build:myrepo, install:myrepo, deploy:myrepo:prod (lowercase, ':'-separated)
@@ -31,6 +37,7 @@ Options:
   --json           machine-readable output
 
 State: $AGENTQ_HOME (default ~/.agentq). Session id: $AGENTQ_SESSION, else <host>-<ppid>.
+Hooks: $AGENTQ_HOOK_MODE rewrite|deny|off, $AGENTQ_HOOK_RULES <rules.json>, $AGENTQ_HOOK_BIN (default agentq).
 Exit codes: 0 ok, 2 usage, 3 refused (frozen/blocked) or timed out; run returns the command's code.`;
 
 function session(): string {
@@ -90,7 +97,82 @@ function formatStatus(rows: ResourceStatus[]): string {
 const formatEntry = (e: JournalEntry): string =>
     `${e.ts.slice(0, 19).replace("T", " ")} #${e.seq} ${e.event.padEnd(8)} ${(e.resource ?? "").padEnd(28)} ${e.session} ${e.purpose ?? e.message ?? ""}${e.reason ? ` (${e.reason})` : ""}${e.exit !== undefined ? ` exit=${e.exit}` : ""}`;
 
+function readStdin(timeoutMs: number): Promise<string> {
+    return new Promise((res) => {
+        let data = "";
+        const done = (): void => {
+            clearTimeout(timer);
+            process.stdin.pause();
+            res(data);
+        };
+        const timer = setTimeout(done, timeoutMs);
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", (d: string) => (data += d));
+        process.stdin.on("end", done);
+        process.stdin.on("error", done);
+    });
+}
+
+function gitInfo(cwd: string): GitInfo | null {
+    const r = spawnSync("git", ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], {
+        cwd,
+        encoding: "utf8",
+        timeout: 5_000,
+        windowsHide: true,
+    });
+    if (r.status !== 0) return null;
+    const [toplevel, commonDir] = r.stdout.trim().split(/\r?\n/);
+    if (!toplevel || !commonDir) return null;
+    return { toplevel, commonDir: isAbsolute(commonDir) ? commonDir : resolve(cwd, commonDir) };
+}
+
+function hookDeps(): HookDeps {
+    const dir = stateDir();
+    return {
+        env: process.env,
+        platform: process.platform,
+        cwd: process.cwd(),
+        stateDir: dir,
+        readFile: (p) => {
+            try {
+                return readFileSync(p, "utf8");
+            } catch {
+                return null;
+            }
+        },
+        git: gitInfo,
+        mark: async (resource) => {
+            const ep = readEndpoint(dir);
+            if (!ep) return null;
+            const rows = await call<ResourceStatus[]>(ep, "acp.status", { resource }, 1_500);
+            return rows.find((r) => r.resource === resource)?.mark ?? null;
+        },
+    };
+}
+
+/** Never fails: on any error print nothing and exit 0 (fail open; agents treat other exits as errors). */
+async function hookMain(agent: string | undefined): Promise<number> {
+    try {
+        if (!HOOK_AGENTS.includes(agent as HookAgent)) return 0;
+        const raw = await readStdin(10_000);
+        const out = await runHook(agent as HookAgent, raw, hookDeps());
+        if (out) process.stdout.write(`${out}\n`);
+    } catch {
+        /* fail open */
+    }
+    return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
+    if (argv[0] === "hook") return hookMain(argv[1]);
+    if (argv[0] === "hook-config") {
+        if (!HOOK_AGENTS.includes(argv[1] as HookAgent)) {
+            console.error(`agentq hook-config: needs one of ${HOOK_AGENTS.join(", ")}`);
+            return 2;
+        }
+        console.log(hookConfig(argv[1] as HookAgent));
+        return 0;
+    }
     const dd = argv.indexOf("--");
     const command = dd >= 0 ? argv.slice(dd + 1) : [];
     const { values, positionals } = parseArgs({
