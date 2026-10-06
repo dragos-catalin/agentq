@@ -36,7 +36,7 @@ Standard slots after migration: brivio `task-1..3`, `release`, `land`; agentq `t
 | codai `feat/agentq-leases` | landed on main `bb5ab1f2d` (first land exit 7: pre-push `@codai/gateway#test` flaked under full-turbo load, 1869/1869 alone; retry OK) |
 | codai migration 0137 | applied to prod BEFORE the images; `migration-parity` prod: journal=138 applied=138, exit 0 |
 | codai gateway | `codai-gateway-00720-wwm` @ `bb5ab1f2d` via deploy-clean; authed `POST /v1/agentq/sync` 200 from 00720-wwm (Cloud Run request log) |
-| codai hub | `codai-hub-00038-6xg` @ `bb5ab1f2d` via deploy-clean; prod `agentq_leases` / `agentq_releases` hold this host's rows |
+| codai hub | `codai-hub-00038-6xg` @ `bb5ab1f2d` via deploy-clean; `hub.codai.ro/ops/agentq` (super_admin, 07:48) renders "Worktree leases" (codai/task-2) and "Releases" (codai/gateway + codai/hub @ bb5ab1f2, done) from host DRAGOS, synced seconds earlier |
 | metu / money commit lock | ported from codai (common git dir, skipped when `AGENTQ_HELD` has `commit:<repo>`, + test) -> metu `896d0e2`, money `25944a6` |
 
 `worktree.ps1 list -All` after the rollout: only `task-N`, `release`, `land` and the pinned `brivio/qa-prod`.
