@@ -263,9 +263,10 @@ function Get-OrphanDirs([string]$main) {
 
 function Get-TargetRepos {
   if ($All) {
-    return Get-ChildItem 'E:\gh' -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName '.git') -PathType Container } |
-      Where-Object { (Get-ChildItem -LiteralPath (Join-Path $_.FullName '.git\worktrees') -Directory -ErrorAction SilentlyContinue | Select-Object -First 1) } |
-      ForEach-Object { $_.FullName }
+    # repos with registered worktrees OR with any dir under <wtroot>\<repo> (orphans left by a raw rm)
+    $withDirs = @(Get-ChildItem -LiteralPath $WtRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' } | ForEach-Object { $_.Name.ToLowerInvariant() })
+    return @(Get-ChildItem 'E:\gh' -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName '.git') -PathType Container } |
+      Where-Object { ($withDirs -contains $_.Name.ToLowerInvariant()) -or (Get-ChildItem -LiteralPath (Join-Path $_.FullName '.git\worktrees') -Directory -ErrorAction SilentlyContinue | Select-Object -First 1) }).FullName
   }
   $start = if ($Repo) { $Repo } else { (Get-Location).Path }
   return @(Get-MainRoot $start)

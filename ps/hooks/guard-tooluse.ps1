@@ -106,13 +106,18 @@ if ($touchText -match '(?i)[\\/]\.wt[\\/]' -and (Test-Path $script:LeaseRootG)) 
     # The sanctioned tools check the lease themselves (and back up); everything else is refused.
     $viaTool = $cmd -match '(?i)(worktree|agentq|deploy-clean)\.ps1'
     if ($isDelete -and -not $viaTool) {
+      # Judge each statement on its own: `rmdir /s X; Get-ChildItem E:\gh\.wt` must not read as
+      # "recursive delete of E:\gh\.wt" (false positive hit live 2026-10-06).
+      $segs = @($cmd.Replace('/', '\') -split '\s*(?:;|&&|\|\||\r?\n)\s*' | Where-Object { $_ -match '(?i)\b(Remove-Item|rm|rmdir|rd|del|ri|erase)\b|worktree\s+(remove|move|prune)|Directory\.Delete|rmSync|rimraf' })
       foreach ($l in $gl) {
         $lp = $l.path
         $parent = Split-Path -Parent $lp
-        # Only the slot ROOT (or a parent) - the holder must still be able to delete files inside it.
-        $hitsSlot = $norm -match ('(?i)' + [regex]::Escape($lp) + '\\?([''"\s]|$)')
-        # a parent (E:\gh\.wt\<repo> or E:\gh\.wt) deleted with a recursive flag also kills the slot
-        $hitsParent = ($norm -match [regex]::Escape($parent) + '([''"\s]|$)' -or $norm -match [regex]::Escape($script:WtRootG) + '([''"\s]|$)') -and $cmd -match '(?i)(-Recurse|-r\b|/s\b|-rf?\b|recursive)'
+        $hitsSlot = $false; $hitsParent = $false
+        foreach ($sg in $segs) {
+          # Only the slot ROOT (or a parent) - the holder must still be able to delete files inside it.
+          if ($sg -match ('(?i)' + [regex]::Escape($lp) + '\\?([''"\s]|$)')) { $hitsSlot = $true }
+          if (($sg -match ('(?i)' + [regex]::Escape($parent) + '\\?([''"\s]|$)') -or $sg -match ('(?i)' + [regex]::Escape($script:WtRootG) + '\\?([''"\s]|$)')) -and $sg -match '(?i)(-Recurse|-r\b|/s\b|-rf?\b|recursive)') { $hitsParent = $true }
+        }
         if ($hitsSlot -or $hitsParent) {
           [Console]::Error.WriteLine("BLOCKED by guard (ADR 0001): '$lp' is a LEASED worktree slot - held by $($l.who). Deleting it destroys another agent's live work (incident 2026-10-06: a cleanup removed a live worktree and a deploy slot mid-release).")
           [Console]::Error.WriteLine("Release your own slot:  pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" unlease -Repo `"$lp`" -LeaseId $($l.id)   (backs up, then frees)")

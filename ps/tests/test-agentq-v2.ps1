@@ -69,6 +69,7 @@ try {
   Check 'backup parent = unpushed local commit' ((git --git-dir=$bare log -1 --format=%s "$remoteSha^") -eq 'local only')
   Check 'no stash used' (-not (git -C $repo stash list))
   Check 'branches untouched (feat/x still exists)' ([bool](git -C $repo rev-parse --verify -q refs/heads/feat/x))
+  Check 'unlease detaches the slot (branch no longer checked out)' ((git -C $l1.path rev-parse --abbrev-ref HEAD) -eq 'HEAD')
 
   # reuse: next lease of task-1 is reset clean at the ref
   $o = AQ lease -Slot task-1 -Purpose 'reuse' -Json; $l3 = $o | Select-Object -Last 1 | ConvertFrom-Json

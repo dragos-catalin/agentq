@@ -136,3 +136,10 @@ Parallel agents work in parallel task slots; only landing is serial.
 - Agents must ask for a slot (`worktree.ps1 lease`) instead of inventing a name. `worktree.ps1 new -Name x` keeps working but only for registered slot names.
 - Release scripts gain a one-line checkpoint call per phase. Scripts without it are treated as one unsafe phase after `prepare`: they can be preempted only while deploy-clean is still preparing.
 - The deploy pool `deploy-1..6` is retired. Concurrent deploys of different targets in one repo use `release-2` where configured.
+
+## Verification (2026-10-06)
+
+- Suites: `ps/tests/run-all.ps1` - agentq v1 30, v2 51, worktree/deploy-clean 18, repo-migrate 11, guard 19 (incl. 3 mutation tests: each rule disabled -> its cases stop blocking). brivio `scripts/release/agentq-phase.test.mjs` (in `release:test`, 126/126) with 4 mutations killed.
+- Live demo on brivio (`.copilot-tmp/demo/demo.ps1`, dry-run release command, throwaway followed branch): agents A and B leased `task-3`/`task-2` in parallel; deploy-clean leased `release` and ran run 1 @2c0d371 to `preflight`; `agentq land` of A -> `demo:preempt`, run 1 stopped "SUPERSEDED before staging" (exit 4); run 2 @bbeeeeb started automatically, entered `staging` (committed); `land` of B -> `demo:pending`; run 2 finished, run 3 @b7ee1dc (newest tip) ran once; slots released clean. No lock surgery, nothing lost.
+- Migration of every repo in `E:\gh`: `docs/migration-2026-10-06.md`.
+- Live findings fixed during rollout: guard read `rmdir X; Get-ChildItem E:\gh\.wt` as a recursive delete of the wt root (now per-statement); unlease left the agent's branch checked out in the slot (now detached); `land` re-picked a union-merged CHANGELOG commit (now `-x` + trailer dedupe).
