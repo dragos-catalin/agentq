@@ -51,6 +51,10 @@ $Verb = 'status'; $Resource = $null; $Purpose = $null; $Message = $null; $Paths 
 $Repo = $null; $ExpectRepo = $null; $State = $null; $Reason = $null; $Id = $null
 $Capacity = 1; $TimeoutMin = 60; $StaleMin = 10; $Last = 30; $Hours = 12; $MinFreeGB = 6
 $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGiven = $false
+# v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
+$Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
+$Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
+$RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @()
 $Rest = @()
 $argv = @($args)
 $dd = [array]::IndexOf($argv, '--')
@@ -81,6 +85,22 @@ while ($i -lt $argv.Count) {
     'nopush' { $NoPush = $true }
     'nowait' { $NoWait = $true }
     'json' { $Json = $true }
+    'slot' { $Slot = & $next }
+    'role' { $Role = & $next }
+    'path' { $WtPath = & $next }
+    'branch' { $Branch = & $next }
+    'onto' { $Onto = & $next }
+    'gate' { $Gate = & $next }
+    'phase' { $Phase = & $next }
+    'unsafe' { $Unsafe = $true }
+    'target' { $Target = & $next }
+    'sha' { $Sha = & $next }
+    'ref' { $Ref = & $next }
+    'follow' { $Follow = & $next }
+    'runid' { $RunId = & $next }
+    'ownerpid' { $OwnerPid = [int](& $next) }
+    'leaseid' { $LeaseId = & $next }
+    'also' { $Also = @((& $next) -split ',' | Where-Object { $_ }) }
     default { throw "agentq: unknown argument '$a' (put the command after --)" }
   }
   $i++
@@ -104,8 +124,9 @@ function ParseUtc($s) { if ($s -is [datetime]) { return $s.ToUniversalTime() }; 
 
 function Get-SessionId {
   foreach ($v in $env:AGENTQ_SESSION, $env:COPILOT_SESSION_ID, $env:CLAUDE_SESSION_ID) { if ($v) { return $v } }
-  # Stable per terminal: the parent shell pid + its start time.
-  $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue).ParentProcessId
+  # Stable per terminal: the parent shell pid. Get-Process .Parent costs ~20 ms; the CIM query it
+  # replaced cost ~570 ms on EVERY agentq call (measured 2026-10-06).
+  $pp = try { (Get-Process -Id $PID).Parent.Id } catch { 0 }
   "term-$pp"
 }
 $Session = Get-SessionId
@@ -303,13 +324,17 @@ function Wait-Turn($ticket, [int]$timeoutMin, [scriptblock]$extraGate, [object[]
 
 function Test-FreeRam([double]$gb) {
   $os = Get-CimInstance Win32_OperatingSystem
-  ($os.FreePhysicalMemory / 1MB) -ge $gb
+  # Commit charge too: 2026-09-30 "memory allocation failed" with 50 GB RAM free because the commit
+  # limit was exhausted (vmmemWSL). FreeVirtualMemory = commit limit - committed (KB).
+  $commitGb = [double](Get-Config).minFreeCommitGB
+  (($os.FreePhysicalMemory / 1MB) -ge $gb) -and ($gb -le 0 -or $commitGb -le 0 -or ($os.FreeVirtualMemory / 1MB) -ge $commitGb)
 }
 
 function Expand-Resources([string]$kind, $repo) {
   $primary = Resolve-Resource $kind $repo
   $list = @($primary)
   if ($primary -like 'build:*' -and $primary -ne 'build:machine') { $list += 'build:machine' }
+  foreach ($a in $Also) { $list += (Resolve-Resource $a $repo) }
   $list
 }
 
@@ -479,6 +504,8 @@ function Invoke-Commit {
         $head = (& git rev-parse --short HEAD).Trim()
         Write-Journal @{ event = 'push'; resource = $res; sha = $head; branch = $branch; repo = $repo.Name }
         Write-Output "pushed $head -> origin/$branch"
+        $acts = @(Notify-Landing $repo.Name $branch "$(& git rev-parse HEAD)".Trim() '')
+        if ($acts) { Write-Output "releases following origin/${branch}: $($acts -join ', ')" }
       }
     } finally { Pop-Location }
   } finally { Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue }
@@ -507,11 +534,13 @@ function Show-Status {
     }
   }
   $marks = @(Get-ChildItem $MDir -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String })
-  if ($Json) { @{ tickets = $rows; marks = $marks } | ConvertTo-Json -Depth 5; return }
+  $v2 = Get-V2Status $(if (-not $All -and $repo) { $repo.Name } else { $null })
+  if ($Json) { $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks; $o | ConvertTo-Json -Depth 5; return }
   if ($marks) {
     Write-Output '== MARKS'
     $marks | ForEach-Object { Write-Output ("{0,-34} {1,-8} since {2} by {3}: {4}" -f $_.resource, $_.state.ToUpper(), $_.at, $_.session, $_.reason) }
   }
+  Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'
     $rows | Format-Table resource, role, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 220 | Write-Output
@@ -621,6 +650,9 @@ function Invoke-Release {
   Write-Journal @{ event = 'done'; resource = $res; ticket = $Id; exit = 0 }
 }
 
+. (Join-Path $PSScriptRoot 'agentq-v2.ps1')
+if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'renew', 'lease-check') { Renew-ForCwd }
+
 switch ($Verb.ToLowerInvariant()) {
   'run' { Invoke-Run }
   'commit' { Invoke-Commit }
@@ -637,5 +669,17 @@ switch ($Verb.ToLowerInvariant()) {
   }
   'acquire' { Invoke-Acquire }
   'release' { Invoke-Release }
+  'lease' { Invoke-Lease }
+  'unlease' { Invoke-Unlease }
+  'renew' { Invoke-Renew }
+  'sweep' { Invoke-Sweep }
+  'lease-check' { Invoke-LeaseCheck }
+  'backup' { Invoke-Backup }
+  'release-begin' { Invoke-ReleaseBegin }
+  'release-phase' { Invoke-ReleasePhase }
+  'release-end' { Invoke-ReleaseEnd }
+  'release-cancel' { Invoke-ReleaseCancel }
+  'notify-landing' { Invoke-NotifyLanding }
+  'land' { Invoke-Land; exit $script:LandExit }
   default { Get-Help $PSCommandPath; exit 2 }
 }

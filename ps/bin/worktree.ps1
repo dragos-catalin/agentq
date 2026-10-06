@@ -44,12 +44,23 @@
 
   Run from inside the repo, or pass -Repo. -All = every repo under E:\gh that
   has worktrees (used by the scheduled task).
+
+    v2 (ADR 0001, E:\gh\agentq\docs\adr\0001-*.md): only STANDARD SLOTS exist - task-1..N,
+    release[-2..], land, and pinned names from agentq-config.json. Agents get one with
+      worktree.ps1 lease [-Slot task-2] -Purpose '<why>' [-Branch b] [-Ref r]   (= agentq lease)
+      worktree.ps1 unlease -Path <slot dir> -LeaseId <id>
+    A LEASED slot is never removed/pruned/migrated, whatever its git state. `migrate` backs up
+    every non-standard (legacy) worktree and orphan dir to refs/backup/wt/... on origin, then
+    removes it; unleased standard slots are kept for reuse (task/pinned removed after 7 days idle).
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [Parameter(Position = 0, Mandatory = $true)][ValidateSet('new', 'list', 'prune', 'remove', 'relocate')][string]$Action,
+    [Parameter(Position = 0, Mandatory = $true)][ValidateSet('new', 'list', 'prune', 'remove', 'relocate', 'lease', 'unlease', 'migrate')][string]$Action,
   [string]$Repo,
   [string]$Name,
+    [string]$Slot,
+    [string]$LeaseId,
+    [string]$Reason,
   [string]$Ref = 'HEAD',
   [string]$Branch,
   [string]$Purpose = '',
@@ -63,6 +74,45 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $WtRoot = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
+  $AgentQ = Join-Path $PSScriptRoot 'agentq.ps1'
+  $CoordRoot = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
+  # Leased slot dirs (lower-case, trailing \). Read directly (no agentq process per worktree).
+  # Fail closed: an unreadable lease file still protects the slot named by its file.
+  $script:Leased = $null
+  function Get-LeasedDirs {
+    if ($null -ne $script:Leased) { return $script:Leased }
+    $out = @{}
+    foreach ($f in Get-ChildItem (Join-Path $CoordRoot 'leases') -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+      $p = $null; $who = '?'
+      try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; $p = $j.path; $who = "$($j.session) ($($j.leaseId)) '$($j.purpose)'" } catch { }
+      if (-not $p) { $p = Join-Path (Join-Path $WtRoot $f.Directory.Name) $f.BaseName; $who = 'unreadable lease file' }
+      $out[([IO.Path]::GetFullPath($p).TrimEnd('\') + '\').ToLowerInvariant()] = $who
+    }
+    $script:Leased = $out
+    $out
+  }
+  function Get-LeaseHolder([string]$p) {
+    $n = ([IO.Path]::GetFullPath($p).TrimEnd('\') + '\').ToLowerInvariant()
+    foreach ($k in (Get-LeasedDirs).Keys) { if ($n.StartsWith($k) -or $k.StartsWith($n)) { return (Get-LeasedDirs)[$k] } }
+    $null
+  }
+  $script:CfgCache = $null
+  function Get-SlotRoleLocal([string]$repoName, [string]$slot) {
+    if ($null -eq $script:CfgCache) {
+      $c = @{ taskSlotsPerRepo = 3; releaseSlots = @{}; pinned = @{}; unleasedRemoveIdleHours = 168 }
+      $f = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
+      if (Test-Path -LiteralPath $f) { $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable; foreach ($k in $j.Keys) { $c[$k] = $j[$k] } }
+      $script:CfgCache = $c
+    }
+    $c = $script:CfgCache
+    $rn = $repoName.ToLowerInvariant()
+    if ($slot -match '^task-(\d+)$' -and [int]$Matches[1] -ge 1 -and [int]$Matches[1] -le $c.taskSlotsPerRepo) { return 'task' }
+    if ($slot -eq 'release' -or $slot -eq 'land') { return $slot }
+    $rs = if ($c.releaseSlots.ContainsKey($rn)) { [int]$c.releaseSlots[$rn] } else { 1 }
+    if ($slot -match '^release-(\d+)$' -and [int]$Matches[1] -ge 2 -and [int]$Matches[1] -le $rs) { return 'release' }
+    if ($c.pinned.ContainsKey($rn) -and @($c.pinned[$rn]) -contains $slot) { return 'pinned' }
+    $null
+  }
 $script:ProcLines = $null
 function Test-InUseByProcess([string]$p) {
   # Exclude this process: its own command line carries `-Path <wt>` and would always match.
@@ -93,6 +143,8 @@ function Get-Worktrees([string]$main) {
 function Get-Assessment($wt, [string]$main) {
   $r = [ordered]@{ Path = $wt.Path; Branch = $(if ($wt.Branch) { $wt.Branch } else { '(detached)' }); Head = $wt.Head.Substring(0, [Math]::Min(9, $wt.Head.Length)); IdleHours = $null; Removable = $false; Reason = '' }
   if ($wt.Main) { $r.Reason = 'main working tree'; return [pscustomobject]$r }
+  $holder = Get-LeaseHolder $wt.Path
+  if ($holder) { $r.Reason = "LEASED by $holder"; return [pscustomobject]$r }
   if ($wt.Locked) { $r.Reason = 'locked (git worktree lock)'; return [pscustomobject]$r }
   if (-not (Test-Path -LiteralPath $wt.Path)) { $r.Removable = $true; $r.Reason = 'missing on disk (stale registration)'; return [pscustomobject]$r }
   $gitdir = (git -C $wt.Path rev-parse --path-format=absolute --git-dir 2>$null)
@@ -121,11 +173,20 @@ function Get-Assessment($wt, [string]$main) {
   }
   if ($null -ne $r.IdleHours -and $r.IdleHours -lt $OlderThanHours) { $r.Reason = "active $($r.IdleHours)h ago (< $OlderThanHours h)"; return [pscustomobject]$r }
   if (Test-InUseByProcess $wt.Path) { $r.Reason = 'a running process references this path'; return [pscustomobject]$r }
+  # Standard slots are reused, not deleted: release/land always kept; task/pinned after 7 days idle.
+  $leaf = Split-Path -Leaf $wt.Path
+  $role = Get-SlotRoleLocal (Split-Path -Leaf $main) $leaf
+  if ($role -in 'release', 'land') { $r.Reason = "standard $role slot (kept for reuse)"; return [pscustomobject]$r }
+  if ($role -and $null -ne $r.IdleHours -and $r.IdleHours -lt $script:CfgCache.unleasedRemoveIdleHours) { $r.Reason = "standard $role slot, idle $($r.IdleHours)h (< $($script:CfgCache.unleasedRemoveIdleHours) h)"; return [pscustomobject]$r }
   $r.Removable = $true; $r.Reason = 'clean, pushed, idle'
   return [pscustomobject]$r
 }
 
 function Remove-WorktreeSafe([string]$wtPath, [string]$main) {
+  # Last line of defence: re-read leases right before deleting (a lease may have been taken since).
+  $script:Leased = $null
+  $holder = Get-LeaseHolder $wtPath
+  if ($holder) { Write-Warning "refusing to delete $wtPath - LEASED by $holder"; return $false }
   if (Test-Path -LiteralPath $wtPath) {
     # rmdir /s removes junctions/symlinks as links and does not recurse into their targets.
     cmd /c rmdir /s /q "`"$wtPath`"" 2>$null
@@ -160,6 +221,8 @@ function Get-OrphanDirs([string]$main) {
   foreach ($d in Get-ChildItem -LiteralPath $repoDir -Directory -Force -ErrorAction SilentlyContinue) {
     if ($d.Name -like '_*') { continue }
     if ($registered -contains $d.FullName.TrimEnd('\').ToLowerInvariant()) { continue }
+    $holder = Get-LeaseHolder $d.FullName
+    if ($holder) { $out += [pscustomobject]@{ Path = $d.FullName; IdleHours = $null; Removable = $false; Reason = "orphan, LEASED by $holder" }; continue }
     $lock = "$($d.FullName).lock"
     if (Test-Path -LiteralPath $lock) {
       $held = $false
@@ -209,10 +272,84 @@ function Get-TargetRepos {
 }
 
 switch ($Action) {
+  'lease' {
+    $a = @('-NoProfile', '-File', $AgentQ, 'lease', '-Purpose', $(if ($Purpose) { $Purpose } else { throw 'worktree lease: -Purpose is required' }))
+    if ($Repo) { $a += @('-Repo', $Repo) }
+    if ($Slot -or $Name) { $a += @('-Slot', $(if ($Slot) { $Slot } else { $Name })) }
+    if ($Branch) { $a += @('-Branch', $Branch) }
+    if ($PSBoundParameters.ContainsKey('Ref')) { $a += @('-Ref', $Ref) }
+    & pwsh @a
+    exit $LASTEXITCODE
+  }
+  'unlease' {
+    if (-not $Path) { throw 'worktree unlease: -Path <slot dir> -LeaseId <id> [-Reason ...]' }
+    $a = @('-NoProfile', '-File', $AgentQ, 'unlease', '-Repo', $Path)
+    if ($LeaseId) { $a += @('-LeaseId', $LeaseId) }
+    if ($Reason) { $a += @('-Reason', $Reason) }
+    & pwsh @a
+    exit $LASTEXITCODE
+  }
+  'migrate' {
+    # Collapse a repo to standard slots: every NON-standard worktree and every orphan dir is backed
+    # up (agentq backup -> refs/backup/wt/<repo>/<name>/<ts> on origin, verified) and removed.
+    # Skipped: leased, in use by a process, active < -OlderThanHours, locked, main tree.
+    $removed = 0; $kept = 0
+    foreach ($main in Get-TargetRepos) {
+      $repoName = Split-Path -Leaf $main
+      & git -C $main worktree prune 2>$null
+      foreach ($wt in Get-Worktrees $main) {
+        if ($wt.Main) { continue }
+        $leaf = Split-Path -Leaf $wt.Path
+        $inRoot = ([IO.Path]::GetFullPath($wt.Path).ToLowerInvariant()).StartsWith(([IO.Path]::GetFullPath((Join-Path $WtRoot $repoName)).TrimEnd('\') + '\').ToLowerInvariant())
+        if ($inRoot -and (Get-SlotRoleLocal $repoName $leaf)) { continue }   # standard slot: prune's job
+        $holder = Get-LeaseHolder $wt.Path
+        $why = if ($holder) { "LEASED by $holder" } elseif ($wt.Locked) { 'locked' } elseif (-not (Test-Path -LiteralPath $wt.Path)) { '' } elseif (Test-InUseByProcess $wt.Path) { 'a running process references it' } else { $null }
+        if ($null -eq $why) {
+          $ct = git -C $wt.Path log -g -1 --format=%ct 2>$null
+          $idle = if ($ct) { ((Get-Date) - [DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours } else { 999 }
+          if ($idle -lt $OlderThanHours) { $why = "active $([math]::Round($idle,1))h ago (< $OlderThanHours h)" }
+        }
+        if ($why) { $kept++; Write-Host ("keep    {0,-55} {1}" -f $wt.Path, $why); continue }
+        if (-not $PSCmdlet.ShouldProcess($wt.Path, 'back up + remove legacy worktree')) { continue }
+        $ref = ''
+        if (Test-Path -LiteralPath $wt.Path) {
+          $ref = (& pwsh -NoProfile -File $AgentQ backup -Path $wt.Path -Slot ("legacy-" + ($leaf -replace '[^A-Za-z0-9._-]', '_')) -Reason 'worktree migrate (ADR 0001)' 2>&1 | Select-Object -Last 1)
+          if ($LASTEXITCODE) { $kept++; Write-Host ("KEEP    {0,-55} backup FAILED: {1}" -f $wt.Path, $ref); continue }
+        }
+        if (Remove-WorktreeSafe $wt.Path $main) { $removed++; Write-Host ("removed {0,-55} backup={1}" -f $wt.Path, $(if ($ref) { $ref } else { 'none needed' })); Remove-BranchIfIntegrated $wt.Branch $main } else { $kept++ }
+      }
+      foreach ($o in Get-OrphanDirs $main) {
+        if ($o.Reason -match 'LEASED|lock held|running process|active') { $kept++; Write-Host ("keep    {0,-55} {1}" -f $o.Path, $o.Reason); continue }
+        if ($o.Removable) {
+          if ($PSCmdlet.ShouldProcess($o.Path, 'remove orphan dir')) { if (Remove-WorktreeSafe $o.Path $main) { $removed++; Write-Host ("removed {0,-55} {1}" -f $o.Path, $o.Reason) } else { $kept++ } }
+          continue
+        }
+        # Orphan with unique files: copy them into a commit (temp repo index over the orphan dir) - no
+        # git metadata there, so archive them as a zip next to the bundles instead; never delete blind.
+        $zipDir = Join-Path $WtRoot '_bundles'; New-Item -ItemType Directory -Force $zipDir | Out-Null
+        $zip = Join-Path $zipDir ("$repoName-orphan-$(Split-Path -Leaf $o.Path)-$((Get-Date).ToString('yyyyMMdd-HHmmss')).zip")
+        if (-not $PSCmdlet.ShouldProcess($o.Path, "archive unique files to $zip + remove")) { continue }
+        $files = @(Get-ChildItem -LiteralPath $o.Path -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\(node_modules|\.next|\.turbo|dist|target|\.git)\\' -and $_.Length -lt 50MB })
+        if ($files.Count) { Compress-Archive -LiteralPath ($files.FullName) -DestinationPath $zip -CompressionLevel Fastest }
+        if ($files.Count -and -not (Test-Path -LiteralPath $zip)) { $kept++; Write-Host ("KEEP    {0,-55} archive failed" -f $o.Path); continue }
+        if (Remove-WorktreeSafe $o.Path $main) { $removed++; Write-Host ("removed {0,-55} archived {1} file(s) -> {2}" -f $o.Path, $files.Count, $zip) } else { $kept++ }
+      }
+    }
+    Write-Host "worktree migrate: removed=$removed kept=$kept"
+  }
   'new' {
     if (-not $Name -or $Name -notmatch '^[a-z0-9][a-z0-9._-]{0,40}$') { throw 'worktree new: -Name is required (lowercase, [a-z0-9._-], <= 41 chars).' }
     $main = Get-MainRoot $(if ($Repo) { $Repo } else { (Get-Location).Path })
     $repoName = Split-Path -Leaf $main
+    # v2: names are standard slots, leased through agentq (ADR 0001). Ad-hoc names are refused.
+    if (-not $env:WORKTREE_ALLOW_ADHOC) {
+      if (-not (Get-SlotRoleLocal $repoName $Name)) { throw "worktree new: '$Name' is not a standard slot (task-1..N, release, land, pinned). Use: worktree.ps1 lease -Purpose '<why>' [-Branch b]  (ADR 0001)" }
+      $a = @('-NoProfile', '-File', $AgentQ, 'lease', '-Repo', $main, '-Slot', $Name, '-Purpose', $(if ($Purpose) { $Purpose } else { "worktree new $Name" }))
+      if ($Branch) { $a += @('-Branch', $Branch) }
+      if ($PSBoundParameters.ContainsKey('Ref')) { $a += @('-Ref', $Ref) }
+      & pwsh @a
+      exit $LASTEXITCODE
+    }
     $dest = Join-Path (Join-Path $WtRoot $repoName) $Name
     if (Test-Path -LiteralPath $dest) { throw "worktree new: $dest already exists. Pick another -Name or reuse it." }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null

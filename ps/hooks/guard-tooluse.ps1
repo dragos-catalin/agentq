@@ -79,6 +79,56 @@ foreach ($container in $payload.tool_input, $payload.toolInput) {
   }
 }
 if ($isEditTool) { $cmd = '' }
+
+# ---- ADR 0001: slot leases (E:\gh\.wt\<repo>\<slot>) --------------------------------------
+# (1) Renew: any tool call whose command or file path touches a leased slot is activity for that
+#     lease (cheap: a dir scan of ~/.codai/coord/leases + one file timestamp).
+# (2) Protect: deleting / removing a leased slot (or a parent of one) is refused, whatever the tool.
+$script:WtRootG = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
+$script:LeaseRootG = Join-Path $(if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }) 'leases'
+function Get-GuardLeases {
+  $out = @()
+  foreach ($f in Get-ChildItem $script:LeaseRootG -Recurse -Filter '*.json' -File -EA SilentlyContinue) {
+    $j = $null; try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { }
+    $p = if ($j -and $j.path) { "$($j.path)" } else { Join-Path (Join-Path $script:WtRootG $f.Directory.Name) $f.BaseName }
+    $out += [pscustomobject]@{ path = $p.TrimEnd('\'); file = $f.FullName; who = $(if ($j) { "$($j.session) ($($j.leaseId)) '$($j.purpose)'" } else { 'unreadable lease' }); id = $(if ($j) { "$($j.leaseId)" } else { '' }) }
+  }
+  $out
+}
+$touchText = "$cmd"
+foreach ($container in $payload.tool_input, $payload.toolInput) { if ($container -and $container -isnot [string]) { foreach ($k in 'filePath', 'path', 'file', 'dirPath', 'cwd') { if ($container.PSObject.Properties.Name -contains $k -and $container.$k) { $touchText += " $($container.$k)" } } } }
+if ($touchText -match '(?i)[\\/]\.wt[\\/]' -and (Test-Path $script:LeaseRootG)) {
+  $norm = $touchText.Replace('/', '\')
+  $gl = @(Get-GuardLeases)
+  foreach ($l in $gl) { if ($norm.IndexOf($l.path, [StringComparison]::OrdinalIgnoreCase) -ge 0) { try { [IO.File]::SetLastWriteTimeUtc("$($l.file).hb", [DateTime]::UtcNow) } catch { } } }
+  if ($cmd) {
+    $isDelete = $cmd -match '(?i)\b(Remove-Item|rm|rmdir|rd|del|ri|erase)\b' -or $cmd -match '(?i)\bgit\b[^;|&]*\bworktree\s+(remove|move|prune)\b' -or $cmd -match '(?i)\[IO\.Directory\]::Delete|Directory\.Delete|rmSync|rimraf'
+    # The sanctioned tools check the lease themselves (and back up); everything else is refused.
+    $viaTool = $cmd -match '(?i)(worktree|agentq|deploy-clean)\.ps1'
+    if ($isDelete -and -not $viaTool) {
+      foreach ($l in $gl) {
+        $lp = $l.path
+        $parent = Split-Path -Parent $lp
+        # Only the slot ROOT (or a parent) - the holder must still be able to delete files inside it.
+        $hitsSlot = $norm -match ('(?i)' + [regex]::Escape($lp) + '\\?([''"\s]|$)')
+        # a parent (E:\gh\.wt\<repo> or E:\gh\.wt) deleted with a recursive flag also kills the slot
+        $hitsParent = ($norm -match [regex]::Escape($parent) + '([''"\s]|$)' -or $norm -match [regex]::Escape($script:WtRootG) + '([''"\s]|$)') -and $cmd -match '(?i)(-Recurse|-r\b|/s\b|-rf?\b|recursive)'
+        if ($hitsSlot -or $hitsParent) {
+          [Console]::Error.WriteLine("BLOCKED by guard (ADR 0001): '$lp' is a LEASED worktree slot - held by $($l.who). Deleting it destroys another agent's live work (incident 2026-10-06: a cleanup removed a live worktree and a deploy slot mid-release).")
+          [Console]::Error.WriteLine("Release your own slot:  pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" unlease -Repo `"$lp`" -LeaseId $($l.id)   (backs up, then frees)")
+          [Console]::Error.WriteLine("Cleanup: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\worktree.ps1`" migrate|prune -All   (skips leased slots). Stale leases expire on their own (agentq sweep).")
+          Signal-Blocked 'delete of leased slot'
+          Deny-Exit
+        }
+      }
+    }
+  }
+}
+# Raw `git worktree remove` / `move` anywhere: only the tools may do it (they check leases + back up).
+if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+(remove|move)\b' -and $cmd -notmatch '(?i)(worktree|agentq|deploy-clean)\.ps1') {
+  [Console]::Error.WriteLine("BLOCKED by guard (ADR 0001): raw 'git worktree remove/move' skips the lease check and the backup. Use: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\worktree.ps1`" remove -Path <dir>  (or unlease your slot).")
+  Deny-Exit
+}
 # Stale-script trap (hit 3x, last 2026-10-05: a denied create_file of ship5.ps1 was run in the
 # SAME parallel tool block, so the OLD script re-committed files under a wrong message). Every
 # denied whole-file write leaves a marker; running a script with that path within 10 min is blocked.
@@ -223,14 +273,13 @@ if ($cmd -notmatch 'PW_ALLOW_LOCAL\s*=\s*1' -and (
 # ~/.copilot/bin/worktree.ps1 (lands in E:\gh\.wt\<repo>\<name>, recorded, prunable)
 # or by deploy-clean.ps1 (pooled slots). `git worktree remove --force` is also
 # refused: it follows junctions into their targets (memory 2026-09-21).
-if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+add\b' -and $cmd -notmatch 'worktree\.ps1|deploy-clean\.ps1') {
-  $wtRoot = if ($env:CODAI_WT_ROOT) { [regex]::Escape($env:CODAI_WT_ROOT) } else { 'E:[\\/]+gh[\\/]+\.wt[\\/]' }
-  if ($cmd -notmatch $wtRoot) {
-    [Console]::Error.WriteLine("BLOCKED by guard-command hook: ad-hoc 'git worktree add' outside E:\gh\.wt. Unmanaged worktrees are never removed (45 had accumulated by 2026-09-27).")
-    [Console]::Error.WriteLine("Use:  pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\worktree.ps1`" new -Name <short-name> [-Ref <sha>] [-Branch <b>] -Purpose '<why>'")
-    [Console]::Error.WriteLine("Deploys: deploy-clean.ps1 (pooled). When done: worktree.ps1 remove -Path <dir>")
-    Deny-Exit
-  }
+# ADR 0001 (2026-10-06): ANY raw `git worktree add` is refused, also inside E:\gh\.wt - only the
+# standard slots exist and they are created by agentq lease (unleased ad-hoc trees were deleted live).
+if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+add\b' -and $cmd -notmatch '(?i)(worktree|agentq|deploy-clean)\.ps1') {
+  [Console]::Error.WriteLine("BLOCKED by guard-command hook: raw 'git worktree add'. Worktrees are fixed, LEASED slots (E:\gh\.wt\<repo>\task-N|release|land, ADR 0001).")
+  [Console]::Error.WriteLine("Use:  pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose '<why>' [-Branch <b>] [-Ref <sha>]   -> prints the slot path + leaseId")
+  [Console]::Error.WriteLine("Deploys: deploy-clean.ps1 (release slot). Landing: agentq land -Branch <b> -Onto <dev|main>. Done: agentq unlease -Repo <slot> -LeaseId <id>")
+  Deny-Exit
 }
 if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+remove\b[^;|&]*(--force|-f\b)') {
   [Console]::Error.WriteLine("BLOCKED by guard-command hook: 'git worktree remove --force' follows Windows junctions and deletes their TARGETS (emptied another clone's node_modules, 2026-09-21), and discards uncommitted work.")

@@ -1,0 +1,10 @@
+{
+  "taskSlotsPerRepo": 3,
+  "taskSlotsMachine": 10,
+  "releaseSlots": { "codai": 2 },
+  "pinned": { "codai": ["db-live"], "brivio": ["qa-prod"] },
+  "leaseDeadIdleMin": 120,
+  "leaseMaxIdleMin": 1440,
+  "unleasedRemoveIdleHours": 168,
+  "minFreeCommitGB": 12
+}
