@@ -41,6 +41,14 @@ Standard slots after migration: brivio `task-1..3`, `release`, `land`; agentq `t
 
 `worktree.ps1 list -All` after the rollout: only `task-N`, `release`, `land` and the pinned `brivio/qa-prod`.
 
+## Re-verification and final cleanup (2026-10-06 07:55)
+
+- `ps/tests/run-all.ps1`: agentq v1 30, v2 51, worktree v2 18, repo-migrate 11, guard 19 — all pass. `test-config-integrity.ps1`: all checks pass (always-on 51.2 KB / 52 KB).
+- Installed `~/.copilot` copies match `ps/` (`worktree-prune-task.ps1` differs only in CRLF).
+- Leftover non-slot dirs zipped (entry count verified) then removed: `_backup/codai-clean-1006-{leftovers,orphans}`, `_backup/codai-cleanup-20260928-000525`, `_backup/codai-tf-20260928-untracked`, `codai/_backups/deploy-1-20261001-162111` -> `_bundles/leftover-*-20261006.zip` (184 MB total). Loose patches/bundles moved (not deleted) to `_bundles/legacy-wt-backup` (27 files) and `_bundles/legacy-codai-backups` (1 bundle); both bundles `git bundle verify` OK against codai.
+- Stale wording removed: brivio `brivio-conventions.instructions.md` (deploy-N pool / `worktree.ps1 new -Name`) -> brivio `21f2e677d`; skill `agent-coordination` deploy-mjs line.
+- `E:\gh\.wt` now holds only slots (`task-N`, `release`, `land`, pinned `qa-prod`) and `_bundles`.
+
 ## Main clones (`repo-migrate.ps1`, report `~/.codai/repo-migrate-report.jsonl`)
 
 | Repo | Dirty state backup | Stashes (backed up, dropped) | Branches deleted (tip on origin) | Bundle (`E:\gh\.wt\_bundles`, no origin / retired) |
