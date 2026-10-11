@@ -78,28 +78,16 @@ function Get-Tickets {
   if (-not (Test-Path $QDir)) { return $out }
   foreach ($d in Get-ChildItem $QDir -Directory) {
     $capFile = Join-Path $d.FullName 'capacity'
-    # v3 tickets carry an explicit `held` flag and holders may exceed the base capacity (quick
-    # burst, beside-batch, burst overrides). The hub derives roles by position ("first capacity
-    # live tickets hold"), so publish holders first (seq) and waiters after (seq + 1e9), and a
-    # capacity of max(cap, holders). Full lane/prio columns in the hub: devcloud DC-060.
-    $files = @(Get-ChildItem $d.FullName -Filter '*.json' -File)
-    $heldCount = @($files | Where-Object { try { $x = Get-Content $_.FullName -Raw | ConvertFrom-Json; $x.PSObject.Properties['v'] -and $x.PSObject.Properties['held'] -and $x.held } catch { $false } }).Count
-    foreach ($f in $files) {
+    foreach ($f in Get-ChildItem $d.FullName -Filter '*.json' -File) {
       try { $t = Get-Content $f.FullName -Raw | ConvertFrom-Json -DateKind String } catch { continue }
       if (-not $t -or -not $t.PSObject.Properties['resource']) { continue }
       $cap = if (Test-Path $capFile) { [int](Get-Content $capFile -Raw) } elseif ($DefaultCapacity.ContainsKey($t.resource)) { $DefaultCapacity[$t.resource] } else { 1 }
-      $seq = [long]$t.seq
-      if ($t.PSObject.Properties['v']) {
-        $cap = [math]::Max($cap, $heldCount)
-        if (-not ($t.PSObject.Properties['held'] -and $t.held)) { $seq += 1000000000 }
-      }
       $hb = "$($f.FullName).hb"
       $beat = if (Test-Path $hb) { (Get-Item $hb).LastWriteTimeUtc } else { ParseUtc $t.created }
       $prop = { param($n) if ($t.PSObject.Properties[$n] -and $null -ne $t.$n) { "$($t.$n)" } else { '' } }
-      $lanePrefix = if ($t.PSObject.Properties['lane'] -and $t.lane) { "[$($t.lane)] " } else { '' }
       $out.Add([ordered]@{
-          id = "$($t.id)"; resource = "$($t.resource)"; seq = $seq; capacity = [math]::Min(64, [math]::Max(1, $cap))
-          pid = [int]$t.pid; session = (& $prop 'session'); purpose = ($lanePrefix + (& $prop 'purpose')); cmd = (& $prop 'cmd'); repo = (& $prop 'repo')
+          id = "$($t.id)"; resource = "$($t.resource)"; seq = [long]$t.seq; capacity = [math]::Max(1, $cap)
+          pid = [int]$t.pid; session = (& $prop 'session'); purpose = (& $prop 'purpose'); cmd = (& $prop 'cmd'); repo = (& $prop 'repo')
           created = (Iso (ParseUtc $t.created)); beat = (Iso $beat); alive = (Test-Alive $t)
         })
     }

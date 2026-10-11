@@ -28,8 +28,7 @@
 param(
   [Parameter(ParameterSetName = 'Run', Mandatory)][string]$Command,
   [Parameter(ParameterSetName = 'Run')][switch]$Wait,
-  # 240 (was 25): 58 of 71 agentq timeouts in 15 days were this default giving up on a busy queue
-  # and dropping the place already earned (devcloud DC-014).
+  # 240 (was 25): the 25-min default gave up on a busy queue and dropped the place already earned.
   [Parameter(ParameterSetName = 'Run')][int]$TimeoutMin = 240,
   # Node's default old-space is ~4 GB, and the heaviest project here (apps/web,
   # 5620 files) needs ~6 GB — so the DEFAULT is the real hazard, not generosity.
@@ -38,10 +37,6 @@ param(
   [Parameter(ParameterSetName = 'Run')][int]$HeapMb = 8192,
   # Shown to every other agent in `agentq status` / the journal. Default = the command.
   [Parameter(ParameterSetName = 'Run')][string]$Purpose,
-  # agentq v3 lane: interactive|quick|gate|heavy|batch (default gate). batch runs at Idle CPU
-  # priority, so higher lanes may run beside it (soft preemption).
-  [Parameter(ParameterSetName = 'Run')][ValidateSet('interactive', 'quick', 'gate', 'heavy', 'batch')][string]$Lane = 'gate',
-  [Parameter(ParameterSetName = 'Run')][int]$Priority = 0,
   # Build log silent this long -> WEDGED marker on the agentq ticket (shown by `agentq status`) and
   # a console warning. Cleared when output resumes. 0 disables.
   [Parameter(ParameterSetName = 'Run')][double]$WedgeMin = 10,
@@ -165,9 +160,9 @@ $sessionId = if ($env:AGENTQ_SESSION) { $env:AGENTQ_SESSION } elseif ($env:COPIL
 $agentq = Join-Path $env:USERPROFILE '.copilot\bin\agentq.ps1'
 if ((Test-Path $agentq) -and ("$env:AGENTQ_HELD" -notmatch '(^|,)build:') -and -not $env:RUN_BUILD_NO_AGENTQ) {
   $why = if ($Purpose) { $Purpose } else { "build: $Command" }
-  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-Lane', $Lane, '-WedgeMin', "$WedgeMin")
+  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-WedgeMin', "$WedgeMin")
   if ($Root) { $self += @('-Root', $Root) }
-  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', 'build', '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root, '-Lane', $Lane, '-Priority', "$Priority")
+  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', 'build', '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root)
   if (-not $Wait) { $aqArgs += '-NoWait' }
   & pwsh @aqArgs -- pwsh @self
   exit $LASTEXITCODE
@@ -256,10 +251,8 @@ try {
   # line here covers cmd, gradle, its Kotlin daemon, node, tsc, rustc. Builds
   # still use every idle cycle; they just lose to anything interactive.
   # RUN_BUILD_PRIORITY=Normal opts out (e.g. a timing measurement).
-  # $cpuClass, not $priority: PowerShell names are case-insensitive and [int]$Priority (agentq lane
-  # priority) is a parameter, so assigning 'BelowNormal' to $priority threw a conversion error.
-  $cpuClass = if ($env:RUN_BUILD_PRIORITY) { $env:RUN_BUILD_PRIORITY } elseif ($Lane -eq 'batch' -or $env:AGENTQ_LANE -eq 'batch') { 'Idle' } else { 'BelowNormal' }
-  try { (Get-Process -Id $PID).PriorityClass = $cpuClass } catch { Write-Host "could not set priority $cpuClass : $_" -ForegroundColor DarkYellow }
+  $priority = if ($env:RUN_BUILD_PRIORITY) { $env:RUN_BUILD_PRIORITY } else { 'BelowNormal' }
+  try { (Get-Process -Id $PID).PriorityClass = $priority } catch { Write-Host "could not set priority $priority : $_" -ForegroundColor DarkYellow }
   # 2>&1 keeps compiler diagnostics, which are the whole reason to read a log.
   # Wait on the PROCESS, not on its stdout pipe: a build that cold-starts a daemon
   # (Gradle, Kotlin, sccache) hands it the inherited pipe handle, so `| Tee-Object`
