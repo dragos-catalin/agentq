@@ -17,6 +17,10 @@ function Get-Config {
   $c = @{
     taskSlotsPerRepo = 3; taskSlotsMachine = 10; releaseSlots = @{}; pinned = @{}
     leaseDeadIdleMin = 120; leaseMaxIdleMin = 1440; unleasedRemoveIdleHours = 168; minFreeCommitGB = 12
+    # v3 scheduler (devcloud F1): machine cap, soft slots, aging, idle-yield watchdog, override limits.
+    machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10
+    bumpMax = 50; burstMax = 2; burstMaxMin = 60; overridesPerHour = 6; runBuildTimeoutMin = 240
+    journalRotateMB = 64
   }
   $f = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
   if (Test-Path -LiteralPath $f) {
@@ -86,6 +90,13 @@ function Read-Leases([string]$repoName) {
       }
       $hb = "$($f.FullName).hb"
       $beat = if (Test-Path -LiteralPath $hb) { (Get-Item -LiteralPath $hb).LastWriteTimeUtc } else { ParseUtc (P $l 'created' (Iso (Now))) }
+      # DC-021: work in a slot from ANOTHER shell (owner shell died) or from a script outside agentq
+      # still touches the slot's git index (status/add/commit/checkout). Count it as activity: 24
+      # leases of live work were expired in 15 days because only the owner pid + .hb counted.
+      $act = Get-SlotGitActivity (P $l 'path' '')
+      # Ignore the index writes of the lease's own checkout (first 2 min after creation).
+      $createdAt = ParseUtc (P $l 'created' (Iso (Now)))
+      if ($act -and $act -gt $beat -and $act -gt $createdAt.AddMinutes(2)) { $beat = $act }
       $alive = Test-Alive ([pscustomobject]@{ pid = [int](P $l 'pid' 0); procStart = (P $l 'procStart' $null) })
       $idle = ((Now) - $beat).TotalMinutes
       $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin)
@@ -100,6 +111,17 @@ function Read-Leases([string]$repoName) {
   $out
 }
 function Norm-Dir([string]$p) { ([IO.Path]::GetFullPath($p).TrimEnd('\', '/') + '\').ToLowerInvariant() }
+function Get-SlotGitActivity([string]$slotPath) {
+  if (-not $slotPath) { return $null }
+  try {
+    $gf = Join-Path $slotPath '.git'
+    if (-not (Test-Path -LiteralPath $gf -PathType Leaf)) { return $null }
+    $gd = ((Get-Content -LiteralPath $gf -Raw) -replace '^gitdir:\s*', '').Trim()
+    if (-not [IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $slotPath $gd }
+    $times = foreach ($n in 'index', 'HEAD', 'logs\HEAD') { $p = Join-Path $gd $n; if (Test-Path -LiteralPath $p) { (Get-Item -LiteralPath $p).LastWriteTimeUtc } }
+    @($times | Sort-Object -Descending)[0]
+  } catch { $null }
+}
 # Lease whose slot contains $path, or whose slot lies inside $path (deleting a parent dir hits it too).
 function Find-LeaseForPath([string]$path) {
   if (-not $path) { return $null }
@@ -346,6 +368,7 @@ function Invoke-Sweep {
     else { $kept++; Write-Output "KEPT $($l.repo)/$($l.slot): backup failed (journal: lease-expire-failed)" }
   }
   [void](Read-Releases $null)   # side effect: dead runs are recorded as failed
+  try { Invoke-RotateJournal } catch { Write-Output "rotate skipped: $_" }
   Write-Output "sweep: expired=$n kept=$kept"
 }
 
@@ -592,6 +615,8 @@ function Invoke-Land {
       if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
       if ($out -match 'non-fast-forward|fetch first|Updates were rejected') { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
       $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
+      $tail = (@($out | Select-Object -Last 6) -join ' | ')
+      Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
       $script:LandExit = 7; return
     }
     if (-not $landed) { [Console]::Error.WriteLine('land: origin kept moving (3 rounds) - try again'); $script:LandExit = 3; return }

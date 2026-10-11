@@ -2,6 +2,25 @@
 
 All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - ps scheduler v3 (ADR 0002)
+
+### Added
+
+- `-Lane interactive|quick|gate|heavy|batch` and `-Priority` on `run` / run-build: waiters are ranked by priority with aging instead of strict FIFO.
+- Atomic multi-resource grant: a run waiting for `build:machine` no longer holds `build:<repo>`.
+- Soft slots: quick-lane burst slots; non-batch jobs run beside batch holders (batch runs at Idle priority).
+- Idle-yield watchdog: a holder whose process tree is idle stops counting against the machine cap (`idle-yield` / `idle-resume` events).
+- `agentq bump`, `agentq burst`, `agentq propose` overrides — reason required, journaled, rate-limited.
+- `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
+- Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
+- Config knobs in `agentq-config.json` (machineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
+
+### Changed
+
+- run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
+- Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
+- agentq-sync publishes v3 holders first so the hub's position model stays correct.
+
 ## [0.2.0] - 2026-10-06
 
 ### Added

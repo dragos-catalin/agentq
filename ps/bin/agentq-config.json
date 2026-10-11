@@ -1,10 +1,30 @@
 {
-  "taskSlotsPerRepo": 4,
+  "taskSlotsPerRepo": 6,
   "taskSlotsMachine": 10,
-  "releaseSlots": { "codai": 2 },
-  "pinned": { "codai": ["db-live"], "brivio": ["qa-prod"] },
+  "releaseSlots": {
+    "codai": 2
+  },
+  "pinned": {
+    "codai": [
+      "db-live"
+    ],
+    "brivio": [
+      "qa-prod"
+    ]
+  },
   "leaseDeadIdleMin": 120,
   "leaseMaxIdleMin": 1440,
   "unleasedRemoveIdleHours": 168,
-  "minFreeCommitGB": 12
+  "minFreeCommitGB": 12,
+  "machineCap": 2,
+  "quickBurst": 1,
+  "agingMin": 5,
+  "idleYieldMin": 5,
+  "idleCpuSec": 10,
+  "bumpMax": 50,
+  "burstMax": 2,
+  "burstMaxMin": 60,
+  "overridesPerHour": 6,
+  "runBuildTimeoutMin": 240,
+  "journalRotateMB": 64
 }

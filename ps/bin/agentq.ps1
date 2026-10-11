@@ -41,6 +41,25 @@ COMMANDS (all accept -Repo <path>; default = current dir's repo. -ExpectRepo <pa
   agentq note    -Message "..."    free-form journal entry (handoffs, "don't touch X")
   agentq acquire / release         low-level (scripts): acquire prints the ticket id
 
+v3 SCHEDULER (devcloud F1, 2026-10-11)
+  -Lane interactive|quick|gate|heavy|batch  (build default gate, others quick); -Priority -50..50.
+  Waiters are ranked by lane base + priority + bumps + aging (+5 per agingMin waited), not FIFO.
+  All tickets of one run are granted ATOMICALLY: nothing is held while any part still waits, so
+  waiting for build:machine no longer blocks build:<repo>. Soft slots on build:machine:
+  quick/interactive get `quickBurst` extra slots; non-batch jobs may run beside batch holders
+  (batch runs at Idle CPU). Idle-yield: a holder whose process tree burned < idleCpuSec over
+  idleYieldMin stops counting against the machine cap until CPU returns.
+  agentq bump    [-Id t] -By 20 -Reason "..."            raise my waiting ticket (cap bumpMax)
+  agentq burst   [-Resource build:machine] -By 1 -Minutes 30 -Reason "..."  temporary extra slot
+                  (refused when RAM/commit headroom < 2x the gate; cap burstMax/burstMaxMin)
+  agentq propose [-Reason "..."]  diagnose my wait and APPLY safe remedies (break dead/STALE >2x
+                  holders, bump my long waits, short burst when RAM allows); prints the rest
+  Overrides need -Reason (>= 8 chars), are journaled and limited to overridesPerHour per session.
+  agentq metrics [-Hours 24] [-Json]   wait/hold p50/p90 per resource x lane x kind
+  agentq rotate                        archive journal now (sweep does it above journalRotateMB)
+  Knobs: bin/agentq-config.json (machineCap quickBurst agingMin idleYieldMin idleCpuSec bumpMax
+  burstMax burstMaxMin overridesPerHour journalRotateMB). Plan: E:\gh\vmui\docs\devcloud\PLAN.md
+
 EXIT CODES: 0 ok; command's own exit code for `run`; 3 = frozen/blocked or timed out;
 2 = usage error.
 #>
@@ -55,6 +74,9 @@ $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGive
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
 $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
 $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @()
+# v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
+$Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
+$script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
 $Rest = @()
 $argv = @($args)
 $dd = [array]::IndexOf($argv, '--')
@@ -76,7 +98,7 @@ while ($i -lt $argv.Count) {
     'reason' { $Reason = & $next }
     'id' { $Id = & $next }
     'capacity' { $Capacity = [int](& $next); $CapacityGiven = $true }
-    'timeoutmin' { $TimeoutMin = [int](& $next) }
+    'timeoutmin' { $TimeoutMin = [int](& $next); $TimeoutGiven = $true }
     'stalemin' { $StaleMin = [int](& $next) }
     'last' { $Last = [int](& $next) }
     'hours' { $Hours = [double](& $next) }
@@ -101,6 +123,10 @@ while ($i -lt $argv.Count) {
     'ownerpid' { $OwnerPid = [int](& $next) }
     'leaseid' { $LeaseId = & $next }
     'also' { $Also = @((& $next) -split ',' | Where-Object { $_ }) }
+    'lane' { $Lane = (& $next).ToLowerInvariant() }
+    'priority' { $Priority = [int](& $next) }
+    'by' { $By = [int](& $next) }
+    'minutes' { $Minutes = [int](& $next) }
     default { throw "agentq: unknown argument '$a' (put the command after --)" }
   }
   $i++
@@ -216,7 +242,7 @@ function Read-Tickets([string]$res) {
 }
 
 function Remove-Ticket($t, [string]$why, [string]$kind = 'reap') {
-  Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $t.file, "$($t.file).hb", "$($t.file).wedged" -Force -ErrorAction SilentlyContinue
   Write-Journal @{ event = $kind; resource = $t.resource; ticket = $t.id; holderSession = $t.session; purpose = $t.purpose; reason = $why }
 }
 
@@ -234,10 +260,101 @@ function Get-Live([string]$res) {
 }
 
 function Get-Capacity([string]$res) {
+  # build:machine: config machineCap (+ an active, unexpired burst) wins over the sticky capacity
+  # file, which is rewritten so the hub/sync readers see the effective value (DC-014).
+  if ($res -eq 'build:machine') {
+    $cap = [int](Get-Config).machineCap + (Get-BurstExtra $res)
+    $f = Join-Path (QPath $res) 'capacity'
+    try { if (-not (Test-Path $f) -or [int](Get-Content $f -Raw) -ne $cap) { New-Item -ItemType Directory -Force (QPath $res) | Out-Null; [IO.File]::WriteAllText($f, "$cap") } } catch {}
+    return $cap
+  }
   $f = Join-Path (QPath $res) 'capacity'
-  if (Test-Path $f) { return [int](Get-Content $f -Raw) }
-  if ($DefaultCapacity.ContainsKey($res)) { return $DefaultCapacity[$res] }
-  1
+  $base = if (Test-Path $f) { [int](Get-Content $f -Raw) } elseif ($DefaultCapacity.ContainsKey($res)) { $DefaultCapacity[$res] } else { 1 }
+  $base + (Get-BurstExtra $res)
+}
+
+# ---- v3 scheduling helpers (devcloud F1, DC-010..013) -----------------------------------
+# P (property-or-default) is defined in agentq-v2.ps1, dot-sourced before any of this runs.
+$LaneBase = [ordered]@{ interactive = 100; quick = 80; gate = 50; heavy = 30; batch = 10 }
+function Resolve-Lane([string]$res, [string]$lane) {
+  if ($lane) {
+    if (-not $LaneBase.Contains($lane)) { throw "agentq: -Lane must be one of $($LaneBase.Keys -join '|')" }
+    return $lane
+  }
+  if ($res -like 'build:*') { return 'gate' }
+  'quick'
+}
+function BurstFile([string]$res) { Join-Path (QPath $res) 'burst.json' }
+function Get-BurstExtra([string]$res) {
+  $f = BurstFile $res
+  if (-not (Test-Path $f)) { return 0 }
+  try {
+    $b = Get-Content $f -Raw | ConvertFrom-Json -DateKind String
+    if ((ParseUtc $b.until) -gt (Now)) { return [int]$b.by }
+    Remove-Item $f -Force -ErrorAction SilentlyContinue
+    Write-Journal @{ event = 'burst-expired'; resource = $res; reason = "$($b.reason)" }
+  } catch {}
+  0
+}
+# Effective priority = lane base + explicit -Priority + bumps + aging (+5 per AgingMin waited).
+function Get-EffPrio($t) {
+  $lane = "$(P $t 'lane' 'gate')"
+  $base = if ($LaneBase.Contains($lane)) { $LaneBase[$lane] } else { 50 }
+  $aging = [int](Get-Config).agingMin
+  $waited = ((Now) - (ParseUtc $t.created)).TotalMinutes
+  $age = if ($aging -gt 0) { 5 * [math]::Floor($waited / $aging) } else { 0 }
+  $base + [int](P $t 'prio' 0) + [int](P $t 'bump' 0) + $age
+}
+# Legacy tickets (no `v`, written by agentq <= 0.2 during an install transition) hold by position.
+function Test-Held($t, [object[]]$live, [int]$cap) {
+  if (P $t 'v') { return [bool](P $t 'held' $false) }
+  $legacy = @($live | Where-Object { -not (P $_ 'v') })
+  [array]::IndexOf(@($legacy | ForEach-Object id), $t.id) -lt $cap
+}
+function Update-Ticket($t, [hashtable]$set) {
+  $raw = Get-Content -LiteralPath $t.file -Raw | ConvertFrom-Json -AsHashtable
+  foreach ($k in $set.Keys) { $raw[$k] = $set[$k] }
+  [IO.File]::WriteAllText("$($t.file).tmp", ($raw | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+  [IO.File]::Move("$($t.file).tmp", $t.file, $true)
+}
+# Can ticket $t take a slot on its resource NOW? Returns @{ ok; why }.
+function Test-Admissible($t, [scriptblock]$gate) {
+  $live = @(Get-Live $t.resource)
+  if (-not ($live | Where-Object id -eq $t.id)) { throw "agentq: ticket $($t.id) vanished from $($t.resource) (broken by another agent? see agentq log)" }
+  $cap = Get-Capacity $t.resource
+  # A holder whose process tree has been idle (idle-yield, DC-012) does not occupy a machine slot.
+  $held = @($live | Where-Object { (Test-Held $_ $live $cap) -and -not ($t.resource -eq 'build:machine' -and (P $_ 'yielded' $false)) })
+  $heldIds = @($live | Where-Object { Test-Held $_ $live $cap } | ForEach-Object { $_.id })
+  # Waiters that cannot start anyway (blocked on another resource of the same run: ready=false)
+  # do not reserve a slot here — backfill lets the next ready waiter use it (DC-013).
+  $waiting = @($live | Where-Object { ($heldIds -notcontains $_.id) -and ($_.id -eq $t.id -or (P $_ 'ready' $true)) } |
+      Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
+  $lane = "$(P $t 'lane' 'gate')"
+  $rank = [array]::IndexOf(@($waiting | ForEach-Object id), $t.id)
+  $ok = ($rank -ge 0 -and $rank -lt ($cap - $held.Count))
+  if (-not $ok -and $t.resource -eq 'build:machine') {
+    # Soft slots (DC-011): quick/interactive jobs get `quickBurst` extra slots so a 5 s lint never
+    # waits behind two 30 min gates; any non-batch job may run beside a batch holder (batch runs at
+    # Idle CPU priority, so it yields — that is the preemption). Ranked only among their peers.
+    $c = Get-Config
+    $heldBatch = @($held | Where-Object { "$(P $_ 'lane' 'gate')" -eq 'batch' }).Count
+    if ($lane -in 'interactive', 'quick') {
+      $peers = @($waiting | Where-Object { "$(P $_ 'lane' 'gate')" -in 'interactive', 'quick' })
+      $r = [array]::IndexOf(@($peers | ForEach-Object id), $t.id)
+      $burstUsed = [math]::Max(0, $held.Count - $cap)
+      $ok = ($r -ge 0 -and $r -lt ([int]$c.quickBurst - $burstUsed))
+      if ($ok) { $script:PreemptNote = 'quick burst slot' }
+    }
+    if (-not $ok -and $lane -ne 'batch' -and $heldBatch -gt 0) {
+      $peers = @($waiting | Where-Object { "$(P $_ 'lane' 'gate')" -ne 'batch' })
+      $r = [array]::IndexOf(@($peers | ForEach-Object id), $t.id)
+      $ok = ($r -ge 0 -and ($held.Count - $heldBatch + $r) -lt $cap)
+      if ($ok) { $script:PreemptNote = "beside $heldBatch batch holder(s)" }
+    }
+  }
+  if (-not $ok) { return @{ ok = $false; why = 'queue'; live = $live; held = $held; cap = $cap; rank = $rank } }
+  if ($gate -and -not (& $gate)) { return @{ ok = $false; why = 'ram'; live = $live; held = $held; cap = $cap; rank = $rank } }
+  @{ ok = $true; why = ''; live = $live; held = $held; cap = $cap; rank = $rank }
 }
 
 function Get-Mark([string]$res) {
@@ -278,6 +395,10 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
       id = $id; seq = $seq; resource = $res; pid = $owner; procStart = (Iso (Get-ProcStart $owner))
       session = $Session; purpose = $purpose; cmd = $cmd; repo = $repoTop; host = $env:COMPUTERNAME
       created = (Iso (Now))
+      # v3: priority scheduling. held flips true when the scheduler grants the slot; ready=false
+      # while the same run is still blocked on another resource (backfill skips it).
+      v = 3; lane = (Resolve-Lane $res $script:Lane); prio = [math]::Max(-50, [math]::Min(50, $script:Priority)); bump = 0
+      held = $false; ready = $true
     }
     $file = Join-Path $dir ('{0:D8}-{1}.json' -f $seq, $id)
     # Atomic publish: a reader must never see a half-written ticket (it would parse-fail,
@@ -289,37 +410,62 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
   } finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
 
-function Wait-Turn($ticket, [int]$timeoutMin, [scriptblock]$extraGate, [object[]]$heldTickets = @()) {
+# Acquire ALL tickets of one run atomically (DC-013): nothing is held while any part waits, so a
+# run waiting for build:machine no longer blocks build:<repo> (96.5 h measured in 15 days).
+# Check+grant happens under one machine-wide mutex so two runs never both take the last slot.
+function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
   $deadline = (Now).AddMinutes($timeoutMin)
-  $announced = $false
+  $announced = [DateTime]::MinValue
+  $ready = @{}; foreach ($t in $tickets) { $ready[$t.id] = $true }
   while ($true) {
-    Assert-NotMarked $ticket.resource
-    [IO.File]::SetLastWriteTimeUtc("$($ticket.file).hb", (Now))
-    # Tickets already held (build:<repo> while waiting for build:machine) must keep beating too:
-    # otherwise a long machine wait makes the repo hold look STALE and another agent breaks it.
-    foreach ($h in $heldTickets) { try { [IO.File]::SetLastWriteTimeUtc("$($h.file).hb", (Now)) } catch {} }
-    $live = @(Get-Live $ticket.resource)
-    $cap = Get-Capacity $ticket.resource
-    $pos = [array]::IndexOf(@($live | ForEach-Object id), $ticket.id)
-    if ($pos -lt 0) { throw "agentq: ticket $($ticket.id) vanished from $($ticket.resource) (broken by another agent? see agentq log)" }
-    $gateOk = if ($extraGate) { & $extraGate } else { $true }
-    if ($pos -lt $cap -and $gateOk) { return }
-    if (-not $announced -or ((Now).Second % 30 -lt 3)) {
-      $ahead = @($live | Select-Object -First $pos)
-      $holders = @($live | Select-Object -First $cap | Where-Object { $_.id -ne $ticket.id })
-      $who = ($holders | ForEach-Object { "$($_.session) '$($_.purpose)' $([math]::Round(((Now) - (ParseUtc $_.created)).TotalMinutes,1))m$(if ($_.stale) { ' STALE' })" }) -join '; '
-      $gateMsg = if (-not $gateOk) { ' (waiting for free RAM)' } else { '' }
-      [Console]::Error.WriteLine("agentq: waiting for $($ticket.resource) — position $($pos + 1 - $cap + 1)/$([math]::Max(1,$live.Count - $cap + 1)), $($ahead.Count) ahead; held by: $who$gateMsg")
-      $announced = $true
+    foreach ($t in $tickets) { Assert-NotMarked $t.resource; [IO.File]::SetLastWriteTimeUtc("$($t.file).hb", (Now)) }
+    $m = [Threading.Mutex]::new($false, 'Global\agentq-sched')
+    $granted = $false; $res = @{}
+    try {
+      try { [void]$m.WaitOne(15000) } catch [Threading.AbandonedMutexException] {}
+      foreach ($t in $tickets) { $res[$t.id] = Test-Admissible $t $gates[$t.id] }
+      $allOk = -not ($tickets | Where-Object { -not $res[$_.id].ok })
+      if ($allOk) {
+        foreach ($t in $tickets) { Update-Ticket $t @{ held = $true; ready = $true; acquired = (Iso (Now)) } }
+        $granted = $true
+      } else {
+        # A ticket whose sibling is blocked is not ready: let others backfill past it.
+        foreach ($t in $tickets) {
+          $sib = @($tickets | Where-Object { $_.id -ne $t.id -and -not $res[$_.id].ok })
+          $r = ($sib.Count -eq 0)
+          if ($ready[$t.id] -ne $r) { Update-Ticket $t @{ ready = $r }; $ready[$t.id] = $r }
+        }
+      }
+    } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
+    if ($granted) {
+      $wait = [math]::Round(((Now) - (ParseUtc $tickets[0].created)).TotalSeconds)
+      Write-Journal @{ event = 'acquired'; resource = (($tickets | ForEach-Object resource) -join ','); tickets = @($tickets | ForEach-Object id); lane = $tickets[0].lane; waitSec = $wait; purpose = $tickets[0].purpose; note = "$script:PreemptNote" }
+      $script:WaitSec = $wait
+      return
+    }
+    if (((Now) - $announced).TotalSeconds -ge 30) {
+      $msgs = foreach ($t in $tickets) {
+        $r = $res[$t.id]; if ($r.ok) { continue }
+        $who = ($r.held | ForEach-Object { "$($_.session) '$($_.purpose)' [$(P $_ 'lane' '?')] $([math]::Round(((Now) - (ParseUtc $_.created)).TotalMinutes,1))m$(if ($_.stale) { ' STALE' })" }) -join '; '
+        $why = if ($r.why -eq 'ram') { 'waiting for free RAM/commit' } else { "rank $($r.rank + 1) by priority, cap $($r.cap)" }
+        "$($t.resource) [$($t.lane)] $why; held by: $who"
+      }
+      [Console]::Error.WriteLine("agentq: waiting — $($msgs -join ' | ')")
+      [Console]::Error.WriteLine("        stuck? agentq propose -Reason '...' | agentq bump -By 20 -Reason '...' | agentq burst -Resource build:machine -Reason '...'")
+      $announced = Now
     }
     if ((Now) -gt $deadline) {
-      Remove-Ticket $ticket "timed out after $timeoutMin min" 'timeout'
-      foreach ($h in $heldTickets) { Remove-Ticket $h "released: timed out waiting for $($ticket.resource)" 'timeout' }
-      [Console]::Error.WriteLine("agentq: gave up waiting for $($ticket.resource) after $timeoutMin min")
+      foreach ($t in $tickets) { Remove-Ticket $t "timed out after $timeoutMin min" 'timeout' }
+      [Console]::Error.WriteLine("agentq: gave up waiting for $(($tickets | ForEach-Object resource) -join ',') after $timeoutMin min")
       exit 3
     }
-    Start-Sleep -Milliseconds 2000
+    Start-Sleep -Milliseconds 1500
   }
+}
+
+function Wait-Turn($ticket, [int]$timeoutMin, [scriptblock]$extraGate, [object[]]$heldTickets = @()) {
+  # Kept for single-resource callers (commit, land, acquire): now priority-aware via Wait-All.
+  Wait-All @($ticket) @{ $ticket.id = $extraGate } $timeoutMin
 }
 
 function Test-FreeRam([double]$gb) {
@@ -339,6 +485,141 @@ function Expand-Resources([string]$kind, $repo) {
 }
 
 function Get-SignalUrl { 'http://127.0.0.1:3737/api/copilot/event' }
+
+function Get-CmdKind([string]$c) {
+  $s = "$c".ToLowerInvariant()
+  switch -Regex ($s) {
+    'playwright|e2e' { return 'e2e' }
+    'gradle' { return 'gradle' }
+    'cargo|rustc|clippy' { return 'cargo' }
+    'next build' { return 'next-build' }
+    'vitest|jest|pytest|\btest\b' { return 'test' }
+    'typecheck|\btsc\b|tsgo' { return 'typecheck' }
+    'lint|eslint|oxlint|biome|knip' { return 'lint' }
+    '\.ps1' { return 'gate-script' }
+    'build|tsdown|vite' { return 'build' }
+    default { return 'other' }
+  }
+}
+
+# ---- overrides (DC-011): every one needs -Reason, is journaled, capped and rate-limited ----
+function Assert-OverrideBudget([string]$verb) {
+  if (-not $Reason -or $Reason.Trim().Length -lt 8) { throw "agentq ${verb}: -Reason '<why, >= 8 chars>' is required (journaled; other agents read it)" }
+  $limit = [int](Get-Config).overridesPerHour
+  $mine = @(Read-Journal 400 ((Now).AddHours(-1)) $null | Where-Object { $_.event -in 'bump', 'burst', 'propose-applied' -and $_.session -eq $Session })
+  if ($limit -gt 0 -and $mine.Count -ge $limit) { [Console]::Error.WriteLine("agentq: override budget spent ($($mine.Count)/$limit per hour for $Session). Ask the user, or wait."); exit 3 }
+}
+function Find-MyTickets {
+  $out = @()
+  foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Select-Object -First 1
+    if (-not $sample) { continue }
+    $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
+    $out += @(Get-Live $res | Where-Object { (-not $Id -and $_.session -eq $Session) -or ($Id -and $_.id -eq $Id) })
+  }
+  $out
+}
+function Invoke-Bump {
+  Assert-OverrideBudget 'bump'
+  $by = if ($By) { $By } else { 20 }
+  $max = [int](Get-Config).bumpMax
+  $mine = @(Find-MyTickets | Where-Object { -not (P $_ 'held' $false) })
+  if (-not $mine) { [Console]::Error.WriteLine("agentq bump: no waiting ticket for session $Session$(if ($Id) { " / id $Id" }) (pass -Id <ticket>)"); exit 2 }
+  foreach ($t in $mine) {
+    $nb = [math]::Min($max, [int](P $t 'bump' 0) + $by)
+    Update-Ticket $t @{ bump = $nb; bumpReason = $Reason }
+    Write-Journal @{ event = 'bump'; resource = $t.resource; ticket = $t.id; by = $by; bump = $nb; reason = $Reason; purpose = $t.purpose }
+    Write-Output "bumped $($t.id) on $($t.resource) to +$nb ($Reason)"
+  }
+}
+function Invoke-Burst {
+  Assert-OverrideBudget 'burst'
+  if (-not $Resource) { $Resource = 'build:machine' }
+  $res = Resolve-Resource $Resource (Get-RepoInfo $Repo)
+  $c = Get-Config
+  $by = [math]::Max(1, [math]::Min([int]$c.burstMax, $(if ($By) { $By } else { 1 })))
+  $min = [math]::Max(1, [math]::Min([int]$c.burstMaxMin, $Minutes))
+  if ($res -eq 'build:machine' -and -not (Test-FreeRam ([double]$MinFreeGB * 2))) {
+    [Console]::Error.WriteLine("agentq burst: refused - less than $([double]$MinFreeGB * 2) GB RAM (or commit headroom) free; a burst would OOM the machine. Use -Where cloud when available."); exit 3
+  }
+  New-Item -ItemType Directory -Force (QPath $res) | Out-Null
+  $b = [ordered]@{ resource = $res; by = $by; until = (Iso ((Now).AddMinutes($min))); reason = $Reason; session = $Session; at = (Iso (Now)) }
+  [IO.File]::WriteAllText((BurstFile $res), ($b | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+  Write-Journal @{ event = 'burst'; resource = $res; by = $by; minutes = $min; reason = $Reason }
+  Write-Output "burst $res +$by for $min min ($Reason)"
+}
+# propose: diagnose why the caller waits and APPLY the safe remedy (break a dead/hung holder,
+# bump a long waiter, or open a short burst when RAM allows). Unsafe remedies are printed only.
+function Invoke-Propose {
+  if (-not $Reason) { $Reason = 'propose: auto-remedy for a long wait' }
+  $repo = Get-RepoInfo $Repo
+  $c = Get-Config
+  $actions = @()
+  foreach ($res in @('build:machine') + @(if ($repo) { "build:$($repo.Name)", "commit:$($repo.Name)", "install:$($repo.Name)" })) {
+    $live = @(Get-Live $res); if (-not $live) { continue }
+    $cap = Get-Capacity $res
+    foreach ($h in @($live | Where-Object { Test-Held $_ $live $cap })) {
+      if ($h.stale -and $h.beatAgeMin -gt (2 * $StaleMin)) {
+        Remove-Ticket $h "propose: heartbeat stale $($h.beatAgeMin) min ($Reason)" 'break'
+        $actions += "broke STALE holder $($h.id) on $res ($($h.beatAgeMin) min)"
+      }
+    }
+    $waiters = @($live | Where-Object { -not (Test-Held $_ $live $cap) })
+    $mine = @($waiters | Where-Object session -eq $Session)
+    foreach ($w in $mine) {
+      $waitedMin = ((Now) - (ParseUtc $w.created)).TotalMinutes
+      if ($waitedMin -ge 10 -and [int](P $w 'bump' 0) -lt 20) {
+        Update-Ticket $w @{ bump = 20; bumpReason = "propose: waited $([math]::Round($waitedMin)) min" }
+        $actions += "bumped own ticket $($w.id) on $res (+20, waited $([math]::Round($waitedMin)) min)"
+      }
+    }
+    if ($res -eq 'build:machine' -and $mine -and -not (Test-Path (BurstFile $res)) -and (Test-FreeRam ([double]$MinFreeGB * 2))) {
+      $b = [ordered]@{ resource = $res; by = 1; until = (Iso ((Now).AddMinutes(20))); reason = "propose: $Reason"; session = $Session; at = (Iso (Now)) }
+      [IO.File]::WriteAllText((BurstFile $res), ($b | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+      $actions += 'opened burst build:machine +1 for 20 min (RAM headroom >= 2x gate)'
+    }
+  }
+  if ($actions) {
+    Write-Journal @{ event = 'propose-applied'; resource = 'agentq'; reason = $Reason; message = ($actions -join '; ') }
+    $actions | ForEach-Object { Write-Output "applied: $_" }
+  } else { Write-Output 'propose: nothing safe to apply (holders healthy, RAM below 2x gate, or no long wait). Consider -Where cloud or agentq bump -Reason.' }
+}
+
+# ---- metrics (DC-017): wait/hold distributions from the journal --------------------------
+function Show-Metrics {
+  $from = (Now).AddHours(-$Hours)
+  $items = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] })
+  $q = { param($a, [double]$p) if (-not $a) { return 0 }; $s = @($a | Sort-Object); $s[[math]::Min($s.Count - 1, [math]::Floor($p * $s.Count))] }
+  $rows = $items | Group-Object { "{0}|{1}|{2}" -f ("$($_.resource)" -replace ',build:machine', ''), "$(P $_ 'lane' '?')", "$(P $_ 'kind' '?')" } | ForEach-Object {
+    $w = @($_.Group | ForEach-Object { [double](P $_ 'waitSec' 0) }); $h = @($_.Group | ForEach-Object { [double]$_.holdSec })
+    $k = $_.Name -split '\|'
+    [pscustomobject]@{ resource = $k[0]; lane = $k[1]; kind = $k[2]; runs = $_.Count; fail = @($_.Group | Where-Object event -eq 'fail').Count
+      waitP50 = (& $q $w 0.5); waitP90 = (& $q $w 0.9); holdP50 = (& $q $h 0.5); holdP90 = (& $q $h 0.9); holdMin = [math]::Round(($h | Measure-Object -Sum).Sum / 60, 1) }
+  } | Sort-Object holdMin -Descending
+  $ev = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'idle-yield', 'bump', 'burst', 'propose-applied', 'timeout', 'reap', 'break' } | Group-Object event | ForEach-Object { "$($_.Name)=$($_.Count)" })
+  if ($Json) { @{ hours = $Hours; rows = @($rows); events = $ev } | ConvertTo-Json -Depth 4; return }
+  Write-Output "== agentq metrics, last $Hours h (seconds; v3 runs only)"
+  if ($rows) { $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Output } else { Write-Output '(no v3 runs yet)' }
+  Write-Output "== scheduler events: $(if ($ev) { $ev -join ' ' } else { 'none' })"
+}
+
+# ---- journal rotation (DC-016): archive when > journalRotateMB; agentq-sync resets its offset
+# when the file shrinks (Get-NewLines: offset > length -> 0) and dedupes on line hash server-side.
+function Invoke-RotateJournal([switch]$Force) {
+  if (-not (Test-Path $Journal)) { return }
+  $mb = (Get-Item $Journal).Length / 1MB
+  if (-not $Force -and $mb -lt [double](Get-Config).journalRotateMB) { return }
+  $arch = Join-Path $Root 'journal-archive'; New-Item -ItemType Directory -Force $arch | Out-Null
+  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  try {
+    try { [void]$m.WaitOne(10000) } catch [Threading.AbandonedMutexException] {}
+    $dst = Join-Path $arch ("journal-{0}.jsonl" -f (Now).ToString('yyyyMMdd-HHmmss'))
+    [IO.File]::Move($Journal, $dst)
+    [IO.File]::WriteAllText($Journal, '', [Text.UTF8Encoding]::new($false))
+  } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
+  Write-Journal @{ event = 'rotate'; resource = 'agentq'; reason = "archived $([math]::Round($mb,1)) MB -> $(Split-Path $dst -Leaf)" }
+  Write-Output "rotated journal ($([math]::Round($mb,1)) MB) -> $dst"
+}
 function Send-Signal([string]$ev, [string]$text) {
   if ($env:AGENTQ_NO_SIGNAL) { return }
   try {
@@ -361,37 +642,80 @@ function Invoke-Run {
   $tickets = @()
   $started = Now
   try {
-    # Queue for each resource only once the previous one is HELD. Creating every ticket up front
-    # put a build:machine ticket in the first two positions while its run still waited for
-    # build:<repo>: a phantom machine hold with no heartbeat, starving everyone (2026-09-30).
+    # v3 (DC-013): all tickets exist from the start but NONE is held until every one is
+    # admissible; the grant is atomic (Wait-All). Held is an explicit flag, so the 2026-09-30
+    # phantom-hold (position = hold) cannot recur.
+    $gates = @{}
     foreach ($r in $resList) {
       $t = New-Ticket $r $Purpose $cmdLine ($repo.Top)
-      $heldSoFar = @($tickets)
       $tickets += $t   # before waiting, so the finally below removes it on Ctrl+C or an exception
-      Write-Journal @{ event = 'queued'; resource = $r; ticket = $t.id; purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
-      $gate = if ($t.resource -eq 'build:machine' -and $MinFreeGB -gt 0) { { Test-FreeRam $MinFreeGB } } else { $null }
-      if ($NoWait) {
-        $live = @(Get-Live $t.resource)
-        if ([array]::IndexOf(@($live | ForEach-Object id), $t.id) -ge (Get-Capacity $t.resource)) {
-          $h = @($live)[0]
-          Remove-Ticket $t 'busy (-NoWait)' 'giveup'
-          [Console]::Error.WriteLine("agentq: $($t.resource) is busy: $($h.session) '$($h.purpose)' since $($h.created)")
-          exit 3
-        }
-      } else { Wait-Turn $t $TimeoutMin $gate $heldSoFar }
+      Write-Journal @{ event = 'queued'; resource = $r; ticket = $t.id; purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name; lane = $t.lane }
+      $gates[$t.id] = if ($t.resource -eq 'build:machine' -and $MinFreeGB -gt 0) { { Test-FreeRam $MinFreeGB } } else { $null }
     }
+    if ($NoWait) {
+      $busy = @($tickets | Where-Object { -not (Test-Admissible $_ $gates[$_.id]).ok })
+      if ($busy) {
+        $h = @(Get-Live $busy[0].resource)[0]
+        foreach ($t in $tickets) { Remove-Ticket $t 'busy (-NoWait)' 'giveup' }
+        [Console]::Error.WriteLine("agentq: $($busy[0].resource) is busy: $($h.session) '$($h.purpose)' since $($h.created)")
+        exit 3
+      }
+      foreach ($t in $tickets) { Update-Ticket $t @{ held = $true; acquired = (Iso (Now)) } }
+      $script:WaitSec = 0
+    } else { Wait-All $tickets $gates $TimeoutMin }
+    $acquiredAt = Now
     $held = ($resList -join ',')
-    Write-Journal @{ event = 'start'; resource = $held; tickets = @($tickets | ForEach-Object id); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
+    Write-Journal @{ event = 'start'; resource = $held; tickets = @($tickets | ForEach-Object id); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name; lane = $tickets[0].lane; waitSec = $script:WaitSec }
     Send-Signal 'agentq-start' "$held — $Purpose"
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $held) | Where-Object { $_ }) -join ','
     $env:AGENTQ_PURPOSE = $Purpose
     $env:AGENTQ_SESSION = $Session
+    $env:AGENTQ_LANE = "$($tickets[0].lane)"
+    # run-build writes <ticket>.wedged beside these when its build log stops growing (WEDGED in status).
+    $env:AGENTQ_TICKET_FILES = (@($env:AGENTQ_TICKET_FILES) + @($tickets | ForEach-Object file) | Where-Object { $_ }) -join ';'
 
     # Heartbeat: a background job touches every ticket's .hb file every 20 s.
+    # Idle watchdog (DC-012): every 60 s it sums the CPU time of this run's process tree. A tree
+    # that burned < idleCpuSec over idleYieldMin minutes is doing nothing locally (waiting on a
+    # cloud VM, network, a hung child): its build:machine ticket YIELDS (does not count against
+    # the machine cap) until CPU comes back. The repo ticket stays held (correctness).
     $hbFiles = @($tickets | ForEach-Object { "$($_.file).hb" })
-    $hb = Start-ThreadJob -ArgumentList (, $hbFiles) -ScriptBlock {
-      param($files)
-      while ($true) { foreach ($f in $files) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 }
+    $machineFile = @($tickets | Where-Object resource -eq 'build:machine' | ForEach-Object file) | Select-Object -First 1
+    $cfg = Get-Config
+    $hb = Start-ThreadJob -ArgumentList $hbFiles, $machineFile, $PID, ([int]$cfg.idleYieldMin), ([double]$cfg.idleCpuSec), $Journal, $Session -ScriptBlock {
+      param($files, $mfile, $rootPid, $yieldMin, $cpuSec, $journal, $session)
+      $samples = [Collections.Generic.List[object]]::new(); $tick = 0; $yielded = $false
+      function TreeCpu([int]$root) {
+        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, KernelModeTime, UserModeTime)
+        $kids = @{}; foreach ($p in $all) { $k = [int]$p.ParentProcessId; if (-not $kids[$k]) { $kids[$k] = [Collections.Generic.List[object]]::new() }; $kids[$k].Add($p) }
+        $sum = 0.0; $stack = [Collections.Generic.Stack[int]]::new(); $stack.Push($root); $seen = @{}
+        while ($stack.Count) { $id = $stack.Pop(); if ($seen[$id]) { continue }; $seen[$id] = 1
+          foreach ($c in @($kids[$id])) { if ($c) { $sum += ([double]$c.KernelModeTime + [double]$c.UserModeTime) / 1e7; $stack.Push([int]$c.ProcessId) } } }
+        $sum
+      }
+      function SetFlag([string]$f, [bool]$v) {
+        try { $raw = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable; $raw['yielded'] = $v; $raw['yieldAt'] = [DateTime]::UtcNow.ToString('o')
+          [IO.File]::WriteAllText("$f.tmp", ($raw | ConvertTo-Json -Depth 4)); [IO.File]::Move("$f.tmp", $f, $true) } catch {}
+      }
+      while ($true) {
+        foreach ($f in $files) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }
+        if ($mfile -and $yieldMin -gt 0 -and ($tick % 3) -eq 0) {
+          try {
+            $samples.Add(@{ t = [DateTime]::UtcNow; cpu = (TreeCpu $rootPid) })
+            # Drop the oldest only while the NEXT one still covers the whole window.
+            while ($samples.Count -gt 2 -and ([DateTime]::UtcNow - $samples[1].t).TotalMinutes -ge $yieldMin) { $samples.RemoveAt(0) }
+            $span = ([DateTime]::UtcNow - $samples[0].t).TotalMinutes
+            $burn = $samples[$samples.Count - 1].cpu - $samples[0].cpu
+            $idle = ($span -ge ($yieldMin - 0.5)) -and ($burn -lt $cpuSec)
+            $busyAgain = $yielded -and $samples.Count -ge 2 -and (($samples[$samples.Count - 1].cpu - $samples[$samples.Count - 2].cpu) -ge $cpuSec)
+            if ($idle -and -not $yielded) { $yielded = $true; SetFlag $mfile $true
+              [IO.File]::AppendAllText($journal, (@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-yield'; resource = 'build:machine'; session = $session; reason = "cpu $([math]::Round($burn,1))s in $([math]::Round($span,1)) min" } | ConvertTo-Json -Compress) + "`n") }
+            elseif ($busyAgain) { $yielded = $false; SetFlag $mfile $false
+              [IO.File]::AppendAllText($journal, (@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-resume'; resource = 'build:machine'; session = $session } | ConvertTo-Json -Compress) + "`n") }
+          } catch {}
+        }
+        $tick++; Start-Sleep -Seconds 20
+      }
     }
     try {
       $exe = $cmdArgs[0]; $argv = @($cmdArgs | Select-Object -Skip 1)
@@ -399,11 +723,12 @@ function Invoke-Run {
       $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }
     } finally { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }
     $dur = [math]::Round(((Now) - $started).TotalSeconds)
-    Write-Journal @{ event = $(if ($code -eq 0) { 'done' } else { 'fail' }); resource = $held; exit = $code; durSec = $dur; purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
+    $holdSec = [math]::Round(((Now) - $acquiredAt).TotalSeconds)
+    Write-Journal @{ event = $(if ($code -eq 0) { 'done' } else { 'fail' }); resource = $held; exit = $code; durSec = $dur; holdSec = $holdSec; waitSec = $script:WaitSec; lane = $tickets[0].lane; kind = (Get-CmdKind $cmdLine); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
     if ($code -ne 0) { Send-Signal 'agentq-fail' "$held failed ($code) — $Purpose" }
     exit $code
   } finally {
-    foreach ($t in $tickets) { Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue }
+    foreach ($t in $tickets) { Remove-Item -LiteralPath $t.file, "$($t.file).hb", "$($t.file).wedged" -Force -ErrorAction SilentlyContinue }
   }
 }
 
@@ -421,6 +746,7 @@ function Invoke-Commit {
   Assert-NotMarked $res
   $t = New-Ticket $res $Purpose "commit $($plist -join ' ')" $repo.Top
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $Purpose; paths = $plist; repo = $repo.Name }
+  $script:CommitDone = $false
   try {
     Wait-Turn $t $TimeoutMin $null
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
@@ -462,6 +788,7 @@ function Invoke-Commit {
         throw "git commit failed ($cc) — nothing committed; unstaged $($ours.Count) path(s) agentq had staged"
       }
       $sha = (& git rev-parse --short HEAD).Trim()
+      $script:CommitDone = $true
       $files = @(& git show --name-only --format= HEAD)
       $foreign = @($files | Where-Object { $f = $_; -not ($plist | Where-Object { $f -like "$($_ -replace '\\','/')*" }) })
       Write-Journal @{ event = 'commit'; resource = $res; sha = $sha; purpose = $Purpose; message = $Message; paths = $files; foreign = $foreign; repo = $repo.Name }
@@ -508,6 +835,11 @@ function Invoke-Commit {
         if ($acts) { Write-Output "releases following origin/${branch}: $($acts -join ', ')" }
       }
     } finally { Pop-Location }
+  } catch {
+    # DC-015: ~30 % of commit tickets ended with no commit and no journaled reason. Record it.
+    $msg = "$($_.Exception.Message)"
+    Write-Journal @{ event = $(if ($script:CommitDone) { 'push-failed' } else { 'commit-failed' }); resource = $res; purpose = $Purpose; reason = $msg.Substring(0, [math]::Min(400, $msg.Length)); paths = $plist; repo = $repo.Name }
+    throw
   } finally { Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue }
 }
 
@@ -522,15 +854,26 @@ function Show-Status {
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
     $live = @(Get-Live $res)
     $cap = Get-Capacity $res
-    $i = 0
+    $wq = @($live | Where-Object { -not (Test-Held $_ $live $cap) } | Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
     foreach ($t in $live) {
+      $isHeld = Test-Held $t $live $cap
+      $role = if ($isHeld) { if (P $t 'yielded' $false) { 'HOLD(idle)' } else { 'HOLD' } } else { "wait#$([array]::IndexOf(@($wq | ForEach-Object id), $t.id) + 1)$(if (-not (P $t 'ready' $true)) { '~' })" }
+      # WEDGED: run-build saw its build log silent for -WedgeMin (sidecar <ticket>.wedged, JSON {since,quietMin,log,pid}).
+      $wedgeTxt = $null
+      if (Test-Path -LiteralPath "$($t.file).wedged") {
+        $wm = '?'
+        try {
+          $w = Get-Content -LiteralPath "$($t.file).wedged" -Raw | ConvertFrom-Json -DateKind String
+          if ($w.PSObject.Properties['since'] -and $w.since) { $q = if ($w.PSObject.Properties['quietMin']) { [double]$w.quietMin } else { 0 }; $wm = [math]::Round(((Now) - (ParseUtc $w.since)).TotalMinutes + $q, 0) }
+        } catch { }
+        $wedgeTxt = "WEDGED(${wm}m)"
+      }
       $rows += [pscustomobject]@{
-        resource = $res; role = $(if ($i -lt $cap) { 'HOLD' } else { "wait#$($i - $cap + 1)" })
-        state = $(if ($t.stale) { "STALE($($t.beatAgeMin)m)" } else { 'ok' })
+        resource = $res; role = $role; lane = "$(P $t 'lane' '-')"; prio = $(if (P $t 'v') { Get-EffPrio $t } else { '-' })
+        state = $(if ($t.stale -and $wedgeTxt) { "STALE($($t.beatAgeMin)m),$wedgeTxt" } elseif ($t.stale) { "STALE($($t.beatAgeMin)m)" } elseif ($wedgeTxt) { $wedgeTxt } else { 'ok' })
         ageMin = [math]::Round(((Now) - (ParseUtc $t.created)).TotalMinutes, 1)
         session = $t.session; purpose = $t.purpose; id = $t.id
       }
-      $i++
     }
   }
   $marks = @(Get-ChildItem $MDir -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String })
@@ -543,8 +886,10 @@ function Show-Status {
   Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'
-    $rows | Format-Table resource, role, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 220 | Write-Output
+    $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
+  $bursts = @(Get-ChildItem $QDir -Recurse -Filter 'burst.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String } | Where-Object { (ParseUtc $_.until) -gt (Now) })
+  foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
 }
 
 function Read-Journal([int]$n, $since, [string]$repoName) {
@@ -669,6 +1014,11 @@ switch ($Verb.ToLowerInvariant()) {
   }
   'acquire' { Invoke-Acquire }
   'release' { Invoke-Release }
+  'bump' { Invoke-Bump }
+  'burst' { Invoke-Burst }
+  'propose' { Invoke-Propose }
+  'metrics' { Show-Metrics }
+  'rotate' { Invoke-RotateJournal -Force }
   'lease' { Invoke-Lease }
   'unlease' { Invoke-Unlease }
   'renew' { Invoke-Renew }

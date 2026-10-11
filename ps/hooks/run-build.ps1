@@ -28,7 +28,9 @@
 param(
   [Parameter(ParameterSetName = 'Run', Mandatory)][string]$Command,
   [Parameter(ParameterSetName = 'Run')][switch]$Wait,
-  [Parameter(ParameterSetName = 'Run')][int]$TimeoutMin = 25,
+  # 240 (was 25): 58 of 71 agentq timeouts in 15 days were this default giving up on a busy queue
+  # and dropping the place already earned (devcloud DC-014).
+  [Parameter(ParameterSetName = 'Run')][int]$TimeoutMin = 240,
   # Node's default old-space is ~4 GB, and the heaviest project here (apps/web,
   # 5620 files) needs ~6 GB — so the DEFAULT is the real hazard, not generosity.
   # 8 GB clears that with margin while still bounding a runaway process; the
@@ -36,6 +38,13 @@ param(
   [Parameter(ParameterSetName = 'Run')][int]$HeapMb = 8192,
   # Shown to every other agent in `agentq status` / the journal. Default = the command.
   [Parameter(ParameterSetName = 'Run')][string]$Purpose,
+  # agentq v3 lane: interactive|quick|gate|heavy|batch (default gate). batch runs at Idle CPU
+  # priority, so higher lanes may run beside it (soft preemption).
+  [Parameter(ParameterSetName = 'Run')][ValidateSet('interactive', 'quick', 'gate', 'heavy', 'batch')][string]$Lane = 'gate',
+  [Parameter(ParameterSetName = 'Run')][int]$Priority = 0,
+  # Build log silent this long -> WEDGED marker on the agentq ticket (shown by `agentq status`) and
+  # a console warning. Cleared when output resumes. 0 disables.
+  [Parameter(ParameterSetName = 'Run')][double]$WedgeMin = 10,
   [Parameter(ParameterSetName = 'Status')][switch]$Status,
   [string]$Root
 )
@@ -156,9 +165,9 @@ $sessionId = if ($env:AGENTQ_SESSION) { $env:AGENTQ_SESSION } elseif ($env:COPIL
 $agentq = Join-Path $env:USERPROFILE '.copilot\bin\agentq.ps1'
 if ((Test-Path $agentq) -and ("$env:AGENTQ_HELD" -notmatch '(^|,)build:') -and -not $env:RUN_BUILD_NO_AGENTQ) {
   $why = if ($Purpose) { $Purpose } else { "build: $Command" }
-  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait')
+  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-Lane', $Lane, '-WedgeMin', "$WedgeMin")
   if ($Root) { $self += @('-Root', $Root) }
-  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', 'build', '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root)
+  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', 'build', '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root, '-Lane', $Lane, '-Priority', "$Priority")
   if (-not $Wait) { $aqArgs += '-NoWait' }
   & pwsh @aqArgs -- pwsh @self
   exit $LASTEXITCODE
@@ -247,15 +256,23 @@ try {
   # line here covers cmd, gradle, its Kotlin daemon, node, tsc, rustc. Builds
   # still use every idle cycle; they just lose to anything interactive.
   # RUN_BUILD_PRIORITY=Normal opts out (e.g. a timing measurement).
-  $priority = if ($env:RUN_BUILD_PRIORITY) { $env:RUN_BUILD_PRIORITY } else { 'BelowNormal' }
-  try { (Get-Process -Id $PID).PriorityClass = $priority } catch { Write-Host "could not set priority $priority : $_" -ForegroundColor DarkYellow }
+  # $cpuClass, not $priority: PowerShell names are case-insensitive and [int]$Priority (agentq lane
+  # priority) is a parameter, so assigning 'BelowNormal' to $priority threw a conversion error.
+  $cpuClass = if ($env:RUN_BUILD_PRIORITY) { $env:RUN_BUILD_PRIORITY } elseif ($Lane -eq 'batch' -or $env:AGENTQ_LANE -eq 'batch') { 'Idle' } else { 'BelowNormal' }
+  try { (Get-Process -Id $PID).PriorityClass = $cpuClass } catch { Write-Host "could not set priority $cpuClass : $_" -ForegroundColor DarkYellow }
   # 2>&1 keeps compiler diagnostics, which are the whole reason to read a log.
   # Wait on the PROCESS, not on its stdout pipe: a build that cold-starts a daemon
   # (Gradle, Kotlin, sccache) hands it the inherited pipe handle, so `| Tee-Object`
   # never sees EOF and run-build hung 3 h after a 103 s gate (titi, 2026-09-29).
   # cmd writes to a file; we stream that file to the console until cmd exits.
   $outFile = "$logPath.out"
-  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList '/d', '/s', '/c', "`"$Command 2>&1`"" -NoNewWindow -PassThru -RedirectStandardOutput $outFile -WorkingDirectory (Get-Location).Path
+  # Isolation (2026-10-12): -NoNewWindow shared the caller's console, so a Ctrl+C sent into a shared
+  # VS Code terminal (another agent, a timed-out tool) reached cmd, which then hung forever at
+  # "Terminate batch job (Y/N)?" holding the build queue. -WindowStyle Hidden gives the child its OWN
+  # console (no foreign Ctrl+C), and stdin from an empty file means no prompt can ever block it.
+  $stdinEmpty = Join-Path $dir 'stdin-empty.txt'
+  if (-not (Test-Path -LiteralPath $stdinEmpty)) { [IO.File]::WriteAllText($stdinEmpty, '') }
+  $proc = Start-Process -FilePath $env:ComSpec -ArgumentList '/d', '/s', '/c', "`"$Command 2>&1`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardInput $stdinEmpty -WorkingDirectory (Get-Location).Path
   $null = $proc.Handle # keep the handle so ExitCode is readable after exit
   $pos = [ref] 0L
   function Send-NewOutput([string] $src, [string] $dst, [ref] $at) {
@@ -271,8 +288,26 @@ try {
       [Console]::Out.Write($chunk); [IO.File]::AppendAllText($dst, $chunk)
     } finally { $fs.Dispose() }
   }
-  while (-not $proc.WaitForExit(500)) { Send-NewOutput $outFile $logPath $pos }
+  # Wedge watch: no new output for -WedgeMin -> <ticket>.wedged beside each agentq ticket we run
+  # under (AGENTQ_TICKET_FILES, set by `agentq run`), so `agentq status` shows WEDGED for this holder.
+  $ticketFiles = @("$env:AGENTQ_TICKET_FILES" -split ';' | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+  $lastGrowth = [DateTime]::UtcNow; $lastPos = 0L; $wedged = $false
+  while (-not $proc.WaitForExit(500)) {
+    Send-NewOutput $outFile $logPath $pos
+    if ($pos.Value -ne $lastPos) {
+      $lastPos = $pos.Value; $lastGrowth = [DateTime]::UtcNow
+      if ($wedged) { $wedged = $false; foreach ($tf in $ticketFiles) { Remove-Item -LiteralPath "$tf.wedged" -Force -ErrorAction SilentlyContinue }; Write-Host 'build output resumed (WEDGED cleared)' -ForegroundColor DarkGray }
+    } elseif (-not $wedged -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $lastGrowth).TotalMinutes -ge $WedgeMin) {
+      $wedged = $true
+      $quiet = [math]::Round(([DateTime]::UtcNow - $lastGrowth).TotalMinutes, 1)
+      $w = @{ since = [DateTime]::UtcNow.ToString('o'); quietMin = $quiet; log = $logPath; pid = $proc.Id } | ConvertTo-Json -Compress
+      foreach ($tf in $ticketFiles) { try { [IO.File]::WriteAllText("$tf.wedged", $w) } catch { } }
+      "=== WEDGED: no output for $quiet min (pid $($proc.Id)) $(Get-Date -Format o)" | Add-Content $logPath -Encoding UTF8
+      Write-Host "WEDGED: build output silent for $quiet min (pid $($proc.Id)). Inspect: wait-job.ps1 -Log '$logPath' -Pid $($proc.Id)" -ForegroundColor Yellow
+    }
+  }
   Send-NewOutput $outFile $logPath $pos
+  foreach ($tf in $ticketFiles) { Remove-Item -LiteralPath "$tf.wedged" -Force -ErrorAction SilentlyContinue }
   Remove-Item $outFile -ErrorAction SilentlyContinue
   $code = $proc.ExitCode
   $env:NODE_OPTIONS = $prevNodeOptions

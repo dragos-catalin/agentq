@@ -37,6 +37,14 @@ $StateFile = if ($env:AGENTQ_SYNC_STATE) { $env:AGENTQ_SYNC_STATE } else { Join-
 $Base = if ($Url) { $Url } elseif ($env:AGENTQ_SYNC_URL) { $env:AGENTQ_SYNC_URL } else { 'https://ai.codai.ro' }
 $Utf8 = [Text.UTF8Encoding]::new($false)
 $DefaultCapacity = @{ 'build:machine' = 2 }
+# Background-job registry (<root>/jobs/*.json, job-start.ps1). Optional: an install without the lib
+# simply sends jobs = [] and a gateway that does not know `jobs` ignores the field.
+$JobsLib = Join-Path $PSScriptRoot 'agentq-jobs-lib.ps1'
+if (Test-Path -LiteralPath $JobsLib) { . $JobsLib }
+function Get-Jobs {
+  if (-not (Get-Command Get-JobsForSync -ErrorAction SilentlyContinue)) { return @() }
+  try { @(Get-JobsForSync) } catch { [Console]::Error.WriteLine("agentq-sync: jobs skipped: $_"); @() }
+}
 
 function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
 function ParseUtc($s) { if ($s -is [datetime]) { return $s.ToUniversalTime() }; [DateTimeOffset]::Parse("$s", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
@@ -70,16 +78,28 @@ function Get-Tickets {
   if (-not (Test-Path $QDir)) { return $out }
   foreach ($d in Get-ChildItem $QDir -Directory) {
     $capFile = Join-Path $d.FullName 'capacity'
-    foreach ($f in Get-ChildItem $d.FullName -Filter '*.json' -File) {
+    # v3 tickets carry an explicit `held` flag and holders may exceed the base capacity (quick
+    # burst, beside-batch, burst overrides). The hub derives roles by position ("first capacity
+    # live tickets hold"), so publish holders first (seq) and waiters after (seq + 1e9), and a
+    # capacity of max(cap, holders). Full lane/prio columns in the hub: devcloud DC-060.
+    $files = @(Get-ChildItem $d.FullName -Filter '*.json' -File)
+    $heldCount = @($files | Where-Object { try { $x = Get-Content $_.FullName -Raw | ConvertFrom-Json; $x.PSObject.Properties['v'] -and $x.PSObject.Properties['held'] -and $x.held } catch { $false } }).Count
+    foreach ($f in $files) {
       try { $t = Get-Content $f.FullName -Raw | ConvertFrom-Json -DateKind String } catch { continue }
       if (-not $t -or -not $t.PSObject.Properties['resource']) { continue }
       $cap = if (Test-Path $capFile) { [int](Get-Content $capFile -Raw) } elseif ($DefaultCapacity.ContainsKey($t.resource)) { $DefaultCapacity[$t.resource] } else { 1 }
+      $seq = [long]$t.seq
+      if ($t.PSObject.Properties['v']) {
+        $cap = [math]::Max($cap, $heldCount)
+        if (-not ($t.PSObject.Properties['held'] -and $t.held)) { $seq += 1000000000 }
+      }
       $hb = "$($f.FullName).hb"
       $beat = if (Test-Path $hb) { (Get-Item $hb).LastWriteTimeUtc } else { ParseUtc $t.created }
       $prop = { param($n) if ($t.PSObject.Properties[$n] -and $null -ne $t.$n) { "$($t.$n)" } else { '' } }
+      $lanePrefix = if ($t.PSObject.Properties['lane'] -and $t.lane) { "[$($t.lane)] " } else { '' }
       $out.Add([ordered]@{
-          id = "$($t.id)"; resource = "$($t.resource)"; seq = [long]$t.seq; capacity = [math]::Max(1, $cap)
-          pid = [int]$t.pid; session = (& $prop 'session'); purpose = (& $prop 'purpose'); cmd = (& $prop 'cmd'); repo = (& $prop 'repo')
+          id = "$($t.id)"; resource = "$($t.resource)"; seq = $seq; capacity = [math]::Min(64, [math]::Max(1, $cap))
+          pid = [int]$t.pid; session = (& $prop 'session'); purpose = ($lanePrefix + (& $prop 'purpose')); cmd = (& $prop 'cmd'); repo = (& $prop 'repo')
           created = (Iso (ParseUtc $t.created)); beat = (Iso $beat); alive = (Test-Alive $t)
         })
     }
@@ -189,10 +209,11 @@ function Invoke-Push {
   $j = Get-NewLines $state.offset
   $body = [ordered]@{
     host = $env:COMPUTERNAME; root = $Root; agentVersion = $Version
-    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); journal = @($j.lines); ackOps = @($state.ack)
+    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); jobs = @(Get-Jobs); journal = @($j.lines); ackOps = @($state.ack)
   }
   if ($DryRun) {
-    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
+    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) jobs=$($body.jobs.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
+    if ($env:AGENTQ_SYNC_DUMP) { [IO.File]::WriteAllText($env:AGENTQ_SYNC_DUMP, ($body | ConvertTo-Json -Depth 6), $Utf8) }
     return
   }
   $json = $body | ConvertTo-Json -Depth 6 -Compress

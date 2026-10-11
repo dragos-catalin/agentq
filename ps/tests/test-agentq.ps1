@@ -124,8 +124,9 @@ $mq = Join-Path $env:AGENTQ_HOME 'queues\build_machine'
 $w = 0; while ($w -lt 60 -and -not (Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 250; $w++ }
 $waiter = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'build', '-Purpose', 'repo-waiter', '-MinFreeGB', '0', '--', 'pwsh', '-NoProfile', '-Command', 'exit 0') -WorkingDirectory $wt -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 4
-$machine = @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { (Get-Content $_.FullName -Raw | ConvertFrom-Json).purpose })
-Check 'waiter for build:<repo> holds no build:machine ticket' (-not ($machine -contains 'repo-waiter')) ($machine -join ',')
+# v3: the waiter may own a queued build:machine ticket, but it must not be HELD (atomic grant).
+$machine = @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'repo-waiter' -and $_.PSObject.Properties['held'] -and $_.held })
+Check 'waiter for build:<repo> holds no build:machine ticket' ($machine.Count -eq 0) "$($machine.Count) held"
 
 # 9. while waiting for build:machine, the already-held build:<repo> ticket keeps beating.
 #    Fill build:machine with two live foreign tickets owned by this test process.

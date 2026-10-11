@@ -97,7 +97,8 @@ if (-not $Inner) {
 $lease = $null
 $code = 1
 try {
-  $leaseJson = & pwsh -NoProfile -File $agentq lease -Repo $Root -Role release -OwnerPid $PID -Purpose "release $Target" -Ref $Ref -Json -TimeoutMin 30 | Select-Object -Last 1
+  # DC-014: was a hard-coded 30 min, so any deploy behind a > 30 min release exited 1 unrun.
+  $leaseJson = & pwsh -NoProfile -File $agentq lease -Repo $Root -Role release -OwnerPid $PID -Purpose "release $Target" -Ref $Ref -Json -TimeoutMin ([math]::Max(30, $QueueTimeoutMin * 3)) | Select-Object -Last 1
   if ($LASTEXITCODE) { throw "deploy-clean: could not lease a release slot (exit $LASTEXITCODE)" }
   $lease = $leaseJson | ConvertFrom-Json
   $wt = $lease.path
