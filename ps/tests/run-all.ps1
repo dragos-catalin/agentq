@@ -7,8 +7,10 @@ $stage = Join-Path ([IO.Path]::GetTempPath()) ('aq-runall-' + [guid]::NewGuid().
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item (Join-Path $bin '*') $stage
 Copy-Item (Join-Path $PSScriptRoot 'test-agentq.ps1') $stage
+Copy-Item (Join-Path $PSScriptRoot 'test-agentq-v3.ps1') $stage
 $suites = [ordered]@{
   'agentq v1'      = @('-File', (Join-Path $stage 'test-agentq.ps1'))
+  'agentq v3'      = @('-File', (Join-Path $stage 'test-agentq-v3.ps1'))
   'agentq v2'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-v2.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'worktree v2'    = @('-File', (Join-Path $PSScriptRoot 'test-worktree-v2.ps1'), '-Bin', $bin, '-Hooks', $hooks)
   'repo-migrate'   = @('-File', (Join-Path $PSScriptRoot 'test-repo-migrate.ps1'), '-Tool', (Join-Path $bin 'repo-migrate.ps1'))
