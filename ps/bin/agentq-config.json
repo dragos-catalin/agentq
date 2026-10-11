@@ -1,5 +1,5 @@
 {
-  "taskSlotsPerRepo": 3,
+  "taskSlotsPerRepo": 4,
   "taskSlotsMachine": 10,
   "releaseSlots": { "codai": 2 },
   "pinned": { "codai": ["db-live"], "brivio": ["qa-prod"] },
