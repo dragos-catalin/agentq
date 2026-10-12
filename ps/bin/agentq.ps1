@@ -690,7 +690,8 @@ function Invoke-Run {
   Assert-ExpectedRepo $repo
   if (-not $Resource) { throw 'agentq run: -Resource build|install|commit|deploy:<target>|<literal> is required' }
   if (-not $Purpose) { throw 'agentq run: -Purpose "<why>" is required (other agents read it)' }
-  $cmdArgs = @($Rest | Where-Object { $_ -ne '--' })
+  # only agentq's own separator is consumed (line ~94); a later '--' belongs to the command (turbo/pnpm/vitest)
+  $cmdArgs = @($Rest)
   if (-not $cmdArgs) { throw 'agentq run: nothing to run (agentq run -Resource build -Purpose x -- <command>)' }
   $cmdLine = ($cmdArgs -join ' ')
   $resList = @(Expand-Resources $Resource $repo)
