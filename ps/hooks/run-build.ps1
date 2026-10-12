@@ -32,7 +32,7 @@ param(
   # and dropping the place already earned (devcloud DC-014).
   [Parameter(ParameterSetName = 'Run')][int]$TimeoutMin = 240,
   # Node's default old-space is ~4 GB, and the heaviest project here (apps/web,
-  # 5620 files) needs ~6 GB — so the DEFAULT is the real hazard, not generosity.
+  # 5620 files) needs ~6 GB ΓÇö so the DEFAULT is the real hazard, not generosity.
   # 8 GB clears that with margin while still bounding a runaway process; the
   # lock already prevents several of these existing at once.
   [Parameter(ParameterSetName = 'Run')][int]$HeapMb = 8192,
@@ -245,6 +245,20 @@ try {
   # builds sequential; this keeps a single one from taking everything.
   # Only set when the caller has not chosen a value.
   $prevNodeOptions = $env:NODE_OPTIONS
+  # devcloud DC-032: self-hosted turbo remote cache (E:\gh\vmui\docs\devcloud\turbo-cache.md).
+  # Only for turbo repos, never over a caller's own TURBO_TOKEN, off with RUN_BUILD_NO_REMOTE_CACHE=1.
+  # The token is DPAPI-encrypted per user; it is never printed or written to the log.
+  $rcCfg = Join-Path $HOME '.codai\turbo-remote.json'; $rcKey = Join-Path $HOME '.codai\turbo-remote.key'
+  if (-not $env:TURBO_TOKEN -and -not $env:RUN_BUILD_NO_REMOTE_CACHE -and (Test-Path (Join-Path $root 'turbo.json')) -and (Test-Path $rcCfg) -and (Test-Path $rcKey)) {
+    try {
+      $rc = Get-Content $rcCfg -Raw | ConvertFrom-Json
+      $sec = ConvertTo-SecureString ([IO.File]::ReadAllText($rcKey).Trim())
+      $env:TURBO_TOKEN = [Net.NetworkCredential]::new('', $sec).Password
+      $env:TURBO_API = $rc.api; $env:TURBO_TEAM = $rc.team
+      Write-Host "turbo remote cache: $($rc.api) (team $($rc.team))" -ForegroundColor DarkGray
+      "=== turbo remote cache $($rc.api)" | Add-Content $logPath -Encoding UTF8
+    } catch { Write-Host "turbo remote cache skipped: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+  }
   if ($Command -notmatch 'max-old-space-size' -and $env:NODE_OPTIONS -notmatch 'max-old-space-size') {
     $env:NODE_OPTIONS = ("$($env:NODE_OPTIONS) --max-old-space-size=$HeapMb").Trim()
     Write-Host "heap capped at ${HeapMb} MB" -ForegroundColor DarkGray
