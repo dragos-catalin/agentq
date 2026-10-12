@@ -32,7 +32,7 @@ param(
   # and dropping the place already earned (devcloud DC-014).
   [Parameter(ParameterSetName = 'Run')][int]$TimeoutMin = 240,
   # Node's default old-space is ~4 GB, and the heaviest project here (apps/web,
-  # 5620 files) needs ~6 GB ΓÇö so the DEFAULT is the real hazard, not generosity.
+  # 5620 files) needs ~6 GB — so the DEFAULT is the real hazard, not generosity.
   # 8 GB clears that with margin while still bounding a runaway process; the
   # lock already prevents several of these existing at once.
   [Parameter(ParameterSetName = 'Run')][int]$HeapMb = 8192,
