@@ -60,6 +60,16 @@ v3 SCHEDULER (devcloud F1, 2026-10-11)
   Knobs: bin/agentq-config.json (machineCap quickBurst agingMin idleYieldMin idleCpuSec bumpMax
   burstMax burstMaxMin overridesPerHour journalRotateMB). Plan: E:\gh\vmui\docs\devcloud\PLAN.md
 
+CLOUD PLACEMENT (devcloud F2, DC-037)
+  agentq run -Resource build -Where local|cloud|auto [-Ws <name>] -Purpose x -- <cmd>
+  cloud = run on the repo's warm workspace through agentq-cloud.ps1 (git delta upload, log stream,
+  remote exit code; contract E:\gh\agentq\spec\job.md). No local tickets are taken.
+  auto  = cloud when the repo has a workspace (config cloudWorkspaces) AND the command is a
+  build/typecheck/test/lint kind AND (local build:machine is full, or free RAM/commit is below
+  the gate, or the kind's local p50 hold >= cloudAutoMinSec). Otherwise local.
+  Default = env AGENTQ_WHERE, else local. AGENTQ_WHERE=local is the opt-out everywhere.
+  Journal: cloud-queued / cloud-done / cloud-fail (resource cloud:<ws>) + placement(where, why).
+
 EXIT CODES: 0 ok; command's own exit code for `run`; 3 = frozen/blocked or timed out;
 2 = usage error.
 #>
@@ -76,6 +86,8 @@ $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $
 $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @()
 # v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
+# devcloud F2: placement.
+$Where = $null; $Ws = $null
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
 $Rest = @()
 $argv = @($args)
@@ -127,6 +139,8 @@ while ($i -lt $argv.Count) {
     'priority' { $Priority = [int](& $next) }
     'by' { $By = [int](& $next) }
     'minutes' { $Minutes = [int](& $next) }
+    'where' { $Where = (& $next).ToLowerInvariant() }
+    'ws' { $Ws = & $next }
     default { throw "agentq: unknown argument '$a' (put the command after --)" }
   }
   $i++
@@ -588,19 +602,22 @@ function Invoke-Propose {
 # ---- metrics (DC-017): wait/hold distributions from the journal --------------------------
 function Show-Metrics {
   $from = (Now).AddHours(-$Hours)
-  $items = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] })
+  $items = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'done', 'fail', 'cloud-done', 'cloud-fail' -and $_.PSObject.Properties['holdSec'] })
   $q = { param($a, [double]$p) if (-not $a) { return 0 }; $s = @($a | Sort-Object); $s[[math]::Min($s.Count - 1, [math]::Floor($p * $s.Count))] }
   $rows = $items | Group-Object { "{0}|{1}|{2}" -f ("$($_.resource)" -replace ',build:machine', ''), "$(P $_ 'lane' '?')", "$(P $_ 'kind' '?')" } | ForEach-Object {
     $w = @($_.Group | ForEach-Object { [double](P $_ 'waitSec' 0) }); $h = @($_.Group | ForEach-Object { [double]$_.holdSec })
     $k = $_.Name -split '\|'
-    [pscustomobject]@{ resource = $k[0]; lane = $k[1]; kind = $k[2]; runs = $_.Count; fail = @($_.Group | Where-Object event -eq 'fail').Count
+    [pscustomobject]@{ resource = $k[0]; lane = $k[1]; kind = $k[2]; runs = $_.Count; fail = @($_.Group | Where-Object event -in 'fail', 'cloud-fail').Count
       waitP50 = (& $q $w 0.5); waitP90 = (& $q $w 0.9); holdP50 = (& $q $h 0.5); holdP90 = (& $q $h 0.9); holdMin = [math]::Round(($h | Measure-Object -Sum).Sum / 60, 1) }
   } | Sort-Object holdMin -Descending
   $ev = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'idle-yield', 'bump', 'burst', 'propose-applied', 'timeout', 'reap', 'break' } | Group-Object event | ForEach-Object { "$($_.Name)=$($_.Count)" })
-  if ($Json) { @{ hours = $Hours; rows = @($rows); events = $ev } | ConvertTo-Json -Depth 4; return }
+  $res = @($items | Where-Object { $_.event -like 'cloud-*' -and $_.PSObject.Properties['resumeSec'] } | ForEach-Object { [double]$_.resumeSec })
+  $cloud = if ($res) { "resumes=$($res.Count) resumeP50=$(& $q $res 0.5)s resumeMax=$(($res | Measure-Object -Maximum).Maximum)s" } else { 'resumes=0' }
+  if ($Json) { @{ hours = $Hours; rows = @($rows); events = $ev; cloud = $cloud } | ConvertTo-Json -Depth 4; return }
   Write-Output "== agentq metrics, last $Hours h (seconds; v3 runs only)"
   if ($rows) { $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Output } else { Write-Output '(no v3 runs yet)' }
   Write-Output "== scheduler events: $(if ($ev) { $ev -join ' ' } else { 'none' })"
+  Write-Output "== cloud: $cloud"
 }
 
 # ---- journal rotation (DC-016): archive when > journalRotateMB; agentq-sync resets its offset
@@ -629,6 +646,45 @@ function Send-Signal([string]$ev, [string]$text) {
 }
 
 # ---------------------------------------------------------------------------------------
+# devcloud F2 (DC-037): decide local vs cloud. Returns @{ where; ws; why }.
+function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
+  $want = if ($Where) { $Where } elseif ($env:AGENTQ_WHERE) { $env:AGENTQ_WHERE.ToLowerInvariant() } else { 'local' }
+  if ($want -notin 'local', 'cloud', 'auto') { throw "agentq: -Where must be local|cloud|auto (got '$want')" }
+  $cfg = Get-Config
+  $map = if ($cfg.ContainsKey('cloudWorkspaces') -and $cfg['cloudWorkspaces']) { $cfg['cloudWorkspaces'] } else { @{} }
+  $ws = if ($Ws) { $Ws } elseif ($repo -and $map.ContainsKey($repo.Name)) { $map[$repo.Name] } else { $null }
+  if ($want -eq 'local') { return @{ where = 'local'; ws = $ws; why = $(if ($Where) { '-Where local' } elseif ($env:AGENTQ_WHERE) { 'AGENTQ_WHERE=local' } else { 'default' }) } }
+  if (-not $ws) {
+    if ($want -eq 'cloud') { throw "agentq: no cloud workspace for repo '$($repo.Name)' (config cloudWorkspaces or -Ws)" }
+    return @{ where = 'local'; ws = $null; why = "auto: no workspace for $($repo.Name)" }
+  }
+  if ($want -eq 'cloud') { return @{ where = 'cloud'; ws = $ws; why = '-Where cloud' } }
+  # auto
+  $kind = Get-CmdKind $cmdLine
+  if ($res -notlike 'build:*' -or $kind -notin 'typecheck', 'test', 'lint', 'build', 'next-build', 'gate-script') { return @{ where = 'local'; ws = $ws; why = "auto: kind $kind / $res stays local" } }
+  $live = @(Get-Live 'build:machine' | Where-Object { (P $_ 'held' $false) -and -not (P $_ 'yielded' $false) })
+  if ($live.Count -ge (Get-Capacity 'build:machine')) { return @{ where = 'cloud'; ws = $ws; why = "auto: build:machine full ($($live.Count) held)" } }
+  if (-not (Test-FreeRam $MinFreeGB)) { return @{ where = 'cloud'; ws = $ws; why = 'auto: local RAM/commit below the gate' } }
+  $minSec = if ($cfg.ContainsKey('cloudAutoMinSec')) { [double]$cfg['cloudAutoMinSec'] } else { 240.0 }
+  $holds = @(Read-Journal 0 ((Now).AddDays(-7)) $repo.Name | Where-Object { $_.event -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] -and (P $_ 'kind' '') -eq $kind } | ForEach-Object { [double]$_.holdSec } | Sort-Object)
+  if ($holds.Count -ge 3) {
+    $p50 = $holds[[math]::Floor($holds.Count / 2)]
+    if ($p50 -ge $minSec) { return @{ where = 'cloud'; ws = $ws; why = "auto: local $kind p50 ${p50}s >= ${minSec}s" } }
+    return @{ where = 'local'; ws = $ws; why = "auto: local $kind p50 ${p50}s < ${minSec}s, machine free" }
+  }
+  @{ where = 'local'; ws = $ws; why = 'auto: machine free, no history' }
+}
+
+function Invoke-CloudRun($repo, [string[]]$cmdArgs, $placement) {
+  $tool = if ($env:AGENTQ_CLOUD_TOOL) { $env:AGENTQ_CLOUD_TOOL } else { Join-Path $PSScriptRoot 'agentq-cloud.ps1' }
+  if (-not (Test-Path $tool)) { throw "agentq: $tool missing (install agentq cloud)" }
+  $a = @('-Ws', $placement.ws, '-Purpose', $Purpose, '-Repo', $repo.Top, '-Lane', $(if ($Lane) { $Lane } else { 'gate' }))
+  if ($TimeoutGiven) { $a += @('-TimeoutMin', "$TimeoutMin") }
+  $all = @($a) + @('--') + @($cmdArgs)
+  & $tool @all
+  exit $LASTEXITCODE
+}
+
 function Invoke-Run {
   $repo = Get-RepoInfo $Repo
   Assert-ExpectedRepo $repo
@@ -639,6 +695,9 @@ function Invoke-Run {
   $cmdLine = ($cmdArgs -join ' ')
   $resList = @(Expand-Resources $Resource $repo)
   foreach ($r in $resList) { Assert-NotMarked $r }
+  $pl = Resolve-Placement $repo $resList[0] $cmdLine
+  if ($Where -or $env:AGENTQ_WHERE) { Write-Journal @{ event = 'placement'; resource = $resList[0]; repo = $(if ($repo) { $repo.Name } else { '' }); where = $pl.where; ws = "$($pl.ws)"; reason = $pl.why; purpose = $Purpose; cmd = $cmdLine } }
+  if ($pl.where -eq 'cloud') { [Console]::Error.WriteLine("agentq: placement cloud:$($pl.ws) ($($pl.why))"); Invoke-CloudRun $repo $cmdArgs $pl }
   $tickets = @()
   $started = Now
   try {

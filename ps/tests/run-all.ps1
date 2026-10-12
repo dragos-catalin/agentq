@@ -16,6 +16,8 @@ $suites = [ordered]@{
   'repo-migrate'   = @('-File', (Join-Path $PSScriptRoot 'test-repo-migrate.ps1'), '-Tool', (Join-Path $bin 'repo-migrate.ps1'))
   'guard'          = @('-File', (Join-Path $PSScriptRoot 'test-guard-v2.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'jobs'           = @('-File', (Join-Path $PSScriptRoot 'test-jobs.ps1'), '-Bin', $bin, '-Hooks', $hooks)
+  'cloud place'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud.ps1'), '-Aq', (Join-Path $stage 'agentq.ps1'))
+  'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
 }
 $bad = @()
 foreach ($k in $suites.Keys) {

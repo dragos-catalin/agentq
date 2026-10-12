@@ -312,7 +312,30 @@ $isBuild = $cmd -match '\b(pnpm|npm|yarn|npx)\s+(run\s+)?(build|typecheck|test:e
            $cmd -match 'typescript[/\\]lib[/\\]tsc\.js' -or
            $cmd -match '\bnode\b.*\btsc\.js\b'
 # The wrapper invokes the real command, so never intercept the wrapper itself.
-$viaWrapper = $cmd -match 'run-build\.ps1'
+$viaWrapper = $cmd -match 'run-build\.ps1|agentq(-cloud)?\.ps1'
+
+# devcloud D19 / DC-037 (2026-10-12): instead of blocking a plain build, REWRITE it into
+# `agentq run -Resource build -Where auto` (queued locally, or sent to the repo's warm cloud
+# workspace when the machine is busy / the job is slow here). Only for VS Code (the only harness
+# that honours updatedInput), only for one simple command (no ; | > & quotes $), and never when
+# AGENTQ_WHERE=local (explicit opt-out -> the block below, as before).
+if ($isBuild -and -not $viaWrapper -and $env:AGENTQ_WHERE -ne 'local' -and
+    $payload.PSObject.Properties.Name -contains 'hook_event_name' -and
+    $cmd.Trim() -match '^[\w@./:=,+\- ]+$') {
+  $aqTool = Join-Path $env:USERPROFILE '.copilot\bin\agentq.ps1'
+  if (Test-Path $aqTool) {
+    $c = $cmd.Trim()
+    $purpose = ('hook: ' + $c); if ($purpose.Length -gt 80) { $purpose = $purpose.Substring(0, 80) }
+    $newCmd = "pwsh -NoProfile -File `"$aqTool`" run -Resource build -Where auto -Purpose '$purpose' -- $c"
+    $ti = [ordered]@{}
+    if ($payload.tool_input -and $payload.tool_input -isnot [string]) { foreach ($p in $payload.tool_input.PSObject.Properties) { $ti[$p.Name] = $p.Value } }
+    $ti['command'] = $newCmd
+    @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'allow'; updatedInput = $ti
+        additionalContext = "guard: '$c' was rewritten to run through agentq (-Where auto: local queue or the warm cloud workspace). Opt out with `$env:AGENTQ_WHERE='local'." } } |
+      ConvertTo-Json -Compress -Depth 6 | Write-Output
+    Flush-Stderr; exit 0
+  }
+}
 
 if ($isBuild -and -not $viaWrapper) {
   $runner = Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1'

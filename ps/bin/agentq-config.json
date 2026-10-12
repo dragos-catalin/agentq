@@ -26,5 +26,9 @@
   "burstMaxMin": 60,
   "overridesPerHour": 6,
   "runBuildTimeoutMin": 240,
-  "journalRotateMB": 64
+  "journalRotateMB": 64,
+  "cloudWorkspaces": {
+    "codai": "codai"
+  },
+  "cloudAutoMinSec": 240
 }
