@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   PreToolUse guard: destructive shell commands AND clobbering whole-file writes.
 
