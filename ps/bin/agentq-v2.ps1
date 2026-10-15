@@ -189,19 +189,47 @@ function Backup-Slot([string]$path, [string]$repoName, [string]$slot, [string]$w
   & git -C $path update-ref $ref $commit
   if ($LASTEXITCODE) { throw "backup: update-ref $ref failed" }
   $hasOrigin = [bool](@(& git -C $path remote 2>$null) -contains 'origin')
+  $pushError = ''; $bundle = ''
   if ($hasOrigin) {
     # --no-verify: a backup ref is not a release; pre-push gates (minutes) would make expiry unusable.
-    & git -C $path push -q --no-verify origin "${commit}:$ref" 2>$null
-    $remote = "$((& git -C $path ls-remote origin $ref 2>$null) | Select-Object -First 1)" -split '\s+' | Select-Object -First 1
-    if ($remote -ne $commit) { throw "backup: push of $ref to origin could not be verified (got '$remote'); local ref kept" }
-  } else {
-    $bdir = Join-Path (Get-WtRoot) '_bundles'; New-Item -ItemType Directory -Force $bdir | Out-Null
-    $bundle = Join-Path $bdir "$repoName-$slot-$((Get-Date).ToString('yyyyMMdd-HHmmss')).bundle"
-    & git -C $path bundle create -q $bundle $ref 2>$null
-    if ($LASTEXITCODE -or -not (Test-Path -LiteralPath $bundle)) { throw "backup: bundle $bundle failed (local ref $ref kept)" }
+    # Output is CAPTURED (it used to go to $null): a refused push (GitHub GH001 on a >100 MB blob,
+    # 2026-10-15) then surfaced only as "could not be verified (got '')" and wedged every later land.
+    $pushOut = @(& git -C $path push --no-verify origin "${commit}:$ref" 2>&1 | ForEach-Object { "$_" })
+    $pushCode = $LASTEXITCODE
+    $remote = ''
+    for ($try = 1; $try -le 3 -and -not $pushCode; $try++) {
+      $remote = "$((& git -C $path ls-remote origin $ref 2>$null) | Select-Object -First 1)" -split '\s+' | Select-Object -First 1
+      if ($remote -eq $commit) { break }
+      Start-Sleep -Milliseconds (500 * $try)
+    }
+    if ($pushCode -or $remote -ne $commit) {
+      $pushError = (@($pushOut | Where-Object { $_ -match '\S' } | Select-Object -Last 6) -join ' | ')
+      if (-not $pushError) { $pushError = "push exit $pushCode; ls-remote got '$remote'" }
+      $pushError = $pushError.Substring(0, [math]::Min(500, $pushError.Length))
+    }
   }
-  Write-Journal @{ event = 'backup'; resource = "slot:${repoName}:$slot"; sha = $commit; ref = $ref; reason = $why; repo = $repoName }
-  $ref
+  # Origin unreachable (network, wrong URL) = fail closed, the caller keeps the lease. Only an origin
+  # that answered and REFUSED the ref (GH001 size limit, a hook) gets the local-bundle fallback.
+  if ($pushError -and $pushError -notmatch 'remote rejected|pre-receive hook declined|GH001|rejected') {
+    throw "backup: push of $ref to origin failed ($pushError); local ref kept"
+  }
+  if (-not $hasOrigin -or $pushError) {
+    # No origin, or origin refused the ref: keep a LOCAL bundle and prove it with `bundle verify`.
+    # With origin only the commits not on it go in (brivio's full history would be GBs).
+    $bdir = Join-Path (Get-WtRoot) '_bundles'; New-Item -ItemType Directory -Force $bdir | Out-Null
+    $bundle = Join-Path $bdir "$repoName-$slot-$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$(Short ([guid]::NewGuid().ToString('N')) 4).bundle"
+    $bargs = @('bundle', 'create', '-q', $bundle, $ref); if ($hasOrigin) { $bargs += @('--not', '--remotes=origin') }
+    & git -C $path @bargs 2>$null
+    if ($LASTEXITCODE -or -not (Test-Path -LiteralPath $bundle)) { throw "backup: bundle $bundle failed (local ref $ref kept)$(if ($pushError) { "; origin refused the push: $pushError" })" }
+    & git -C $path bundle verify -q $bundle 2>$null | Out-Null
+    if ($LASTEXITCODE) { throw "backup: bundle $bundle does not verify (local ref $ref kept)$(if ($pushError) { "; origin refused the push: $pushError" })" }
+    if ($pushError) { [Console]::Error.WriteLine("agentq: backup push of $ref refused by origin ($pushError); kept as verified bundle $bundle") }
+  }
+  $j = @{ event = 'backup'; resource = "slot:${repoName}:$slot"; sha = $commit; ref = $ref; reason = $why; repo = $repoName }
+  if ($pushError) { $j.pushError = $pushError }
+  if ($bundle) { $j.bundle = $bundle }
+  Write-Journal $j
+  if ($pushError) { "$ref (bundle $bundle)" } else { $ref }
 }
 
 # Bring a slot to a fresh state at $ref (+ optional branch). The caller holds the lease and has
@@ -537,9 +565,46 @@ function Invoke-ReleaseCancel {
 }
 
 # ---- landing queue ------------------------------------------------------------------------
+# Union-merge one conflicted path IN BYTES: git writes the three stages to files and merges them in
+# place; nothing is decoded by PowerShell. The old resolver piped `git show :N:path` through the
+# pipeline (native output decoded with the console code page, CP437 under pwsh) and re-wrote it as
+# UTF-8, so every non-ASCII byte became 2-3 bytes on each land - brivio's CHANGELOG went 24 -> 124 MB
+# and GitHub refused the push (GH001, 2026-10-15). Order: ours (onto) then theirs (the pick).
+function Merge-UnionBytes([string]$wt, [string]$p) {
+  $line = "$(& git -C $wt checkout-index --stage=all --temp -- $p 2>$null)".Trim()
+  if ($LASTEXITCODE -or -not $line) { return $false }
+  $names = ($line -split "`t")[0] -split ' '
+  if ($names.Count -lt 3) { return $false }
+  $tmps = @($names | Where-Object { $_ -ne '.' } | ForEach-Object { Join-Path $wt $_ })
+  try {
+    if ($names[1] -eq '.' -or $names[2] -eq '.') { return $false }   # delete/modify: not a union case
+    $base = if ($names[0] -eq '.') { $e = Join-Path $wt ('.aq-empty-' + [guid]::NewGuid().ToString('N')); [IO.File]::WriteAllBytes($e, [byte[]]@()); $tmps += $e; $e } else { Join-Path $wt $names[0] }
+    $ours = Join-Path $wt $names[1]; $theirs = Join-Path $wt $names[2]
+    & git -C $wt merge-file --union $ours $base $theirs 2>$null | Out-Null
+    if ($LASTEXITCODE) { return $false }   # --union never leaves conflicts; non-zero = error
+    Copy-Item -LiteralPath $ours -Destination (Join-Path $wt $p) -Force
+    & git -C $wt add -- $p
+    return (-not $LASTEXITCODE)
+  } finally { foreach ($x in $tmps) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue } }
+}
+
+# A CHANGELOG blob that grows past 1.5x its size on origin is a resolver bug, never a real entry
+# (a real one adds KBs to a 24 MB file). Returns 'path: old -> new' strings for offenders.
+function Get-OversizedChangelogs([string]$wt, [string]$baseRef, [double]$factor = 1.5) {
+  $out = @()
+  foreach ($p in @(& git -C $wt diff --name-only $baseRef HEAD 2>$null | Where-Object { $_ -match '(^|/)CHANGELOG\.md$' })) {
+    $old = "$(& git -C $wt cat-file -s "${baseRef}:$p" 2>$null)".Trim()
+    if ($LASTEXITCODE -or -not $old) { continue }   # new file: nothing to compare against
+    $new = "$(& git -C $wt cat-file -s "HEAD:$p" 2>$null)".Trim()
+    if ($LASTEXITCODE -or -not $new) { continue }   # deleted
+    if ([double]$new -gt $factor * [double]$old) { $out += "${p}: $old -> $new bytes" }
+  }
+  $out
+}
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
-# landed, 5 conflict, 6 gate failed, 7 push refused, 3 busy/remote kept moving.
+# landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
+# 3 busy/remote kept moving.
 function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -582,14 +647,7 @@ function Invoke-Land {
         $resolver = Join-Path $wt 'scripts\land-resolve.ps1'
         if (Test-Path -LiteralPath $resolver) { & pwsh -NoProfile -File $resolver -Paths ($conf -join ',') -Worktree $wt 2>&1 | ForEach-Object { Write-Output "  resolver: $_" } }
         foreach ($p in @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ -match '(^|/)CHANGELOG\.md$' })) {
-          # Both sides' entries are kept (union); order is ours-then-theirs within a conflicting hunk.
-          $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aq-mf-" + [guid]::NewGuid().ToString('N'))
-          New-Item -ItemType Directory $tmp | Out-Null
-          foreach ($s in 1, 2, 3) { [IO.File]::WriteAllText((Join-Path $tmp "$s"), (@(& git -C $wt show ":${s}:$p" 2>$null) -join "`n") + "`n", [Text.UTF8Encoding]::new($false)) }
-          $merged = @(& git -C $wt merge-file -p --union (Join-Path $tmp '2') (Join-Path $tmp '1') (Join-Path $tmp '3')) -join "`n"
-          [IO.File]::WriteAllText((Join-Path $wt $p), $merged + "`n", [Text.UTF8Encoding]::new($false))
-          & git -C $wt add -- $p
-          Remove-Item -Recurse -Force $tmp
+          if (-not (Merge-UnionBytes $wt $p)) { break }
         }
         $left = @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ })
         $markers = @(& git -C $wt diff --cached --name-only 2>$null | Where-Object { $_ } | Where-Object { $f = Join-Path $wt $_; (Test-Path -LiteralPath $f -PathType Leaf) -and (Select-String -LiteralPath $f -Pattern '^(<{7}|>{7})( |$)' -Quiet) })
@@ -610,6 +668,14 @@ function Invoke-Land {
         $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
         & pwsh -NoProfile -File $rb -Root $wt -Wait -TimeoutMin 120 -Purpose "land gate $Branch" -Command $Gate
         if ($LASTEXITCODE) { Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $LASTEXITCODE; reason = $Gate; repo = $repo.Name }; [Console]::Error.WriteLine("land: gate failed ($LASTEXITCODE) - nothing pushed"); $script:LandExit = 6; return }
+      }
+      $big = @(Get-OversizedChangelogs $wt "origin/$Onto")
+      if ($big.Count) {
+        Write-Journal @{ event = 'land-oversized'; resource = $res; exit = 8; branch = $Onto; paths = $big; reason = "CHANGELOG grew past 1.5x origin/$Onto"; repo = $repo.Name }
+        [Console]::Error.WriteLine("land: REFUSED - CHANGELOG grew past 1.5x its size on origin/${Onto}: $($big -join '; '). Nothing pushed. Rebuild $Branch on origin/$Onto (take its CHANGELOG, re-add your entry) and land again.")
+        # Drop the bad result so the land-finished backup does not try to push it to origin.
+        Initialize-Slot $main $wt "origin/$Onto" '' $false
+        $script:LandExit = 8; return
       }
       $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
       if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
