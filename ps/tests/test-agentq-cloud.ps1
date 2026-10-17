@@ -90,6 +90,18 @@ $m = (& pwsh -NoProfile -File $Aq metrics -Hours 1) -join "`n"
 Check 'metrics show cloud row' ($m -match 'cloud:wsrepo') ''
 Check 'metrics show resume p50' ($m -match 'resumes=1 resumeP50=9.5s') ($m -split "`n" | Select-Object -Last 1)
 
+# 10. DC-063: explicit -Ws overrides the repo mapping; agentq-cloud reads cloudRegistry from config
+# (an unknown workspace is exit 2 = usage, a registered one reaches the network step).
+$rc = Run $repo @('-Where', 'cloud', '-Ws', 'vitals-win') 'cargo test -p vitals-core'
+Check 'explicit -Ws wins over mapping' ("$((Calls) | Select-Object -Last 1)" -match '-Ws vitals-win .*-- cargo test -p vitals-core') "$((Calls) | Select-Object -Last 1)"
+$real = Join-Path (Split-Path $PSScriptRoot) 'bin\agentq-cloud.ps1'
+$cfg2 = Join-Path ([IO.Path]::GetTempPath()) "aq-reg-$PID.json"
+@{ cloudRegistry = @{ 'zz-ws' = @{ project = 'p-none'; zone = 'z-none' } } } | ConvertTo-Json -Depth 4 | Set-Content $cfg2
+$env:AGENTQ_CONFIG = $cfg2
+$o = (& pwsh -NoProfile -File $real -Ws 'unknown-ws' -Purpose regtest -- echo 2>&1) -join ' '
+Check 'unknown workspace is usage error' ($LASTEXITCODE -eq 2 -and $o -match 'zz-ws' -and $o -match 'vitals-win') $o
+Remove-Item $cfg2 -ErrorAction SilentlyContinue
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Remove-Item Env:AGENTQ_CONFIG, Env:AGENTQ_SESSION, Env:AGENTQ_CLOUD_TOOL -ErrorAction SilentlyContinue
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

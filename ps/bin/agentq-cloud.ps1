@@ -38,7 +38,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 
 # Workspace registry: where each warm workspace lives (VM project/zone). Control plane = $CtlProject.
-$Registry = @{ codai = @{ project = 'codai-training'; zone = 'europe-west4-a' } }
+# Built-ins + config `cloudRegistry` ({ "<ws>": { "project": "..", "zone": ".." } }) so a new
+# workspace needs no code change. vitals-win (DC-063) = Windows Server 2025 for Windows-only gates.
+$Registry = @{ codai = @{ project = 'codai-training'; zone = 'europe-west4-a' }; 'vitals-win' = @{ project = 'codai-training'; zone = 'europe-west4-a' } }
+try {
+  $cfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
+  if (Test-Path -LiteralPath $cfgPath) {
+    $cr = (Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties['cloudRegistry']
+    if ($cr -and $cr.Value) { foreach ($p in $cr.Value.PSObject.Properties) { $Registry[$p.Name] = @{ project = "$($p.Value.project)"; zone = "$($p.Value.zone)" } } }
+  }
+} catch { [Console]::Error.WriteLine("agentq-cloud: cloudRegistry ignored ($($_.Exception.Message))") }
 if (-not $Registry.ContainsKey($Ws) -and -not ($Project -and $Zone)) { [Console]::Error.WriteLine("agentq-cloud: unknown workspace '$Ws' (known: $($Registry.Keys -join ', '); or pass -Project/-Zone)"); exit 2 }
 if (-not $Project) { $Project = $Registry[$Ws].project }
 if (-not $Zone) { $Zone = $Registry[$Ws].zone }
@@ -177,7 +186,8 @@ try {
   # 4. upload artefacts, then the queue entry LAST (the agent may claim it the moment it lands)
   if ($hasBundle) { Write-Obj "jobs/$id/bundle" (Join-Path $tmp 'bundle') }
   if ($hasPatch) { Write-Obj "jobs/$id/patch" (Join-Path $tmp 'patch') }
-  $spec = [ordered]@{ v = 1; id = $id; repo = $repoName; sha = $head; bundle = $hasBundle; patch = $hasPatch; cmd = $cmd
+  # argv: Windows workspaces quote for PowerShell from the raw tokens (cmd is POSIX-quoted for bash).
+  $spec = [ordered]@{ v = 1; id = $id; repo = $repoName; sha = $head; bundle = $hasBundle; patch = $hasPatch; cmd = $cmd; argv = @($Rest | ForEach-Object { "$_" })
     timeoutSec = $TimeoutMin * 60; lane = $Lane; purpose = $Purpose; session = $Session; noInstall = $NoInstall
     submittedAt = [DateTime]::UtcNow.ToString('o'); client = $env:COMPUTERNAME }
   $sf = Join-Path $tmp 'spec.json'; [IO.File]::WriteAllText($sf, ($spec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))

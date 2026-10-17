@@ -28,7 +28,12 @@
   "runBuildTimeoutMin": 240,
   "journalRotateMB": 64,
   "cloudWorkspaces": {
-    "codai": "codai"
+    "codai": "codai",
+    "vitals": "vitals-win"
+  },
+  "cloudRegistry": {
+    "codai": { "project": "codai-training", "zone": "europe-west4-a" },
+    "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" }
   },
   "cloudAutoMinSec": 240
 }

@@ -3,6 +3,9 @@
 // persistent checkout (warm node_modules / turbo / pnpm store), streams the log back, suspends the VM
 // when idle. Zero dependencies: GCS + Compute + Secret Manager over REST with the metadata token.
 // Contract: E:\gh\agentq\spec\job.md (v1). Client: ps/bin/agentq-cloud.ps1.
+// DC-063: the same file runs on Windows workspaces (process.platform === 'win32'): work dir C:\work,
+// the command runs as a pwsh script built from spec.argv (PowerShell quoting, not POSIX), process
+// trees are killed with taskkill. Linux behaviour is unchanged.
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,8 +13,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const MD = 'http://metadata.google.internal/computeMetadata/v1';
-const md = async (p) => (await fetch(`${MD}/${p}`, { headers: { 'Metadata-Flavor': 'Google' } })).text();
-const attr = async (k, d = '') => { try { const r = await fetch(`${MD}/instance/attributes/${k}`, { headers: { 'Metadata-Flavor': 'Google' } }); return r.ok ? (await r.text()).trim() : d; } catch { return d; } };
+const isWin = process.platform === 'win32';
+// Every request has a deadline (DC-063): on ws-vitals-win a request in flight across a suspend never settled
+// (heartbeat frozen at the pre-suspend time, VM RUNNING, queue never claimed). Uploads get longer.
+const T = (ms) => AbortSignal.timeout(ms);
+const md = async (p) => (await fetch(`${MD}/${p}`, { headers: { 'Metadata-Flavor': 'Google' }, signal: T(15_000) })).text();
+const attr = async (k, d = '') => { try { const r = await fetch(`${MD}/instance/attributes/${k}`, { headers: { 'Metadata-Flavor': 'Google' }, signal: T(15_000) }); return r.ok ? (await r.text()).trim() : d; } catch { return d; } };
 
 let tok = { v: '', exp: 0 };
 async function token() {
@@ -21,7 +28,7 @@ async function token() {
   return tok.v;
 }
 async function api(url, init = {}) {
-  const r = await fetch(url, { ...init, headers: { Authorization: `Bearer ${await token()}`, ...(init.headers || {}) } });
+  const r = await fetch(url, { signal: T(init.body ? 600_000 : 60_000), ...init, headers: { Authorization: `Bearer ${await token()}`, ...(init.headers || {}) } });
   if (!r.ok && r.status !== 404) throw new Error(`${init.method || 'GET'} ${url.split('?')[0]} -> ${r.status} ${(await r.text()).slice(0, 300)}`);
   return r;
 }
@@ -31,7 +38,7 @@ const gs = {
   get: async (b, o) => { const r = await api(`https://storage.googleapis.com/storage/v1/b/${b}/o/${enc(o)}?alt=media`); return r.status === 404 ? null : Buffer.from(await r.arrayBuffer()); },
   put: async (b, o, body, type = 'application/octet-stream') => api(`https://storage.googleapis.com/upload/storage/v1/b/${b}/o?uploadType=media&name=${enc(o)}`, { method: 'POST', body, headers: { 'Content-Type': type } }),
   // claim = delete with ifGenerationMatch: only one agent wins a queued job.
-  claim: async (b, o, gen) => { const r = await fetch(`https://storage.googleapis.com/storage/v1/b/${b}/o/${enc(o)}?ifGenerationMatch=${gen}`, { method: 'DELETE', headers: { Authorization: `Bearer ${await token()}` } }); return r.status === 204; },
+  claim: async (b, o, gen) => { const r = await fetch(`https://storage.googleapis.com/storage/v1/b/${b}/o/${enc(o)}?ifGenerationMatch=${gen}`, { method: 'DELETE', headers: { Authorization: `Bearer ${await token()}` }, signal: T(60_000) }); return r.status === 204; },
 };
 
 const cfg = {
@@ -45,7 +52,7 @@ const cfg = {
   secretProject: await attr('devcloud-secret-project', ''),
   turboSecret: await attr('devcloud-turbo-secret', 'devcloud-turbo-token'),
   turboApi: await attr('devcloud-turbo-api', ''),
-  work: '/work',
+  work: isWin ? await attr('devcloud-work', 'C:\\work') : '/work',
 };
 if (!cfg.secretProject) cfg.secretProject = cfg.project;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -60,6 +67,30 @@ async function loadTurbo() {
 
 function sh(cmd, args, opts = {}) { return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28, ...opts }).toString(); }
 const repoKey = (r) => String(r).toLowerCase().replace(/[^\w.-]/g, '_');
+
+// Windows: the client sends argv (spec.argv) besides the POSIX-quoted cmd. One element = a pwsh
+// script line as-is (`-- 'pnpm typecheck; cargo test'`); several = a command invocation, each token
+// single-quoted for PowerShell. The script ends with the native exit code: `pwsh -Command` alone
+// maps any native failure to 1 (measured: `cmd /c exit 5` -> 1), which would hide real codes.
+const psq = (s) => (/^[\w@./:=,+\\-]+$/.test(s) ? s : `'${String(s).replace(/'/g, "''")}'`);
+function winScript(spec) {
+  const argv = Array.isArray(spec.argv) && spec.argv.length ? spec.argv.map(String) : null;
+  const body = !argv ? spec.cmd : argv.length === 1 ? argv[0] : `& ${argv.map(psq).join(' ')}`;
+  return [
+    "$ErrorActionPreference = 'Continue'",
+    '$global:LASTEXITCODE = 0',
+    body,
+    '$devcloudOk = $?',
+    'if ($LASTEXITCODE) { exit $LASTEXITCODE }',
+    'if (-not $devcloudOk) { exit 1 }',
+    'exit 0',
+    '',
+  ].join('\r\n');
+}
+function killTree(p) {
+  if (isWin) { try { execFileSync('taskkill', ['/T', '/F', '/PID', String(p.pid)], { stdio: 'ignore' }); } catch { p.kill(); } return; }
+  try { process.kill(-p.pid, 'SIGKILL'); } catch { p.kill('SIGKILL'); }
+}
 
 // Shas this workspace has (and therefore all their ancestors): the client picks its bundle base from
 // these via merge-base, so only the commits the workspace lacks travel.
@@ -87,9 +118,9 @@ async function runJob(spec) {
   };
   const step = (cmd, args, o = {}) => new Promise((res) => {
     append(`$ ${cmd} ${args.join(' ')}\n`);
-    const p = spawn(cmd, args, { cwd: o.cwd || dir, env: o.env || process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const p = spawn(cmd, args, { cwd: o.cwd || dir, env: o.env || process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: !isWin, windowsHide: true });
     let killed = false;
-    const timer = o.timeoutSec ? setTimeout(() => { killed = true; append(`\n[devcloud] timeout after ${o.timeoutSec}s, killing\n`); try { process.kill(-p.pid, 'SIGKILL'); } catch { p.kill('SIGKILL'); } }, o.timeoutSec * 1000) : null;
+    const timer = o.timeoutSec ? setTimeout(() => { killed = true; append(`\n[devcloud] timeout after ${o.timeoutSec}s, killing\n`); killTree(p); }, o.timeoutSec * 1000) : null;
     p.stdout.on('data', (d) => { append(d.toString()); void flush(); });
     p.stderr.on('data', (d) => { append(d.toString()); void flush(); });
     p.on('error', (e) => { append(`[devcloud] spawn ${cmd}: ${e.message}\n`); });
@@ -147,7 +178,14 @@ async function runJob(spec) {
     const env = { ...process.env, CI: '1', FORCE_COLOR: '0', NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=16384', ...(spec.env || {}) };
     if (turboToken && !env.TURBO_TOKEN) Object.assign(env, { TURBO_API: cfg.turboApi, TURBO_TEAM: 'dragos', TURBO_TOKEN: turboToken });
     append(`\n[devcloud] run on ${cfg.name} (${os.cpus().length} vCPU): ${spec.cmd}\n`);
-    exit = await step('bash', ['-lc', spec.cmd], { env, timeoutSec: spec.timeoutSec || 3600 });
+    if (isWin) {
+      const js = path.join(os.tmpdir(), `devcloud-job-${spec.id}.ps1`);
+      fs.writeFileSync(js, winScript(spec));
+      try { exit = await step('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', js], { env, timeoutSec: spec.timeoutSec || 3600 }); }
+      finally { fs.rmSync(js, { force: true }); }
+    } else {
+      exit = await step('bash', ['-lc', spec.cmd], { env, timeoutSec: spec.timeoutSec || 3600 });
+    }
     phases.run = Math.round((Date.now() - s) / 100) / 10;
   } catch (e) {
     append(`\n[devcloud] ERROR: ${e.message}\n`); if (!exit) exit = 1;
@@ -167,11 +205,21 @@ async function suspendSelf() {
 
 async function main() {
   if (!cfg.bucket || !cfg.ws) throw new Error('metadata devcloud-bucket / devcloud-ws missing');
+  // Windows has no ssh path: publish the tail of the previous run's log (agent-loop.ps1 appends to it), so a
+  // hang or crash is diagnosable from gs://<bucket>/ws/<ws>/agent-log-tail.
+  if (isWin) {
+    try { const t = fs.readFileSync('C:\\devcloud\\agent.log'); await gs.put(cfg.bucket, `ws/${cfg.ws}/agent-log-tail`, t.subarray(Math.max(0, t.length - 65536)), 'text/plain; charset=utf-8'); } catch (e) { log('log tail', e.message); }
+  }
   await loadTurbo();
   log('agent up', JSON.stringify({ ws: cfg.ws, bucket: cfg.bucket, zone: cfg.zone, idleMin: cfg.idleMin, vcpu: os.cpus().length, secretProject: cfg.secretProject, turbo: !!turboToken }));
-  let lastWork = Date.now(); let lastHb = 0; let lastTick = Date.now();
+  let lastWork = Date.now(); let lastHb = 0; let lastTick = Date.now(); let lastSelfCheck = Date.now();
+  // Watchdog: timers still fire while the loop awaits. No loop pass for 5 min outside a job = something
+  // hung -> exit; systemd (Restart=always) / agent-loop.ps1 start a fresh agent.
+  let inJob = false; let loopAt = Date.now();
+  setInterval(() => { if (!inJob && Date.now() - loopAt > 300_000) { log('watchdog: loop stalled', Math.round((Date.now() - loopAt) / 1000), 's, exiting'); process.exit(3); } }, 30_000).unref();
   const hb = (state) => gs.put(cfg.bucket, `ws/${cfg.ws}/heartbeat`, JSON.stringify({ at: new Date().toISOString(), host: cfg.name, state, idleSec: Math.round((Date.now() - lastWork) / 1000) }), 'application/json').catch(() => {});
   for (;;) {
+    loopAt = Date.now();
     // a jump in wall time = we were suspended; restart the idle clock and refresh the token
     if (Date.now() - lastTick > 30_000) { log('resumed after', Math.round((Date.now() - lastTick) / 1000), 's'); lastWork = Date.now(); tok.exp = 0; lastHb = 0; }
     lastTick = Date.now();
@@ -185,12 +233,21 @@ async function main() {
         log('claimed', spec.id, spec.cmd);
         await hb('busy');
         if (!turboToken) await loadTurbo();
-        await runJob(spec);
+        inJob = true;
+        try { await runJob(spec); } finally { inJob = false; loopAt = Date.now(); }
         lastWork = Date.now(); lastTick = Date.now();
         continue;
       }
     }
     if (Date.now() - lastHb > 30_000) { lastHb = Date.now(); await hb('idle'); }
+    // Windows has no `gcloud compute ssh` restart path: while idle, adopt a newer agent pushed to metadata by
+    // workspace.ps1 -UpdateAgent and exit; the agent-loop.ps1 wrapper starts the new file.
+    if (isWin && Date.now() - lastSelfCheck > 60_000) {
+      lastSelfCheck = Date.now();
+      const fresh = await attr('runner-agent', '');
+      const self = process.argv[1];
+      if (fresh.length > 1000 && fresh !== fs.readFileSync(self, 'utf8').trim()) { fs.writeFileSync(self, fresh); log('agent updated from metadata, restarting'); process.exit(0); }
+    }
     if (cfg.idleMin > 0 && Date.now() - lastWork > cfg.idleMin * 60_000) { await suspendSelf(); lastWork = Date.now(); await new Promise((r) => setTimeout(r, 20_000)); continue; }
     await new Promise((r) => setTimeout(r, 1000));
   }
