@@ -20,8 +20,9 @@ try {
   New-Item -ItemType Directory -Force $work | Out-Null
   # Suspend needs hibernation off in the guest (GCE suspend docs, "Enable suspend operations on Windows").
   & powercfg.exe /hibernate off
-  # Dev-machine parity found by vitals-win tests (DC-063): raw IOCTL_DISK_PERFORMANCE counters are off on
-  # Server until `diskperf -Y` (a desktop has them on because Task Manager asks); takes effect at once.
+  # Dev-machine parity attempt (DC-063): enable raw IOCTL_DISK_PERFORMANCE counters. MEASURED: not enough on
+  # GCE - the boot disk still reports bytes_read 0 after -Y and a reboot (vitals-win
+  # the_system_volume_reports_activity_counters stays red); kept because it is harmless and right on Server.
   & diskperf.exe -Y | Out-Null
   try { Add-MpPreference -ExclusionPath $work, 'C:\cargo', 'C:\rustup', 'C:\Users\dev\AppData\Local\pnpm' -ErrorAction Stop } catch { Say "::warn defender: $($_.Exception.Message)" }
 
