@@ -20,6 +20,9 @@ try {
   New-Item -ItemType Directory -Force $work | Out-Null
   # Suspend needs hibernation off in the guest (GCE suspend docs, "Enable suspend operations on Windows").
   & powercfg.exe /hibernate off
+  # Dev-machine parity found by vitals-win tests (DC-063): raw IOCTL_DISK_PERFORMANCE counters are off on
+  # Server until `diskperf -Y` (a desktop has them on because Task Manager asks); takes effect at once.
+  & diskperf.exe -Y | Out-Null
   try { Add-MpPreference -ExclusionPath $work, 'C:\cargo', 'C:\rustup', 'C:\Users\dev\AppData\Local\pnpm' -ErrorAction Stop } catch { Say "::warn defender: $($_.Exception.Message)" }
 
   $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'.ToCharArray()
@@ -39,6 +42,9 @@ try {
   $wrapper = @'
 $D = 'C:\devcloud'
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+# A profile created by a batch logon has no Start Menu tree, so FOLDERID_Startup does not resolve (vitals-win
+# known_folders_resolve). Interactive profiles always have it.
+New-Item -ItemType Directory -Force "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" | Out-Null
 while ($true) {
   if ((Test-Path "$D\agent.log") -and (Get-Item "$D\agent.log").Length -gt 20MB) { Move-Item -Force "$D\agent.log" "$D\agent.old.log" }
   & 'C:\Program Files\nodejs\node.exe' "$D\runner-agent.mjs" 2>&1 | ForEach-Object { "$_" } | Out-File -FilePath "$D\agent.log" -Append -Encoding utf8
