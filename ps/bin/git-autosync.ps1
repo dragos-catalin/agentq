@@ -187,18 +187,26 @@ function Save-Snapshot([string]$r, [string]$name, [string]$remote) {
   [pscustomobject]@{ sha = $sha; ref = $ref; ts = $ts; where = $where }
 }
 
-# Land the replayed commits through agentq (clean land slot, dedupe, hooks on the clean result).
-function Invoke-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [string]$branch, [string]$base) {
+# Land the replayed commits through agentq (clean land slot, dedupe, hooks on the clean result), DETACHED:
+# a codai land runs the full pre-push (20-40 min) and must not freeze the other repos' sync.
+# Returns the started job record; a later pass reads its rc file.
+function Start-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [string]$branch, [string]$base, [string]$name) {
   $topic = "autosync/replay-$branch"
   G $r push -q --no-verify --force $remote "$($base):refs/heads/$topic" 2>&1 | Out-Null
-  if ($LASTEXITCODE) { return @{ ok = $false; why = "push of $topic failed" } }
+  if ($LASTEXITCODE) { return $null }
   $land = if ($env:GIT_AUTOSYNC_LAND) { $env:GIT_AUTOSYNC_LAND } else { Join-Path $HOME '.copilot\bin\agentq.ps1' }
-  $logf = Join-Path $HOME '.codai\git-autosync-push.log'
-  Push-Location $r
-  try { & pwsh -NoProfile -File $land land -Branch $topic -Onto $upBranch -Purpose "git-autosync replay of deferred commits on $branch" *> $logf; $rc = $LASTEXITCODE }
-  finally { Pop-Location }
-  if ($rc -eq 0) { G $r push -q --no-verify $remote ":refs/heads/$topic" 2>&1 | Out-Null; return @{ ok = $true; why = '' } }
-  @{ ok = $false; why = "agentq land exit $rc (see ~/.codai/git-autosync-push.log; topic $topic kept on $remote)" }
+  $dir = Join-Path $HOME ".codai\autosync-land"; New-Item -ItemType Directory -Force $dir | Out-Null
+  $id = "$name-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))"
+  $logf = Join-Path $dir "$id.log"; $rcf = Join-Path $dir "$id.rc"; $wrap = Join-Path $dir "$id.ps1"
+  $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+  $body = @(
+    "Set-Location -LiteralPath $(& $q $r)",
+    "& pwsh -NoProfile -File $(& $q $land) land -Branch $(& $q $topic) -Onto $(& $q $upBranch) -Purpose $(& $q "git-autosync replay of deferred commits on $branch") *> $(& $q $logf)",
+    "[IO.File]::WriteAllText($(& $q $rcf), [string]`$LASTEXITCODE)"
+  ) -join "`n"
+  [IO.File]::WriteAllText($wrap, $body, [Text.UTF8Encoding]::new($false))
+  $p = Start-Process pwsh -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrap -WindowStyle Hidden -PassThru
+  @{ pid = $p.Id; started = [DateTime]::UtcNow.ToString('o'); rc = $rcf; log = $logf; topic = $topic; head = ''; target = '' }
 }
 
 function Sync-Repo([string]$r) {
@@ -220,6 +228,18 @@ function Sync-Repo([string]$r) {
   $head = (G $r rev-parse HEAD).Trim(); $target = (G $r rev-parse $up).Trim()
   if ($head -eq $target) { return @{ code = 0; msg = 'in sync' } }
   $unique = @(G $r cherry $up HEAD | Where-Object { $_ -like '+*' } | ForEach-Object { ($_ -split ' ')[1] })
+  # A finished detached land is collected first: once it succeeded nothing is unique any more, so this
+  # cannot live inside the `$unique.Count` branch (topic + state were left behind, 2026-10-17 test 3).
+  $stL = Get-State
+  if ($stL.ContainsKey('landing') -and $stL['landing'].ContainsKey($name)) {
+    $jb = $stL['landing'][$name]
+    $done = Test-Path $jb.rc
+    if (-not $done -and -not (Get-Process -Id $jb.pid -ErrorAction SilentlyContinue)) { $done = $true }
+    if ($done -and -not $unique.Count) {
+      $stL['landing'].Remove($name); Set-State $stL
+      G $r push -q --no-verify $remote ":refs/heads/$($jb.topic)" 2>&1 | Out-Null
+    }
+  }
   if ($unique.Count -and $ReplayRepos -notcontains $name -and $ReplayRepos -notcontains '*') {
     return @{ code = 3; msg = "refuse: $($unique.Count) unpushed commit(s) not on $up and $name is not a replay repo; its owner must push them (or back them up to a branch)" }
   }
@@ -258,23 +278,41 @@ function Sync-Repo([string]$r) {
   if ($unique.Count) {
     if ($WhatIf) { return @{ code = 0; msg = "would replay+push $($unique.Count) unpushed commit(s) onto $up, then move" } }
     $upBranch = $up.Substring($remote.Length + 1)
-    # Backoff: the same (HEAD, upstream) pair that failed to land is not retried for ReplayBackoffMin.
-    $key = "$name|$head|$target"; $st = Get-State; if (-not $st.ContainsKey('replayFail')) { $st['replayFail'] = @{} }
-    $f = $st['replayFail'][$key]
-    if ($f -and ([DateTime]::UtcNow - [DateTime]$f.at).TotalMinutes -lt $ReplayBackoffMin) {
-      return @{ code = 3; msg = "refuse: replay of $($unique.Count) commit(s) failed to land at $($f.at) ($($f.why)); backing off until HEAD or $up changes or $ReplayBackoffMin min pass" }
+    $key = "$name|$head|$target"
+    $st = Get-State; foreach ($k in 'replayFail', 'landing') { if (-not $st.ContainsKey($k)) { $st[$k] = @{} } }
+    $job = $st['landing'][$name]
+    if ($job) {
+      if (-not (Test-Path $job.rc)) {
+        $alive = Get-Process -Id $job.pid -ErrorAction SilentlyContinue
+        if ($alive) { return @{ code = 3; msg = "skip: replay land running since $($job.started) (pid $($job.pid), log $($job.log))" } }
+        $rcv = 'died'
+      } else { $rcv = "$(Get-Content $job.rc -Raw)".Trim() }
+      $st['landing'].Remove($name)
+      if ($rcv -eq '0') {
+        G $r push -q --no-verify $remote ":refs/heads/$($job.topic)" 2>&1 | Out-Null
+        Set-State $st
+        G $r fetch -q $remote 2>&1 | Out-Null
+        $target = (G $r rev-parse $up).Trim()
+        if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
+        $published = "landed $($unique.Count) deferred commit(s) via agentq land; "
+      } else {
+        $st['replayFail'][$job.key] = @{ at = [DateTime]::UtcNow.ToString('o'); why = "agentq land exit $rcv (log $($job.log); topic $($job.topic) kept on $remote)" }
+        Set-State $st
+        return @{ code = 3; msg = "refuse: replay of $($unique.Count) unpushed commit(s) did not land (agentq land exit $rcv, log $($job.log)); next try after $ReplayBackoffMin min or when HEAD/$up moves" }
+      }
+    } else {
+      # Backoff: the same (HEAD, upstream) pair that failed to land is not retried for ReplayBackoffMin.
+      $f = $st['replayFail'][$key]
+      if ($f -and ([DateTime]::UtcNow - [DateTime]$f.at).TotalMinutes -lt $ReplayBackoffMin) {
+        return @{ code = 3; msg = "refuse: replay of $($unique.Count) commit(s) failed to land at $($f.at) ($($f.why)); backing off until HEAD or $up changes or $ReplayBackoffMin min pass" }
+      }
+      $job = Start-ReplayLand $r $remote $upBranch $branch $base $name
+      if (-not $job) { return @{ code = 3; msg = "refuse: could not push autosync/replay-$branch to $remote; will retry" } }
+      $job.key = $key
+      $st = Get-State; if (-not $st.ContainsKey('landing')) { $st['landing'] = @{} }
+      $st['landing'][$name] = $job; Set-State $st
+      return @{ code = 3; msg = "skip: started agentq land of $($unique.Count) deferred commit(s) (pid $($job.pid), log $($job.log)); the move happens on a later pass" }
     }
-    $res = Invoke-ReplayLand $r $remote $upBranch $branch $base
-    if (-not $res.ok) {
-      $st = Get-State; if (-not $st.ContainsKey('replayFail')) { $st['replayFail'] = @{} }
-      $st['replayFail'][$key] = @{ at = [DateTime]::UtcNow.ToString('o'); why = $res.why }; Set-State $st
-      return @{ code = 3; msg = "refuse: replay of $($unique.Count) unpushed commit(s) did not land: $($res.why); next try after $ReplayBackoffMin min or when HEAD/$up moves" }
-    }
-    G $r fetch -q $remote 2>&1 | Out-Null
-    $target = (G $r rev-parse $up).Trim()
-    # land dedupes against upstream, so every unique commit must now be on upstream; otherwise stop.
-    if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
-    $published = "landed $($unique.Count) deferred commit(s) via agentq land; "
   }
   $behind = [int](G $r rev-list --count "HEAD..$target"); $ahead = [int](G $r rev-list --count "$target..HEAD")
 

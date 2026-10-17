@@ -12,6 +12,9 @@ $env:GIT_AUTOSYNC_BACKUP_URL = Join-Path $root 'backups.git'; git init -q --bare
 $env:GIT_AUTOSYNC_VISIBILITY = 'private'
 $env:GIT_AUTOSYNC_LAND = Join-Path $PSScriptRoot 'fake-land.ps1'
 $env:FAKE_LAND_CALLS = Join-Path $root 'land-calls.txt'
+$env:GIT_AUTOSYNC_LAND_DIR = Join-Path $root 'land'
+# replay is async: pass 1 starts the land, wait for its rc file, pass 2 collects + moves
+function RunLand($r) { $c = Run $r; $d = (Get-Date).AddSeconds(90); while ((Get-Date) -lt $d -and @(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.rc -ErrorAction SilentlyContinue).Count -lt (@(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.ps1 -ErrorAction SilentlyContinue).Count)) { Start-Sleep 1 }; Run $r }
 $env:GIT_AUTOSYNC_MUTEX = 'Local\gas-test-' + [guid]::NewGuid().ToString('N')
 $env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'core.safecrlf'; $env:GIT_CONFIG_VALUE_0 = 'false'
 $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NAME = 't'; $env:GIT_COMMITTER_EMAIL = 't@t'
@@ -42,7 +45,7 @@ Ok (-not (git -C $r.a status --porcelain)) '2 tree clean'
 
 # 3 real unpushed commit (agentq push deferred) -> replayed onto origin, pushed, clone moved; dirty edit kept
 $r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "3`n"; W "$($r.a)\z.txt" "wip`n"; git -C $r.a add z.txt
-Ok ((Run $r) -eq 0) '3 landed via land'; git -C $r.a fetch -q
+Ok ((RunLand $r) -eq 0) '3 landed via land'; git -C $r.a fetch -q
 Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '3 at origin'
 Ok ((git -C $r.a log origin/main --format=%s) -contains 'mine') '3 commit on origin'
 Ok (((git -C $r.a show origin/main:x.txt) -join '') -eq '3') '3 upstream change kept'
@@ -93,10 +96,10 @@ Ok (@(Backups $r).Count -eq 1) '4n backup branch on origin'
 
 # 3f land fails -> refused, nothing moved, and NOT retried on the next pass (backoff); retried when upstream moves
 $r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "f`n"; $h = git -C $r.a rev-parse HEAD; Remove-Item $env:FAKE_LAND_CALLS -ErrorAction SilentlyContinue
-$env:FAKE_LAND_FAIL = '1'; Ok ((Run $r) -eq 3) '3f refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '3f HEAD unchanged'
+$env:FAKE_LAND_FAIL = '1'; Ok ((RunLand $r) -eq 3) '3f refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '3f HEAD unchanged'
 Ok ((Run $r) -eq 3) '3f second pass refused'; Ok (@(Get-Content $env:FAKE_LAND_CALLS).Count -eq 1) '3f backoff: land not retried'
 Remove-Item Env:FAKE_LAND_FAIL; Push-B $r 'x.txt' "g`n"
-Ok ((Run $r) -eq 0) '3f upstream moved -> retried and landed'; git -C $r.a fetch -q
+Ok ((RunLand $r) -eq 0) '3f upstream moved -> retried and landed'; git -C $r.a fetch -q
 Ok ((git -C $r.a log origin/main --format=%s) -contains 'mine') '3f commit on origin'
 
 # 4v PUBLIC repo -> backup goes to the private backup repo, never to origin
