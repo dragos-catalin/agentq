@@ -155,5 +155,24 @@ Ok ((Run $r) -eq 0) '5 exit 0'; Ok ((git -C $r.a diff --cached --name-only) -eq 
 $r = Fresh; Push-B $r 'x.txt' "6`n"; W "$($r.a)\.git\MERGE_HEAD" (git -C $r.a rev-parse HEAD); $h = git -C $r.a rev-parse HEAD
 Ok ((Run $r) -eq 3) '6 skipped'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '6 HEAD unchanged'
 
+# 7 upstream changes MODE (100755 -> 100644) + content; local copy staged == new content but old mode
+#   (core.filemode=false keeps 755 on git add) -> moved, not "would be overwritten" (agentq 2026-10-17)
+$r = Fresh; git -C $r.a config core.filemode false; W "$($r.a)\m.sh" "a`n"; git -C $r.a add m.sh; git -C $r.a update-index --chmod=+x m.sh; git -C $r.a commit -qm exe; git -C $r.a push -q origin main 2>$null
+git -C $r.b pull -q 2>$null; W "$($r.b)\m.sh" "b`n"; git -C $r.b add m.sh; git -C $r.b update-index --chmod=-x m.sh; git -C $r.b commit -qm noexe; git -C $r.b push -q origin main 2>$null
+W "$($r.a)\m.sh" "b`n"; git -C $r.a add m.sh
+Ok ((Run $r) -eq 0) '7 exit 0'; Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '7 at origin'
+Ok (-not (git -C $r.a status --porcelain)) '7 tree clean'; Ok (((git -C $r.a ls-files -s m.sh) -split '\s+')[0] -eq '100644') '7 index mode = upstream'
+
+# 8 local-commit-only repo (vitals policy) -> hold, no land, HEAD unchanged
+$r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "8`n"; $h = git -C $r.a rev-parse HEAD
+$calls = @(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.ps1 -ErrorAction SilentlyContinue).Count
+Ok ((Run $r @('-LocalCommitRepos', (Split-Path $r.a -Leaf))) -eq 3) '8 held'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '8 HEAD unchanged'
+Ok (@(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.ps1 -ErrorAction SilentlyContinue).Count -eq $calls) '8 no land started'
+Ok ((Get-Content $env:GIT_AUTOSYNC_LOG -Raw) -match 'hold: 1 local commit') '8 hold logged'
+
+# 9 land wrappers stay in the override dir, never in the real ~/.codai/autosync-land
+Ok (@(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -File -ErrorAction SilentlyContinue).Count -gt 0) '9 land files in override dir'
+Ok (@(Get-ChildItem (Join-Path $HOME '.codai\autosync-land') -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*gas-*' -or $_.Name -like 'o*-a*' }).Count -eq 0) '9 real land dir untouched'
+
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

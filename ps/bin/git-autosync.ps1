@@ -54,6 +54,8 @@ param(
   # Repos whose unpushed commits autosync may replay+push (agentq defers pushes there). Elsewhere an
   # unpushed commit only refuses: gta-nexus had 67 local-only commits that must never auto-land.
   [string[]]$ReplayRepos = @('codai', 'brivio', 'money', 'metu', 'mmo'),
+  # Repos whose agents commit locally and never push by policy (vitals ADR-0019): unpushed commits are expected.
+  [string[]]$LocalCommitRepos = @('vitals'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
   [switch]$ParkNow, [double]$ParkIdleHours = 6, [switch]$Report,
   [string]$BackupUrl = 'https://github.com/dragos-catalin/shared-clone-backups.git',
@@ -70,6 +72,7 @@ $LastMsg = @{}
 $CoordQ = Join-Path $HOME '.codai\coord\queues'
 $Repo = @($Repo | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $ReplayRepos = @($ReplayRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+$LocalCommitRepos = @($LocalCommitRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
 
 function Write-Log([string]$repo, [string]$msg) {
   $line = '{0} {1} {2}' -f ([DateTime]::UtcNow.ToString('o')), (Split-Path $repo -Leaf), $msg
@@ -195,7 +198,7 @@ function Start-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [strin
   G $r push -q --no-verify --force $remote "$($base):refs/heads/$topic" 2>&1 | Out-Null
   if ($LASTEXITCODE) { return $null }
   $land = if ($env:GIT_AUTOSYNC_LAND) { $env:GIT_AUTOSYNC_LAND } else { Join-Path $HOME '.copilot\bin\agentq.ps1' }
-  $dir = Join-Path $HOME ".codai\autosync-land"; New-Item -ItemType Directory -Force $dir | Out-Null
+  $dir = if ($env:GIT_AUTOSYNC_LAND_DIR) { $env:GIT_AUTOSYNC_LAND_DIR } else { Join-Path $HOME ".codai\autosync-land" }; New-Item -ItemType Directory -Force $dir | Out-Null
   $id = "$name-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))"
   $logf = Join-Path $dir "$id.log"; $rcf = Join-Path $dir "$id.rc"; $wrap = Join-Path $dir "$id.ps1"
   $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
@@ -240,6 +243,8 @@ function Sync-Repo([string]$r) {
       G $r push -q --no-verify $remote ":refs/heads/$($jb.topic)" 2>&1 | Out-Null
     }
   }
+  # Local-commit repos (vitals ADR-0019: agents commit, only the owner pushes) are never replayed.
+  if ($unique.Count -and $LocalCommitRepos -contains $name.ToLowerInvariant()) { return @{ code = 3; msg = "hold: $($unique.Count) local commit(s) awaiting the owner's push ($name policy: agents never push); not moved" } }
   if ($unique.Count -and $ReplayRepos -notcontains $name -and $ReplayRepos -notcontains '*') {
     return @{ code = 3; msg = "refuse: $($unique.Count) unpushed commit(s) not on $up and $name is not a replay repo; its owner must push them (or back them up to a branch)" }
   }
@@ -311,7 +316,7 @@ function Sync-Repo([string]$r) {
       $job.key = $key
       $st = Get-State; if (-not $st.ContainsKey('landing')) { $st['landing'] = @{} }
       $st['landing'][$name] = $job; Set-State $st
-      return @{ code = 3; msg = "skip: started agentq land of $($unique.Count) deferred commit(s) (pid $($job.pid), log $($job.log)); the move happens on a later pass" }
+      return @{ code = 3; msg = "replay: started agentq land of $($unique.Count) deferred commit(s) (pid $($job.pid), log $($job.log)); the move happens on a later pass" }
     }
   }
   $behind = [int](G $r rev-list --count "HEAD..$target"); $ahead = [int](G $r rev-list --count "$target..HEAD")
@@ -429,7 +434,14 @@ function Sync-Repo([string]$r) {
     }
   }
 
-  foreach ($p in $stage) { if (Test-Path -LiteralPath (Join-Path $r $p)) { G $r add -- $p } else { G $r rm -q --cached --ignore-unmatch -- $p 2>&1 | Out-Null } }
+  # Already-upstream paths: stage the TARGET entry (mode + blob) exactly. `git add` keeps the old mode
+  # when core.filemode=false (Windows), so a 100755 -> 100644 change upstream left an index entry equal
+  # to neither tree and read-tree refused "would be overwritten" (agentq cloud/runner-agent.mjs 2026-10-17).
+  foreach ($p in $stage) {
+    $ls = "$(G $r ls-tree $target -- $p)"
+    if ($ls) { $parts = $ls -split '\s+'; G $r update-index --add --cacheinfo "$($parts[0]),$($parts[2]),$p" }
+    else { G $r rm -q --cached --ignore-unmatch -- $p 2>&1 | Out-Null }
+  }
   foreach ($sv in $superseded) {
     # Old bytes stay recoverable (git cat-file blob <id>, id in the log line); then index + worktree =
     # target blob, so the two-tree read-tree below sees index == target and leaves the path alone.
@@ -443,8 +455,12 @@ function Sync-Repo([string]$r) {
   G $r update-ref "refs/backup/autosync/$branch" $head
   # Stale stat info ("Entry ... not uptodate. Cannot merge", dragoscatalin 2026-10-17) makes read-tree refuse.
   G $r update-index -q --refresh 2>&1 | Out-Null
-  G $r read-tree -m -u HEAD $target
-  if ($LASTEXITCODE) { return @{ code = 3; msg = "refuse: read-tree -m failed ($LASTEXITCODE); nothing moved" } }
+  $rtOut = @(G $r read-tree -m -u HEAD $target 2>&1 | ForEach-Object { "$_" })
+  if ($LASTEXITCODE) {
+    $why = (@($rtOut | Where-Object { $_ -match 'error|fatal' }) | Select-Object -First 2) -join ' | '
+    $prep = if ($resolved.Count -or $superseded.Count -or $stage.Count -or $untrackedHit.Count) { "; branch NOT moved but $($resolved.Count + $superseded.Count + $stage.Count + $untrackedHit.Count) path(s) were already set to upstream (dirty state backed up" + $(if ($snap) { " as $($snap.where):$($snap.ref)" } else { " in the object store" }) + "); the next pass completes the move" } else { '' }
+    return @{ code = 3; msg = "refuse: read-tree -m failed ($why)$prep" }
+  }
   G $r update-ref -m "git-autosync: fast-forward to $up" "refs/heads/$branch" $target $head
   if ($LASTEXITCODE) { return @{ code = 3; msg = "refuse: $branch moved concurrently (update-ref lost the race); will retry" } }
   foreach ($x in @($resolved | Where-Object { $_.kind -eq 'merged' })) { [IO.File]::WriteAllBytes((Join-Path $r $x.p), $x.bytes) }
@@ -510,13 +526,20 @@ do {
       if (Test-Path (Join-Path $_ '.git')) { & git -C $_ --no-optional-locks fetch -q --all 2>&1 | Out-Null }
     }
     $script:NoFetch = $true
+    try {
+      $st = Get-State; $chg = $false
+      if ($st.ContainsKey('replayFail')) { foreach ($k in @($st['replayFail'].Keys)) { if (([DateTime]::UtcNow - [DateTime]$st['replayFail'][$k].at).TotalHours -gt 24) { $st['replayFail'].Remove($k); $chg = $true } } }
+      if ($chg) { Set-State $st }
+      $ld = if ($env:GIT_AUTOSYNC_LAND_DIR) { $env:GIT_AUTOSYNC_LAND_DIR } else { Join-Path $HOME '.codai\autosync-land' }
+      Get-ChildItem $ld -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
   }
   foreach ($r in $Repo) {
     # One pass at a time machine-wide: the -Loop task and a manual run must never interleave.
     $pm = [Threading.Mutex]::new($false, $(if ($env:GIT_AUTOSYNC_MUTEX) { $env:GIT_AUTOSYNC_MUTEX } else { 'Global\git-autosync-pass' }))
     try {
       if (-not $pm.WaitOne(60000)) { $res = @{ code = 3; msg = 'skip: another git-autosync pass is running' } }
-      else { try { $res = Sync-Repo $r } catch { $res = @{ code = 3; msg = "error: $_" } } finally { $pm.ReleaseMutex() } }
+      else { try { $res = Sync-Repo $r } catch { $res = @{ code = 3; msg = "error: $_ (line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim()))" } } finally { $pm.ReleaseMutex() } }
     } finally { $pm.Dispose() }
     # Log only actions and refusals, not the steady "in sync" state.
     # Log actions and refusals, not the steady "in sync" state; in -Loop a repeated message is logged once.
