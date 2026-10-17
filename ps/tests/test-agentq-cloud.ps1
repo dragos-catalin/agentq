@@ -90,6 +90,28 @@ $m = (& pwsh -NoProfile -File $Aq metrics -Hours 1) -join "`n"
 Check 'metrics show cloud row' ($m -match 'cloud:wsrepo') ''
 Check 'metrics show resume p50' ($m -match 'resumes=1 resumeP50=9.5s') ($m -split "`n" | Select-Object -Last 1)
 
+# 9. circuit breaker: tool exit 4 (nothing submitted) -> the command runs locally, rc 0.
+$env:STUB_EXIT = '4'
+$n = (Calls).Count
+$rc = Run $repo @('-Where', 'cloud') $localCmd
+Check 'exit 4 falls back to local' ($rc -eq 0 -and (Calls).Count -eq $n + 1) "rc=$rc"
+Check 'fallback journaled' (@(Journal | Where-Object { $_.event -eq 'placement' -and $_.resource -eq 'cloud-fallback' }).Count -eq 1) ''
+# 9b. AGENTQ_CLOUD_STRICT=1 keeps the failure visible.
+$env:AGENTQ_CLOUD_STRICT = '1'
+$rc = Run $repo @('-Where', 'cloud') $localCmd
+Remove-Item Env:AGENTQ_CLOUD_STRICT
+Check 'strict mode propagates exit 4' ($rc -eq 4) "rc=$rc"
+Remove-Item Env:STUB_EXIT
+# 9c. an unexpired cloud-down record places locally without calling the tool; an expired one is ignored.
+$dd = Join-Path $env:AGENTQ_HOME 'cloud-down'; New-Item -ItemType Directory -Force $dd | Out-Null
+@{ ws = 'wsrepo'; since = [DateTime]::UtcNow.ToString('o'); until = [DateTime]::UtcNow.AddMinutes(10).ToString('o'); reason = 'test' } | ConvertTo-Json | Set-Content (Join-Path $dd 'wsrepo.json')
+$n = (Calls).Count
+$rc = Run $repo @('-Where', 'cloud') $localCmd
+Check 'cloud-down skips the tool' ($rc -eq 0 -and (Calls).Count -eq $n) "rc=$rc calls=$((Calls).Count)"
+@{ ws = 'wsrepo'; since = [DateTime]::UtcNow.AddMinutes(-30).ToString('o'); until = [DateTime]::UtcNow.AddMinutes(-1).ToString('o'); reason = 'old' } | ConvertTo-Json | Set-Content (Join-Path $dd 'wsrepo.json')
+$rc = Run $repo @('-Where', 'cloud') $localCmd
+Check 'expired cloud-down is ignored' ((Calls).Count -eq $n + 1 -and -not (Test-Path (Join-Path $dd 'wsrepo.json'))) "calls=$((Calls).Count)"
+
 # 10. DC-063: explicit -Ws overrides the repo mapping; agentq-cloud reads cloudRegistry from config
 # (an unknown workspace is exit 2 = usage, a registered one reaches the network step).
 $rc = Run $repo @('-Where', 'cloud', '-Ws', 'vitals-win') 'cargo test -p vitals-core'

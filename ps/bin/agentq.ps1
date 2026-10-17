@@ -277,7 +277,7 @@ function Get-Capacity([string]$res) {
   # build:machine: config machineCap (+ an active, unexpired burst) wins over the sticky capacity
   # file, which is rewritten so the hub/sync readers see the effective value (DC-014).
   if ($res -eq 'build:machine') {
-    $cap = [int](Get-Config).machineCap + (Get-BurstExtra $res)
+    $cap = (Get-AdaptiveMachineCap) + (Get-BurstExtra $res)
     $f = Join-Path (QPath $res) 'capacity'
     try { if (-not (Test-Path $f) -or [int](Get-Content $f -Raw) -ne $cap) { New-Item -ItemType Directory -Force (QPath $res) | Out-Null; [IO.File]::WriteAllText($f, "$cap") } } catch {}
     return $cap
@@ -285,6 +285,70 @@ function Get-Capacity([string]$res) {
   $f = Join-Path (QPath $res) 'capacity'
   $base = if (Test-Path $f) { [int](Get-Content $f -Raw) } elseif ($DefaultCapacity.ContainsKey($res)) { $DefaultCapacity[$res] } else { 1 }
   $base + (Get-BurstExtra $res)
+}
+
+# Adaptive machine cap (S18-08, 2026-10-17). A fixed 2 left the i9 idle at night and saturated it
+# during the day. Config `machineCapAdaptive` = { min, max, cpuHigh, cpuLow, minFreeRamGB,
+# minFreeCommitGB, everySec }; absent -> the fixed machineCap. The decision is shared by every agentq
+# process through queues/build_machine/adaptive.json and refreshed at most every `everySec`, because
+# Get-Capacity runs on every 1.5 s poll. CPU is the AVERAGE since the previous refresh
+# (raw perf-counter deltas), so a one-second spike cannot flap the cap. One step per refresh.
+# Raw counter, not Add-Type GetSystemTimes: compiling the P/Invoke cost ~730 ms per agentq process
+# and PerfFormattedData ~14 s under load (measured 2026-10-17); PerfRawData answers in ~33 ms.
+# Raw PercentProcessorTime for _Total is cumulative IDLE time in 100 ns units.
+function Get-SysTimes {
+  $r = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'" -Property PercentProcessorTime, Timestamp_Sys100NS
+  @{ idle = [long]$r.PercentProcessorTime; total = [long]$r.Timestamp_Sys100NS }
+}
+function Get-AdaptiveMachineCap {
+  $cfg = Get-Config
+  $fixed = [int]$cfg.machineCap
+  $a = if ($cfg.ContainsKey('machineCapAdaptive')) { $cfg['machineCapAdaptive'] } else { $null }
+  if (-not $a) { return $fixed }
+  # config is read -AsHashtable, and P() only sees object properties
+  $H = { param($k, $d) if ($a.ContainsKey($k) -and $null -ne $a[$k]) { $a[$k] } else { $d } }
+  function P($o, $k, $d) { & $H $k $d }
+  $min = [int](P $a 'min' $fixed); $max = [int](P $a 'max' $fixed)
+  if ($max -le $min) { return $min }
+  $every = [double](P $a 'everySec' 15)
+  $f = Join-Path (QPath 'build:machine') 'adaptive.json'
+  $prev = $null
+  try { if (Test-Path -LiteralPath $f) { $prev = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable } } catch {}
+  $now = Now
+  $prevAt = $null
+  if ($prev -and $prev.at) {
+    $prevAt = if ($prev.at -is [datetime]) { $prev.at.ToUniversalTime() } else { try { [DateTime]::Parse("$($prev.at)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() } catch { $null } }
+  }
+  if ($prevAt -and ($now - $prevAt).TotalSeconds -lt $every) {
+    return [math]::Max($min, [math]::Min($max, [int]$prev.cap))
+  }
+  $m = [Threading.Mutex]::new($false, 'Global\agentq-adaptive')
+  $got = $false
+  try {
+    try { $got = $m.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
+    if (-not $got) { return $(if ($prev) { [math]::Max($min, [math]::Min($max, [int]$prev.cap)) } else { $min }) }
+    $t = Get-SysTimes
+    $cpu = $null
+    if ($prev -and $prev.total -and ([long]$t.total - [long]$prev.total) -gt 0) {
+      $dt = [double]([long]$t.total - [long]$prev.total); $di = [double]([long]$t.idle - [long]$prev.idle)
+      $cpu = [math]::Round(100 * (1 - $di / $dt), 1)
+    }
+    $os = Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory, FreeVirtualMemory
+    $ram = [math]::Round($os.FreePhysicalMemory / 1MB, 1); $commit = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
+    $cap = if ($prev -and $prev.cap) { [int]$prev.cap } else { $min }
+    $why = 'hold'
+    $memLow = ($ram -lt [double](P $a 'minFreeRamGB' 24)) -or ($commit -lt [double](P $a 'minFreeCommitGB' 24))
+    if ($memLow) { $cap--; $why = "memory low (ram ${ram} GB, commit ${commit} GB)" }
+    elseif ($null -ne $cpu -and $cpu -ge [double](P $a 'cpuHigh' 85)) { $cap--; $why = "cpu ${cpu}% >= high" }
+    elseif ($null -ne $cpu -and $cpu -le [double](P $a 'cpuLow' 55)) { $cap++; $why = "cpu ${cpu}% <= low" }
+    $cap = [math]::Max($min, [math]::Min($max, $cap))
+    $rec = [ordered]@{ at = Iso $now; cap = $cap; cpu = $cpu; freeRamGB = $ram; freeCommitGB = $commit; why = $why; idle = $t.idle; total = $t.total; min = $min; max = $max }
+    New-Item -ItemType Directory -Force (QPath 'build:machine') | Out-Null
+    [IO.File]::WriteAllText("$f.tmp", ($rec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force "$f.tmp" $f
+    if ($prev -and [int]$prev.cap -ne $cap) { Write-Journal @{ event = 'cap'; resource = 'build:machine'; from = [int]$prev.cap; to = $cap; reason = $why; cpu = $cpu; freeRamGB = $ram; freeCommitGB = $commit } }
+    return $cap
+  } catch { return $(if ($prev -and $prev.cap) { [int]$prev.cap } else { $fixed }) }
+  finally { if ($got) { try { $m.ReleaseMutex() } catch {} }; $m.Dispose() }
 }
 
 # ---- v3 scheduling helpers (devcloud F1, DC-010..013) -----------------------------------
@@ -658,6 +722,8 @@ function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
     if ($want -eq 'cloud') { throw "agentq: no cloud workspace for repo '$($repo.Name)' (config cloudWorkspaces or -Ws)" }
     return @{ where = 'local'; ws = $null; why = "auto: no workspace for $($repo.Name)" }
   }
+  $down = Get-CloudDown $ws
+  if ($down -and $env:AGENTQ_CLOUD_STRICT -ne '1') { return @{ where = 'local'; ws = $ws; why = "cloud:$ws down until $($down.until) ($($down.reason))" } }
   if ($want -eq 'cloud') { return @{ where = 'cloud'; ws = $ws; why = '-Where cloud' } }
   # auto
   $kind = Get-CmdKind $cmdLine
@@ -675,6 +741,22 @@ function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
   @{ where = 'local'; ws = $ws; why = 'auto: machine free, no history' }
 }
 
+# cloud-down/<ws>.json is written by agentq-cloud when a run could not even be submitted (VM gone,
+# auth, quota). Returns the record while it is unexpired, else $null (and removes a stale file).
+function Get-CloudDown([string]$ws) {
+  $f = Join-Path (Join-Path $Root 'cloud-down') "$ws.json"
+  if (-not (Test-Path -LiteralPath $f)) { return $null }
+  try {
+    $d = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    # pwsh 7 ConvertFrom-Json already turns ISO strings into DateTime; re-parsing its culture
+    # string (ro-RO here) threw and silently disabled the breaker.
+    $until = if ($d.until -is [datetime]) { $d.until } else { [DateTime]::Parse("$($d.until)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+    if ($until.ToUniversalTime() -gt (Now)) { return $d }
+    Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue
+  } catch {}
+  $null
+}
+
 function Invoke-CloudRun($repo, [string[]]$cmdArgs, $placement) {
   $tool = if ($env:AGENTQ_CLOUD_TOOL) { $env:AGENTQ_CLOUD_TOOL } else { Join-Path $PSScriptRoot 'agentq-cloud.ps1' }
   if (-not (Test-Path $tool)) { throw "agentq: $tool missing (install agentq cloud)" }
@@ -682,7 +764,14 @@ function Invoke-CloudRun($repo, [string[]]$cmdArgs, $placement) {
   if ($TimeoutGiven) { $a += @('-TimeoutMin', "$TimeoutMin") }
   $all = @($a) + @('--') + @($cmdArgs)
   & $tool @all
-  exit $LASTEXITCODE
+  $rc = $LASTEXITCODE
+  # 4 = nothing was submitted: run it here instead of failing the caller's hook/commit.
+  if ($rc -eq 4 -and $env:AGENTQ_CLOUD_STRICT -ne '1') {
+    [Console]::Error.WriteLine("agentq: cloud:$($placement.ws) unavailable, running locally")
+    Write-Journal @{ event = 'placement'; resource = 'cloud-fallback'; repo = $(if ($repo) { $repo.Name } else { '' }); where = 'local'; ws = "$($placement.ws)"; reason = 'cloud unavailable (exit 4), fell back to local'; purpose = $Purpose }
+    return
+  }
+  exit $rc
 }
 
 function Invoke-Run {
@@ -1057,6 +1146,55 @@ function Invoke-Release {
 
 . (Join-Path $PSScriptRoot 'agentq-v2.ps1')
 if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'renew', 'lease-check') { Renew-ForCwd }
+
+# Agent registry (S18-09, 2026-10-17). Every agentq call records WHO called: the session, the AI
+# client (from env + the process ancestry), the app that owns the shell, the repo and the last
+# purpose, in coord/agents/<session>.json. Readers (Vitals, the hub) join it with tickets and
+# leases by `session`, so "this build belongs to that Copilot Chat in that VS Code window" is a
+# lookup, not a guess. Hooks are the trust surface and not ours to edit; this path is.
+function Get-AgentClient {
+  if ($env:AGENTQ_CLIENT) { return $env:AGENTQ_CLIENT }
+  if ($env:CLAUDECODE -or $env:CLAUDE_CODE_ENTRYPOINT) { return 'claude-code' }
+  if ($env:CODEX_SANDBOX -or $env:CODEX_HOME -or $env:CODEX_MANAGED_BY_NPM) { return 'codex' }
+  if ($env:CODAI_AGENT -or $env:CODAI_SESSION_ID) { return 'codai' }
+  if ($env:COPILOT_AGENT -and $env:TERM_PROGRAM -eq 'vscode') { return 'vscode-copilot' }
+  if ($env:COPILOT_AGENT -or $env:COPILOT_SESSION_ID) { return 'copilot-cli' }
+  if ($env:TERM_PROGRAM -eq 'vscode') { return 'vscode' }
+  $null
+}
+function Register-Agent {
+  if ($env:AGENTQ_NO_REGISTRY -eq '1') { return }
+  try {
+    $dir = Join-Path $Root 'agents'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    $f = Join-Path $dir ((Safe $Session) + '.json')
+    # ancestry: shell = our parent; app = first ancestor that is a known AI host (<= 8 hops, ~20 ms each)
+    $me = Get-Process -Id $PID -ErrorAction Stop
+    $shell = $me.Parent; $app = $null; $p = $shell; $hops = 0
+    $hosts = '^(Code - Insiders|Code|codai-desktop|copilot|copilot-runtime|claude|Claude|codex|Cursor|Windsurf|WindowsTerminal)$'
+    while ($p -and $hops -lt 8) { if ($p.ProcessName -match $hosts) { $app = $p; break }; $p = $p.Parent; $hops++ }
+    $prev = $null
+    if (Test-Path -LiteralPath $f) { try { $prev = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable } catch {} }
+    $repoName = try { (Get-RepoInfo $Repo).Name } catch { $null }
+    $client = Get-AgentClient
+    if (-not $client -and $app) { $client = switch -regex ($app.ProcessName) { '^codai' { 'codai' } '^copilot' { 'copilot-cli' } '^(claude|Claude)$' { 'claude-code' } '^codex$' { 'codex' } '^Code' { 'vscode' } default { $null } } }
+    $rec = [ordered]@{
+      v = 1; session = $Session; client = $client
+      app = $(if ($app) { $app.ProcessName } else { $null }); appPid = $(if ($app) { $app.Id } else { $null })
+      appStart = $(if ($app) { Iso $app.StartTime } else { $null })
+      shellPid = $(if ($shell) { $shell.Id } else { $null }); shellStart = $(if ($shell) { Iso $shell.StartTime } else { $null })
+      model = $(if ($env:COPILOT_MODEL) { $env:COPILOT_MODEL } elseif ($env:COPILOT_PROVIDER_WIRE_MODEL) { $env:COPILOT_PROVIDER_WIRE_MODEL } else { $null })
+      cwd = (Get-Location).Path; repo = $repoName
+      firstSeen = $(if ($prev -and $prev.firstSeen) { "$($prev.firstSeen)" } else { Iso (Now) }); lastSeen = Iso (Now)
+      calls = $(if ($prev -and $prev.calls) { [int]$prev.calls + 1 } else { 1 })
+      lastVerb = $Verb.ToLowerInvariant(); lastPurpose = $(if ($Purpose) { $Purpose } elseif ($prev) { $prev.lastPurpose } else { $null })
+      host = $env:COMPUTERNAME
+    }
+    $tmp = "$f.$PID.tmp"
+    [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force -LiteralPath $tmp -Destination $f
+  } catch {}
+}
+if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'metrics', 'since', 'help') { Register-Agent }
 
 switch ($Verb.ToLowerInvariant()) {
   'run' { Invoke-Run }

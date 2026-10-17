@@ -55,21 +55,24 @@ Check 'status shows lane column' ($st -match 'lane') ''
 $h.WaitForExit(60000) | Out-Null; $w.WaitForExit(60000) | Out-Null
 
 # 3. quick burst: with machineCap 1 held by a gate, a quick lane run starts immediately.
-$h = Start-Run $repo2 'gate-holder' 'gate' 'Start-Sleep -Seconds 8'
+# Holder sleeps 25 s, pass threshold 15 s: a waiting run takes >= ~23 s, a non-waiting one is
+# pwsh startup only (3-6 s idle, up to ~10 s with the CPU at 95 %). The old 8 s / 6 s pair could not
+# tell the two apart under load and failed on unmodified HEAD (2026-10-17).
+$h = Start-Run $repo2 'gate-holder' 'gate' 'Start-Sleep -Seconds 25'
 Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
 $t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'lint' -Lane quick -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
 $secs = ((Get-Date) - $t0).TotalSeconds
-Check 'quick lane uses burst slot (no wait)' ($LASTEXITCODE -eq 0 -and $secs -lt 6) "exit $LASTEXITCODE ${secs}s"
+Check 'quick lane uses burst slot (no wait)' ($LASTEXITCODE -eq 0 -and $secs -lt 15) "exit $LASTEXITCODE ${secs}s"
 $h.WaitForExit(60000) | Out-Null
 
 # 4. non-batch beside batch: batch holder does not block a gate run.
-$h = Start-Run $repo2 'batch-holder' 'batch' 'Start-Sleep -Seconds 8'
+$h = Start-Run $repo2 'batch-holder' 'batch' 'Start-Sleep -Seconds 25'
 Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
 $t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'gate-beside-batch' -Lane gate -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
 $secs = ((Get-Date) - $t0).TotalSeconds
-Check 'gate runs beside batch holder' ($LASTEXITCODE -eq 0 -and $secs -lt 6) "exit $LASTEXITCODE ${secs}s"
+Check 'gate runs beside batch holder' ($LASTEXITCODE -eq 0 -and $secs -lt 15) "exit $LASTEXITCODE ${secs}s"
 $h.WaitForExit(60000) | Out-Null
 
 # 5. yielded holder does not count: a fake live machine holder marked yielded leaves the slot free.
@@ -141,7 +144,8 @@ $yielded = Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction Silently
 Check 'idle watchdog marks sleeping holder yielded' ([bool]$yielded) ''
 $t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'beside-idle' -Lane gate -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
-Check 'gate runs beside an idle-yielded holder' ($LASTEXITCODE -eq 0 -and ((Get-Date) - $t0).TotalSeconds -lt 8) "exit $LASTEXITCODE"
+$secs = ((Get-Date) - $t0).TotalSeconds
+Check 'gate runs beside an idle-yielded holder' ($LASTEXITCODE -eq 0 -and $secs -lt 20) "exit $LASTEXITCODE ${secs}s"
 Check 'idle-yield journaled' (@(Journal | Where-Object event -eq 'idle-yield').Count -ge 1)
 Stop-Process -Id $h.Id -Force -ErrorAction SilentlyContinue
 

@@ -5,6 +5,11 @@ $aq = Join-Path $PSScriptRoot 'agentq.ps1'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentq-test-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:AGENTQ_NO_SIGNAL = '1'
+# Pin the policy: the installed config may enable machineCapAdaptive, which makes capacity depend
+# on live CPU/RAM and turned queue-shape assertions into load-dependent flakes (2026-10-17).
+New-Item -ItemType Directory -Force $tmp | Out-Null
+$env:AGENTQ_CONFIG = Join-Path $tmp 'agentq-config.json'
+@{ machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10; minFreeCommitGB = 0 } | ConvertTo-Json | Set-Content $env:AGENTQ_CONFIG
 $repo = Join-Path $tmp 'repo'; $wt = Join-Path $tmp 'wt'
 New-Item -ItemType Directory -Force $repo | Out-Null
 git -C $repo init -q -b main; git -C $repo config user.email t@t; git -C $repo config user.name t

@@ -16,7 +16,9 @@ FLOW  resume VM if SUSPENDED/TERMINATED -> upload bundle/patch -> queue spec (wr
 JOURNAL  cloud-queued / cloud-done / cloud-fail in ~/.codai/coord/journal.jsonl with holdSec,
       waitSec (queue -> claimed, includes resume), lane, kind=cloud, resource cloud:<ws>, so
       `agentq metrics` shows cloud runs beside local ones.
-EXIT  remote exit code; 3 = could not submit / timed out waiting; 2 = usage.
+EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavailable, NOTHING
+  submitted (agentq falls back to local and skips this workspace until cloud-down/<ws>.json
+  expires); 2 = usage.
 #>
 $Ws = 'codai'; $Purpose = $null; $Lane = 'gate'; $TimeoutMin = 60; $RepoArg = $null; $NoPatch = $false
 $Status = $false; $Suspend = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
@@ -140,6 +142,12 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) "agentq-cloud-$id"; New-Item -ItemTy
 $cmd = ($Rest | ForEach-Object { $s = "$_"; if ($s -match '^[\w@./:=,+-]+$') { $s } else { "'" + ($s -replace "'", "'\''") + "'" } }) -join ' '
 $t0 = [DateTime]::UtcNow
 $prevEap = $ErrorActionPreference
+$submitted = $false
+# Circuit breaker (2026-10-17): ws-codai was deleted and every hook paid ~5 s of gcloud plus a
+# failed commit before anyone noticed. A failure before the queue entry exists records
+# cloud-down/<ws>.json; agentq reads it and places runs locally until it expires.
+$DownDir = Join-Path $Root 'cloud-down'; $DownFile = Join-Path $DownDir "$Ws.json"
+$DownMin = if ($env:AGENTQ_CLOUD_DOWN_MIN) { [int]$env:AGENTQ_CLOUD_DOWN_MIN } else { 15 }
 try {
   # 1. resume first (runs in parallel with delta building)
   $st = Get-VmStatus; $resumeFrom = $st; $resumeAt = $null
@@ -192,6 +200,8 @@ try {
     submittedAt = [DateTime]::UtcNow.ToString('o'); client = $env:COMPUTERNAME }
   $sf = Join-Path $tmp 'spec.json'; [IO.File]::WriteAllText($sf, ($spec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
   Write-Obj "ws/$Ws/queue/$id.json" $sf 'application/json'
+  $submitted = $true
+  Remove-Item -LiteralPath $DownFile -ErrorAction SilentlyContinue
   $queuedAt = [DateTime]::UtcNow
   $submitSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
   Write-Journal @{ event = 'cloud-queued'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; command = $cmd; sha = $head; submitSec = $submitSec }
@@ -238,8 +248,18 @@ try {
   exit ([int]$result.exit)
 } catch {
   $ErrorActionPreference = $prevEap
-  Write-Journal @{ event = 'cloud-fail'; resource = "cloud:$Ws"; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; reason = "$($_.Exception.Message)".Substring(0, [math]::Min(300, "$($_.Exception.Message)".Length)) }
-  [Console]::Error.WriteLine("agentq-cloud: $($_.Exception.Message)"); exit 3
+  $reason = "$($_.Exception.Message)".Substring(0, [math]::Min(300, "$($_.Exception.Message)".Length))
+  Write-Journal @{ event = 'cloud-fail'; resource = "cloud:$Ws"; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; reason = $reason; submitted = $submitted }
+  [Console]::Error.WriteLine("agentq-cloud: $($_.Exception.Message)")
+  if (-not $submitted) {
+    try {
+      New-Item -ItemType Directory -Force $DownDir | Out-Null
+      $d = [ordered]@{ ws = $Ws; since = [DateTime]::UtcNow.ToString('o'); until = [DateTime]::UtcNow.AddMinutes($DownMin).ToString('o'); reason = $reason }
+      [IO.File]::WriteAllText("$DownFile.tmp", ($d | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force "$DownFile.tmp" $DownFile
+    } catch {}
+    exit 4
+  }
+  exit 3
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

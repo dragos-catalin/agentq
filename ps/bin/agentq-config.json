@@ -17,6 +17,15 @@
   "unleasedRemoveIdleHours": 168,
   "minFreeCommitGB": 12,
   "machineCap": 2,
+  "machineCapAdaptive": {
+    "min": 2,
+    "max": 4,
+    "cpuHigh": 85,
+    "cpuLow": 55,
+    "minFreeRamGB": 24,
+    "minFreeCommitGB": 24,
+    "everySec": 15
+  },
   "quickBurst": 1,
   "agingMin": 5,
   "idleYieldMin": 5,
