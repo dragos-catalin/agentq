@@ -174,5 +174,23 @@ Ok ((Get-Content $env:GIT_AUTOSYNC_LOG -Raw) -match 'hold: 1 local commit') '8 h
 Ok (@(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -File -ErrorAction SilentlyContinue).Count -gt 0) '9 land files in override dir'
 Ok (@(Get-ChildItem (Join-Path $HOME '.codai\autosync-land') -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*gas-*' -or $_.Name -like 'o*-a*' }).Count -eq 0) '9 real land dir untouched'
 
+# 10 local commit REPUBLISHED upstream by its agent (same author+subject, new date, slightly different
+#    patch on a shared tracker line) -> conflicting original dropped after a verified backup, clone moves
+$r = Fresh; Push-B $r 'x.txt' "other`n"
+W "$($r.a)\t.md" "row: mine`n"; W "$($r.a)\y.txt" "y2`n"; git -C $r.a add -A; git -C $r.a commit -qm 'feat: L-36 thing'; $orig = git -C $r.a rev-parse HEAD
+git -C $r.b pull -q 2>$null; W "$($r.b)\t.md" "row: theirs`n"; W "$($r.b)\y.txt" "y2`n"; git -C $r.b add -A; git -C $r.b commit -qm 'feat: L-36 thing' --date '2026-01-01T00:00:00'; git -C $r.b push -q origin main 2>$null
+Ok ((Run $r) -eq 0) '10 exit 0'; Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '10 at origin'
+$bk10 = @(git -C $r.o for-each-ref --format='%(objectname) %(refname)' refs/heads/backup/shared-clone | Where-Object { $_ -like '*-twins-*' })
+Ok ($bk10.Count -eq 1 -and $bk10[0].StartsWith($orig)) '10 original backed up on origin'
+Ok ((Get-Content $env:GIT_AUTOSYNC_LOG -Raw) -match 'dropped 1 local commit\(s\) already republished upstream .*own lines kept in backup: t\.md') '10 logged with own files'
+Ok (@(Get-ChildItem -Recurse $env:GIT_AUTOSYNC_PARK -Filter MANIFEST.tsv | Where-Object { $_.DirectoryName -like '*-twins' -and (Get-Content $_.FullName -Raw) -match $orig }).Count -eq 1) '10 twins manifest'
+Ok (-not (git -C $r.o for-each-ref refs/heads/autosync)) '10 no replay started'
+
+# 10b same author+subject upstream, but the local commit ALSO writes a file the twin never touched -> refused
+$r = Fresh; Push-B $r 'x.txt' "other`n"
+W "$($r.a)\t.md" "row: mine`n"; W "$($r.a)\x.txt" "mine-x`n"; git -C $r.a add -A; git -C $r.a commit -qm 'feat: L-37 thing'; $h = git -C $r.a rev-parse HEAD
+git -C $r.b pull -q 2>$null; W "$($r.b)\t.md" "row: theirs`n"; git -C $r.b add -A; git -C $r.b commit -qm 'feat: L-37 thing'; git -C $r.b push -q origin main 2>$null
+Ok ((Run $r) -eq 3) '10b refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '10b HEAD unchanged'
+
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

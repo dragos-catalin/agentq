@@ -259,8 +259,34 @@ function Sync-Repo([string]$r) {
     # resolved conflicts) publishes the SAME author/date/subject with a different patch; the
     # original then conflicts forever and strands the clone (2026-09-29, f36becc8 vs b34abc2e).
     $upKeys = @{}; G $r log -n 2000 --format='%an%x1f%aI%x1f%s' $up | ForEach-Object { $upKeys[$_] = 1 }
+    # Agents also REPUBLISH a deferred commit themselves (agentq land / temp-index commit rebased on
+    # upstream): same author + subject, new date, slightly different patch, original left in the clone
+    # -> conflicts forever (codai 2026-10-17 13:42-19:33, 88f1f08e vs 2e42f797). Twin = same author email
+    # + subject in merge-base..upstream AND every file it touches is either a blob upstream already wrote
+    # or a file the twin itself rewrote. The original is backed up (and its unique files listed) first.
+    $mbase = (G $r merge-base HEAD $up | Select-Object -First 1).Trim()
+    $twinKeys = @{}
+    foreach ($ln in @(G $r log --format='%H%x1f%ae%x1f%s' "$mbase..$up")) { $tp = $ln -split [char]0x1f, 3; if ($tp.Count -eq 3 -and -not $twinKeys.ContainsKey("$($tp[1])$([char]0x1f)$($tp[2])")) { $twinKeys["$($tp[1])$([char]0x1f)$($tp[2])"] = $tp[0] } }
+    $upBlobs = @{}
+    foreach ($ln in @(G $r log --format= --raw --no-abbrev --no-renames "$mbase..$up")) { if ($ln -and $ln[0] -eq ':') { $upBlobs[(($ln.Substring(0, $ln.IndexOf("`t"))) -split ' ')[3]] = 1 } }
+    $twins = @()
     foreach ($c in $unique) {
       if ($upKeys.ContainsKey(((G $r log -1 --format='%an%x1f%aI%x1f%s' $c) -join ''))) { continue }
+      $tw = $twinKeys[((G $r log -1 --format='%ae%x1f%s' $c) -join '')]
+      if ($tw) {
+        $twPaths = @{}; G $r -c core.quotepath=off diff-tree --no-commit-id '-r' --name-only --no-renames $tw | ForEach-Object { $twPaths[$_] = 1 }
+        # Fail CLOSED: a git error yields no lines, which must never read as "nothing unique".
+        $cLines = @(G $r -c core.quotepath=off diff-tree --no-commit-id '-r' --no-renames $c | Where-Object { $_ -and $_[0] -eq ':' })
+        $safe = ($LASTEXITCODE -eq 0 -and $cLines.Count -gt 0 -and $twPaths.Count -gt 0); $own = @()
+        foreach ($ln in $(if ($safe) { $cLines } else { @() })) {
+          $tab = $ln.IndexOf("`t"); $blob = ($ln.Substring(0, $tab) -split ' ')[3]; $pp = $ln.Substring($tab + 1)
+          if ($upBlobs.ContainsKey($blob)) { continue }
+          if ($blob -match '^0+$' -and -not (G $r rev-parse --verify --quiet "$($up):$pp")) { continue }
+          if ($twPaths.ContainsKey($pp)) { $own += $pp; continue }
+          $safe = $false; break
+        }
+        if ($safe) { $twins += [pscustomobject]@{ c = $c; twin = $tw; own = $own }; continue }
+      }
       $parent = (G $r rev-parse --verify --quiet "$c^").Trim()
       $mt = @(G $r merge-tree --write-tree --merge-base $parent $base $c 2>$null); $mtCode = $LASTEXITCODE
       $tree = if ($mt.Count) { $mt[0] } else { $null }
@@ -277,6 +303,20 @@ function Sync-Repo([string]$r) {
       $env:GIT_AUTHOR_NAME = $an; $env:GIT_AUTHOR_EMAIL = $ae; $env:GIT_AUTHOR_DATE = $ad
       try { $base = (G $r commit-tree $tree.Trim() -p $base -F $msgFile).Trim() }
       finally { Remove-Item Env:GIT_AUTHOR_NAME, Env:GIT_AUTHOR_EMAIL, Env:GIT_AUTHOR_DATE -ErrorAction SilentlyContinue; Remove-Item $msgFile }
+    }
+    if ($twins.Count) {
+      $tdesc = ($twins | ForEach-Object { "$($_.c.Substring(0,8))=>$($_.twin.Substring(0,8))" + $(if ($_.own.Count) { " (own lines kept in backup: $($_.own -join ' '))" } else { '' }) }) -join ', '
+      if ($WhatIf) { return @{ code = 0; msg = "would drop $($twins.Count) local commit(s) already republished upstream [$tdesc], then move" } }
+      $prev = @(G $r for-each-ref --format='%(refname)' --points-at $head 'refs/backup/shared-clone/' | Where-Object { $_ -like "*/$name-twins-*" })
+      $tts = if ($prev.Count) { ($prev[0] -split "$name-twins-")[1] } else { [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') }
+      if ((Get-Visibility $r $remote) -eq 'private') { $tdest = $remote; $tref = "backup/shared-clone/$name-twins-$tts" } else { $tdest = $BackupUrl; $tref = "$name/twins-$tts" }
+      G $r update-ref "refs/backup/shared-clone/$name-twins-$tts" $head | Out-Null
+      G $r push -q --no-verify $tdest "$($head):refs/heads/$tref" 2>&1 | Out-Null
+      if ((((G $r ls-remote $tdest "refs/heads/$tref") -split '\s+') | Select-Object -First 1) -ne $head) { return @{ code = 3; msg = "refuse: backup push of local commits republished upstream failed; nothing dropped [$tdesc]" } }
+      $tdir = Join-Path $ParkRoot "$name\$tts-twins"; New-Item -ItemType Directory -Force $tdir | Out-Null
+      $tman = @("commit`ttwin`tsubject`tfiles_only_in_original`tbackup_ref") + @($twins | ForEach-Object { "$($_.c)`t$($_.twin)`t$((G $r log -1 --format=%s $_.c) -join '')`t$($_.own -join ' ')`t$($tdest):$tref" })
+      [IO.File]::WriteAllText((Join-Path $tdir 'MANIFEST.tsv'), ($tman -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+      $published += "dropped $($twins.Count) local commit(s) already republished upstream [$tdesc], originals backed up as $($tdest -replace '^https://github\.com/', ''):$tref; "
     }
     if ($replayed -eq 0) { $unique = @() }
   }
@@ -298,7 +338,8 @@ function Sync-Repo([string]$r) {
         Set-State $st
         G $r fetch -q $remote 2>&1 | Out-Null
         $target = (G $r rev-parse $up).Trim()
-        if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
+        $twinSet = @($twins | ForEach-Object { $_.c })
+        if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' } | Where-Object { $twinSet -notcontains ($_ -split ' ')[1] }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
         $published = "landed $($unique.Count) deferred commit(s) via agentq land; "
       } else {
         $st['replayFail'][$job.key] = @{ at = [DateTime]::UtcNow.ToString('o'); why = "agentq land exit $rcv (log $($job.log); topic $($job.topic) kept on $remote)" }
