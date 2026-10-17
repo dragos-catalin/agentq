@@ -37,7 +37,13 @@ function Deny-Exit {
   exit 2
 }
 # Flush captured non-blocking warnings (WARNING lines) on a normal allow path.
-function Flush-Stderr { $t = $script:DenyWriter.ToString(); if ($t) { $script:RealStderr.Write($t) } }
+function Flush-Stderr {
+  $t = $script:DenyWriter.ToString(); if ($t) { $script:RealStderr.Write($t) }
+  # Allow path only (Deny-Exit never calls this): surface a non-blocking advisory to the agent.
+  if ($script:SharedWarn -and $payload.PSObject.Properties.Name -contains 'hook_event_name') {
+    @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; additionalContext = $script:SharedWarn } } | ConvertTo-Json -Compress -Depth 4 | Write-Output
+  }
+}
 
 # Physical "blocked" signal (room bulb flash / desk screen). Background so the
 # block itself is not delayed; the receiver is vmui on this PC.
@@ -79,6 +85,34 @@ foreach ($container in $payload.tool_input, $payload.toolInput) {
   }
 }
 if ($isEditTool) { $cmd = '' }
+
+# ---- shared-clone source writes (2026-10-17) -----------------------------------------------
+# Drafts edited directly in the shared clone (E:\gh\<repo>) stay behind after the same work lands
+# from a worktree slot in another form; git-autosync then cannot fast-forward (codai/brivio/
+# dragoscatalin/dashy/vmui were 1-26 days behind on exactly that). Non-blocking advisory, emitted
+# by Flush-Stderr on the allow path. Scratch, docs/plan/markdown and non-repo paths are exempt.
+$script:SharedWarn = $null
+if ($isEditTool -and -not $env:CODAI_SHARED_CLONE_WRITE_OK) {
+  $wp = $null
+  foreach ($container in $payload.tool_input, $payload.toolInput) {
+    if (-not $container -or $container -is [string]) { continue }
+    foreach ($k in 'filePath', 'path', 'file') { if (-not $wp -and $container.PSObject.Properties.Name -contains $k -and $container.$k) { $wp = "$($container.$k)" } }
+    if (-not $wp -and $container.PSObject.Properties.Name -contains 'input' -and "$($container.input)" -match '\*\*\* (?:Update|Add|Delete) File: ([^\r\n]+)') { $wp = $Matches[1].Trim() }
+  }
+  $ghRoot = if ($env:CODAI_GH_ROOT) { $env:CODAI_GH_ROOT } else { 'E:\gh' }
+  if ($wp) {
+    $wpn = $wp.Replace('/', '\') -replace '^(?i)file:\\+', ''
+    $rx = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
+    if ($wpn -match $rx -and $Matches.repo -ne '.wt') {
+      $repoDir = Join-Path $ghRoot $Matches.repo; $rel = $Matches.rel
+      $exempt = $rel -match '(?i)^(\.copilot-tmp|\.git|plan|docs|memories)\\' -or $rel -match '(?i)\.(md|mdx|txt|csv)$'
+      if (-not $exempt -and (Test-Path -LiteralPath (Join-Path $repoDir '.git') -PathType Container)) {
+        $script:SharedWarn = "WARNING (shared clone): editing $rel directly in the SHARED clone $repoDir. Other agents work here too, and a draft left behind after the same work lands from a worktree blocks git-autosync (2026-10-17). Do source work in a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], commit + push from there, then unlease. A deliberate small fix committed right away via agentq commit is fine."
+        [Console]::Error.WriteLine($script:SharedWarn)
+      }
+    }
+  }
+}
 
 # ---- ADR 0001: slot leases (E:\gh\.wt\<repo>\<slot>) --------------------------------------
 # (1) Renew: any tool call whose command or file path touches a leased slot is activity for that
