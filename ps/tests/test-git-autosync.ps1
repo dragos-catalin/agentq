@@ -7,6 +7,11 @@ New-Item -ItemType Directory $root | Out-Null
 $env:GIT_AUTOSYNC_LOG = Join-Path $root 'autosync.log'
 $env:GIT_AUTOSYNC_PARK = Join-Path $root 'parked'
 $env:GIT_AUTOSYNC_NO_NOTE = '1'
+$env:GIT_AUTOSYNC_STATE = Join-Path $root 'state.json'
+$env:GIT_AUTOSYNC_BACKUP_URL = Join-Path $root 'backups.git'; git init -q --bare $env:GIT_AUTOSYNC_BACKUP_URL
+$env:GIT_AUTOSYNC_VISIBILITY = 'private'
+$env:GIT_AUTOSYNC_LAND = Join-Path $PSScriptRoot 'fake-land.ps1'
+$env:FAKE_LAND_CALLS = Join-Path $root 'land-calls.txt'
 $env:GIT_AUTOSYNC_MUTEX = 'Local\gas-test-' + [guid]::NewGuid().ToString('N')
 $env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'core.safecrlf'; $env:GIT_CONFIG_VALUE_0 = 'false'
 $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NAME = 't'; $env:GIT_COMMITTER_EMAIL = 't@t'
@@ -37,11 +42,13 @@ Ok (-not (git -C $r.a status --porcelain)) '2 tree clean'
 
 # 3 real unpushed commit (agentq push deferred) -> replayed onto origin, pushed, clone moved; dirty edit kept
 $r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "3`n"; W "$($r.a)\z.txt" "wip`n"; git -C $r.a add z.txt
-Ok ((Run $r) -eq 0) '3 published'; git -C $r.a fetch -q
+Ok ((Run $r) -eq 0) '3 landed via land'; git -C $r.a fetch -q
 Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '3 at origin'
 Ok ((git -C $r.a log origin/main --format=%s) -contains 'mine') '3 commit on origin'
 Ok (((git -C $r.a show origin/main:x.txt) -join '') -eq '3') '3 upstream change kept'
 Ok ((git -C $r.a diff --cached --name-only) -eq 'z.txt') '3 staged wip kept'
+Ok (@(Get-Content $env:FAKE_LAND_CALLS -ErrorAction SilentlyContinue).Count -eq 1) '3 land called once'
+Ok (-not (git -C $r.o for-each-ref refs/heads/autosync)) '3 replay topic cleaned up'
 
 # 3b unpushed commit that conflicts with upstream -> refuse, nothing moves
 $r = Fresh; W "$($r.a)\x.txt" "mine`n"; git -C $r.a commit -qam 'mine'; $h = git -C $r.a rev-parse HEAD; Push-B $r 'x.txt' "theirs`n"
@@ -83,6 +90,23 @@ git -C $r.b mv old.txt new.txt; W "$($r.b)\new.txt" "l1`nl2`nl3`nl4`nl5`nl6`nl7`
 W "$($r.a)\old.txt" "l1`nl2`nmine`nl4`nl5`nl6`n"; Age "$($r.a)\old.txt"
 Ok ((Run $r) -eq 0) '4n exit 0'; Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '4n at origin'
 Ok (@(Backups $r).Count -eq 1) '4n backup branch on origin'
+
+# 3f land fails -> refused, nothing moved, and NOT retried on the next pass (backoff); retried when upstream moves
+$r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "f`n"; $h = git -C $r.a rev-parse HEAD; Remove-Item $env:FAKE_LAND_CALLS -ErrorAction SilentlyContinue
+$env:FAKE_LAND_FAIL = '1'; Ok ((Run $r) -eq 3) '3f refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '3f HEAD unchanged'
+Ok ((Run $r) -eq 3) '3f second pass refused'; Ok (@(Get-Content $env:FAKE_LAND_CALLS).Count -eq 1) '3f backoff: land not retried'
+Remove-Item Env:FAKE_LAND_FAIL; Push-B $r 'x.txt' "g`n"
+Ok ((Run $r) -eq 0) '3f upstream moved -> retried and landed'; git -C $r.a fetch -q
+Ok ((git -C $r.a log origin/main --format=%s) -contains 'mine') '3f commit on origin'
+
+# 4v PUBLIC repo -> backup goes to the private backup repo, never to origin
+$r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; Age "$($r.a)\x.txt"
+$env:GIT_AUTOSYNC_VISIBILITY = 'public'; Ok ((Run $r) -eq 0) '4v exit 0'; $env:GIT_AUTOSYNC_VISIBILITY = 'private'
+Ok (@(Backups $r).Count -eq 0) '4v nothing on public origin'
+$nm = Split-Path $r.a -Leaf; $br = @(git -C $env:GIT_AUTOSYNC_BACKUP_URL for-each-ref --format='%(refname)' "refs/heads/$nm/")
+Ok ($br.Count -eq 1) '4v backup in private backup repo'
+Ok ($br.Count -eq 1 -and ((git -C $env:GIT_AUTOSYNC_BACKUP_URL show "$($br[0]):x.txt") -join '') -eq 'ours') '4v backup holds the edit'
+Ok (@(Get-ChildItem -Recurse -File $env:GIT_AUTOSYNC_PARK -Filter *.bundle | Where-Object { $_.FullName -like "*$nm*" }).Count -eq 1) '4v local bundle written'
 
 # 4r unpushed commit in a NON-replay repo -> refused, nothing pushed
 $r = Fresh; W "$($r.a)\y.txt" "mine`n"; git -C $r.a commit -qam 'mine'; Push-B $r 'x.txt' "r`n"; $h = git -C $r.a rev-parse HEAD

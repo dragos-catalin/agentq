@@ -36,6 +36,14 @@ What one pass does, per repo (only when it is provably safe):
 
   git-autosync.ps1 [-Repo E:\gh\codai[,E:\gh\brivio]] [-WhatIf] [-ParkNow] [-ParkIdleHours 6]
                    [-Loop -IntervalSec 120] [-Install] [-Status] [-Report]
+
+  BACKUP TARGET (2026-10-17 audit): 15 of 25 repos are PUBLIC, so a backup branch on origin publishes
+  WIP drafts. Private repos -> origin (objects already there, tiny push). Public or unknown visibility ->
+  the private repo -BackupUrl (refs/heads/<repo>/<ts>). A thin local bundle is always written too.
+  REPLAY (2026-10-17 audit): pushing from the shared clone ran pre-push over OTHER agents' dirty files
+  (knip failed on a file not in the commit; could also pass falsely) and retried a full pre-push every
+  pass. Now: commits go to origin autosync/replay-<branch> (--no-verify, own namespace) and land via
+  `agentq land` (clean slot, dedupe, hooks on the clean result). A failed land backs off -ReplayBackoffMin.
 Log: ~/.codai/git-autosync.log (one line per action). Exit 0 = in sync or moved, 3 = skipped/refused.
 #>
 param(
@@ -47,12 +55,17 @@ param(
   # unpushed commit only refuses: gta-nexus had 67 local-only commits that must never auto-land.
   [string[]]$ReplayRepos = @('codai', 'brivio', 'money', 'metu', 'mmo'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
-  [switch]$ParkNow, [double]$ParkIdleHours = 6, [switch]$Report
+  [switch]$ParkNow, [double]$ParkIdleHours = 6, [switch]$Report,
+  [string]$BackupUrl = 'https://github.com/dragos-catalin/shared-clone-backups.git',
+  [int]$ReplayBackoffMin = 60, [int]$FetchThrottle = 8
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 $Log = if ($env:GIT_AUTOSYNC_LOG) { $env:GIT_AUTOSYNC_LOG } else { Join-Path $HOME '.codai\git-autosync.log' }
 $ParkRoot = if ($env:GIT_AUTOSYNC_PARK) { $env:GIT_AUTOSYNC_PARK } else { Join-Path $HOME '.codai\parked' }
+$StateFile = if ($env:GIT_AUTOSYNC_STATE) { $env:GIT_AUTOSYNC_STATE } else { Join-Path $HOME '.codai\git-autosync-state.json' }
+if ($env:GIT_AUTOSYNC_BACKUP_URL) { $BackupUrl = $env:GIT_AUTOSYNC_BACKUP_URL }
+$script:NoFetch = $false
 $LastMsg = @{}
 $CoordQ = Join-Path $HOME '.codai\coord\queues'
 $Repo = @($Repo | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
@@ -65,6 +78,26 @@ function Write-Log([string]$repo, [string]$msg) {
 }
 
 function G([string]$repo) { & git -C $repo --no-optional-locks @args }
+
+function Get-State { if (Test-Path $StateFile) { try { return (Get-Content $StateFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }; @{} }
+function Set-State($s) { [IO.File]::WriteAllText($StateFile, ($s | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false)) }
+
+# 'private' | 'public' | 'unknown', cached 24 h. GIT_AUTOSYNC_VISIBILITY overrides (tests).
+function Get-Visibility([string]$r, [string]$remote) {
+  if ($env:GIT_AUTOSYNC_VISIBILITY) { return $env:GIT_AUTOSYNC_VISIBILITY }
+  $url = "$(G $r remote get-url $remote 2>$null)".Trim()
+  $st = Get-State; if (-not $st.ContainsKey('visibility')) { $st['visibility'] = @{} }
+  $c = $st['visibility'][$url]
+  if ($c -and ([DateTime]::UtcNow - [DateTime]$c.at).TotalHours -lt 24) { return $c.v }
+  $slug = $url -replace '^https://github\.com/', '' -replace '^git@github\.com:', '' -replace '\.git$', ''
+  $v = 'unknown'
+  if ($slug -ne $url -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+    $o = "$(& gh repo view $slug --json visibility -q .visibility 2>$null)".Trim().ToLowerInvariant()
+    if ($o -in 'private', 'internal') { $v = 'private' } elseif ($o -eq 'public') { $v = 'public' }
+  }
+  $st['visibility'][$url] = @{ v = $v; at = [DateTime]::UtcNow.ToString('o') }; Set-State $st
+  $v
+}
 
 # Byte-exact blob -> file (PowerShell pipes re-encode text; cmd redirection does not).
 function Save-Blob([string]$repo, [string]$id, [string]$file) {
@@ -141,12 +174,31 @@ function Save-Snapshot([string]$r, [string]$name, [string]$remote) {
     $tree = ((G $r write-tree) | Select-Object -First 1).Trim()
   } finally { if ($old) { $env:GIT_INDEX_FILE = $old } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }; Remove-Item $idx -ErrorAction SilentlyContinue }
   $sha = ((G $r commit-tree $tree -p HEAD -m "backup: dirty state of the $name shared clone before git-autosync park ($ts); nothing discarded") | Select-Object -First 1).Trim()
-  $ref = "backup/shared-clone/$name-$ts"
-  G $r update-ref "refs/$ref" $sha | Out-Null
-  G $r push -q --no-verify $remote "$($sha):refs/heads/$ref" 2>&1 | Out-Null
-  $remoteSha = ((G $r ls-remote $remote "refs/heads/$ref") -split '\s+' | Select-Object -First 1)
+  G $r update-ref "refs/backup/shared-clone/$name-$ts" $sha | Out-Null
+  # Thin local bundle (HEAD is the prerequisite): survives even if every remote is unreachable.
+  $bdir = Join-Path $ParkRoot "$name\bundles"; New-Item -ItemType Directory -Force $bdir | Out-Null
+  G $r bundle create -q (Join-Path $bdir "$ts.bundle") "refs/backup/shared-clone/$name-$ts" "^HEAD" 2>&1 | Out-Null
+  if ((Get-Visibility $r $remote) -eq 'private') { $dest = $remote; $ref = "backup/shared-clone/$name-$ts" }
+  else { $dest = $BackupUrl; $ref = "$name/$ts" }
+  G $r push -q --no-verify $dest "$($sha):refs/heads/$ref" 2>&1 | Out-Null
+  $remoteSha = ((G $r ls-remote $dest "refs/heads/$ref") -split '\s+' | Select-Object -First 1)
   if ($remoteSha -ne $sha) { return $null }
-  [pscustomobject]@{ sha = $sha; ref = $ref; ts = $ts }
+  $where = if ($dest -eq $remote) { $remote } else { ($BackupUrl -replace '^https://github\.com/', '' -replace '\.git$', '') }
+  [pscustomobject]@{ sha = $sha; ref = $ref; ts = $ts; where = $where }
+}
+
+# Land the replayed commits through agentq (clean land slot, dedupe, hooks on the clean result).
+function Invoke-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [string]$branch, [string]$base) {
+  $topic = "autosync/replay-$branch"
+  G $r push -q --no-verify --force $remote "$($base):refs/heads/$topic" 2>&1 | Out-Null
+  if ($LASTEXITCODE) { return @{ ok = $false; why = "push of $topic failed" } }
+  $land = if ($env:GIT_AUTOSYNC_LAND) { $env:GIT_AUTOSYNC_LAND } else { Join-Path $HOME '.copilot\bin\agentq.ps1' }
+  $logf = Join-Path $HOME '.codai\git-autosync-push.log'
+  Push-Location $r
+  try { & pwsh -NoProfile -File $land land -Branch $topic -Onto $upBranch -Purpose "git-autosync replay of deferred commits on $branch" *> $logf; $rc = $LASTEXITCODE }
+  finally { Pop-Location }
+  if ($rc -eq 0) { G $r push -q --no-verify $remote ":refs/heads/$topic" 2>&1 | Out-Null; return @{ ok = $true; why = '' } }
+  @{ ok = $false; why = "agentq land exit $rc (see ~/.codai/git-autosync-push.log; topic $topic kept on $remote)" }
 }
 
 function Sync-Repo([string]$r) {
@@ -164,7 +216,7 @@ function Sync-Repo([string]$r) {
   if ((Test-Path $cq) -and (Get-ChildItem $cq -Filter '*.json' -File -ErrorAction SilentlyContinue)) { return @{ code = 3; msg = 'skip: agentq commit in progress' } }
 
   $remote = ($up -split '/')[0]
-  G $r fetch -q $remote 2>&1 | Out-Null
+  if (-not $script:NoFetch) { G $r fetch -q $remote 2>&1 | Out-Null }
   $head = (G $r rev-parse HEAD).Trim(); $target = (G $r rev-parse $up).Trim()
   if ($head -eq $target) { return @{ code = 0; msg = 'in sync' } }
   $unique = @(G $r cherry $up HEAD | Where-Object { $_ -like '+*' } | ForEach-Object { ($_ -split ' ')[1] })
@@ -206,20 +258,23 @@ function Sync-Repo([string]$r) {
   if ($unique.Count) {
     if ($WhatIf) { return @{ code = 0; msg = "would replay+push $($unique.Count) unpushed commit(s) onto $up, then move" } }
     $upBranch = $up.Substring($remote.Length + 1)
-    $pushOut = G $r push $remote "$($base):refs/heads/$upBranch" 2>&1; [IO.File]::WriteAllText((Join-Path $HOME '.codai\git-autosync-push.log'), ($pushOut | Out-String))
-    if ($LASTEXITCODE) {
-      # The pre-push build-perf budget re-times an uncached typecheck and trips under machine load
-      # (other agents' builds). Accept ONLY that failure, and only when every turbo task passed.
-      $txt = $pushOut | Out-String
-      $perfOnly = $txt -match 'build-perf budget exceeded' -and $txt -match 'Tasks:\s+(\d+) successful, \1 total' -and $txt -notmatch 'Failed:\s'
-      if (-not $perfOnly) { return @{ code = 3; msg = "refuse: push of $($unique.Count) replayed commit(s) failed pre-push (see ~/.codai/git-autosync-push.log); will retry" } }
-      G $r push -q --no-verify $remote "$($base):refs/heads/$upBranch" 2>&1 | Out-Null
-      if ($LASTEXITCODE) { return @{ code = 3; msg = 'refuse: push failed after a perf-only hook failure (race?); will retry' } }
-      $published = 'hook: only the load-sensitive build-perf timing failed, all turbo tasks passed; '
+    # Backoff: the same (HEAD, upstream) pair that failed to land is not retried for ReplayBackoffMin.
+    $key = "$name|$head|$target"; $st = Get-State; if (-not $st.ContainsKey('replayFail')) { $st['replayFail'] = @{} }
+    $f = $st['replayFail'][$key]
+    if ($f -and ([DateTime]::UtcNow - [DateTime]$f.at).TotalMinutes -lt $ReplayBackoffMin) {
+      return @{ code = 3; msg = "refuse: replay of $($unique.Count) commit(s) failed to land at $($f.at) ($($f.why)); backing off until HEAD or $up changes or $ReplayBackoffMin min pass" }
+    }
+    $res = Invoke-ReplayLand $r $remote $upBranch $branch $base
+    if (-not $res.ok) {
+      $st = Get-State; if (-not $st.ContainsKey('replayFail')) { $st['replayFail'] = @{} }
+      $st['replayFail'][$key] = @{ at = [DateTime]::UtcNow.ToString('o'); why = $res.why }; Set-State $st
+      return @{ code = 3; msg = "refuse: replay of $($unique.Count) unpushed commit(s) did not land: $($res.why); next try after $ReplayBackoffMin min or when HEAD/$up moves" }
     }
     G $r fetch -q $remote 2>&1 | Out-Null
-    $published = "$($published)published $($unique.Count) unpushed commit(s) as $($base.Substring(0,8)); "
-    $target = $base
+    $target = (G $r rev-parse $up).Trim()
+    # land dedupes against upstream, so every unique commit must now be on upstream; otherwise stop.
+    if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
+    $published = "landed $($unique.Count) deferred commit(s) via agentq land; "
   }
   $behind = [int](G $r rev-list --count "HEAD..$target"); $ahead = [int](G $r rev-list --count "$target..HEAD")
 
@@ -302,8 +357,8 @@ function Sync-Repo([string]$r) {
   $snap = $null; $parkDir = $null
   if ($resolved.Count) {
     $snap = Save-Snapshot $r $name $remote
-    if (-not $snap) { return @{ code = 3; msg = "refuse: backup push of the dirty state to $remote failed; nothing parked or moved" } }
-    $what += ", full dirty state backed up as $remote/$($snap.ref) ($($snap.sha.Substring(0,10)))"
+    if (-not $snap) { return @{ code = 3; msg = "refuse: backup push of the dirty state failed (origin if private, else $BackupUrl); nothing parked or moved" } }
+    $what += ", full dirty state backed up as $($snap.where):$($snap.ref) ($($snap.sha.Substring(0,10)))"
     $parkList = @($resolved | Where-Object { $_.kind -eq 'park' })
     if ($parkList.Count) {
       $parkDir = Join-Path $ParkRoot "$name\$($snap.ts)"
@@ -318,7 +373,7 @@ function Sync-Repo([string]$r) {
         }
         $hb = ((G $r rev-parse --verify --quiet "HEAD:$($x.p)" 2>$null) | Select-Object -First 1); $tb = ((G $r rev-parse --verify --quiet "$($target):$($x.p)" 2>$null) | Select-Object -First 1)
         $ib = ((G $r rev-parse --verify --quiet ":$($x.p)" 2>$null) | Select-Object -First 1)
-        $man += "$($x.p)`t$(if ($x.untracked) {'untracked'} else {'tracked'})`t$($x.why)`t$lb`t$ib`t$hb`t$tb`t$remote/$($snap.ref)"
+        $man += "$($x.p)`t$(if ($x.untracked) {'untracked'} else {'tracked'})`t$($x.why)`t$lb`t$ib`t$hb`t$tb`t$($snap.where):$($snap.ref)"
       }
       [IO.File]::WriteAllText((Join-Path $parkDir 'MANIFEST.tsv'), ($man -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
       $what += ", parked $($parkList.Count) in $parkDir"
@@ -332,7 +387,7 @@ function Sync-Repo([string]$r) {
       $ls = (G $r ls-tree $src -- $x.p) -split '\s+'
       G $r update-index --add --cacheinfo "$($ls[0]),$($ls[2]),$($x.p)"
       G $r checkout-index -f -- $x.p
-      if ($LASTEXITCODE) { return @{ code = 3; msg = "refuse: could not reset $($x.p) for the move; dirty state is safe in $remote/$($snap.ref)" } }
+      if ($LASTEXITCODE) { return @{ code = 3; msg = "refuse: could not reset $($x.p) for the move; dirty state is safe in $($snap.where):$($snap.ref)" } }
     }
   }
 
@@ -358,7 +413,7 @@ function Sync-Repo([string]$r) {
   if ($resolved.Count) {
     $aq = Join-Path $HOME '.copilot\bin\agentq.ps1'
     if ((Test-Path $aq) -and -not $env:GIT_AUTOSYNC_NO_NOTE) {
-      $note = "git-autosync: $name moved to $up; dirty state backed up as $remote/$($snap.ref)" + $(if ($parkDir) { "; $(@($resolved | Where-Object kind -eq 'park').Count) colliding file(s) parked in $parkDir (MANIFEST.tsv) - re-apply by hand if still wanted" } else { '' })
+      $note = "git-autosync: $name moved to $up; dirty state backed up as $($snap.where):$($snap.ref)" + $(if ($parkDir) { "; $(@($resolved | Where-Object kind -eq 'park').Count) colliding file(s) parked in $parkDir (MANIFEST.tsv) - re-apply by hand if still wanted" } else { '' })
       Push-Location $r; try { & pwsh -NoProfile -File $aq note -Message $note *> $null } finally { Pop-Location }
     }
   }
@@ -411,6 +466,13 @@ if ($Loop) {
 }
 $rc = 0
 do {
+  if ($Loop -and $Repo.Count -gt 1) {
+    # One parallel fetch round per pass (sequential fetches made a 24-repo pass take ~6 min).
+    $Repo | ForEach-Object -ThrottleLimit $FetchThrottle -Parallel {
+      if (Test-Path (Join-Path $_ '.git')) { & git -C $_ --no-optional-locks fetch -q --all 2>&1 | Out-Null }
+    }
+    $script:NoFetch = $true
+  }
   foreach ($r in $Repo) {
     # One pass at a time machine-wide: the -Loop task and a manual run must never interleave.
     $pm = [Threading.Mutex]::new($false, $(if ($env:GIT_AUTOSYNC_MUTEX) { $env:GIT_AUTOSYNC_MUTEX } else { 'Global\git-autosync-pass' }))
