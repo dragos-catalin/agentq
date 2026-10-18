@@ -28,15 +28,15 @@ state). Killing one makes VS Code post "terminal exited" into that chat and inte
 the "agents freeze until I stop them and say continue" symptom. VS Code disposes those terminals
 itself when the command or the chat ends. So a chat-associated terminal is never reaped, with one
 exception: when a ptyHost is at -CriticalCap (near the ~190-terminal crash), background ones idle
-for -CriticalMinAgeMin are reaped, oldest first, down to -CriticalCap. If the association list
+for -CriticalMinAgeMin are reaped, oldest first, in one batch down to -CriticalLow. If the association list
 cannot be read at all, nothing young is reaped (only the 3 h rule applies).
 
   reap-terminals.ps1 [-WhatIf] [-MinAgeHours 3] [-KeepNewest 4] [-SoftCap 80] [-PressureMinAgeMin 20]
-                     [-CriticalCap 150] [-CriticalMinAgeMin 60] [-Json]
+                     [-CriticalCap 150] [-CriticalLow 120] [-CriticalMinAgeMin 30] [-Json]
 EXIT 0 ok, 2 usage.
 #>
 param([switch]$WhatIf, [double]$MinAgeHours = 3, [int]$KeepNewest = 4, [double]$MaxCpuSec = 1, [int]$SampleSec = 20,
-  [int]$SoftCap = 80, [double]$PressureMinAgeMin = 20, [int]$CriticalCap = 150, [double]$CriticalMinAgeMin = 60,
+  [int]$SoftCap = 80, [double]$PressureMinAgeMin = 20, [int]$CriticalCap = 150, [int]$CriticalLow = 120, [double]$CriticalMinAgeMin = 30,
   [string]$AssocTool = (Join-Path $PSScriptRoot 'vscode-chat-terminals.mjs'), [switch]$Json)
 $ErrorActionPreference = 'Stop'
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
@@ -107,8 +107,9 @@ $idle = @(foreach ($p in $cand) {
   [pscustomobject]@{ pid = $id; parent = [int]$p.ParentProcessId; created = $p.CreationDate; ageH = [math]::Round(($now - $p.CreationDate).TotalHours, 2); privMB = [math]::Round($p.PrivatePageCount / 1MB); chat = $chatPid.ContainsKey($id) }
 })
 # keep the newest N idle terminals per parent window. Under pressure, young (< MinAgeHours) idle
-# terminals are taken only until the host is back at SoftCap, oldest first; chat terminals only
-# until it is back under CriticalCap.
+# terminals are taken only until the host is back at SoftCap, oldest first. Chat terminals go in
+# one batch down to CriticalLow (hysteresis): each kill raises a VS Code "terminal exited" alert,
+# and trimming to just under CriticalCap fired a fresh batch every 10 min as agents opened more.
 $reap = @($idle | Group-Object parent | ForEach-Object {
     $sorted = @($_.Group | Sort-Object created -Descending | Select-Object -Skip $KeepNewest)
     $total = [int]$perHost[[int]$_.Name]
@@ -117,7 +118,7 @@ $reap = @($idle | Group-Object parent | ForEach-Object {
     $excess = [math]::Max(0, $total - $old.Count - $SoftCap)
     $takeYoung = @($young | Select-Object -First $excess)
     $chatBg = @($sorted | Where-Object { $_.chat } | Sort-Object created)
-    $critExcess = [math]::Max(0, $total - $old.Count - $takeYoung.Count - $CriticalCap + 1)
+    $critExcess = [math]::Max(0, $total - $old.Count - $takeYoung.Count - $CriticalLow)
     $old
     $takeYoung
     $chatBg | Select-Object -First $critExcess

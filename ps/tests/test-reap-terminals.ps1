@@ -45,11 +45,21 @@ try {
   Check 'summary reports protected chat terminals' ($out -match 'chatProtected\s+2') $out
 
   # 2. at the critical cap a chat BACKGROUND terminal may go; a chat foreground one still never.
-  $out = Run @('-SoftCap', '0', '-PressureMinAgeMin', '0', '-CriticalCap', '2', '-CriticalMinAgeMin', '0', '-MinAgeHours', '100')
+  $out = Run @('-SoftCap', '0', '-PressureMinAgeMin', '0', '-CriticalCap', '2', '-CriticalLow', '1', '-CriticalMinAgeMin', '0', '-MinAgeHours', '100')
   Start-Sleep 1
   Check 'chat background terminal is reaped at the critical cap' (-not (Alive $bg)) $out
   Check 'chat foreground terminal survives even at the critical cap' (Alive $fg) $out
   Stop-Process -Id $h.Host.Id -Force -ErrorAction SilentlyContinue; Stop-Process -Id $fg -Force -ErrorAction SilentlyContinue
+
+  # 2b. hysteresis: crossing the critical cap trims chat background terminals down to CriticalLow
+  # in one batch (oldest first), not to one under the cap, so the alerts come rarely.
+  $h = Start-Host 5
+  ($h.Pids | ForEach-Object { "$_ bg" }) + '#read 1' | Set-Content $assoc
+  $out = Run @('-SoftCap', '0', '-PressureMinAgeMin', '0', '-CriticalCap', '5', '-CriticalLow', '2', '-CriticalMinAgeMin', '0', '-MinAgeHours', '100')
+  Start-Sleep 1
+  Check 'critical cap trims chat background terminals down to CriticalLow in one batch' (@($h.Pids | Where-Object { Alive $_ }).Count -eq 2) (($h.Pids | ForEach-Object { "$_=$(Alive $_)" }) -join ' ')
+  Stop-Process -Id $h.Host.Id -Force -ErrorAction SilentlyContinue
+  $h.Pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
 
   # 3. association list unreadable: no young terminal is reaped under pressure (3 h rule only).
   $h = Start-Host 3
