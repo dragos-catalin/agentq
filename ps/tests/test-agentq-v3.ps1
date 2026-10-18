@@ -55,24 +55,24 @@ Check 'status shows lane column' ($st -match 'lane') ''
 $h.WaitForExit(60000) | Out-Null; $w.WaitForExit(60000) | Out-Null
 
 # 3. quick burst: with machineCap 1 held by a gate, a quick lane run starts immediately.
-# Holder sleeps 25 s, pass threshold 15 s: a waiting run takes >= ~23 s, a non-waiting one is
-# pwsh startup only (3-6 s idle, up to ~10 s with the CPU at 95 %). The old 8 s / 6 s pair could not
-# tell the two apart under load and failed on unmodified HEAD (2026-10-17).
+# Judged on the scheduler's own `waitSec` (ticket created -> granted) from the journal, not wall
+# clock: wall clock includes pwsh startup, which reached 17-19 s on a loaded machine (2026-10-18,
+# install.ps1 refused to install on this test alone). Holder sleeps 25 s, so a run that had to wait
+# shows waitSec >= ~20; one admitted beside it shows ~0-2.
+function WaitSecOf([string]$purpose) { $e = @(Journal | Where-Object { $_.event -eq 'acquired' -and $_.purpose -eq $purpose }) | Select-Object -Last 1; if ($e) { [double]$e.waitSec } else { -1 } }
 $h = Start-Run $repo2 'gate-holder' 'gate' 'Start-Sleep -Seconds 25'
 Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
-$t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'lint' -Lane quick -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
-$secs = ((Get-Date) - $t0).TotalSeconds
-Check 'quick lane uses burst slot (no wait)' ($LASTEXITCODE -eq 0 -and $secs -lt 15) "exit $LASTEXITCODE ${secs}s"
+$rc = $LASTEXITCODE; $ws = WaitSecOf 'lint'; $holderAlive = -not $h.HasExited
+Check 'quick lane uses burst slot (no wait)' ($rc -eq 0 -and $ws -ge 0 -and $ws -lt 10 -and $holderAlive) "exit $rc waitSec=$ws holderAlive=$holderAlive"
 $h.WaitForExit(60000) | Out-Null
 
 # 4. non-batch beside batch: batch holder does not block a gate run.
 $h = Start-Run $repo2 'batch-holder' 'batch' 'Start-Sleep -Seconds 25'
 Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
-$t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'gate-beside-batch' -Lane gate -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
-$secs = ((Get-Date) - $t0).TotalSeconds
-Check 'gate runs beside batch holder' ($LASTEXITCODE -eq 0 -and $secs -lt 15) "exit $LASTEXITCODE ${secs}s"
+$rc = $LASTEXITCODE; $ws = WaitSecOf 'gate-beside-batch'; $holderAlive = -not $h.HasExited
+Check 'gate runs beside batch holder' ($rc -eq 0 -and $ws -ge 0 -and $ws -lt 10 -and $holderAlive) "exit $rc waitSec=$ws holderAlive=$holderAlive"
 $h.WaitForExit(60000) | Out-Null
 
 # 5. yielded holder does not count: a fake live machine holder marked yielded leaves the slot free.
