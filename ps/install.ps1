@@ -25,10 +25,15 @@ $map = [ordered]@{
   'bin\reap-terminals.ps1' = 'bin\reap-terminals.ps1'; 'tests\test-agentq-adaptive.ps1' = 'bin\test-agentq-adaptive.ps1'
   # 2026-10-18: VS Code chat-terminal associations, so the reaper never interrupts an agent
   'bin\vscode-chat-terminals.mjs' = 'bin\vscode-chat-terminals.mjs'; 'tests\test-reap-terminals.ps1' = 'bin\test-reap-terminals.ps1'
-  # 2026-10-18: Ctrl+C + exit before any force-kill of a terminal
-  'bin\console-signal.ps1' = 'bin\console-signal.ps1'
   # ADR 0003 wave 1: publish, lease activity + notices + slot prep, PowerShell entry hardening
   'tests\test-agentq-publish.ps1' = 'bin\test-agentq-publish.ps1'; 'tests\test-agentq-lease3.ps1' = 'bin\test-agentq-lease3.ps1'; 'tests\test-agentq-args.ps1' = 'bin\test-agentq-args.ps1'
+  # ADR 0003 W2-4 job objects + W4-4 SLO report
+  'bin\agentq-jobobject-lib.ps1' = 'bin\agentq-jobobject-lib.ps1'; 'bin\agentq-jobobject.ps1' = 'bin\agentq-jobobject.ps1'; 'bin\agentq-slo.mjs' = 'bin\agentq-slo.mjs'
+  'tests\test-jobobject.ps1' = 'bin\test-jobobject.ps1'
+  # 2026-10-18: Ctrl+C + exit before any force-kill of a terminal
+  'bin\console-signal.ps1' = 'bin\console-signal.ps1'
+  # 2026-10-18: stop a stuck command, keep the terminal (Ctrl+C -> Y -> Ctrl+Break -> kill children)
+  'bin\term-interrupt.ps1' = 'bin\term-interrupt.ps1'; 'tests\test-term-interrupt.ps1' = 'bin\test-term-interrupt.ps1'
 }
 $dst = Join-Path $env:USERPROFILE '.copilot'
 $drift = @()

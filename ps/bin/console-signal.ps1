@@ -10,10 +10,17 @@ it sees a normal interrupt/exit instead of a process vanishing mid-read.
 Runs as its own process on purpose: attaching to another console means detaching from ours first
 (a process has at most one console), which would break the caller's own output.
 
-  console-signal.ps1 -Pids 123,456 [-NoExit]
+Signals (-Signal): CtrlC (default; CTRL_C_EVENT, Ctrl+C on the keyboard), CtrlBreak (CTRL_BREAK_EVENT,
+Ctrl+Break: processes that ignore Ctrl+C - SetConsoleCtrlHandler(NULL,TRUE), `cmd` waiting at
+"Terminate batch job (Y/N)?", child processes started with CREATE_NEW_PROCESS_GROUP - still get it;
+.NET/pwsh/node treat it as a hard stop) or None. -Type <text> types that text + Enter instead of `exit`
+(e.g. -Type Y answers "Terminate batch job (Y/N)?"). -NoExit types nothing.
+
+  console-signal.ps1 -Pids 123,456 [-Signal CtrlC|CtrlBreak|None] [-Type <text> | -NoExit]
 Prints one line per pid: "<pid> ok" or "<pid> fail <reason>". EXIT 0 always (per-pid result).
 #>
-param([Parameter(Mandatory)][string]$Pids, [switch]$NoExit)
+param([Parameter(Mandatory)][string]$Pids, [ValidateSet('CtrlC', 'CtrlBreak', 'None')][string]$Signal = 'CtrlC',
+  [string]$Type = 'exit', [switch]$NoExit)
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
 using System;
@@ -43,18 +50,19 @@ public static class ConSig {
     return r;
   }
   // "" on success, else the failing step + Win32 error
-  public static string Signal(uint pid, bool typeExit) {
+  // ev: 0 = CTRL_C_EVENT, 1 = CTRL_BREAK_EVENT, -1 = none. text: typed + Enter when not null.
+  public static string Signal(uint pid, int ev, string text) {
     FreeConsole();
     if (!AttachConsole(pid)) return "attach " + Marshal.GetLastWin32Error();
     try {
       SetConsoleCtrlHandler(IntPtr.Zero, true); // this helper ignores the Ctrl+C it raises
-      if (!GenerateConsoleCtrlEvent(0, 0)) return "ctrl-c " + Marshal.GetLastWin32Error();
-      if (!typeExit) return "";
-      System.Threading.Thread.Sleep(300); // let the shell abandon whatever it was reading
+      SetConsoleCtrlHandler(Handler, true);     // ...and the Ctrl+Break (NULL handler covers only Ctrl+C)
+      if (ev >= 0 && !GenerateConsoleCtrlEvent((uint)ev, 0)) return "event " + ev + " " + Marshal.GetLastWin32Error();
+      if (text == null) return "";
+      if (ev >= 0) System.Threading.Thread.Sleep(300); // let the shell abandon whatever it was reading
       IntPtr h = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
       if (h == new IntPtr(-1)) return "conin " + Marshal.GetLastWin32Error();
       try {
-        string text = "exit";
         var recs = new System.Collections.Generic.List<INPUT_RECORD>();
         foreach (char c in text) { ushort vk = (ushort)char.ToUpperInvariant(c); recs.Add(Key(c, vk, true)); recs.Add(Key(c, vk, false)); }
         recs.Add(Key('\r', 0x0D, true)); recs.Add(Key('\r', 0x0D, false));
@@ -63,10 +71,15 @@ public static class ConSig {
       return "";
     } finally { FreeConsole(); SetConsoleCtrlHandler(IntPtr.Zero, false); }
   }
+  public delegate bool CtrlHandler(uint ctrlType);
+  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(CtrlHandler h, bool add);
+  static readonly CtrlHandler Handler = t => true; // swallow every event in this helper process
 }
 '@
+$ev = @{ CtrlC = 0; CtrlBreak = 1; None = -1 }[$Signal]
+$text = if ($NoExit) { $null } else { $Type }
 foreach ($p in @($Pids -split ',' | Where-Object { $_ -match '^\d+$' })) {
-  $err = [ConSig]::Signal([uint32]$p, -not $NoExit)
+  $err = [ConSig]::Signal([uint32]$p, $ev, $text)
   # stdout is gone while attached elsewhere; write through a file-backed stream is not needed
   # because Signal() detaches before returning and Write-Output goes to our original handle.
   if ($err) { Write-Output "$p fail $err" } else { Write-Output "$p ok" }

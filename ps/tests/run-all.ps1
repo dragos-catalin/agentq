@@ -20,6 +20,7 @@ $suites = [ordered]@{
   'cloud place'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud.ps1'), '-Aq', (Join-Path $stage 'agentq.ps1'))
   'adaptive+reg'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-adaptive.ps1'))
   'reap terminals' = @('-File', (Join-Path $PSScriptRoot 'test-reap-terminals.ps1'), '-Tool', (Join-Path $bin 'reap-terminals.ps1'))
+  'term interrupt' = @('-File', (Join-Path $PSScriptRoot 'test-term-interrupt.ps1'), '-Tool', (Join-Path $bin 'term-interrupt.ps1'))
   'git-autosync'   = @('-File', (Join-Path $PSScriptRoot 'test-git-autosync.ps1'), '-Tool', (Join-Path $bin 'git-autosync.ps1'))
   'guard shared'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-shared.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
@@ -27,6 +28,9 @@ $suites = [ordered]@{
   'publish'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-publish.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'args'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # ADR 0003 wave 2/4
+  'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
+  'slo'            = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-slo.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo selftest' }")
 }
 $bad = @()
 foreach ($k in $suites.Keys) {
