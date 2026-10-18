@@ -17,12 +17,16 @@ $assoc = Join-Path $tmp 'assoc.txt'
 $env:REAP_TERMINALS_ASSOC_FILE = $assoc
 
 # host: starts N idle terminals and waits; writes their pids
-function Start-Host([int]$n) {
+function Start-Host([int]$n, [string]$body = 'Start-Sleep 600') {
   $pidFile = Join-Path $tmp ("pids-" + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt')
   $script = @"
-`$ps = 1..$n | ForEach-Object { Start-Process pwsh -ArgumentList '-NoProfile','-NoLogo','-Command','Start-Sleep 600 # $mark' -WindowStyle Hidden -PassThru }
+`$ps = 1..$n | ForEach-Object { Start-Process pwsh -ArgumentList '-NoProfile','-NoLogo','-Command','$body # $mark' -WindowStyle Hidden -PassThru }
 (`$ps | ForEach-Object Id) -join ',' | Set-Content '$pidFile'
-Start-Sleep 600
+`$done = @{}
+for (`$i = 0; `$i -lt 1200; `$i++) {
+  foreach (`$p in `$ps) { if (`$p.HasExited -and -not `$done[`$p.Id]) { `$done[`$p.Id] = 1; Add-Content '$pidFile.codes' ('{0}={1}' -f `$p.Id, `$p.ExitCode) } }
+  Start-Sleep -Milliseconds 250
+}
 "@
   $h = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', $script -WindowStyle Hidden -PassThru
   for ($i = 0; $i -lt 60 -and -not (Test-Path $pidFile); $i++) { Start-Sleep -Milliseconds 500 }
@@ -30,9 +34,38 @@ Start-Sleep 600
   [pscustomobject]@{ Host = $h; Pids = @((Get-Content $pidFile -Raw).Trim() -split ',' | ForEach-Object { [int]$_ }) }
 }
 function Alive([int]$id) { [bool](Get-Process -Id $id -ErrorAction SilentlyContinue) }
-function Run([string[]]$extra) { & pwsh -NoProfile -File $Tool -SampleSec 1 -KeepNewest 0 @extra 2>&1 | Out-String }
+function Run([string[]]$extra) { & pwsh -NoProfile -File $Tool -SampleSec 1 -KeepNewest 0 -GraceSec 6 @extra 2>&1 | Out-String }
+function Reaps([int]$id) { @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') -ErrorAction SilentlyContinue | ConvertFrom-Json | Where-Object { $_.pid -eq $id }) }
+# exit code the stand-in host saw for a terminal ($null until it noticed the exit)
+function ExitCode([int]$id) { foreach ($f in Get-ChildItem $tmp -Filter '*.codes') { foreach ($l in Get-Content $f.FullName) { if ($l -match "^$id=(-?\d+)$") { return [long]$Matches[1] } } }; $null }
 
 try {
+  # 0. interrupt first: a shell that honours Ctrl+C closes itself and is journaled graceful; one that
+  # ignores Ctrl+C and never reads `exit` is force-killed only after the grace period.
+  $h = Start-Host 1
+  # SetConsoleCtrlHandler(NULL, TRUE) = this process ignores Ctrl+C; the busy loop never reads `exit`
+  $deafPs1 = Join-Path $tmp 'deaf.ps1'
+  $deafReady = Join-Path $tmp 'deaf.ready'
+  Set-Content -LiteralPath $deafPs1 -Value (@'
+$t = Add-Type -PassThru -Name D -Namespace R -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr h, bool a);'
+[void]$t::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+Set-Content -LiteralPath 'READY' -Value 1
+while ($true) { Start-Sleep -Milliseconds 200 }
+'@).Replace('READY', $deafReady)
+  $deaf = Start-Host 1 "& $deafPs1"
+  for ($i = 0; $i -lt 60 -and -not (Test-Path $deafReady); $i++) { Start-Sleep -Milliseconds 500 }
+  Set-Content -LiteralPath $assoc -Value '#read 1'
+  $t = Get-Date
+  $out = Run @('-SoftCap', '0', '-PressureMinAgeMin', '0', '-MinAgeHours', '100')
+  $took = ((Get-Date) - $t).TotalSeconds
+  for ($i = 0; $i -lt 8 -and $null -eq (ExitCode $h.Pids[0]); $i++) { Start-Sleep -Milliseconds 250 }
+  $code = ExitCode $h.Pids[0]
+  # Stop-Process -Force = TerminateProcess(-1); anything else means the shell ended itself
+  Check 'an interruptible terminal closes itself and is journaled graceful' ((-not (Alive $h.Pids[0])) -and (Reaps $h.Pids[0]).how -eq 'graceful' -and $null -ne $code -and $code -ne -1) "code=$code $(Reaps $h.Pids[0] | ConvertTo-Json -Compress)"
+  Check 'a terminal ignoring the interrupt is force-killed and journaled forced' ((-not (Alive $deaf.Pids[0])) -and (Reaps $deaf.Pids[0]).how -eq 'forced') "ready=$(Test-Path $deafReady) $(Reaps $deaf.Pids[0] | ConvertTo-Json -Compress)"
+  Check 'the force-kill waits for the grace period' ($took -ge 6) "took $took s"
+  foreach ($x in $h, $deaf) { Stop-Process -Id $x.Host.Id -Force -ErrorAction SilentlyContinue }
+
   # 1. pressure mode: plain idle terminals are reaped, chat-associated ones (fg and bg) survive.
   $h = Start-Host 6
   $fg = $h.Pids[0]; $bg = $h.Pids[1]; $plain = $h.Pids[2..5]

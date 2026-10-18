@@ -31,13 +31,19 @@ exception: when a ptyHost is at -CriticalCap (near the ~190-terminal crash), bac
 for -CriticalMinAgeMin are reaped, oldest first, in one batch down to -CriticalLow. If the association list
 cannot be read at all, nothing young is reaped (only the 3 h rule applies).
 
+INTERRUPT FIRST (2026-10-18, owner). A terminal is never killed outright: console-signal.ps1 raises
+CTRL+C on its console (what a keyboard Ctrl+C does) and types `exit`, so an idle shell closes itself
+with code 0 - no "terminated with exit code -1" alert, and an agent that was still using it sees a
+normal interrupt. Only shells still alive after -GraceSec are force-killed (journal how=forced).
+
   reap-terminals.ps1 [-WhatIf] [-MinAgeHours 3] [-KeepNewest 4] [-SoftCap 80] [-PressureMinAgeMin 20]
-                     [-CriticalCap 150] [-CriticalLow 120] [-CriticalMinAgeMin 30] [-Json]
+                     [-CriticalCap 150] [-CriticalLow 120] [-CriticalMinAgeMin 30] [-GraceSec 20] [-Json]
 EXIT 0 ok, 2 usage.
 #>
 param([switch]$WhatIf, [double]$MinAgeHours = 3, [int]$KeepNewest = 4, [double]$MaxCpuSec = 1, [int]$SampleSec = 20,
   [int]$SoftCap = 80, [double]$PressureMinAgeMin = 20, [int]$CriticalCap = 150, [int]$CriticalLow = 120, [double]$CriticalMinAgeMin = 30,
-  [string]$AssocTool = (Join-Path $PSScriptRoot 'vscode-chat-terminals.mjs'), [switch]$Json)
+  [int]$GraceSec = 20, [string]$AssocTool = (Join-Path $PSScriptRoot 'vscode-chat-terminals.mjs'),
+  [string]$SignalTool = (Join-Path $PSScriptRoot 'console-signal.ps1'), [switch]$Json)
 $ErrorActionPreference = 'Stop'
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
 $Journal = Join-Path $Root 'journal.jsonl'
@@ -123,15 +129,27 @@ $reap = @($idle | Group-Object parent | ForEach-Object {
     $takeYoung
     $chatBg | Select-Object -First $critExcess
   })
-$killed = 0; $freedMB = 0
-foreach ($r in $reap) {
-  if ($WhatIf) { continue }
-  try {
-    Stop-Process -Id $r.pid -Force -ErrorAction Stop; $killed++; $freedMB += $r.privMB
-    $line = @{ ts = [DateTime]::UtcNow.ToString('o'); session = 'reap-terminals'; event = 'reap-terminal'; pid = $r.pid; ageH = $r.ageH; privMB = $r.privMB; chat = $r.chat } | ConvertTo-Json -Compress
-    $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
-    try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
-  } catch {}
+function Write-Reap($r, [string]$how) {
+  $line = @{ ts = [DateTime]::UtcNow.ToString('o'); session = 'reap-terminals'; event = 'reap-terminal'; pid = $r.pid; ageH = $r.ageH; privMB = $r.privMB; chat = $r.chat; how = $how } | ConvertTo-Json -Compress
+  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
+}
+# same process as the one we judged idle? (pids are recycled)
+function Test-Same($r) { try { $g = Get-Process -Id $r.pid -ErrorAction Stop; [math]::Abs(($g.StartTime - $r.created).TotalSeconds) -le 2 } catch { $false } }
+$killed = 0; $freedMB = 0; $graceful = 0; $forced = 0
+if (-not $WhatIf -and $reap.Count) {
+  # 1. interrupt: Ctrl+C + `exit` on each console, in a separate process (it re-attaches consoles)
+  $sigOut = @(try { & pwsh -NoProfile -File $SignalTool -Pids (($reap | ForEach-Object pid) -join ',') 2>&1 } catch { @() })
+  # 2. grace: wait for the shells to close themselves
+  $deadline = (Get-Date).AddSeconds($GraceSec)
+  do { $alive = @($reap | Where-Object { Test-Same $_ }); if ($alive.Count) { Start-Sleep -Milliseconds 500 } } while ($alive.Count -and (Get-Date) -lt $deadline)
+  # 3. only what ignored the interrupt is killed
+  foreach ($r in $reap) {
+    if (Test-Same $r) {
+      try { Stop-Process -Id $r.pid -Force -ErrorAction Stop; $forced++; Write-Reap $r 'forced' } catch { continue }
+    } else { $graceful++; Write-Reap $r 'graceful' }
+    $killed++; $freedMB += $r.privMB
+  }
 }
 $terms = @($all | Where-Object { $_.Name -in 'pwsh.exe', 'powershell.exe' -and "$($_.CommandLine)" -match $ShellMark })
 # registry hygiene: agents/<session>.json entries untouched for a week are pruned
@@ -140,6 +158,6 @@ if (Test-Path $regDir) { Get-ChildItem -LiteralPath $regDir -Filter '*.json' -Er
 $sum = [ordered]@{ terminals = $terms.Count; terminalsMB = [int](($terms | Measure-Object PrivatePageCount -Sum).Sum / 1MB)
   pressured = ($pressured | ForEach-Object { "$_=$($perHost[$_])" }) -join ' '; chatTerminals = $chatPid.Count; chatProtected = $skipChat; assocRead = $assocOk
   candidates = $cand.Count; idle = $idle.Count
-  skipped = ($skip.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '; reapable = $reap.Count; reapableMB = [int](($reap | Measure-Object privMB -Sum).Sum); killed = $killed; freedMB = $freedMB; whatIf = [bool]$WhatIf }
+  skipped = ($skip.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '; reapable = $reap.Count; reapableMB = [int](($reap | Measure-Object privMB -Sum).Sum); killed = $killed; graceful = $graceful; forced = $forced; freedMB = $freedMB; whatIf = [bool]$WhatIf }
 if ($Json) { $sum | ConvertTo-Json -Compress } else { $sum.GetEnumerator() | ForEach-Object { '{0,-11} {1}' -f $_.Key, $_.Value } }
 exit 0
