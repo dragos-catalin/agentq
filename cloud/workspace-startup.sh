@@ -5,6 +5,9 @@
 # bundle when the SSD was discarded (resume after a discard-local-ssd suspend).
 set -euo pipefail
 exec > >(tee -a /var/log/devcloud-startup.log) 2>&1
+# A rerun over ssh (workspace.ps1 -UpdateAgent) starts in the caller's home, which `dev` cannot
+# read: pnpm then dies with ERR_PNPM_CLI_PREFIX_IO_ERROR and set -e skipped everything after it.
+cd /
 md() { curl -fsS -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" || true; }
 NODE_VERSION="$(md node-version)"; NODE_VERSION="${NODE_VERSION:-24.21.0}"
 PNPM_VERSION="$(md pnpm-version)"; PNPM_VERSION="${PNPM_VERSION:-12.9.1}"
