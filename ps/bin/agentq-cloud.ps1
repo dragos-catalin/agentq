@@ -63,7 +63,7 @@ function Out-Line([string]$s) { [Console]::Out.WriteLine($s) }
 function Write-Journal([hashtable]$e) {
   $e.ts = [DateTime]::UtcNow.ToString('o'); $e.session = $Session
   $line = $e | ConvertTo-Json -Compress -Depth 6
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) }
   finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
 }

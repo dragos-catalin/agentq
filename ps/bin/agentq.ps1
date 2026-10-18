@@ -228,7 +228,7 @@ function QPath([string]$res) { Join-Path $QDir (Safe $res) }
 function Write-Journal([hashtable]$e) {
   $e.ts = Iso (Now); if (-not $e.ContainsKey('session')) { $e.session = $Session }
   $line = ($e | ConvertTo-Json -Compress -Depth 6)
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) }
   finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
@@ -337,7 +337,7 @@ function Get-AdaptiveMachineCap {
   if ($prevAt -and ($now - $prevAt).TotalSeconds -lt $every) {
     return [math]::Max($min, [math]::Min($max, [int]$prev.cap))
   }
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-adaptive')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-adaptive$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   $got = $false
   try {
     try { $got = $m.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
@@ -471,7 +471,7 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
     $cap = if ($script:Capacity -gt 1) { $script:Capacity } else { Get-Capacity $res }
     [IO.File]::WriteAllText((Join-Path $dir 'capacity'), "$cap")
   }
-  $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $res)")
+  $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $res)$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try {
     [void]$m.WaitOne(10000)
     $seqFile = Join-Path $dir 'seq'
@@ -512,7 +512,7 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
   $ready = @{}; foreach ($t in $tickets) { $ready[$t.id] = $true }
   while ($true) {
     foreach ($t in $tickets) { Assert-NotMarked $t.resource; [IO.File]::SetLastWriteTimeUtc("$($t.file).hb", (Now)) }
-    $m = [Threading.Mutex]::new($false, 'Global\agentq-sched')
+    $m = [Threading.Mutex]::new($false, "Global\agentq-sched$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
     $granted = $false; $res = @{}
     try {
       try { [void]$m.WaitOne(15000) } catch [Threading.AbandonedMutexException] {}
@@ -706,7 +706,7 @@ function Invoke-RotateJournal([switch]$Force) {
   $mb = (Get-Item $Journal).Length / 1MB
   if (-not $Force -and $mb -lt [double](Get-Config).journalRotateMB) { return }
   $arch = Join-Path $Root 'journal-archive'; New-Item -ItemType Directory -Force $arch | Out-Null
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try {
     try { [void]$m.WaitOne(10000) } catch [Threading.AbandonedMutexException] {}
     $dst = Join-Path $arch ("journal-{0}.jsonl" -f (Now).ToString('yyyyMMdd-HHmmss'))
@@ -881,14 +881,33 @@ function Invoke-Run {
         $tick++; Start-Sleep -Seconds 20
       }
     }
+    # ADR 0003 W2-4: this process (and every child it starts) runs in a job object: leftover children die
+    # with the holder (kill-on-close) and CPU is shared by lane weight when the machine is saturated.
+    # Best effort: any failure runs the command exactly as before. AGENTQ_NO_JOBOBJ=1 disables it.
+    $jobInfo = $null
+    if ($env:AGENTQ_NO_JOBOBJ -ne '1') {
+      $libJ = Join-Path $PSScriptRoot 'agentq-jobobject-lib.ps1'
+      if (Test-Path -LiteralPath $libJ) {
+        . $libJ
+        $wByLane = @{ interactive = 9; quick = 8; gate = 7; heavy = 4; batch = 2 }
+        $lw = "$($tickets[0].lane)"; $wt = if ($wByLane.ContainsKey($lw)) { $wByLane[$lw] } else { 5 }
+        if ($held -like 'land:*' -or $Purpose -match '^land gate') { $wt = 9 }
+        $jobInfo = Enter-AgentqJob $wt
+        if ($jobInfo.error) { Write-Journal @{ event = 'jobobj-failed'; resource = $held; reason = $jobInfo.error; repo = $repo.Name } }
+        else { $jobInfo.weight = $wt }
+      }
+    }
     try {
       $exe = $cmdArgs[0]; $argv = @($cmdArgs | Select-Object -Skip 1)
       & $exe @argv
       $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }
     } finally { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }
+    $jstat = if ($jobInfo -and $jobInfo.job -ne [IntPtr]::Zero) { Get-AgentqJobStats $jobInfo.job } else { $null }
     $dur = [math]::Round(((Now) - $started).TotalSeconds)
     $holdSec = [math]::Round(((Now) - $acquiredAt).TotalSeconds)
-    Write-Journal @{ event = $(if ($code -eq 0) { 'done' } else { 'fail' }); resource = $held; exit = $code; durSec = $dur; holdSec = $holdSec; waitSec = $script:WaitSec; lane = $tickets[0].lane; kind = (Get-CmdKind $cmdLine); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
+    $je = @{ event = $(if ($code -eq 0) { 'done' } else { 'fail' }); resource = $held; exit = $code; durSec = $dur; holdSec = $holdSec; waitSec = $script:WaitSec; lane = $tickets[0].lane; kind = (Get-CmdKind $cmdLine); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
+    if ($jstat) { $je.cpuSec = $jstat.cpuSec; $je.peakMB = $jstat.peakMB; $je.procs = $jstat.procs; $je.cpuWeight = $jobInfo.weight }
+    Write-Journal $je
     if ($code -ne 0) { Send-Signal 'agentq-fail' "$held failed ($code) — $Purpose" }
     exit $code
   } finally {
@@ -1249,5 +1268,7 @@ switch ($Verb.ToLowerInvariant()) {
   'notify-landing' { Invoke-NotifyLanding }
   'land' { Invoke-Land; exit $script:LandExit }
   'publish' { Invoke-Publish; if ($DoLand) { exit $script:LandExit } }
+  # ADR 0003 W4-4: SLO report from the journal (ready->landed p90, flake rate, lost work, queue waits, bypass).
+  'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; & node @sa; exit $LASTEXITCODE }
   default { Get-Help $PSCommandPath; exit 2 }
 }

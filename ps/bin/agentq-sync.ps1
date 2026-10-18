@@ -180,7 +180,7 @@ function Get-NewLines([long]$offset) {
 function Write-JournalLine([hashtable]$e) {
   $e.ts = Iso ([DateTime]::UtcNow)
   $line = ($e | ConvertTo-Json -Compress -Depth 6)
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText($Journal, $line + "`n", $Utf8) }
   finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
 }
@@ -267,7 +267,7 @@ if ($Install) {
 }
 if ($Loop) {
   # One loop per user session.
-  $mx = [Threading.Mutex]::new($false, 'Global\agentq-sync-loop')
+  $mx = [Threading.Mutex]::new($false, "Global\agentq-sync-loop$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   if (-not $mx.WaitOne(0)) { 'agentq-sync: loop already running'; exit 0 }
   while ($true) {
     try { Invoke-Push | Out-Null } catch { [Console]::Error.WriteLine("$_") }

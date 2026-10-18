@@ -57,8 +57,14 @@ Set-Content (Join-Path $qd '00000000-ghost001.json') $ghost
 Check 'dead-pid ticket reaped' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
 
 # 5. -NoWait on a busy resource exits 3 without waiting.
-$holder = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'install', '-Purpose', 'hold', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 20') -WorkingDirectory $repo -PassThru -WindowStyle Hidden
-$w = 0; while ($w -lt 40 -and -not (Get-ChildItem (Join-Path $env:AGENTQ_HOME 'queues') -Recurse -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like '*install_*' })) { Start-Sleep -Milliseconds 250; $w++ }; Start-Sleep -Seconds 1
+$holder = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'install', '-Purpose', 'hold', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 90') -WorkingDirectory $repo -PassThru -WindowStyle Hidden
+# Wait until the holder is GRANTED (held=true), not merely queued: under load the grant took
+# >15 s and the probe then found the resource free (2026-10-18, 1 of 3 runs).
+$w = 0; while ($w -lt 240) {
+  $hf = Get-ChildItem (Join-Path $env:AGENTQ_HOME 'queues') -Recurse -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like '*install_*' } | Select-Object -First 1
+  if ($hf) { try { if ((Get-Content $hf.FullName -Raw | ConvertFrom-Json).held) { break } } catch {} }
+  Start-Sleep -Milliseconds 250; $w++
+}
 & pwsh -NoProfile -File $aq run -Resource install -Purpose 'nowait' -NoWait -- pwsh -NoProfile -Command 'exit 0' 2>$null
 Check '-NoWait busy exits 3' ($LASTEXITCODE -eq 3) "got $LASTEXITCODE"
 $st = (& pwsh -NoProfile -File $aq status) -join "`n"

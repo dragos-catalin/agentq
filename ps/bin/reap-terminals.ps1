@@ -131,7 +131,7 @@ $reap = @($idle | Group-Object parent | ForEach-Object {
   })
 function Write-Reap($r, [string]$how) {
   $line = @{ ts = [DateTime]::UtcNow.ToString('o'); session = 'reap-terminals'; event = 'reap-terminal'; pid = $r.pid; ageH = $r.ageH; privMB = $r.privMB; chat = $r.chat; how = $how } | ConvertTo-Json -Compress
-  $m = [Threading.Mutex]::new($false, 'Global\agentq-journal')
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
 }
 # same process as the one we judged idle? (pids are recycled)

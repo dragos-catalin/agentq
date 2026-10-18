@@ -35,7 +35,7 @@ $suites = [ordered]@{
 $bad = @()
 foreach ($k in $suites.Keys) {
   $a = $suites[$k]
-  if (-not (Test-Path $a[1])) { Write-Host "SKIP $k (missing $($a[1]))"; continue }
+  if ($a[0] -eq '-File' -and -not (Test-Path $a[1])) { Write-Host "SKIP $k (missing $($a[1]))"; continue }
   $out = @(& pwsh -NoProfile @a 2>&1 | ForEach-Object { "$_" })
   $code = $LASTEXITCODE
   $fails = @($out | Where-Object { $_ -match '^\s*(FAIL)\b' })

@@ -61,7 +61,7 @@ function Read-JsonFile([string]$file) {
   'UNREADABLE'
 }
 function With-Mutex([string]$name, [scriptblock]$body) {
-  $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $name)")
+  $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $name)$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { try { [void]$m.WaitOne(30000) } catch [Threading.AbandonedMutexException] {} ; & $body }
   finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
@@ -94,8 +94,8 @@ function Get-ExtraLeaseActivity {
     }
     $jd = Join-Path $Root 'jobs'
     if (Test-Path -LiteralPath $jd) {
-      $since = (Now).AddDays(-2).ToString('yyyyMMdd')
-      foreach ($f in @(Get-ChildItem -LiteralPath $jd -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -ge $since })) {
+      $cut = (Now).AddDays(-2)
+      foreach ($f in @(Get-ChildItem -LiteralPath $jd -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $cut } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 200)) {
         try {
           $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -DateKind String
           if ((P $j 'state' '') -ne 'running' -or -not (P $j 'pid' 0)) { continue }
@@ -122,8 +122,11 @@ function Get-LeaseExtraBeat($l) {
 # Any agentq call from the lease's own session, or naming it with -LeaseId, renews it.
 function Renew-ForSession {
   try {
-    foreach ($l in @(Read-Leases $null)) {
-      if (($LeaseId -and (P $l 'leaseId') -eq $LeaseId) -or ((P $l 'session') -eq $Session)) { Touch-Lease $l }
+    foreach ($f in @(Get-ChildItem -LiteralPath $LDir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+      $raw = [IO.File]::ReadAllText($f.FullName)
+      if (-not ($raw.Contains("`"$Session`"") -or ($LeaseId -and $raw.Contains("`"$LeaseId`"")))) { continue }
+      $l = $raw | ConvertFrom-Json
+      if (($LeaseId -and (P $l 'leaseId') -eq $LeaseId) -or ((P $l 'session') -eq $Session)) { Touch-Lease ([pscustomobject]@{ file = $f.FullName }) }
     }
   } catch {}
 }
@@ -186,11 +189,15 @@ function Read-Leases([string]$repoName) {
       # Ignore the index writes of the lease's own checkout (first 2 min after creation).
       $createdAt = ParseUtc (P $l 'created' (Iso (Now)))
       if ($act -and $act -gt $beat -and $act -gt $createdAt.AddMinutes(2)) { $beat = $act }
-      $xa = Get-LeaseExtraBeat $l
-      if ($xa -and $xa -gt $beat) { $beat = $xa }
       $alive = Test-Alive ([pscustomobject]@{ pid = [int](P $l 'pid' 0); procStart = (P $l 'procStart' $null) })
       $idle = ((Now) - $beat).TotalMinutes
       $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin)
+      # W1-3: the ticket/job scan costs seconds on a big registry, so only a lease that would be
+      # stale pays for it (most calls see no stale lease and never scan).
+      if ($stale) {
+        $xa = Get-LeaseExtraBeat $l
+        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin) }
+      }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
       $l | Add-Member -NotePropertyName beat -NotePropertyValue $beat -Force
       $l | Add-Member -NotePropertyName alive -NotePropertyValue $alive -Force

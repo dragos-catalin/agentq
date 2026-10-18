@@ -19,7 +19,7 @@ function ConvertTo-JobUtc($s) {
 function New-JobId { '{0}-{1}' -f [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'), [guid]::NewGuid().ToString('N').Substring(0, 4) }
 
 function Invoke-JobLocked([string]$id, [scriptblock]$body) {
-  $m = [Threading.Mutex]::new($false, "Global\agentq-job-$($id -replace '[^A-Za-z0-9_-]', '_')")
+  $m = [Threading.Mutex]::new($false, "Global\agentq-job-$($id -replace '[^A-Za-z0-9_-]', '_')$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   $got = $false
   try {
     try { $got = $m.WaitOne(10000) } catch [Threading.AbandonedMutexException] { $got = $true }

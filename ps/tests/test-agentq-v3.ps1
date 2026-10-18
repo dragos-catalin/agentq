@@ -31,18 +31,21 @@ function Wait-For([scriptblock]$cond, [int]$sec = 30) { $t = 0; while ($t -lt ($
 $order = Join-Path $tmp 'order.log'
 
 # 1. priority beats FIFO: with machineCap 1 held, a later quick/high waiter starts before an earlier batch waiter.
-$h = Start-Run $repo 'holder' 'gate' 'Start-Sleep -Seconds 6'
-Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
+# Holder sleeps 40 s and both waiters must be queued before it releases: under load pwsh startup
+# took >6 s and the old 6 s holder released before the heavy waiter existed (run-all 2026-10-18).
+$h = Start-Run $repo 'holder' 'gate' 'Start-Sleep -Seconds 40'
+Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'holder' -and $_.held }).Count -ge 1 } 60 | Out-Null
 $b = Start-Run $repo2 'batchy' 'batch' "Add-Content '$order' batch"
-Start-Sleep 2
+Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'batchy' }).Count -ge 1 } 60 | Out-Null
 $g = Start-Run $repo2 'urgent' 'heavy' "Add-Content '$order' heavy" 40
+Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'urgent' }).Count -ge 1 } 60 | Out-Null
 $h, $b, $g | ForEach-Object { $_.WaitForExit(90000) | Out-Null }
 $o = @(Get-Content $order -ErrorAction SilentlyContinue)
 Check 'higher priority waiter goes first' ($o.Count -eq 2 -and $o[0] -eq 'heavy') ($o -join ',')
 
 # 2. no repo hold while waiting for the machine: a run in repo A waiting for build:machine must not hold build:repo.
 Remove-Item $order -ErrorAction SilentlyContinue
-$h = Start-Run $repo2 'machine-holder' 'gate' 'Start-Sleep -Seconds 15'
+$h = Start-Run $repo2 'machine-holder' 'gate' 'Start-Sleep -Seconds 45'
 Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'machine-holder' -and $_.held }).Count -ge 1 } | Out-Null
 $w = Start-Run $repo 'repo-waiter' 'gate' 'exit 0'
 Wait-For { Get-ChildItem (Join-Path $env:AGENTQ_HOME 'queues\build_repo') -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 2
