@@ -798,6 +798,21 @@ function Invoke-Land {
   $main = Get-MainTop $repo
   $res = "land:$($repo.Name)"
   Assert-NotMarked $res
+  # W2-6: refuse BEFORE queueing when the topic cannot merge onto the current tip (outside the files the
+  # land resolver/finalizer handle). Saves the whole queue wait + slot setup of a land that ends in exit 5.
+  & git -C $main fetch -q origin $Onto 2>$null
+  $preRef = if ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$Branch" 2>$null)) { "refs/remotes/origin/$Branch" } elseif ((& git -C $main rev-parse --verify -q "refs/heads/$Branch" 2>$null)) { "refs/heads/$Branch" } else { $null }
+  if ($preRef -and -not $env:AGENTQ_LAND_NO_PRECHECK) {
+    $mt = @(& git -C $main merge-tree --write-tree --name-only --no-messages "origin/$Onto" $preRef 2>$null | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -eq 1) {
+      $hard = @($mt | Select-Object -Skip 1 | Where-Object { $_ -and $_ -notmatch '(^|/)(CHANGELOG\.md|package\.json)$' -and $_ -notmatch '^changes/' })
+      if ($hard.Count) {
+        Write-Journal @{ event = 'land-precheck-conflict'; resource = $res; branch = $Onto; paths = $hard; reason = "$Branch conflicts with origin/$Onto before queueing"; repo = $repo.Name }
+        [Console]::Error.WriteLine("land: $Branch does not merge onto origin/$Onto (conflicts: $($hard -join ', ')). Nothing queued. Rebase it in your slot, push, and land again.")
+        $script:LandExit = 5; return
+      }
+    }
+  }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
   $lease = $null; $hb = $null
