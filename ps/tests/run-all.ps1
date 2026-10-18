@@ -19,6 +19,7 @@ $suites = [ordered]@{
   'jobs'           = @('-File', (Join-Path $PSScriptRoot 'test-jobs.ps1'), '-Bin', $bin, '-Hooks', $hooks)
   'cloud place'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud.ps1'), '-Aq', (Join-Path $stage 'agentq.ps1'))
   'adaptive+reg'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-adaptive.ps1'))
+  'reap terminals' = @('-File', (Join-Path $PSScriptRoot 'test-reap-terminals.ps1'), '-Tool', (Join-Path $bin 'reap-terminals.ps1'))
   'git-autosync'   = @('-File', (Join-Path $PSScriptRoot 'test-git-autosync.ps1'), '-Tool', (Join-Path $bin 'git-autosync.ps1'))
   'guard shared'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-shared.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
