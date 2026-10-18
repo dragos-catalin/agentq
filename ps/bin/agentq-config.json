@@ -1,5 +1,5 @@
 {
-  "taskSlotsPerRepo": 8,
+  "taskSlotsPerRepo": 9,
   "taskSlotsMachine": 12,
   "releaseSlots": {
     "codai": 2
