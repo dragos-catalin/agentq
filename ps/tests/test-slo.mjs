@@ -15,6 +15,8 @@ const lines = [
   j({ ts: T('01:50'), event: 'flake', repo: 'r', resource: 'land:r', session: 'B', exit: 7 }),
   j({ ts: T('02:00'), event: 'land', repo: 'r', resource: 'land:r', session: 'B', branch: 'main' }),
   j({ ts: T('02:10'), event: 'land-push-failed', repo: 'r', resource: 'land:r', session: 'C', exit: 7 }),
+  j({ ts: T('02:11'), event: 'land-push-failed', repo: 'r', resource: 'land:r', session: 'C', exit: 7, reason: 'FAIL src/x.test.ts | husky - pre-push script failed' }),
+  j({ ts: T('02:12'), event: 'land-finalize-failed', repo: 'r', resource: 'land:r', session: 'C', exit: 2, reason: 'fragment invalid' }),
   j({ ts: T('02:20'), event: 'acquired', resource: 'commit:r', session: 'C', tickets: ['t4'], waitSec: 10 }),
   j({ ts: T('02:21'), event: 'commit', repo: 'r', resource: 'commit:r', session: 'C', sha: 'abc' }),
   j({ ts: T('02:22'), event: 'commit-failed', repo: 'r', resource: 'commit:r', session: 'C' }),
@@ -35,13 +37,13 @@ async function* gen() { for (const l of lines) yield l; }
 const rep = await compute(gen(), { days: 7, now: T('12:00') });
 const r = rep.byRepo.r, s = rep.byRepo.s, o = rep.overall;
 
-assert.equal(rep.journal.lines, 24);
+assert.equal(rep.journal.lines, 26);
 assert.equal(rep.journal.badLines, 1);
-assert.equal(rep.journal.eventsInWindow, 22);
+assert.equal(rep.journal.eventsInWindow, 24);
 // landing
 assert.equal(r.landing.lands, 2);
-assert.deepEqual(r.landing.failByCause, { conflict: 1, pushRefused: 1, gate: 0, oversized: 0 });
-assert.equal(r.landing.failureRate, 0.5);
+assert.deepEqual(r.landing.failByCause, { conflict: 1, prePush: 1, pushRefused: 1, gate: 0, oversized: 0, finalize: 1 });
+assert.equal(r.landing.failureRate, 4 / 6);
 assert.equal(r.landing.publishRefused, 1);
 // queue
 assert.deepEqual(r.queueWaitSec.land, { n: 1, p50: 60, p90: 60 });
@@ -55,8 +57,8 @@ assert.equal(r.bypass.pushTopicBranch, 1);
 assert.equal(r.bypass.share, 1 / 3);
 // flake
 assert.equal(r.flake.flakes, 1);
-assert.equal(r.flake.rate, 0.25);
-assert.equal(r.flake.shareOfPushFailures, 0.5);
+assert.equal(r.flake.rate, 1 / 6);
+assert.equal(r.flake.shareOfPushFailures, 1 / 3);
 // lost work
 // clean expiry / clean foreign break (no ref = nothing unique) are NOT incidents; a failed backup is.
 assert.equal(r.lostWork.incidents, 2);
@@ -70,7 +72,7 @@ assert.deepEqual(r.readyToLandedMin, { n: 2, p50: 30, p90: 60, unpaired: 0 });
 assert.equal(o.landing.lands, 2);
 assert.equal(rep.slo.readyToLandedP90Min.value, 60);
 assert.equal(rep.slo.readyToLandedP90Min.verdict, 'FAIL');
-assert.equal(rep.slo.flakeRatePct.value, 25);
+assert.ok(Math.abs(rep.slo.flakeRatePct.value - 100 / 6) < 1e-9);
 assert.equal(rep.slo.flakeRatePct.verdict, 'FAIL');
 assert.equal(rep.slo.lostWorkIncidents.verdict, 'FAIL');
 // helpers

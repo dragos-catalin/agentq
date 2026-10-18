@@ -36,7 +36,11 @@ const LAND_FAIL = {
   'land-push-failed': 'pushRefused',
   'land-gate-failed': 'gate',
   'land-oversized': 'oversized',
+  'land-finalize-failed': 'finalize',
 };
+// A land-push-failed whose reason carries the hook's output = the repo pre-push gate failed (lint, tests,
+// platform gates); only the rest is the remote refusing the push.
+export const PRE_PUSH_RE = /pre-push|husky|FAIL |Tests? +\d+ failed|ELIFECYCLE|error TS\d|lint error/i;
 const BENIGN_BREAK = /clean|landed|merged|done|finished|pushed/i;
 
 export function parseArgs(argv) {
@@ -64,7 +68,7 @@ const repoOf = (o) => o.repo || String(o.resource ?? '').split(',')[0].split(':'
 
 function newRepo() {
   return {
-    lands: 0, landFail: { conflict: 0, pushRefused: 0, gate: 0, oversized: 0 }, publish: 0, publishRefused: 0,
+    lands: 0, landFail: { conflict: 0, prePush: 0, pushRefused: 0, gate: 0, oversized: 0, finalize: 0 }, publish: 0, publishRefused: 0,
     waits: { build: [], commit: [], land: [] },
     commitAcquired: 0, commits: 0, commitFailed: 0, pushFailed: 0, pushDeferred: 0,
     directPush: 0, branchPush: 0, flake: 0,
@@ -132,7 +136,10 @@ export async function compute(lines, { days = 7, now = null } = {}) {
         if (q && q.length) { r.readyToLandedMin.push((t - q[0]) / 6e4); q.length = 0; } else r.unpairedLands++;
         break;
       }
-      case 'land-conflict': case 'land-push-failed': case 'land-gate-failed': case 'land-oversized':
+      case 'land-push-failed':
+        if (PRE_PUSH_RE.test(String(o.reason ?? ''))) r.landFail.prePush++; else r.landFail.pushRefused++;
+        break;
+      case 'land-conflict': case 'land-gate-failed': case 'land-oversized': case 'land-finalize-failed':
         r.landFail[LAND_FAIL[ev]]++; break;
       case 'publish-refused': r.publishRefused++; r.lost.prevented++; break;
       case 'commit': r.commits++; break;
@@ -173,7 +180,7 @@ function summarizeRepo(r) {
     queueWaitSec: { build: q(r.waits.build), commit: q(r.waits.commit), land: q(r.waits.land) },
     commitPath: { acquired: r.commitAcquired, commits: r.commits, commitFailed: r.commitFailed, pushFailed: r.pushFailed, pushDeferred: r.pushDeferred },
     bypass: { directPushIntegration: r.directPush, pushTopicBranch: r.branchPush, share: integ ? r.directPush / integ : null },
-    flake: { flakes: r.flake, shareOfPushFailures: r.flake + r.landFail.pushRefused ? r.flake / (r.flake + r.landFail.pushRefused) : null, rate: attempts ? r.flake / attempts : null },
+    flake: { flakes: r.flake, shareOfPushFailures: r.flake + r.landFail.prePush + r.landFail.pushRefused ? r.flake / (r.flake + r.landFail.prePush + r.landFail.pushRefused) : null, rate: attempts ? r.flake / attempts : null },
     lostWork: { incidents: r.lost.incidents, recoveredExpire: r.lost.recoveredExpire, recoveredBreak: r.lost.recoveredBreak, foreignBreakBenign: r.lost.foreignBreakBenign, prevented: r.lost.prevented, details: r.lost.details.slice(0, 20) },
     readyToLandedMin: { n: r.readyToLandedMin.length, p50: pct(r.readyToLandedMin, 50), p90: pct(r.readyToLandedMin, 90), unpaired: r.unpairedLands },
     _raw: r,
@@ -231,8 +238,8 @@ export function render(rep) {
   out.push('SLO');
   out.push(table(['target', 'value', 'goal', 'verdict'], Object.entries(rep.slo).map(([k, s]) => [k, f1(s.value), s.target, s.verdict])));
   out.push('\nLANDING');
-  out.push(table(['repo', 'lands', 'fail', 'conflict', 'pushRef', 'gate', 'oversz', 'failRate', 'publish', 'pubRef'],
-    rows((n, s) => [n, s.landing.lands, s.landing.failures, s.landing.failByCause.conflict, s.landing.failByCause.pushRefused, s.landing.failByCause.gate, s.landing.failByCause.oversized, fp(s.landing.failureRate), s.landing.publish, s.landing.publishRefused])));
+  out.push(table(['repo', 'lands', 'fail', 'conflict', 'prePush', 'pushRef', 'gate', 'oversz', 'final', 'failRate', 'publish', 'pubRef'],
+    rows((n, s) => [n, s.landing.lands, s.landing.failures, s.landing.failByCause.conflict, s.landing.failByCause.prePush, s.landing.failByCause.pushRefused, s.landing.failByCause.gate, s.landing.failByCause.oversized, s.landing.failByCause.finalize, fp(s.landing.failureRate), s.landing.publish, s.landing.publishRefused])));
   out.push('\nQUEUE WAIT (p50 / p90, n)');
   out.push(table(['repo', 'build', 'commit', 'land'],
     rows((n, s) => [n, ...['build', 'commit', 'land'].map((k) => { const q = s.queueWaitSec[k]; return q.n ? `${fm(q.p50)}/${fm(q.p90)} n${q.n}` : '-'; })])));
