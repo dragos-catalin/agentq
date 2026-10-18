@@ -247,7 +247,7 @@ function Test-Alive($t) {
 function Read-Tickets([string]$res) {
   $dir = QPath $res
   if (-not (Test-Path $dir)) { return @() }
-  @(Get-ChildItem $dir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
+  @(Get-ChildItem $dir -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Sort-Object Name | ForEach-Object {
       try {
         $raw = $null
         for ($r = 0; $r -lt 5; $r++) {
@@ -605,7 +605,7 @@ function Assert-OverrideBudget([string]$verb) {
 function Find-MyTickets {
   $out = @()
   foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Select-Object -First 1
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
     $out += @(Get-Live $res | Where-Object { (-not $Id -and $_.session -eq $Session) -or ($Id -and $_.id -eq $Id) })
@@ -1031,7 +1031,7 @@ function Show-Status {
   $dirs = @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)
   $rows = @()
   foreach ($d in $dirs) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Select-Object -First 1
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }

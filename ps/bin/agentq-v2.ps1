@@ -165,7 +165,7 @@ function Get-RecentLeaseLosses([int]$hours = 24) {
 # ---- leases -------------------------------------------------------------------------------
 # Liveness for AGENTS (no long-lived process): owner shell pid + activity heartbeat (guard hook on
 # every tool call touching the slot, agentq calls from inside it, renew).
-# Stale = (owner dead AND idle > leaseDeadIdleMin) OR idle > leaseMaxIdleMin.
+# Stale = (owner dead AND idle > leaseDeadIdleMin, 3 min for the land slot) OR idle > leaseMaxIdleMin.
 function Read-Leases([string]$repoName) {
   $dirs = if ($repoName) { @(Join-Path $LDir $repoName) } else { @(Get-ChildItem $LDir -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
   $cfg = Get-Config
@@ -191,12 +191,14 @@ function Read-Leases([string]$repoName) {
       if ($act -and $act -gt $beat -and $act -gt $createdAt.AddMinutes(2)) { $beat = $act }
       $alive = Test-Alive ([pscustomobject]@{ pid = [int](P $l 'pid' 0); procStart = (P $l 'procStart' $null) })
       $idle = ((Now) - $beat).TotalMinutes
-      $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin)
+      # The land lease owner is the agentq land process itself (20 s heartbeat): dead owner = land over.
+      $deadIdle = if ((P $l 'role' '') -eq 'land') { 3 } else { $cfg.leaseDeadIdleMin }
+      $stale = ((-not $alive) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin)
       # W1-3: the ticket/job scan costs seconds on a big registry, so only a lease that would be
       # stale pays for it (most calls see no stale lease and never scan).
       if ($stale) {
         $xa = Get-LeaseExtraBeat $l
-        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin) }
+        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not $alive) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin) }
       }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
       $l | Add-Member -NotePropertyName beat -NotePropertyValue $beat -Force
@@ -787,7 +789,7 @@ function Test-InfraFlake([string[]]$out) {
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
-# 3 busy/remote kept moving.
+# 9 repo land-finalize refused, 3 busy/remote kept moving.
 function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -851,6 +853,22 @@ function Invoke-Land {
         $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
         & pwsh -NoProfile -File $rb -Root $wt -Wait -TimeoutMin 120 -Purpose "land gate $Branch" -Command $Gate
         if ($LASTEXITCODE) { Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $LASTEXITCODE; reason = $Gate; repo = $repo.Name }; [Console]::Error.WriteLine("land: gate failed ($LASTEXITCODE) - nothing pushed"); $script:LandExit = 6; return }
+      }
+      # Repo-owned land finalize (ADR 0003 W3, changelog fragments): assembles changes/*.md into ONE
+      # chore(release) commit on the CURRENT origin/<onto>, so two topics never claim the same version.
+      $finalizer = Join-Path $wt 'scripts\land-finalize.ps1'
+      if (Test-Path -LiteralPath $finalizer) {
+        $baseSha = "$(& git -C $wt rev-parse "origin/$Onto" 2>$null)".Trim()
+        $fo = @(& pwsh -NoProfile -File $finalizer -Worktree $wt -Onto $Onto -Base $baseSha -Branch $Branch 2>&1 | ForEach-Object { "$_" })
+        $frc = $LASTEXITCODE
+        $fo | ForEach-Object { Write-Output "  finalize: $_" }
+        if ($frc) {
+          $why2 = "$(@($fo | Select-Object -Last 3) -join ' | ')"
+          Write-Journal @{ event = 'land-finalize-failed'; resource = $res; exit = $frc; branch = $Onto; reason = $why2.Substring(0, [math]::Min(500, $why2.Length)); repo = $repo.Name }
+          [Console]::Error.WriteLine("land: scripts/land-finalize.ps1 exit $frc - nothing pushed. Fix the fragment(s) on $Branch and land again.")
+          Initialize-Slot $main $wt "origin/$Onto" '' $false
+          $script:LandExit = 9; return
+        }
       }
       $big = @(Get-OversizedChangelogs $wt "origin/$Onto")
       if ($big.Count) {

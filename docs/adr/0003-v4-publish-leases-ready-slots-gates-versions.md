@@ -1,6 +1,6 @@
 # ADR 0003: agentq v4 - publish, durable leases, ready slots, faster gates, conflict-free versions
 
-Status: accepted 2026-10-18 (owner decisions via a research + brainstorm round). Wave 1 implemented; waves 2-4 are the plan.
+Status: accepted 2026-10-18 (owner decisions via a research + brainstorm round). Wave 1 implemented; wave 2 partly (W2-1 codai, W2-4, SLO report) and wave 3 (brivio) implemented 2026-10-18; the rest is the plan.
 
 ## Context
 
@@ -35,7 +35,16 @@ Research on 2026-10-18 (scripts and raw output: `E:\gh\codai\.copilot-tmp\agq-re
 | W1-7 | (open) `hooks/guard-tooluse.ps1` contains a second copy of the command-guard section after the write-guard `Deny-Exit` (lines ~558-927 repeat ~66-450). Likely unreachable. It is the security hook, so removing it needs its own change with the guard suites plus a mutation check, not a housekeeping edit. | Found 2026-10-18 |
 | W1-6 | Housekeeping: `jobs.ps1 prune -Days 7` runs in the 30-minute prune task. README no longer says FIFO. ADR 0001 slot counts point to config. | 2,428 job files, docs contradicting v3 |
 
-### Wave 2: gate speed and reliability (planned)
+### Wave 2: gate speed and reliability (partly implemented 2026-10-18)
+
+Implemented:
+
+- **W2-1 (codai)**: `.husky/pre-push` keeps `turbo run typecheck test build --filter=...[<merge-base>]`, and a change to root config (`pnpm-lock.yaml`, `pnpm-workspace.yaml`, `turbo.json`, root `package.json`, `tsconfig*.json`, `.husky`) now forces the FULL run instead of an affected-only one (before, a lockfile-only push skipped every task). It lands through `agentq publish -Land`. brivio's pre-push already scoped by affected packages.
+- **W2-4**: `agentq run` puts the command into a Windows Job Object (`agentq-jobobject-lib.ps1`): kill-on-close (orphaned children die with their holder), a CPU weight per lane (interactive 9, land 9, quick 8, gate 7, heavy 4, batch 2), and the `done` journal event carries `cpuSec`, `peakMB`, `procs` and `cpuWeight`. `AGENTQ_NO_JOBOBJ=1` turns it off. Test: `test-jobobject.ps1`.
+- **W4-4, first half**: `agentq slo [-Days 7] [-Json]` (`agentq-slo.mjs`) computes from the journal: ready-to-landed p50/p90, land failure rate by cause (conflict, gate, push refused, oversized, finalize), flake rate, queue waits per resource, and lost-work incidents (expiry or break without a backup ref). First real 7-day report: ready-to-landed p90 8.8 min, flake 0, 2 lost-work incidents (both before the W1 backup fixes).
+- Also: a session renewal reads lease files directly and scans extra activity only for leases about to go stale (`agentq note` 13 s -> ~2 s). Named mutexes get an `AGENTQ_HOME` suffix, so test suites never contend with the live queue. The guard hook lost a 369-line dead duplicate (a mutation test proved it was unreachable).
+
+Still planned:
 
 | Id | Change | Expected effect |
 | --- | --- | --- |
@@ -46,12 +55,23 @@ Research on 2026-10-18 (scripts and raw output: `E:\gh\codai\.copilot-tmp\agq-re
 | W2-5 | Land batching: 2-4 queued topics combined (merge-tree, no working tree), one gate, bisection on failure. Optimistic acceptance when a later batch that contains a failed one passes. Batch size adapts to the measured failure rate. | More lands per gate hour |
 | W2-6 | Re-verify against the tip before queueing: `land` refuses early, in the agent's slot, when the topic does not apply cleanly on the current tip. | Conflicts found before the serial land slot |
 
-### Wave 3: version and CHANGELOG conflicts disappear (planned, needs repo changes in brivio and codai)
+### Wave 3: version and CHANGELOG conflicts disappear (implemented in brivio 2026-10-18)
+
+Implemented in brivio (`changes/README.md` is the user guide):
+
+- `pnpm changelog:new <Type> <slug>` writes `changes/<UTC ts>-<slug>-<hex>.md` (front matter `type`, optional `bump`, `refs`; body = the bullet).
+- `agentq land` runs the repo's `scripts/land-finalize.ps1 -Worktree -Onto -Base -Branch` after the picks and the gate, before the oversize check and the push. The script assembles every pending fragment on the CURRENT `origin/<onto>` into ONE `chore(release): <version>` commit (version + CHANGELOG section + fragments deleted). A hand-edited legacy CHANGELOG entry is converted into a fragment and gets its own fresh version. Exit 0 = HEAD unchanged or one commit added; any other exit = **land exit 9**, nothing pushed, journaled as `land-finalize-failed`. A repo without the script lands exactly as before (`test-land-finalize.ps1`).
+- `scripts/land-resolve.ps1` handles a CHANGELOG conflict during a pick by turning the topic's entry into a fragment instead of the byte union.
+- Pre-commit: `BRIVIO_CHANGELOG_MODE=either` (default during the transition) accepts one fragment OR the old bump + entry; `fragment` refuses hand edits; `legacy` is the old rule.
+
+codai is not converted: its pre-commit asks for a bump only for the three public SDKs (`packages/sdk`, `sdk-python`, `live-agent`), each with its own CHANGELOG, so same-version races are rare there. Revisit if the SLO report shows SDK land conflicts.
+
+Original plan:
 
 | Id | Change |
 | --- | --- |
 | W3-1 | Changelog fragments: each change adds `changes/<ts>-<slug>.<type>.md`. No commit edits CHANGELOG.md or the version. |
-| W3-2 | The version and CHANGELOG are assigned at land/release time by one step (`agentq land` calls the repo's `scripts/assemble-changelog`), so two agents can never claim the same version. |
+| W3-2 | The version and CHANGELOG are assigned at land/release time by one step (`agentq land` calls the repo's `scripts/land-finalize.ps1`), so two agents can never claim the same version. |
 | W3-3 | Pre-commit hooks in brivio and codai stop requiring a bump per commit and require a fragment instead. The union merge driver for CHANGELOG is removed. |
 
 ### Wave 4: architecture (planned, each gets its own ADR before building)

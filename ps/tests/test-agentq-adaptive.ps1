@@ -49,6 +49,12 @@ $at = (Get-Content $af -Raw | ConvertFrom-Json).at
 $null = Tick
 Check 'refresh window reuses the decision' ((Get-Content $af -Raw | ConvertFrom-Json).at -eq $at) ''
 
+# 4b. adaptive.json sits in the build:machine queue dir but is not a ticket: status/bump must not read
+# it as one (2026-10-18: every `agentq status` died "property 'resource' cannot be found" once the
+# build:machine queue drained and adaptive.json was the first *.json there).
+$o = @(& pwsh -NoProfile -File $aq status -All 2>&1 | ForEach-Object { "$_" }); $src = $LASTEXITCODE
+Check 'status with only adaptive.json in build_machine' ($src -eq 0 -and -not ($o -match 'cannot be found')) ($o | Select-Object -Last 4 | Out-String)
+
 # 5. agent registry: every run records the caller under agents/<session>.json, counting calls.
 $rf = Join-Path $env:AGENTQ_HOME 'agents\adapttest.json'
 $r = if (Test-Path $rf) { Get-Content $rf -Raw | ConvertFrom-Json } else { $null }
