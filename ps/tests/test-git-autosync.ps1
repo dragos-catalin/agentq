@@ -13,6 +13,7 @@ $env:GIT_AUTOSYNC_VISIBILITY = 'private'
 $env:GIT_AUTOSYNC_LAND = Join-Path $PSScriptRoot 'fake-land.ps1'
 $env:FAKE_LAND_CALLS = Join-Path $root 'land-calls.txt'
 $env:GIT_AUTOSYNC_LAND_DIR = Join-Path $root 'land'
+$env:GIT_AUTOSYNC_OWNER_CHECK = 'off'
 # replay is async: pass 1 starts the land, wait for its rc file, pass 2 collects + moves
 function RunLand($r) { $c = Run $r; $d = (Get-Date).AddSeconds(90); while ((Get-Date) -lt $d -and @(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.rc -ErrorAction SilentlyContinue).Count -lt (@(Get-ChildItem $env:GIT_AUTOSYNC_LAND_DIR -Filter *.ps1 -ErrorAction SilentlyContinue).Count)) { Start-Sleep 1 }; Run $r }
 $env:GIT_AUTOSYNC_MUTEX = 'Local\gas-test-' + [guid]::NewGuid().ToString('N')
@@ -191,6 +192,23 @@ $r = Fresh; Push-B $r 'x.txt' "other`n"
 W "$($r.a)\t.md" "row: mine`n"; W "$($r.a)\x.txt" "mine-x`n"; git -C $r.a add -A; git -C $r.a commit -qm 'feat: L-37 thing'; $h = git -C $r.a rev-parse HEAD
 git -C $r.b pull -q 2>$null; W "$($r.b)\t.md" "row: theirs`n"; git -C $r.b add -A; git -C $r.b commit -qm 'feat: L-37 thing'; git -C $r.b push -q origin main 2>$null
 Ok ((Run $r) -eq 3) '10b refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '10b HEAD unchanged'
+
+# 11 conflicting draft idle 2 h (> 1 h default) but a live session owns it -> held, not parked
+$own = Join-Path $root 'owner-active.ps1'; [IO.File]::WriteAllText($own, 'exit 3')
+$r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; (Get-Item "$($r.a)\x.txt").LastWriteTime = (Get-Date).AddHours(-2); $h = git -C $r.a rev-parse HEAD
+$env:GIT_AUTOSYNC_OWNER_CHECK = $own
+Ok ((Run $r) -eq 3) '11 held (active owner)'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '11 HEAD unchanged'; Ok ((Get-Content "$($r.a)\x.txt" -Raw) -eq "ours`n") '11 edit intact'
+Ok ((Get-Content $env:GIT_AUTOSYNC_LOG -Raw) -match 'live agent session touched it') '11 reason logged'
+# 11b owner check crashes / missing -> treated as active
+$env:GIT_AUTOSYNC_OWNER_CHECK = Join-Path $root 'missing-check.ps1'
+Ok ((Run $r) -eq 3) '11b missing check = held'
+# 11c nobody active (exit 0) -> parked after 1 h idle, moved
+$nob = Join-Path $root 'owner-none.ps1'; [IO.File]::WriteAllText($nob, 'exit 0'); $env:GIT_AUTOSYNC_OWNER_CHECK = $nob
+Ok ((Run $r) -eq 0) '11c parked + moved'; Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '11c at origin'
+# 11d edited 20 min ago -> held by the idle gate even with nobody active
+$r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; (Get-Item "$($r.a)\x.txt").LastWriteTime = (Get-Date).AddMinutes(-20)
+Ok ((Run $r) -eq 3) '11d held (<1 h idle)'
+$env:GIT_AUTOSYNC_OWNER_CHECK = 'off'
 
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

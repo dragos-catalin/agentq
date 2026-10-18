@@ -32,9 +32,10 @@ What one pass does, per repo (only when it is provably safe):
       exactly like `git rebase --autostash`;
     - real conflict / binary / delete-vs-modify / untracked unique -> copied to
       ~/.codai/parked/<repo>/<ts>/ (+ MANIFEST.tsv), blob written to the object store, upstream taken,
-      journaled with `agentq note`. Only when the file is idle >= -ParkIdleHours (default 6) or -ParkNow.
+      journaled with `agentq note`. Only when the file is idle >= -ParkIdleHours (default 1, owner 2026-10-18) AND no live agent session touched it
+      in the last 30 min (who-owns-file.ps1; a failing check counts as active), or -ParkNow.
 
-  git-autosync.ps1 [-Repo E:\gh\codai[,E:\gh\brivio]] [-WhatIf] [-ParkNow] [-ParkIdleHours 6]
+  git-autosync.ps1 [-Repo E:\gh\codai[,E:\gh\brivio]] [-WhatIf] [-ParkNow] [-ParkIdleHours 1]
                    [-Loop -IntervalSec 120] [-Install] [-Status] [-Report]
 
   BACKUP TARGET (2026-10-17 audit): 15 of 25 repos are PUBLIC, so a backup branch on origin publishes
@@ -57,7 +58,7 @@ param(
   # Repos whose agents commit locally and never push by policy (vitals ADR-0019): unpushed commits are expected.
   [string[]]$LocalCommitRepos = @('vitals'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
-  [switch]$ParkNow, [double]$ParkIdleHours = 6, [switch]$Report,
+  [switch]$ParkNow, [double]$ParkIdleHours = 1, [switch]$Report,
   [string]$BackupUrl = 'https://github.com/dragos-catalin/shared-clone-backups.git',
   [int]$ReplayBackoffMin = 60, [int]$FetchThrottle = 8
 )
@@ -210,6 +211,18 @@ function Start-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [strin
   [IO.File]::WriteAllText($wrap, $body, [Text.UTF8Encoding]::new($false))
   $p = Start-Process pwsh -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrap -WindowStyle Hidden -PassThru
   @{ pid = $p.Id; started = [DateTime]::UtcNow.ToString('o'); rc = $rcf; log = $logf; topic = $topic; head = ''; target = '' }
+}
+
+# A file a live agent session touched in the last 30 min is never parked, however old its mtime (a hot
+# tracker kept codai 33 commits behind for hours, 2026-10-17). who-owns-file.ps1 exit 3 = ACTIVE-OWNER,
+# 0 = nobody; anything else (missing, crash) counts as active. GIT_AUTOSYNC_OWNER_CHECK=off for tests.
+function Test-ActiveOwner([string]$r, [string]$p) {
+  $chk = if ($env:GIT_AUTOSYNC_OWNER_CHECK) { $env:GIT_AUTOSYNC_OWNER_CHECK } else { Join-Path $HOME '.copilot\hooks\who-owns-file.ps1' }
+  if ($chk -eq 'off') { return $false }
+  if (-not (Test-Path $chk)) { return $true }
+  Push-Location $r
+  try { & pwsh -NoProfile -File $chk -Path $p *> $null; $rc = $LASTEXITCODE } finally { Pop-Location }
+  return ($rc -ne 0)
 }
 
 function Sync-Repo([string]$r) {
@@ -425,6 +438,7 @@ function Sync-Repo([string]$r) {
     if ($res.kind -eq 'park' -and -not $ParkNow) {
       $full = Join-Path $r $p
       if ((Test-Path -LiteralPath $full) -and ((Get-Date) - (Get-Item -LiteralPath $full).LastWriteTime).TotalHours -lt $ParkIdleHours) { $hold += "$c [$($res.why), edited <$($ParkIdleHours)h ago]"; continue }
+      if (Test-ActiveOwner $r $p) { $hold += "$c [$($res.why), a live agent session touched it <30 min ago]"; continue }
     }
     $resolved += [pscustomobject]@{ p = $p; untracked = $isU; kind = $res.kind; why = $res.why; bytes = $res.bytes }
   }
