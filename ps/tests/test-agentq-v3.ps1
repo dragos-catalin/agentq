@@ -142,10 +142,11 @@ Check 'propose-applied journaled' (@(Journal | Where-Object event -eq 'propose-a
 $h = Start-Run $repo2 'sleepy' 'gate' 'Start-Sleep -Seconds 100'
 $yielded = Wait-For { @(Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'sleepy' -and $_.PSObject.Properties['yielded'] -and $_.yielded }).Count -ge 1 } 95
 Check 'idle watchdog marks sleeping holder yielded' ([bool]$yielded) ''
-$t0 = Get-Date
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'beside-idle' -Lane gate -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
-$secs = ((Get-Date) - $t0).TotalSeconds
-Check 'gate runs beside an idle-yielded holder' ($LASTEXITCODE -eq 0 -and $secs -lt 20) "exit $LASTEXITCODE ${secs}s"
+# waitSec, not wall clock (see test 3): the holder sleeps ~100 s, so a run that had to wait for it
+# shows waitSec far above 10.
+$rc = $LASTEXITCODE; $ws = WaitSecOf 'beside-idle'; $holderAlive = -not $h.HasExited
+Check 'gate runs beside an idle-yielded holder' ($rc -eq 0 -and $ws -ge 0 -and $ws -lt 10 -and $holderAlive) "exit $rc waitSec=$ws holderAlive=$holderAlive"
 Check 'idle-yield journaled' (@(Journal | Where-Object event -eq 'idle-yield').Count -ge 1)
 Stop-Process -Id $h.Id -Force -ErrorAction SilentlyContinue
 
