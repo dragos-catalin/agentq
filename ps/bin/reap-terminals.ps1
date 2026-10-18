@@ -14,10 +14,19 @@ A shell is reaped only when ALL hold:
 Newest -KeepNewest idle terminals per VS Code window are kept (default 4), so a person's own open
 terminals survive. -WhatIf lists without killing. Every kill is journaled (event reap-terminal).
 
-  reap-terminals.ps1 [-WhatIf] [-MinAgeHours 3] [-KeepNewest 4] [-Json]
+PRESSURE MODE (2026-10-18). One VS Code ptyHost process owns every integrated terminal of a window,
+and it costs ~14 MB per terminal. At ~190 terminals it reached 2.6 GB and crashed (exit 0x80000003,
+2.6 GB crashpad dumps at each crash, 2026-10-16 20:42 / 10-17 07:25 / 10-18 05:03): every terminal
+died at once, agents' running commands hung, and VS Code relaunched 167 shells in the same minute,
+so the count was back at the crash line immediately. Agents open terminals far faster than the
+3 h age limit retires them. When a ptyHost carries more than -SoftCap terminals, idle ones are
+reaped from -PressureMinAgeMin instead (same idle tests), down to -SoftCap.
+
+  reap-terminals.ps1 [-WhatIf] [-MinAgeHours 3] [-KeepNewest 4] [-SoftCap 80] [-PressureMinAgeMin 20] [-Json]
 EXIT 0 ok, 2 usage.
 #>
-param([switch]$WhatIf, [double]$MinAgeHours = 3, [int]$KeepNewest = 4, [double]$MaxCpuSec = 1, [int]$SampleSec = 20, [switch]$Json)
+param([switch]$WhatIf, [double]$MinAgeHours = 3, [int]$KeepNewest = 4, [double]$MaxCpuSec = 1, [int]$SampleSec = 20,
+  [int]$SoftCap = 80, [double]$PressureMinAgeMin = 20, [switch]$Json)
 $ErrorActionPreference = 'Stop'
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
 $Journal = Join-Path $Root 'journal.jsonl'
@@ -32,12 +41,21 @@ foreach ($f in @(Get-ChildItem (Join-Path $Root 'queues') -Recurse -Filter '*.js
   try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json; if ($j.pid) { $agentqPids[[int]$j.pid] = $true } } catch {}
 }
 $now = Get-Date
+# terminals per ptyHost: the parent of an integrated-terminal shell IS the ptyHost process
+$perHost = @{}
+foreach ($p in $all) {
+  if ($p.Name -in 'pwsh.exe', 'powershell.exe' -and "$($p.CommandLine)" -match 'shellIntegration\.ps1') {
+    $pp = [int]$p.ParentProcessId; if (-not $perHost.ContainsKey($pp)) { $perHost[$pp] = 0 }; $perHost[$pp]++
+  }
+}
+$pressured = @($perHost.Keys | Where-Object { $perHost[$_] -gt $SoftCap })
 $cand = @(foreach ($p in $all) {
   if ($p.Name -notin 'pwsh.exe', 'powershell.exe') { continue }
   if ("$($p.CommandLine)" -notmatch 'shellIntegration\.ps1') { continue }
   $par = $byId[[int]$p.ParentProcessId]
   if (-not $par -or $par.Name -notmatch '^Code( - Insiders)?\.exe$|^VSCodium') { continue }
-  if (($now - $p.CreationDate).TotalHours -lt $MinAgeHours) { continue }
+  $minH = if ([int]$p.ParentProcessId -in $pressured) { $PressureMinAgeMin / 60 } else { $MinAgeHours }
+  if (($now - $p.CreationDate).TotalHours -lt $minH) { continue }
   if ($kids.ContainsKey([int]$p.ProcessId)) { continue }
   if ($agentqPids.ContainsKey([int]$p.ProcessId)) { continue }
   $p
@@ -55,10 +73,18 @@ $idle = @(foreach ($p in $cand) {
   if ([math]::Abs(($gp.StartTime - $p.CreationDate).TotalSeconds) -gt 2) { $skip.recycled++; continue }
   if (($gp.TotalProcessorTime.TotalSeconds - $t0[$id]) -ge $MaxCpuSec) { $skip.busy++; continue }
   if ($kids2.ContainsKey($id)) { $skip.child++; continue }
-  [pscustomobject]@{ pid = $id; parent = [int]$p.ParentProcessId; created = $p.CreationDate; ageH = [math]::Round(($now - $p.CreationDate).TotalHours, 1); privMB = [math]::Round($p.PrivatePageCount / 1MB) }
+  [pscustomobject]@{ pid = $id; parent = [int]$p.ParentProcessId; created = $p.CreationDate; ageH = [math]::Round(($now - $p.CreationDate).TotalHours, 2); privMB = [math]::Round($p.PrivatePageCount / 1MB) }
 })
-# keep the newest N idle terminals per parent window
-$reap = @($idle | Group-Object parent | ForEach-Object { $_.Group | Sort-Object created -Descending | Select-Object -Skip $KeepNewest })
+# keep the newest N idle terminals per parent window. Under pressure, young (< MinAgeHours) idle
+# terminals are taken only until the host is back at SoftCap, oldest first.
+$reap = @($idle | Group-Object parent | ForEach-Object {
+    $sorted = @($_.Group | Sort-Object created -Descending | Select-Object -Skip $KeepNewest)
+    $old = @($sorted | Where-Object { $_.ageH -ge $MinAgeHours })
+    $young = @($sorted | Where-Object { $_.ageH -lt $MinAgeHours } | Sort-Object created)
+    $excess = [math]::Max(0, [int]$perHost[[int]$_.Name] - $old.Count - $SoftCap)
+    $old
+    $young | Select-Object -First $excess
+  })
 $killed = 0; $freedMB = 0
 foreach ($r in $reap) {
   if ($WhatIf) { continue }
@@ -73,7 +99,8 @@ $terms = @($all | Where-Object { $_.Name -in 'pwsh.exe', 'powershell.exe' -and "
 # registry hygiene: agents/<session>.json entries untouched for a week are pruned
 $regDir = Join-Path $Root 'agents'
 if (Test-Path $regDir) { Get-ChildItem -LiteralPath $regDir -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue }
-$sum = [ordered]@{ terminals = $terms.Count; terminalsMB = [int](($terms | Measure-Object PrivatePageCount -Sum).Sum / 1MB); candidates = $cand.Count; idle = $idle.Count
+$sum = [ordered]@{ terminals = $terms.Count; terminalsMB = [int](($terms | Measure-Object PrivatePageCount -Sum).Sum / 1MB)
+  pressured = ($pressured | ForEach-Object { "$_=$($perHost[$_])" }) -join ' '; candidates = $cand.Count; idle = $idle.Count
   skipped = ($skip.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '; reapable = $reap.Count; reapableMB = [int](($reap | Measure-Object privMB -Sum).Sum); killed = $killed; freedMB = $freedMB; whatIf = [bool]$WhatIf }
 if ($Json) { $sum | ConvertTo-Json -Compress } else { $sum.GetEnumerator() | ForEach-Object { '{0,-11} {1}' -f $_.Key, $_.Value } }
 exit 0
