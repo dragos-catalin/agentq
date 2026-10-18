@@ -5,3 +5,5 @@ $log = Join-Path $env:USERPROFILE '.codai\worktree-prune.log'
 & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'agentq.ps1') sweep *>> $log
 & (Join-Path $PSScriptRoot 'worktree.ps1') prune -All *>> $log
 & (Join-Path $PSScriptRoot 'worktree.ps1') migrate -All -OlderThanHours 24 *>> $log
+# ADR 0003 W1-6: the job registry grew to 2382 files in 7 days (nothing pruned it).
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'jobs.ps1') prune -Days 7 *>> $log

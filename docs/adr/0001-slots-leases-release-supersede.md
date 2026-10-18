@@ -104,7 +104,7 @@ Parallel agents work in parallel task slots; only landing is serial.
 ### 5. Machine-wide safety
 
 - `build:machine` capacity 2 + free RAM >= 6 GB **and free commit charge >= 12 GB** (2026-09-30: OOM with 50 GB RAM free).
-- Task slot cap 10 machine-wide, 3 per repo.
+- Task slot cap 10 machine-wide, 3 per repo (initial values; now config `taskSlotsPerRepo` / `taskSlotsMachine`, 10 / 16 since 2026-10-18).
 - No global git config writes by any tool. All resources are per repo except `build:machine`.
 - Side locks are folded into agentq: brivio `deploy-mjs.lock` is skipped when `AGENTQ_HELD` contains `deploy:brivio`, and `deploy.mjs` builds services from `DEPLOY_WORKTREE` instead of creating its own worktree.
 

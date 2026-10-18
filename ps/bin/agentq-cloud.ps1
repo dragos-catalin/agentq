@@ -241,10 +241,12 @@ try {
   $ev = if ([int]$result.exit -eq 0) { 'cloud-done' } else { 'cloud-fail' }
   $j = @{ event = $ev; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; command = $cmd
     exit = [int]$result.exit; waitSec = $waitSec; submitSec = $submitSec; holdSec = [double]$result.durSec; durSec = [math]::Round(($end - $t0).TotalSeconds, 1)
-    phases = $result.phases; host = $result.host; resumeFrom = $resumeFrom }
+    phases = $(if ($result.PSObject.Properties['phases']) { $result.phases } else { @{} }); host = $(if ($result.PSObject.Properties['host']) { $result.host } else { '' }); resumeFrom = $resumeFrom }
   if ($null -ne $resumeSec) { $j.resumeSec = $resumeSec }
   Write-Journal $j
-  Out-Line ("[agentq-cloud] {0} exit={1} total {2:N1}s (upload {3:N1}s, queue->claim {4:N1}s{5}, remote {6:N1}s: sync {7} install {8} run {9})" -f $id, $result.exit, ($end - $t0).TotalSeconds, $submitSec, $waitSec, $(if ($null -ne $resumeSec) { ", resume ${resumeSec}s" } else { '' }), $result.durSec, $result.phases.sync, $result.phases.install, $result.phases.run)
+  $ph = $result.PSObject.Properties['phases']; $ph = if ($ph) { $ph.Value } else { $null }
+  $P = { param($n) if ($ph -and $ph.PSObject.Properties[$n]) { $ph.$n } else { '-' } }
+  Out-Line ("[agentq-cloud] {0} exit={1} total {2:N1}s (upload {3:N1}s, queue->claim {4:N1}s{5}, remote {6:N1}s: sync {7} install {8} run {9})" -f $id, $result.exit, ($end - $t0).TotalSeconds, $submitSec, $waitSec, $(if ($null -ne $resumeSec) { ", resume ${resumeSec}s" } else { '' }), $result.durSec, (& $P 'sync'), (& $P 'install'), (& $P 'run'))
   exit ([int]$result.exit)
 } catch {
   $ErrorActionPreference = $prevEap
@@ -254,7 +256,8 @@ try {
   if (-not $submitted) {
     try {
       New-Item -ItemType Directory -Force $DownDir | Out-Null
-      $d = [ordered]@{ ws = $Ws; since = [DateTime]::UtcNow.ToString('o'); until = [DateTime]::UtcNow.AddMinutes($DownMin).ToString('o'); reason = $reason }
+      $dm = if ($reason -match '-> 404|was not found') { [math]::Max($DownMin, 120) } else { $DownMin }
+      $d = [ordered]@{ ws = $Ws; since = [DateTime]::UtcNow.ToString('o'); until = [DateTime]::UtcNow.AddMinutes($dm).ToString('o'); reason = $reason }
       [IO.File]::WriteAllText("$DownFile.tmp", ($d | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force "$DownFile.tmp" $DownFile
     } catch {}
     exit 4

@@ -11,7 +11,7 @@ agentq is the coordinator I have run on my own machine since September 2026 acro
 ## Approach
 
 - **Resources** are plain strings: `build:<repo>`, `build:machine` (capacity 2), `install:<repo>`, `commit:<repo>`, `deploy:<repo>:<target>`.
-- **FIFO tickets** with a capacity per resource. No priorities, no overtaking.
+- **Tickets** with a capacity per resource, scheduled by lane + priority + aging (PowerShell v3, [ADR 0002](docs/adr/0002-v3-scheduler-lanes-overrides-watchdog.md)); the TypeScript ACP-Lock daemon below is still FIFO.
 - **Leases**: a ticket expires unless it heartbeats. A holder whose process died is released at once. Waiting extends the lease, so a long queue never looks stale.
 - **Freeze marks**: `agentq mark -r deploy:web:prod --state frozen --reason "incident: 500s since 08:12Z"`. New tickets are refused with the reason; current holders finish.
 - **Journal**: every acquire, release, expiry, break, mark and note is appended to a hash-chained JSONL file. `agentq log` shows what others did; `agentq verify-journal` proves nothing was edited.

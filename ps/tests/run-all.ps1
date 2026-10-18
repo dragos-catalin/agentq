@@ -23,6 +23,10 @@ $suites = [ordered]@{
   'git-autosync'   = @('-File', (Join-Path $PSScriptRoot 'test-git-autosync.ps1'), '-Tool', (Join-Path $bin 'git-autosync.ps1'))
   'guard shared'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-shared.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
+  # ADR 0003 wave 1
+  'publish'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-publish.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'args'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
 }
 $bad = @()
 foreach ($k in $suites.Keys) {

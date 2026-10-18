@@ -12,6 +12,7 @@ foreach ($d in $LDir, $RDir) { if (-not (Test-Path $d)) { New-Item -ItemType Dir
 # ---- policy -------------------------------------------------------------------------------
 # AGENTQ_CONFIG overrides the file (tests); missing keys fall back to these defaults.
 $script:Cfg = $null
+$script:LeaseActivity = $null
 function Get-Config {
   if ($script:Cfg) { return $script:Cfg }
   $c = @{
@@ -70,6 +71,94 @@ function Get-LeaseFile([string]$repoName, [string]$slot) { Join-Path (Join-Path 
 function Get-DefaultOwner { if ($OwnerPid -gt 0) { return $OwnerPid }; if ($env:AGENTQ_OWNER_PID) { return [int]$env:AGENTQ_OWNER_PID }; try { (Get-Process -Id $PID).Parent.Id } catch { $PID } }
 function Short([string]$s, [int]$n = 10) { if (-not $s) { return '' }; $s.Substring(0, [math]::Min($n, $s.Length)) }
 
+# ---- lease activity beyond the slot (ADR 0003 W1-3) ---------------------------------------------
+# 24 leases of live work expired in 15 days (ADR 0002) and ~9 more after DC-021: the owner shell died
+# or the work ran OUTSIDE the slot (job-start gates, run-build, land, agentq calls from the main clone).
+# A lease is now also active while (a) a live agentq ticket runs with its repo inside the slot,
+# (b) a running job-start job has its cwd or command inside the slot, or (c) an agentq call names the
+# lease (-LeaseId) or comes from the lease's session. Computed once per process (Read-Leases runs
+# on every status/sync call).
+function Get-ExtraLeaseActivity {
+  if ($null -ne $script:LeaseActivity) { return $script:LeaseActivity }
+  $acts = @()
+  try {
+    foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
+      foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+          $t = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -DateKind String
+          if (-not $t.repo -or -not (Test-Alive $t)) { continue }
+          $hb = "$($f.FullName).hb"; $at = if (Test-Path -LiteralPath $hb) { (Get-Item -LiteralPath $hb).LastWriteTimeUtc } else { $f.LastWriteTimeUtc }
+          $acts += [pscustomobject]@{ path = (Norm-Dir "$($t.repo)"); text = ''; at = $at }
+        } catch {}
+      }
+    }
+    $jd = Join-Path $Root 'jobs'
+    if (Test-Path -LiteralPath $jd) {
+      $since = (Now).AddDays(-2).ToString('yyyyMMdd')
+      foreach ($f in @(Get-ChildItem -LiteralPath $jd -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -ge $since })) {
+        try {
+          $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -DateKind String
+          if ((P $j 'state' '') -ne 'running' -or -not (P $j 'pid' 0)) { continue }
+          if (-not (Get-Process -Id ([int]$j.pid) -ErrorAction SilentlyContinue)) { continue }
+          $log = P $j 'log' ''; $at = if ($log -and (Test-Path -LiteralPath $log)) { (Get-Item -LiteralPath $log).LastWriteTimeUtc } else { $f.LastWriteTimeUtc }
+          $acts += [pscustomobject]@{ path = $(if (P $j 'cwd' '') { Norm-Dir "$($j.cwd)" } else { '' }); text = "$(P $j 'command' '')".ToLowerInvariant(); at = $at }
+        } catch {}
+      }
+    }
+  } catch {}
+  $script:LeaseActivity = $acts
+  $acts
+}
+function Get-LeaseExtraBeat($l) {
+  $lp = "$(P $l 'path' '')"; if (-not $lp) { return $null }
+  $ln = Norm-Dir $lp; $lt = $lp.ToLowerInvariant()
+  $best = $null
+  foreach ($a in @(Get-ExtraLeaseActivity)) {
+    $hit = ($a.path -and $a.path.StartsWith($ln)) -or ($a.text -and $a.text.Contains($lt))
+    if ($hit -and (-not $best -or $a.at -gt $best)) { $best = $a.at }
+  }
+  $best
+}
+# Any agentq call from the lease's own session, or naming it with -LeaseId, renews it.
+function Renew-ForSession {
+  try {
+    foreach ($l in @(Read-Leases $null)) {
+      if (($LeaseId -and (P $l 'leaseId') -eq $LeaseId) -or ((P $l 'session') -eq $Session)) { Touch-Lease $l }
+    }
+  } catch {}
+}
+
+# ---- lease-loss notices (ADR 0003 W1-3) -------------------------------------------------------
+# An expired or broken lease used to be discovered only by finding foreign files in "my" slot. The
+# holder's session now gets a notice that agentq prints (stderr) on its next call, and `status`
+# lists losses of the last 24 h with the backup ref to restore from.
+function Add-LeaseNotice($l, [string]$event, [string]$why, [string]$ref) {
+  try {
+    $nd = Join-Path $Root 'notices'; if (-not (Test-Path -LiteralPath $nd)) { New-Item -ItemType Directory -Force $nd | Out-Null }
+    $n = [ordered]@{ ts = (Iso (Now)); event = $event; repo = $l.repo; slot = $l.slot; leaseId = (P $l 'leaseId'); purpose = (P $l 'purpose'); branch = (P $l 'branch'); reason = $why; ref = $ref; by = $Session }
+    [IO.File]::AppendAllText((Join-Path $nd ((Safe "$(P $l 'session')") + '.jsonl')), (($n | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
+  } catch {}
+}
+function Show-LeaseNotices {
+  try {
+    $f = Join-Path (Join-Path $Root 'notices') ((Safe $Session) + '.jsonl')
+    if (-not (Test-Path -LiteralPath $f)) { return }
+    $lines = @(Get-Content -LiteralPath $f | Where-Object { $_ })
+    Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+    foreach ($ln in $lines) {
+      $n = $ln | ConvertFrom-Json
+      $restore = if ($n.ref) { " Unsaved state is in $($n.ref): git diff --binary <base> $($n.ref) --output=x.patch, then git apply --3way x.patch in a NEW lease." } else { ' Nothing unsaved was in it.' }
+      [Console]::Error.WriteLine("agentq: NOTICE your lease $($n.leaseId) on $($n.repo)/$($n.slot) ('$($n.purpose)') ended at $($n.ts): $($n.event) - $($n.reason).$restore Do not write to that slot again.")
+    }
+  } catch {}
+}
+function Get-RecentLeaseLosses([int]$hours = 24) {
+  try {
+    $cut = (Now).AddHours(-$hours)
+    @(Get-Content -LiteralPath $Journal -Tail 4000 -ErrorAction Stop | Where-Object { $_ -match '"event":"(lease-expire|lease-break)"' } | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ -and (ParseUtc $_.ts) -gt $cut })
+  } catch { @() }
+}
+
 # ---- leases -------------------------------------------------------------------------------
 # Liveness for AGENTS (no long-lived process): owner shell pid + activity heartbeat (guard hook on
 # every tool call touching the slot, agentq calls from inside it, renew).
@@ -97,6 +186,8 @@ function Read-Leases([string]$repoName) {
       # Ignore the index writes of the lease's own checkout (first 2 min after creation).
       $createdAt = ParseUtc (P $l 'created' (Iso (Now)))
       if ($act -and $act -gt $beat -and $act -gt $createdAt.AddMinutes(2)) { $beat = $act }
+      $xa = Get-LeaseExtraBeat $l
+      if ($xa -and $xa -gt $beat) { $beat = $xa }
       $alive = Test-Alive ([pscustomobject]@{ pid = [int](P $l 'pid' 0); procStart = (P $l 'procStart' $null) })
       $idle = ((Now) - $beat).TotalMinutes
       $stale = ((-not $alive) -and $idle -gt $cfg.leaseDeadIdleMin) -or ($idle -gt $cfg.leaseMaxIdleMin)
@@ -232,6 +323,73 @@ function Backup-Slot([string]$path, [string]$repoName, [string]$slot, [string]$w
   if ($pushError) { "$ref (bundle $bundle)" } else { $ref }
 }
 
+# ---- slot readiness (ADR 0003 W1-4) ---------------------------------------------------------------
+# A stale <gitdir>/index.lock left by a killed checkout made `lease` fail with "checkout origin/main
+# failed" 54 times and blocked prod releases for 3 h (2026-10-15). Remove it only when no git process
+# is using that worktree.
+function Clear-StaleIndexLock([string]$path) {
+  try {
+    $gf = Join-Path $path '.git'
+    if (-not (Test-Path -LiteralPath $gf -PathType Leaf)) { return }
+    $gd = ((Get-Content -LiteralPath $gf -Raw) -replace '^gitdir:\s*', '').Trim()
+    if (-not [IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $path $gd }
+    $lock = Join-Path $gd 'index.lock'
+    if (-not (Test-Path -LiteralPath $lock)) { return }
+    $needle = $path.TrimEnd('\').ToLowerInvariant()
+    $busy = @(Get-CimInstance Win32_Process -Filter "Name='git.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)".ToLowerInvariant().Contains($needle) })
+    if ($busy.Count) { return }
+    if (((Now) - (Get-Item -LiteralPath $lock).LastWriteTimeUtc).TotalSeconds -lt 30) { return }
+    Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+    Write-Journal @{ event = 'slot-unlock'; resource = "slot:$path"; reason = 'stale index.lock removed (no git process on the worktree)' }
+  } catch {}
+}
+# Fresh slots failed their first commit/gate ~19 times: missing node_modules after a lockfile change,
+# no .husky/_ (hooks silently skipped), unbuilt workspace dists. Prepare-Slot makes the slot usable:
+#  - repo script scripts/slot-prep.ps1 -Worktree <path> -Main <main> if present (repo knows best);
+#  - else for pnpm repos: frozen install under install:<repo> when the lockfile differs from the last
+#    prep, and .husky/_ copied from the main clone when the worktree lacks it.
+# Never fails the lease: problems are printed + journaled (slot-prep-failed) and the slot is marked
+# not ready in <coord>/prep/<repo>--<slot>.json, so the agent knows before its first commit.
+function Prepare-Slot([string]$main, [string]$path, [string]$repoName) {
+  if ($env:AGENTQ_NO_PREP -eq '1') { return }
+  # State lives in the coord dir, not in the slot: an untracked file there made every clean slot look
+  # dirty (unlease backed it up, worktree v2 test 2026-10-18).
+  $pd = Join-Path $Root 'prep'; if (-not (Test-Path -LiteralPath $pd)) { New-Item -ItemType Directory -Force $pd | Out-Null }
+  $stateF = Join-Path $pd ((Safe "$repoName--$(Split-Path $path -Leaf)") + '.json')
+  $st = [ordered]@{ at = (Iso (Now)); lock = ''; steps = @(); ready = $true }
+  try {
+    $custom = Join-Path $path 'scripts\slot-prep.ps1'
+    if (Test-Path -LiteralPath $custom) {
+      $out = @(& pwsh -NoProfile -File $custom -Worktree $path -Main $main 2>&1 | ForEach-Object { "$_" })
+      $st.steps += "slot-prep.ps1 rc=$LASTEXITCODE"
+      if ($LASTEXITCODE) { $st.ready = $false; $out | Select-Object -Last 15 | ForEach-Object { [Console]::Error.WriteLine("  slot-prep: $_") } }
+    } elseif (Test-Path -LiteralPath (Join-Path $path 'pnpm-lock.yaml')) {
+      $lockHash = (Get-FileHash -LiteralPath (Join-Path $path 'pnpm-lock.yaml') -Algorithm SHA1).Hash
+      $prev = $null; if (Test-Path -LiteralPath $stateF) { try { $prev = Get-Content -LiteralPath $stateF -Raw | ConvertFrom-Json } catch {} }
+      $st.lock = $lockHash
+      $nm = Test-Path -LiteralPath (Join-Path $path 'node_modules\.modules.yaml')
+      if (-not $nm -or -not $prev -or (P $prev 'lock' '') -ne $lockHash -or -not (P $prev 'ready' $false)) {
+        $aq = Join-Path $PSScriptRoot 'agentq.ps1'
+        $out = @(& pwsh -NoProfile -File $aq run -Resource install -Purpose "slot prep $repoName/$(Split-Path $path -Leaf)" -Repo $path -- pnpm install --frozen-lockfile --prefer-offline 2>&1 | ForEach-Object { "$_" })
+        $st.steps += "pnpm install rc=$LASTEXITCODE"
+        if ($LASTEXITCODE) { $st.ready = $false; $out | Select-Object -Last 12 | ForEach-Object { [Console]::Error.WriteLine("  slot-prep: $_") } }
+      } else { $st.steps += 'pnpm install skipped (lockfile unchanged)' }
+    }
+    $hp = "$(& git -C $path config --get core.hooksPath 2>$null)".Trim()
+    if ($hp -eq '.husky/_' -and -not (Test-Path -LiteralPath (Join-Path $path '.husky\_\pre-commit'))) {
+      $srcH = Join-Path $main '.husky\_'
+      if (Test-Path -LiteralPath $srcH) { Copy-Item -LiteralPath $srcH -Destination (Join-Path $path '.husky') -Recurse -Force; $st.steps += 'copied .husky/_ from main clone' }
+      else { $st.ready = $false; $st.steps += '.husky/_ missing (run pnpm exec husky)' }
+    }
+  } catch { $st.ready = $false; $st.steps += "error: $($_.Exception.Message)" }
+  try { [IO.File]::WriteAllText($stateF, ($st | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)) } catch {}
+  if (-not $st.ready) {
+    Write-Journal @{ event = 'slot-prep-failed'; resource = "slot:${repoName}:$(Split-Path $path -Leaf)"; reason = ($st.steps -join '; '); repo = $repoName }
+    [Console]::Error.WriteLine("agentq: WARNING slot $path is not ready: $($st.steps -join '; ')")
+  }
+  $st
+}
+
 # Bring a slot to a fresh state at $ref (+ optional branch). The caller holds the lease and has
 # already backed up anything unique, so discarding inside THIS slot is safe by construction.
 function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$branch, [bool]$copyEnv) {
@@ -248,10 +406,12 @@ function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$br
     & git -C $main worktree add -q --detach $path $ref 2>&1 | Out-Null
     if ($LASTEXITCODE) { throw "slot ${path}: git worktree add failed" }
   } else {
+    Clear-StaleIndexLock $path
     foreach ($op in 'merge', 'cherry-pick', 'rebase') { & git -C $path $op --abort 2>$null | Out-Null }
     & git -C $path reset -q --hard 2>$null
     & git -C $path checkout -q --detach $ref 2>$null
-    if ($LASTEXITCODE) { throw "slot ${path}: checkout $ref failed" }
+    if ($LASTEXITCODE) { Clear-StaleIndexLock $path; & git -C $path reset -q --hard 2>$null; & git -C $path checkout -q -f --detach $ref 2>$null }
+    if ($LASTEXITCODE) { $why = @(& git -C $path checkout -q --detach $ref 2>&1 | ForEach-Object { "$_" }) -join ' | '; throw "slot ${path}: checkout $ref failed ($why)" }
     & git -C $path reset -q --hard $ref
     & git -C $path clean -fdq 2>$null   # not -x: keeps node_modules and build caches (the point of reuse)
   }
@@ -274,6 +434,7 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   $p = "$(P $l 'path')"
   if ($event -notin 'lease-failed', 'lease-expire-failed' -and $p -and (Test-Path -LiteralPath (Join-Path $p '.git'))) { & git -C $p checkout -q --detach 2>$null | Out-Null }
   Remove-Item -LiteralPath $l.file, "$($l.file).hb" -Force -ErrorAction SilentlyContinue
+  if ($event -in 'lease-expire', 'lease-break' -and (P $l 'session') -ne $Session) { Add-LeaseNotice $l $event $why $backupRef }
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo }
 }
 # Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed).
@@ -350,6 +511,7 @@ function Invoke-Lease {
     # tree) is backed up before the reset. A failed backup aborts the lease: nothing is discarded.
     if (Test-Path -LiteralPath $l.path) { [void](Backup-Slot $l.path $repo.Name $l.slot "pre-reset for new lease $($l.leaseId)" -CommitsOnly:($l.role -eq 'release')) }
     Initialize-Slot $main $l.path $refToUse $Branch (-not $env:AGENTQ_NO_ENV_COPY)
+    if ($l.role -in 'task', 'pinned') { [void](Prepare-Slot $main $l.path $repo.Name) }
   } catch {
     Remove-LeaseRecord $l 'lease-failed' "$($_.Exception.Message)" ''
     throw
@@ -384,7 +546,7 @@ function Invoke-Unlease {
 
 function Invoke-Renew {
   $p = if ($WtPath) { $WtPath } else { (Get-Location).Path }
-  $l = Find-LeaseForPath $p
+  $l = if ($LeaseId) { Read-Leases $null | Where-Object { (P $_ 'leaseId') -eq $LeaseId } | Select-Object -First 1 } else { Find-LeaseForPath $p }
   if ($l) { Touch-Lease $l; Write-Output "renewed $($l.repo)/$($l.slot)" } else { Write-Output "no lease covers $p" }
 }
 
@@ -601,6 +763,20 @@ function Get-OversizedChangelogs([string]$wt, [string]$baseRef, [double]$factor 
   }
   $out
 }
+# ADR 0003 W2-3: a push refused by the pre-push hook ONLY because of machine load (vitest worker start
+# timeouts, hook timeouts, EBUSY/EPERM on Windows temp files) is retried once; the journal records it
+# as a flake. Real failures (assertions, type errors, lint) never match these patterns.
+$InfraFlakePatterns = @(
+  'Failed to start (forks|threads) worker', 'Timeout starting (forks|threads) runner', 'Hook timed out in \d+ms',
+  'Test timed out in \d+ms', 'EBUSY: resource busy or locked', 'EPERM: operation not permitted, (rename|unlink|open)',
+  'ENOTEMPTY: directory not empty, rmdir .*vitest', 'spawn .* ENOMEM', 'JavaScript heap out of memory', 'Worker exited unexpectedly'
+)
+function Test-InfraFlake([string[]]$out) {
+  $txt = $out -join "`n"
+  if ($txt -match '(AssertionError|error TS\d+|✗ .*lint|Expected .* to (be|equal))') { return $null }
+  foreach ($p in $InfraFlakePatterns) { if ($txt -match $p) { return $Matches[0] } }
+  $null
+}
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
@@ -625,7 +801,7 @@ function Invoke-Land {
     $wt = $lease.path
     & git -C $main fetch -q origin 2>$null
     $topicRef = if ((& git -C $main rev-parse --verify -q "refs/heads/$Branch" 2>$null)) { "refs/heads/$Branch" } elseif ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$Branch" 2>$null)) { "refs/remotes/origin/$Branch" } else { throw "land: branch $Branch not found locally or on origin" }
-    $landed = $null; $nothing = $false
+    $landed = $null; $nothing = $false; $flakeRetried = $false
     for ($round = 1; $round -le 3 -and -not $landed; $round++) {
       & git -C $main fetch -q origin $Onto 2>$null
       if (Test-Path -LiteralPath $wt) { [void](Backup-Slot $wt $repo.Name 'land' 'leftover in land slot') }
@@ -679,6 +855,14 @@ function Invoke-Land {
       }
       $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
       if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
+      $flake = if (-not $flakeRetried -and -not ($out -match 'non-fast-forward|fetch first|Updates were rejected')) { Test-InfraFlake $out } else { $null }
+      if ($flake) {
+        $flakeRetried = $true
+        Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push infra failure, retrying once: $flake"; repo = $repo.Name }
+        Write-Output "land: pre-push failed on an infrastructure pattern ($flake) - retrying the push once"
+        $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+        if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
+      }
       if ($out -match 'non-fast-forward|fetch first|Updates were rejected') { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
       $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
       $tail = (@($out | Select-Object -Last 6) -join ' | ')
@@ -702,6 +886,92 @@ function Invoke-Land {
   }
 }
 
+# ---- publish (ADR 0003 W1-2) -------------------------------------------------------------
+# The supported form of the hand-written "temp-index plumbing commit" (reinvented ~18 times, 2026-10).
+# Takes ONLY -Paths from the current working tree (any clone or slot), builds a commit whose parent is
+# the CURRENT origin/<Onto> tip in a throwaway index (the shared index/worktree are never touched),
+# refuses when the result would delete lines in a file the caller did not change relative to its own
+# base (= reverting work that landed meanwhile), pushes a fresh topic, verifies it on the remote, and
+# with -Land hands it to Invoke-Land. Blobs are written from the file bytes via the repo's own
+# clean filters (git hash-object --path), so EOL/attributes match what a normal commit would store.
+function Invoke-Publish {
+  $repo = Get-RepoInfo $RepoArg
+  Assert-ExpectedRepo $repo
+  if (-not $repo) { throw 'agentq publish: not in a git repo' }
+  if (-not $Purpose -or -not $Message) { throw 'agentq publish -Paths a,b -Message "type(scope): msg" -Purpose "why" [-Onto main] [-Base <ref>] [-Land] [-NoPush]' }
+  $plist = @($Paths | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() -replace '\\', '/' } | Where-Object { $_ })
+  if (-not $plist) { throw 'agentq publish: -Paths a,b,c is required' }
+  $top = $repo.Top
+  $onto = if ($Onto) { $Onto } else { $b = "$(& git -C $top rev-parse --abbrev-ref '@{u}' 2>$null)".Trim(); if ($b -match '^[^/]+/(.+)$') { $Matches[1] } else { 'main' } }
+  & git -C $top fetch -q origin $onto 2>$null
+  if ($LASTEXITCODE) { throw "agentq publish: git fetch origin $onto failed" }
+  $tip = "$(& git -C $top rev-parse "origin/$onto")".Trim()
+  # Base = the commit the caller edited on top of; default HEAD. Used only for the revert guard.
+  $base = if ($Base) { "$(& git -C $top rev-parse --verify "$Base^{commit}" 2>$null)".Trim() } else { "$(& git -C $top rev-parse HEAD)".Trim() }
+  if (-not $base) { throw "agentq publish: -Base $Base is not a commit" }
+  $idx = Join-Path ([IO.Path]::GetTempPath()) ("aq-pub-" + [guid]::NewGuid().ToString('N') + '.idx')
+  $oldIdx = $env:GIT_INDEX_FILE
+  $reverts = @(); $changed = @()
+  try {
+    $env:GIT_INDEX_FILE = $idx
+    & git -C $top read-tree $tip; if ($LASTEXITCODE) { throw 'read-tree failed' }
+    foreach ($p in $plist) {
+      $full = Join-Path $top $p
+      if (Test-Path -LiteralPath $full -PathType Leaf) {
+        $blob = "$(& git -C $top hash-object -w --path $p -- $full)".Trim()
+        if (-not $blob) { throw "hash-object failed for $p" }
+        $mode = "$(& git -C $top ls-tree $tip -- $p)".Trim() -split '\s+' | Select-Object -First 1
+        if (-not $mode) { $mode = "$(& git -C $top ls-files -s -- $p)".Trim() -split '\s+' | Select-Object -First 1 }
+        if (-not $mode) { $mode = '100644' }
+        & git -C $top update-index --add --cacheinfo "$mode,$blob,$p"; if ($LASTEXITCODE) { throw "update-index failed for $p" }
+      } else {
+        & git -C $top update-index --force-remove -- $p
+      }
+    }
+    $tree = "$(& git -C $top write-tree)".Trim()
+  } finally { if ($oldIdx) { $env:GIT_INDEX_FILE = $oldIdx } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }; Remove-Item -LiteralPath $idx -Force -ErrorAction SilentlyContinue }
+  if ($tree -eq "$(& git -C $top rev-parse "$tip^{tree}")".Trim()) { Write-Output "publish: nothing to publish - origin/$onto already has these $($plist.Count) path(s) as on disk"; return }
+  # Revert guard: for every path, compare (base -> disk) with (tip -> result). Lines the tip has that
+  # base did not have, and that our result drops, would be someone else's landed work being undone.
+  foreach ($p in $plist) {
+    $onTip = "$(& git -C $top rev-parse --verify -q "$($tip):$p" 2>$null)".Trim()
+    $onBase = "$(& git -C $top rev-parse --verify -q "$($base):$p" 2>$null)".Trim()
+    $ours = "$(& git -C $top rev-parse --verify -q "$($tree):$p" 2>$null)".Trim()
+    if ($onTip -ne $ours) { $changed += $p }
+    if ($onTip -and $onBase -and $onTip -ne $onBase -and $ours -ne $onTip) {
+      $tipAdds = @(& git -C $top diff --no-color --unified=0 $onBase $onTip 2>$null | Where-Object { $_ -match '^\+[^+]' } | ForEach-Object { $_.Substring(1) })
+      $dropped = @(& git -C $top diff --no-color --unified=0 $onTip $ours 2>$null | Where-Object { $_ -match '^-[^-]' } | ForEach-Object { $_.Substring(1) })
+      $lost = @($tipAdds | Where-Object { $dropped -contains $_ })
+      if ($lost.Count) { $reverts += "$p ($($lost.Count) line(s) landed after your base would be removed)" }
+    }
+    if ($onTip -and -not $ours -and $onBase -ne $onTip) { $reverts += "$p (deleted, but origin/$onto changed it after your base)" }
+  }
+  if ($reverts.Count -and -not $Force) {
+    Write-Journal @{ event = 'publish-refused'; resource = "commit:$($repo.Name)"; purpose = $Purpose; paths = $plist; reason = ($reverts -join '; '); repo = $repo.Name }
+    [Console]::Error.WriteLine("publish: REFUSED - would revert work that landed on origin/$onto after your base $(Short $base):`n  " + ($reverts -join "`n  ") + "`nRebase those files on origin/$onto (or pass -Force if the removal is intended).")
+    exit 5
+  }
+  $msgFile = [IO.Path]::GetTempFileName()
+  [IO.File]::WriteAllText($msgFile, "$Message`n`nAgent-Session: $Session`nAgent-Purpose: $Purpose", [Text.UTF8Encoding]::new($false))
+  $sha = "$(& git -C $top commit-tree $tree -p $tip -F $msgFile)".Trim(); Remove-Item $msgFile -Force
+  if (-not $sha) { throw 'commit-tree failed' }
+  $stat = @(& git -C $top diff --numstat $tip $sha)
+  Write-Output "publish: $(Short $sha 12) on origin/$onto @ $(Short $tip 12) ($($changed.Count) file(s))"
+  $stat | ForEach-Object { Write-Output "  $_" }
+  Write-Journal @{ event = 'publish'; resource = "commit:$($repo.Name)"; sha = $sha; branch = $onto; purpose = $Purpose; message = $Message; paths = $changed; repo = $repo.Name }
+  if ($NoPush) { Write-Output "publish: -NoPush, commit $sha exists only locally"; return }
+  $topic = if ($Branch) { $Branch } else { "publish/$(($Session -replace '[^A-Za-z0-9-]', '-').ToLowerInvariant())-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))" }
+  $out = @(& git -C $top push -q --no-verify origin "$($sha):refs/heads/$topic" 2>&1 | ForEach-Object { "$_" })
+  $remote = "$(& git -C $top ls-remote origin "refs/heads/$topic")".Trim() -split '\s+' | Select-Object -First 1
+  if ($remote -ne $sha) { $out | Select-Object -Last 10 | ForEach-Object { [Console]::Error.WriteLine($_) }; throw "publish: push of $topic not verified on origin (got '$remote')" }
+  Write-Output "publish: pushed origin/$topic = $(Short $sha 12)"
+  if (-not $DoLand) { Write-Output "publish: land it with: agentq land -Branch $topic -Onto $onto -Purpose `"$Purpose`""; return }
+  $script:Branch = $topic; $script:Onto = $onto
+  Invoke-Land
+  if ($script:LandExit -eq 0) { & git -C $top push -q --no-verify origin ":refs/heads/$topic" 2>$null | Out-Null }
+}
+
+
 # ---- status sections (called from Show-Status) -------------------------------------------
 function Get-V2Status([string]$repoName) {
   $leases = @(Read-Leases $repoName)
@@ -715,6 +985,11 @@ function Format-V2Status($v) {
       $extra = @(); if ($r.supersedeSha) { $extra += "supersede->$(Short $r.supersedeSha)" }; if ($r.pendingSha) { $extra += "pending->$(Short $r.pendingSha)" }
       Write-Output ("{0,-28} {1,-11} {2,-10} phase={3}{4} follow={5} {6} {7}" -f "$($r.repo)/$($r.target)", "$($r.state)".ToUpper(), (Short $r.sha), $r.phase, $(if ($r.committed) { ' (committed)' } else { ' (preemptible)' }), $r.follow, $r.session, ($extra -join ' '))
     }
+  }
+  $lost = @(Get-RecentLeaseLosses 24)
+  if ($lost.Count) {
+    Write-Output '== LEASES LOST (24 h) - restore from the ref'
+    $lost | Format-Table @{n = 'when'; e = { "$($_.ts)".Substring(0, 16) } }, event, resource, holderSession, purpose, ref -AutoSize | Out-String -Width 220 | Write-Output
   }
   if ($v.leases) {
     Write-Output '== SLOTS (leases)'

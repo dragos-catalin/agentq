@@ -83,7 +83,7 @@ $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGive
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
 $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
-$RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @()
+$RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $DoLand = $false; $Force = $false
 # v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
 # devcloud F2: placement.
@@ -103,7 +103,14 @@ while ($i -lt $argv.Count) {
     'resource' { $Resource = & $next }
     'purpose' { $Purpose = & $next }
     'message' { $Message = & $next }
-    'paths' { $Paths = @((& $next) -split ',') }
+    'paths' {
+      # In-process '& agentq.ps1 -Paths $arr' delivers ONE arg "a b c" (or the array itself); a .ps1
+      # wrapper with -File delivers "a,b". Accept all: commas first, then whitespace when no comma.
+      $raw = @($argv[$i + 1]); if ($i + 1 -ge $argv.Count) { throw "agentq: $a needs a value" }; $script:i++
+      $vals = @(); foreach ($r in $raw) { $vals += @("$r") }
+      while ($i + 1 -lt $argv.Count -and "$($argv[$i + 1])" -notlike '-*') { $script:i++; $vals += "$($argv[$i])" }
+      $Paths = @($vals | ForEach-Object { if ($_ -match ',') { $_ -split ',' } elseif ($_ -match '\s' -and -not (Test-Path -LiteralPath $_)) { $_ -split '\s+' } else { $_ } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
     'repo' { $Repo = & $next }
     'expectrepo' { $ExpectRepo = & $next }
     'state' { $State = & $next }
@@ -140,8 +147,16 @@ while ($i -lt $argv.Count) {
     'by' { $By = [int](& $next) }
     'minutes' { $Minutes = [int](& $next) }
     'where' { $Where = (& $next).ToLowerInvariant() }
+    'base' { $Base = & $next }
+    'land' { $DoLand = $true }
+    'force' { $Force = $true }
     'ws' { $Ws = & $next }
-    default { throw "agentq: unknown argument '$a' (put the command after --)" }
+    default {
+      if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
+        throw "agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'."
+      }
+      throw "agentq: unknown argument '$a' (put the command after --)"
+    }
   }
   $i++
 }$ErrorActionPreference = 'Stop'
@@ -1146,6 +1161,10 @@ function Invoke-Release {
 
 . (Join-Path $PSScriptRoot 'agentq-v2.ps1')
 if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'renew', 'lease-check') { Renew-ForCwd }
+# Session renewal only for verbs that mean "this agent is working"; maintenance verbs (sweep, break,
+# unlease, metrics, rotate) from the same session must not keep a lease alive they are judging.
+if ($Verb.ToLowerInvariant() -in 'run', 'commit', 'publish', 'land', 'note', 'acquire', 'release', 'bump', 'propose', 'lease', 'backup', 'since') { Renew-ForSession }
+if ($Verb.ToLowerInvariant() -notin 'lease-check') { Show-LeaseNotices }
 
 # Agent registry (S18-09, 2026-10-17). Every agentq call records WHO called: the session, the AI
 # client (from env + the process ancestry), the app that owns the shell, the repo and the last
@@ -1229,5 +1248,6 @@ switch ($Verb.ToLowerInvariant()) {
   'release-cancel' { Invoke-ReleaseCancel }
   'notify-landing' { Invoke-NotifyLanding }
   'land' { Invoke-Land; exit $script:LandExit }
+  'publish' { Invoke-Publish; if ($DoLand) { exit $script:LandExit } }
   default { Get-Help $PSCommandPath; exit 2 }
 }
