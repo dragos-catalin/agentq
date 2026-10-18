@@ -36,6 +36,20 @@ if [ ! -f /opt/devcloud/.installed-$NODE_VERSION-$PNPM_VERSION ]; then
 fi
 sudo -u dev -H bash -lc "pnpm config set store-dir /work/.pnpm-store >/dev/null"
 
+# --- Rust + Tauri 2 Linux libraries (vitals: Linux clippy/test from verify.ps1, QA2-4). Separate
+# marker so existing workspaces pick it up on the next boot or -UpdateAgent without a node reinstall.
+# rustup default stays `stable`; repos pin their own toolchain (rust-toolchain.toml / CI 1.99.0) and
+# rustup installs that on first use. CARGO_TARGET_DIR is left alone: each repo's target/ is on /work.
+RUST_TOOLCHAIN="$(md rust-toolchain)"; RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.99.0}"
+if [ ! -f /opt/devcloud/.rust-$RUST_TOOLCHAIN ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+  sudo -u dev -H bash -c 'command -v rustup >/dev/null 2>&1 || ~/.cargo/bin/rustup --version >/dev/null 2>&1 || curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable -c clippy,rustfmt'
+  sudo -u dev -H bash -c "~/.cargo/bin/rustup toolchain install $RUST_TOOLCHAIN --profile minimal -c clippy,rustfmt"
+  touch /opt/devcloud/.rust-$RUST_TOOLCHAIN
+fi
+
 # --- runner-agent from metadata (always the latest pushed by the provisioner)
 mkdir -p /opt/devcloud
 md runner-agent > /opt/devcloud/runner-agent.mjs.new && [ -s /opt/devcloud/runner-agent.mjs.new ] && mv /opt/devcloud/runner-agent.mjs.new /opt/devcloud/runner-agent.mjs
