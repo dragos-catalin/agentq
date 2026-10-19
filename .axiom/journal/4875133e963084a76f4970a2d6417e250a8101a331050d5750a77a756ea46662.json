@@ -1,0 +1,1 @@
+{"manifestDigest":"sha256:4875133e963084a76f4970a2d6417e250a8101a331050d5750a77a756ea46662","phase":"committed","steps":[{"path":".gitignore","op":"overwrite","done":true,"backup":".axiom/backup/4875133e963084a76f4970a2d6417e250a8101a331050d5750a77a756ea46662/.gitignore"}],"startedAt":"2026-10-19T16:06:19.116Z","pid":74304}
