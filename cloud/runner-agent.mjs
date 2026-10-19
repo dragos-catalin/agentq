@@ -204,11 +204,13 @@ async function runJob(spec) {
   log('job', spec.id, 'exit', exit, JSON.stringify(phases));
 }
 
-// Busy = any login session (`who`: sshd, VS Code Remote-SSH) or 1-min load above devcloud-busy-load.
+// Busy = any login session (`who`, or an sshd session process: covers notty sessions such as VS Code Remote-SSH and `gcloud compute ssh --command`) or 1-min load above devcloud-busy-load.
 function interactiveBusy() {
   if (!cfg.interactive || isWin) return false;
   try {
     if (execFileSync('who', { encoding: 'utf8', timeout: 5000 }).trim()) return true;
+    const ps = execFileSync('ps', ['-eo', 'args='], { encoding: 'utf8', timeout: 5000 });
+    if (/^sshd(-session)?: [^ ]+@(notty|pts)/m.test(ps)) return true;
     return Number(fs.readFileSync('/proc/loadavg', 'utf8').split(' ')[0]) > cfg.busyLoad;
   } catch { return false; }
 }
