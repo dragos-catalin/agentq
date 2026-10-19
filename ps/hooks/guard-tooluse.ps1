@@ -28,9 +28,33 @@ $script:DenyWriter = [System.IO.StringWriter]::new()
 [Console]::SetError([System.IO.TextWriter]::Synchronized($script:DenyWriter))
 function Deny-Exit {
   $text = $script:DenyWriter.ToString().TrimEnd()
+  # 2026-10-19 owner decision (axiom D-40): WARN, do not block - except HARD (irreversible) actions.
+  # An agent may also state why it proceeds: `axiom-override: <reason>` in explanation/goal/command.
+  $hard = '(?i)Force-push rewrites|git reset --hard destroys|git clean -f deletes|worktree remove --force\S* follows|is a LEASED worktree slot|Recursive (force )?delete'
+  # A raw `worktree remove` is soft, but a FORCED one follows junctions (irreversible) -> hard.
+  if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+remove\b[^;|&]*(--force|-f\b)') { $text += "`n'git worktree remove --force' follows Windows junctions and deletes their targets." }
+  if ($text -notmatch $hard) {
+    $ti = $payload.tool_input; if (-not $ti) { $ti = $payload.toolInput }
+    $ov = $null
+    foreach ($field in @("$($ti.explanation)", "$($ti.goal)", "$cmd")) {
+      $m = [regex]::Match($field, '(?i)axiom-override:\s*([^\r\n]{8,300})')
+      if ($m.Success) { $ov = $m; break }
+    }
+    $why = if ($ov) { "OVERRIDE (agent: $($ov.Groups[1].Value.Trim()))" } else { 'WARNING (allowed)' }
+    $msg = "$why - $($text -replace 'BLOCKED by', 'flagged by')"
+    # The write is allowed, so a stale-script marker for it would wrongly flag the next run.
+    if ($path -and $script:DeniedDir -and (Test-Path $script:DeniedDir)) {
+      Get-ChildItem $script:DeniedDir -File -EA SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw -EA SilentlyContinue).Trim() -eq "$path" } | Remove-Item -EA SilentlyContinue
+    }
+    $script:RealStderr.Write($msg + [Environment]::NewLine)
+    if ($payload.PSObject.Properties.Name -contains 'hook_event_name') {
+      @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; additionalContext = $msg } } | ConvertTo-Json -Compress -Depth 4 | Write-Output
+    }
+    exit 0
+  }
   $script:RealStderr.Write($text + [Environment]::NewLine)
   if ($payload.PSObject.Properties.Name -contains 'hook_event_name') {
-    @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'deny'; permissionDecisionReason = $text } } |
+    @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'deny'; permissionDecisionReason = ($text + ' (HARD block: irreversible - ask the user)') } } |
       ConvertTo-Json -Compress -Depth 4 | Write-Output
     exit 0
   }
