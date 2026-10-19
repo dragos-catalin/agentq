@@ -32,10 +32,17 @@ getent group devbox-users >/dev/null || groupadd devbox-users
 id dev >/dev/null 2>&1 && usermod -aG devbox-users dev
 
 # --- agentq system install (root-owned code: users run it, nobody but root changes it)
+# From the COMMITTED origin/main of the checkout, never its working tree: /work/agentq may carry someone's
+# uncommitted (or devsync-mirrored) edits, which must not become system code for every user.
+if [ -d "$SRC/.git" ] && git -C "$SRC" fetch -q origin 2>/dev/null; then
+  CLEAN=$(mktemp -d); git -C "$SRC" archive origin/main ps | tar -x -C "$CLEAN"; REV=$(git -C "$SRC" rev-parse --short origin/main); SRC="$CLEAN"
+else REV=working-tree; fi
 install -d -m 0755 /opt/agentq/bin
 cp -f "$SRC"/ps/bin/*.ps1 "$SRC"/ps/bin/*.mjs "$SRC"/ps/bin/agentq-config.json /opt/agentq/bin/ 2>/dev/null || true
 install -m 0755 "$SRC/ps/bin/devbox-teams.py" /usr/local/sbin/devbox-teams
 chown -R root:root /opt/agentq && chmod -R a+rX,go-w /opt/agentq
+echo "$REV" > /opt/agentq/REVISION
+[ -n "${CLEAN:-}" ] && rm -rf "$CLEAN"
 cat > /usr/local/bin/agentq <<'EOF'
 #!/usr/bin/env bash
 # agentq on the devbox: per-user store ~/.codai/coord + system store /var/lib/agentq (ADR 0007)
@@ -70,4 +77,4 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now agentq-sweep.timer >/dev/null 2>&1 || true
-echo ROOT_TOOLS_OK "$(gh --version | head -1)" "$(sops --version 2>/dev/null | head -1)" "pwsh $(pwsh -v 2>/dev/null)" "agentq $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)"
+echo ROOT_TOOLS_OK "$(gh --version | head -1)" "$(sops --version 2>/dev/null | head -1)" "pwsh $(pwsh -v 2>/dev/null)" "agentq $(cat /opt/agentq/REVISION)"
