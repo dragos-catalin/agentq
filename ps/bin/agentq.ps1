@@ -858,11 +858,19 @@ function Invoke-Run {
       param($files, $mfile, $rootPid, $yieldMin, $cpuSec, $journal, $session)
       $samples = [Collections.Generic.List[object]]::new(); $tick = 0; $yielded = $false
       function TreeCpu([int]$root) {
-        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, KernelModeTime, UserModeTime)
-        $kids = @{}; foreach ($p in $all) { $k = [int]$p.ParentProcessId; if (-not $kids[$k]) { $kids[$k] = [Collections.Generic.List[object]]::new() }; $kids[$k].Add($p) }
+        # Get-Process + .Parent, NOT Get-CimInstance Win32_Process: each WMI enumeration cost
+        # WmiPrvSE ~6.7 s of CPU with ~1200 processes (measured elevated 2026-10-19), and every
+        # agentq run holder did one per minute -> ~1 core of WmiPrvSE with 10 holders. This
+        # path takes ~0.25 s in-process and touches no WMI provider.
+        $kids = @{}
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+          $k = try { [int]$p.Parent.Id } catch { -1 }
+          if ($k -le 0) { continue }
+          if (-not $kids[$k]) { $kids[$k] = [Collections.Generic.List[object]]::new() }; $kids[$k].Add($p)
+        }
         $sum = 0.0; $stack = [Collections.Generic.Stack[int]]::new(); $stack.Push($root); $seen = @{}
         while ($stack.Count) { $id = $stack.Pop(); if ($seen[$id]) { continue }; $seen[$id] = 1
-          foreach ($c in @($kids[$id])) { if ($c) { $sum += ([double]$c.KernelModeTime + [double]$c.UserModeTime) / 1e7; $stack.Push([int]$c.ProcessId) } } }
+          foreach ($c in @($kids[$id])) { if ($c) { $cpu = try { $c.TotalProcessorTime.TotalSeconds } catch { 0 }; $sum += [double]$cpu; $stack.Push([int]$c.Id) } } }
         $sum
       }
       function SetFlag([string]$f, [bool]$v) {
