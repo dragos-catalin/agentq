@@ -11,6 +11,10 @@ or sent into a shared VS Code terminal can never reach it (the "Terminate batch 
 caller capturing our output never waits for the job; the command gets an empty stdin (no prompt blocks).
 Log: <cwd>\.copilot-tmp\jobs\<id>.log (combined output, then `EXIT=<code>` and `DONE`).
 Registry: <AGENTQ_HOME or ~/.codai/coord>\jobs\<id>.json (mirrored to the hub by agentq-sync).
+Priority (-Priority, default BelowNormal): the runner lowers its own priority class before starting
+the command, so the whole tree inherits it. Background builds/tests then yield to interactive work -
+VS Code terminals took 2-7 s (up to tens of seconds) to start while 32 cores were saturated by jobs
+at Normal (2026-10-19). Use Normal for a job the user is actively waiting on, Idle for overnight work.
 Prints: id, pid, log, and the wait-job / jobs command lines.
 #>
 [CmdletBinding(PositionalBinding = $false)]
@@ -18,7 +22,8 @@ param(
   [Parameter(Mandatory)][string]$Label,
   [string]$Command, [string]$File,
   [Parameter(ValueFromRemainingArguments)][Alias('Args')][string[]]$ArgList = @(),
-  [string]$Cwd, [double]$ExpectedMin = 10, [string]$Repo, [switch]$Json
+  [string]$Cwd, [double]$ExpectedMin = 10, [string]$Repo,
+  [ValidateSet('Idle', 'BelowNormal', 'Normal')][string]$Priority = 'BelowNormal', [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
@@ -48,7 +53,7 @@ Save-Job @{
   id = $id; label = $Label; command = $display; file = $(if ($File) { $File } else { $null }); args = @($ArgList)
   cwd = $Cwd; repo = $Repo; pid = 0; pidStart = $null; log = $log; expectedMin = $ExpectedMin
   startedAt = (Get-JobIso ([DateTime]::UtcNow)); state = 'running'; ownerPid = $owner; host = $env:COMPUTERNAME
-  exitCode = $null; endedAt = $null
+  exitCode = $null; endedAt = $null; priority = $Priority
 }
 $runner = Join-Path $PSScriptRoot 'job-run.ps1'
 # ShellExecute + Hidden: the runner gets its OWN hidden console and inherits NO handles. Inheriting our

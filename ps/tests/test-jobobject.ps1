@@ -120,6 +120,20 @@ Start-Sleep -Milliseconds 800
 $alive2 = $orphan2 -and (Get-Process -Id $orphan2 -ErrorAction SilentlyContinue)
 Check 'AGENTQ_NO_JOBOBJ=1: orphan survives (control)' ([bool]$alive2) "orphan=$orphan2"
 if ($alive2) { Stop-Process -Id $orphan2 -Force -ErrorAction SilentlyContinue }
+# 7) agentq run lowers the command's priority class by lane, so builds yield to terminals and the editor
+$prF = Join-Path $tmpA 'prio.txt'
+$probe = "[IO.File]::WriteAllText('$prF', [string](Get-Process -Id `$PID).PriorityClass)"
+Push-Location $rp
+& pwsh -NoProfile -File $aqRun run -Resource install -Purpose 'prio quick' -- pwsh -NoProfile -Command $probe *> $null
+$pq = if (Test-Path $prF) { Get-Content $prF -Raw } else { '' }
+Remove-Item $prF -ErrorAction SilentlyContinue
+& pwsh -NoProfile -File $aqRun run -Resource build -Lane batch -Purpose 'prio batch' -- pwsh -NoProfile -Command $probe *> $null
+$pb = if (Test-Path $prF) { Get-Content $prF -Raw } else { '' }
+Pop-Location
+Check 'agentq run (quick lane): command runs BelowNormal' ($pq -eq 'BelowNormal') "got '$pq'"
+Check 'agentq run (batch lane): command runs Idle' ($pb -eq 'Idle') "got '$pb'"
+$jl = Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'done' } | Select-Object -Last 1
+Check 'agentq run: done event records the priority' ($jl.priority -eq 'Idle') ($jl | ConvertTo-Json -Compress)
 Remove-Item Env:AGENTQ_HOME, Env:AGENTQ_CONFIG -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $tmpA -ErrorAction SilentlyContinue
 

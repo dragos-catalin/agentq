@@ -109,6 +109,17 @@ Check 'jobs list shows done' (@($lst | Where-Object { $_.id -eq $o.id -and $_.st
 $show = (& pwsh -NoProfile -File $jobs show $o.id) -join "`n"
 Check 'jobs show prints json + tail' ($show -match '"label": "unit ok"' -and $show -match 'EXIT=0')
 
+# --- priority: the job's command runs below normal by default, so it yields to interactive work ------
+$pcmd = '"prio=" + (Get-Process -Id $PID).PriorityClass'
+$o = (& pwsh -NoProfile -File $start -Label 'prio default' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
+$pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
+Check 'job command inherits BelowNormal priority by default' ($pl -match 'prio=BelowNormal') $pl
+$o = (& pwsh -NoProfile -File $start -Label 'prio normal' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Priority Normal -Json) | ConvertFrom-Json
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
+$pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
+Check 'job-start -Priority Normal runs the command at Normal' ($pl -match 'prio=Normal') $pl
+
 # failing job -> failed + wait-job exit 1
 $o2 = (& pwsh -NoProfile -File $start -Label 'unit fail' -Command '"boom"; exit 7' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
 $r = Run-Wait @('-JobId', $o2.id, '-EveryS', '0.3', '-MaxSec', '60')

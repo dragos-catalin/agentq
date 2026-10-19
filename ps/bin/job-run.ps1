@@ -19,6 +19,9 @@ function Out-Log([string]$s) {
 }
 Out-Log "=== job $Id ($($job['label'])) started $(Get-JobIso ([DateTime]::UtcNow)) pid $PID"
 Out-Log "=== cwd $($job['cwd'])"
+# Children inherit the creator's priority class, so lowering ours lowers the whole job tree.
+$prio = if ($job['priority']) { "$($job['priority'])" } else { 'BelowNormal' }
+try { (Get-Process -Id $PID).PriorityClass = [Diagnostics.ProcessPriorityClass]$prio } catch { Out-Log "job-run: priority $prio not applied: $($_.Exception.Message)" }
 $code = 1
 try {
   if ($job['cwd']) { Set-Location -LiteralPath "$($job['cwd'])" }

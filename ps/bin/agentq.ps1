@@ -905,6 +905,13 @@ function Invoke-Run {
         else { $jobInfo.weight = $wt }
       }
     }
+    # Job-object weight only arbitrates BETWEEN jobs; VS Code, its terminals and the agents' shells are in
+    # no job, so a saturating build still starved them (terminals 2-7 s, up to tens of s to start, 32/32
+    # cores busy, 2026-10-19). A priority class does compete with them, and children inherit it.
+    # interactive/land stay Normal; quick/gate/heavy BelowNormal; batch Idle. AGENTQ_RUN_PRIORITY overrides.
+    $pcByLane = @{ interactive = 'Normal'; quick = 'BelowNormal'; gate = 'BelowNormal'; heavy = 'BelowNormal'; batch = 'Idle' }
+    $pc = if ($env:AGENTQ_RUN_PRIORITY) { $env:AGENTQ_RUN_PRIORITY } elseif ($held -like 'land:*' -or $Purpose -match '^land gate') { 'Normal' } elseif ($pcByLane.ContainsKey("$($tickets[0].lane)")) { $pcByLane["$($tickets[0].lane)"] } else { 'BelowNormal' }
+    try { (Get-Process -Id $PID).PriorityClass = [Diagnostics.ProcessPriorityClass]$pc; if ($jobInfo) { $jobInfo.priority = $pc } } catch {}
     try {
       $exe = $cmdArgs[0]; $argv = @($cmdArgs | Select-Object -Skip 1)
       & $exe @argv
@@ -915,6 +922,7 @@ function Invoke-Run {
     $holdSec = [math]::Round(((Now) - $acquiredAt).TotalSeconds)
     $je = @{ event = $(if ($code -eq 0) { 'done' } else { 'fail' }); resource = $held; exit = $code; durSec = $dur; holdSec = $holdSec; waitSec = $script:WaitSec; lane = $tickets[0].lane; kind = (Get-CmdKind $cmdLine); purpose = $Purpose; cmd = $cmdLine; repo = $repo.Name }
     if ($jstat) { $je.cpuSec = $jstat.cpuSec; $je.peakMB = $jstat.peakMB; $je.procs = $jstat.procs; $je.cpuWeight = $jobInfo.weight }
+    if ($pc) { $je.priority = $pc }
     Write-Journal $je
     if ($code -ne 0) { Send-Signal 'agentq-fail' "$held failed ($code) — $Purpose" }
     exit $code
