@@ -45,6 +45,9 @@ const cfg = {
   bucket: await attr('devcloud-bucket'),
   ws: await attr('devcloud-ws'),
   idleMin: Number(await attr('devcloud-idle-min', '15')),
+  // devbox: interactive workspace (VS Code Remote / SSH / codaid). Never suspend while a session or load is present.
+  interactive: (await attr('devcloud-interactive', '0')) === '1',
+  busyLoad: Number(await attr('devcloud-busy-load', '1.0')),
   project: await md('project/project-id'),
   zone: (await md('instance/zone')).split('/').pop(),
   name: await md('instance/name'),
@@ -201,7 +204,17 @@ async function runJob(spec) {
   log('job', spec.id, 'exit', exit, JSON.stringify(phases));
 }
 
+// Busy = any login session (`who`: sshd, VS Code Remote-SSH) or 1-min load above devcloud-busy-load.
+function interactiveBusy() {
+  if (!cfg.interactive || isWin) return false;
+  try {
+    if (execFileSync('who', { encoding: 'utf8', timeout: 5000 }).trim()) return true;
+    return Number(fs.readFileSync('/proc/loadavg', 'utf8').split(' ')[0]) > cfg.busyLoad;
+  } catch { return false; }
+}
+
 async function suspendSelf() {
+  if (interactiveBusy()) { log('idle timer hit, interactive session or load present -> stay up'); return false; }
   log(`idle ${cfg.idleMin} min -> suspend`);
   await gs.put(cfg.bucket, `ws/${cfg.ws}/heartbeat`, JSON.stringify({ at: new Date().toISOString(), host: cfg.name, state: 'suspending' }), 'application/json').catch(() => {});
   await api(`https://compute.googleapis.com/compute/v1/projects/${cfg.project}/zones/${cfg.zone}/instances/${cfg.name}/suspend`, { method: 'POST' }).catch((e) => log('suspend failed', e.message));
@@ -215,7 +228,7 @@ async function main() {
     try { const t = fs.readFileSync('C:\\devcloud\\agent.log'); await gs.put(cfg.bucket, `ws/${cfg.ws}/agent-log-tail`, t.subarray(Math.max(0, t.length - 65536)), 'text/plain; charset=utf-8'); } catch (e) { log('log tail', e.message); }
   }
   await loadTurbo();
-  log('agent up', JSON.stringify({ ws: cfg.ws, bucket: cfg.bucket, zone: cfg.zone, idleMin: cfg.idleMin, vcpu: os.cpus().length, secretProject: cfg.secretProject, turbo: !!turboToken }));
+  log('agent up', JSON.stringify({ interactive: cfg.interactive, ws: cfg.ws, bucket: cfg.bucket, zone: cfg.zone, idleMin: cfg.idleMin, vcpu: os.cpus().length, secretProject: cfg.secretProject, turbo: !!turboToken }));
   let lastWork = Date.now(); let lastHb = 0; let lastTick = Date.now(); let lastSelfCheck = Date.now();
   // Watchdog: timers still fire while the loop awaits. No loop pass for 5 min outside a job = something
   // hung -> exit; systemd (Restart=always) / agent-loop.ps1 start a fresh agent.
@@ -252,7 +265,7 @@ async function main() {
       const self = process.argv[1];
       if (fresh.length > 1000 && fresh !== fs.readFileSync(self, 'utf8').trim()) { fs.writeFileSync(self, fresh); log('agent updated from metadata, restarting'); process.exit(0); }
     }
-    if (cfg.idleMin > 0 && Date.now() - lastWork > cfg.idleMin * 60_000) { await suspendSelf(); lastWork = Date.now(); await new Promise((r) => setTimeout(r, 20_000)); continue; }
+    if (cfg.idleMin > 0 && Date.now() - lastWork > cfg.idleMin * 60_000) { const did = await suspendSelf(); lastWork = Date.now(); if (did) await new Promise((r) => setTimeout(r, 20_000)); continue; }
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
