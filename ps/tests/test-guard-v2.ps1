@@ -16,11 +16,14 @@ Set-Content "$fx\coord\leases\brivio\task-2.json.hb" ''
 $fails = 0
 function Check([string]$n, [bool]$ok, [string]$d = '') { if ($ok) { Write-Host "PASS $n" } else { Write-Host "FAIL $n $d" -ForegroundColor Red; $script:fails++ } }
 # Returns $true when the guard BLOCKS (VS Code dialect: JSON deny on stdout, exit 0).
-function Blocks([string]$g, [string]$command, [string]$tool = 'run_in_terminal') {
+# Since axiom D-40 (2026-10-19) a soft rule is a WARNING (allowed, additionalContext): `flag = $true`
+# cases expect that warning instead of a deny, and Flags() is what the mutations check for them.
+function Hook([string]$g, [string]$command, [string]$tool = 'run_in_terminal') {
   $p = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = @{ command = $command } } | ConvertTo-Json -Compress
-  $out = ($p | pwsh -NoProfile -File $g 2>$null) -join ''
-  $out -match '"permissionDecision":"deny"'
+  ($p | pwsh -NoProfile -File $g 2>$null) -join ''
 }
+function Blocks([string]$g, [string]$command, [string]$tool = 'run_in_terminal') { (Hook $g $command $tool) -match '"permissionDecision":"deny"' }
+function Flags([string]$g, [string]$command) { $o = Hook $g $command; ($o -match 'WARNING \(allowed\)') -and ($o -notmatch '"permissionDecision":"deny"') }
 $cases = [ordered]@{
   'rm leased slot'                  = @{ cmd = "Remove-Item -Recurse -Force '$slot'"; block = $true; rule = 'lease-delete' }
   'rmdir /s leased slot'            = @{ cmd = "cmd /c rmdir /s /q `"$slot`""; block = $true; rule = 'lease-delete' }
@@ -29,15 +32,20 @@ $cases = [ordered]@{
   'rm leased slot trailing slash'   = @{ cmd = "Remove-Item -Recurse '$slot\'"; block = $true; rule = 'lease-delete' }
   'rm unleased slot allowed'        = @{ cmd = "Remove-Item -Recurse -Force '$fx\.wt\brivio\task-3'"; block = $false; rule = '' }
   'worktree.ps1 prune allowed'      = @{ cmd = "pwsh -NoProfile -File C:\x\worktree.ps1 prune -All"; block = $false; rule = '' }
-  'raw worktree add (even in .wt)'  = @{ cmd = "git -C E:\gh\brivio worktree add $fx\.wt\brivio\x HEAD"; block = $true; rule = 'raw-add' }
-  'raw worktree remove'             = @{ cmd = "git -C E:\gh\brivio worktree remove $fx\.wt\brivio\task-3"; block = $true; rule = 'raw-remove' }
-  'raw worktree move'               = @{ cmd = "git worktree move a b"; block = $true; rule = 'raw-remove' }
+  'raw worktree add (even in .wt)'  = @{ cmd = "git -C E:\gh\brivio worktree add $fx\.wt\brivio\x HEAD"; block = $false; flag = $true; rule = 'raw-add' }
+  'raw worktree remove'             = @{ cmd = "git -C E:\gh\brivio worktree remove $fx\.wt\brivio\task-3"; block = $false; flag = $true; rule = 'raw-remove' }
+  'raw worktree move'               = @{ cmd = "git worktree move a b"; block = $false; flag = $true; rule = 'raw-remove' }
+  'raw worktree remove --force'     = @{ cmd = "git worktree remove --force $fx\.wt\brivio\task-3"; block = $true; rule = 'force-hard' }
   'agentq lease allowed'            = @{ cmd = "pwsh -NoProfile -File C:\x\agentq.ps1 lease -Purpose x"; block = $false; rule = '' }
   'read inside leased slot allowed' = @{ cmd = "Get-Content '$slot\a.txt'"; block = $false; rule = '' }
   'rmdir other dir; list wt root'   = @{ cmd = "cmd /c rmdir /s /q `"$fx\.wt\brivio\task-3`"; Get-ChildItem $fx\.wt -Directory"; block = $false; rule = '' }
   'list; then rm -r leased slot'    = @{ cmd = "Get-ChildItem $fx\.wt; Remove-Item -Recurse '$slot'"; block = $true; rule = 'lease-delete' }
 }
-foreach ($k in $cases.Keys) { $c = $cases[$k]; Check "guard: $k" ((Blocks $Guard $c.cmd) -eq $c.block) $c.cmd }
+foreach ($k in $cases.Keys) {
+  $c = $cases[$k]
+  if ($c.flag) { Check "guard: $k (warning, allowed)" (Flags $Guard $c.cmd) $c.cmd }
+  else { Check "guard: $k" ((Blocks $Guard $c.cmd) -eq $c.block) $c.cmd }
+}
 
 # renewal: touching the slot refreshes its heartbeat
 [IO.File]::SetLastWriteTimeUtc("$fx\coord\leases\brivio\task-2.json.hb", [DateTime]::UtcNow.AddHours(-5))
@@ -66,8 +74,12 @@ foreach ($m in $mutations.Keys) {
   # the mutated guard must reference lib\ beside it like the real one
   if (Test-Path (Join-Path (Split-Path $Guard) 'lib')) { Copy-Item (Join-Path (Split-Path $Guard) 'lib') "$fx\lib" -Recurse -Force -ErrorAction SilentlyContinue }
   $killed = $true
-  foreach ($k in $cases.Keys) { $c = $cases[$k]; if ($c.rule -eq $m -and (Blocks $mut $c.cmd)) { $killed = $false } }
-  Check "mutation '$m' is caught by the tests (rule disabled -> its cases stop blocking)" $killed
+  foreach ($k in $cases.Keys) {
+    $c = $cases[$k]
+    if ($c.rule -ne $m) { continue }
+    if ($c.flag) { if (Flags $mut $c.cmd) { $killed = $false } } elseif (Blocks $mut $c.cmd) { $killed = $false }
+  }
+  Check "mutation '$m' is caught by the tests (rule disabled -> its cases stop being flagged)" $killed
 }
 Remove-Item Env:CODAI_WT_ROOT, Env:AGENTQ_HOME -ErrorAction SilentlyContinue
 cmd /c rmdir /s /q "`"$fx`"" 2>$null
