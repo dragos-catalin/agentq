@@ -38,11 +38,13 @@
   "journalRotateMB": 64,
   "cloudWorkspaces": {
     "codai": "codai",
-    "vitals": "vitals-win"
+    "vitals": "vitals-win",
+    "watch-faces": "watch-faces"
   },
   "cloudRegistry": {
     "codai": { "project": "codai-training", "zone": "europe-west4-a" },
-    "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" }
+    "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" },
+    "watch-faces": { "project": "codai-training", "zone": "europe-west4-a" }
   },
   "cloudAutoMinSec": 240
 }
