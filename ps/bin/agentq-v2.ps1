@@ -484,6 +484,7 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
         $l = [ordered]@{
           leaseId = [guid]::NewGuid().ToString('N').Substring(0, 8); repo = $repoName; slot = $s; role = $role; path = $p
           branch = "$branch"; purpose = $purpose; session = $Session; pid = $owner; procStart = $(if ($st) { Iso $st } else { $null }); created = (Iso (Now)); host = $env:COMPUTERNAME
+          claims = @($(if ($role -in 'task', 'pinned') { $Claims } else { @() }))
         }
         $f = Get-LeaseFile $repoName $s
         Write-JsonAtomic $f $l
@@ -505,6 +506,72 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   }
 }
 
+# ---- path claims (ADR 0005 / ADR 0003 W4-2) ----------------------------------------------------
+# Advisory: a lease may declare the paths it will touch ('apps/hub/**,packages/ui/**'). Overlaps with other
+# live leases of the repo are printed + journaled (claim-overlap); a land ticket from a claiming slot carries
+# the claims, and among WAITING land tickets an overlapping younger lease ranks after the older one.
+function Get-ClaimPrefix([string]$g) {
+  $g = $g.Replace('\', '/').TrimStart('/')
+  $i = $g.IndexOfAny([char[]]'*?[')
+  $p = if ($i -ge 0) { $g.Substring(0, $i) } else { $g }
+  # Only whole segments count: 'apps/hu*' -> 'apps/'; 'apps/hub/**' -> 'apps/hub/'
+  if ($i -ge 0 -and -not $p.EndsWith('/')) { $j = $p.LastIndexOf('/'); $p = if ($j -ge 0) { $p.Substring(0, $j + 1) } else { '' } }
+  $p
+}
+function Test-GlobOverlap([string]$a, [string]$b) {
+  $pa = Get-ClaimPrefix $a; $pb = Get-ClaimPrefix $b
+  $wa = $a -match '[*?\[]'; $wb = $b -match '[*?\[]'
+  if (-not $wa -and -not $wb) { return $a.TrimStart('/') -eq $b.TrimStart('/') }
+  # Literal path vs glob: the literal must lie under the glob's prefix (or equal it as a dir).
+  if (-not $wa) { return ($a.TrimStart('/') + '/').StartsWith($pb) -or $a.TrimStart('/').StartsWith($pb) }
+  if (-not $wb) { return ($b.TrimStart('/') + '/').StartsWith($pa) -or $b.TrimStart('/').StartsWith($pa) }
+  $pa.StartsWith($pb) -or $pb.StartsWith($pa)
+}
+function Test-ClaimOverlap($ca, $cb) {
+  $hits = @()
+  foreach ($x in @($ca)) { foreach ($y in @($cb)) { if ($x -and $y -and (Test-GlobOverlap "$x" "$y")) { $hits += "$x ~ $y" } } }
+  $hits
+}
+function Show-ClaimOverlaps($repoName, $lease, $claims) {
+  if (-not @($claims).Count) { return }
+  foreach ($o in @(Read-Leases $repoName | Where-Object { $_.leaseId -ne $lease.leaseId -and -not $_.stale -and @(P $_ 'claims' @()).Count })) {
+    $hits = @(Test-ClaimOverlap $claims (P $o 'claims' @()))
+    if (-not $hits.Count) { continue }
+    Write-Journal @{ event = 'claim-overlap'; resource = "slot:${repoName}:$($lease.slot)"; ticket = $lease.leaseId; paths = $hits; reason = "overlaps $($o.slot) ($($o.session) '$($o.purpose)')"; repo = $repoName }
+    [Console]::Error.WriteLine("agentq: claim overlap with $repoName/$($o.slot) ($($o.session), '$($o.purpose)', since $((P $o 'created' '?'))): $($hits -join '; '). Coordinate, or expect your land to queue after theirs.")
+  }
+}
+# Land waiters: a ticket whose claims overlap an OLDER lease's claims ranks after that ticket.
+function Sort-ByClaims([object[]]$w) {
+  $list = [System.Collections.Generic.List[object]]::new(); foreach ($x in $w) { $list.Add($x) }
+  for ($pass = 0; $pass -lt $list.Count; $pass++) {
+    $moved = $false
+    for ($i = 0; $i -lt $list.Count - 1; $i++) {
+      $a = $list[$i]
+      $ca = @(P $a 'claims' @()); if (-not $ca.Count) { continue }
+      for ($j = $i + 1; $j -lt $list.Count; $j++) {
+        $b = $list[$j]; $cb = @(P $b 'claims' @()); if (-not $cb.Count) { continue }
+        $la = "$(P $a 'leaseCreated' '')"; $lb = "$(P $b 'leaseCreated' '')"
+        if ($la -and $lb -and [string]::CompareOrdinal($lb, $la) -lt 0 -and @(Test-ClaimOverlap $ca $cb).Count) { $list.RemoveAt($j); $list.Insert($i, $b); $moved = $true; break }
+      }
+      if ($moved) { break }
+    }
+    if (-not $moved) { break }
+  }
+  @($list)
+}
+function Invoke-Claim {
+  if (-not $LeaseId -or -not @($Claims).Count) { throw "agentq claim -LeaseId <id> -Claims 'apps/x/**,packages/y/**' (replaces the lease's claims)" }
+  $l = Read-Leases $null | Where-Object { (P $_ 'leaseId') -eq $LeaseId } | Select-Object -First 1
+  if (-not $l) { throw "agentq claim: no live lease $LeaseId" }
+  $raw = Get-Content -LiteralPath $l.file -Raw | ConvertFrom-Json -AsHashtable
+  $raw.claims = @($Claims)
+  Write-JsonAtomic $l.file $raw
+  Write-Journal @{ event = 'claim'; resource = "slot:$($l.repo):$($l.slot)"; ticket = $LeaseId; paths = @($Claims); repo = $l.repo }
+  Write-Output "claims on $($l.repo)/$($l.slot): $(@($Claims) -join ', ')"
+  Show-ClaimOverlaps $l.repo $l @($Claims)
+}
+
 function Invoke-Lease {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -521,6 +588,7 @@ function Invoke-Lease {
     if (Test-Path -LiteralPath $l.path) { [void](Backup-Slot $l.path $repo.Name $l.slot "pre-reset for new lease $($l.leaseId)" -CommitsOnly:($l.role -eq 'release')) }
     Initialize-Slot $main $l.path $refToUse $Branch (-not $env:AGENTQ_NO_ENV_COPY)
     if ($l.role -in 'task', 'pinned') { [void](Prepare-Slot $main $l.path $repo.Name) }
+    if (@($Claims).Count) { Show-ClaimOverlaps $repo.Name $l @($Claims) }
   } catch {
     Remove-LeaseRecord $l 'lease-failed' "$($_.Exception.Message)" ''
     throw
@@ -1065,7 +1133,11 @@ function Invoke-Land {
     }
   }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
-  try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate" } } catch {}
+  $cwdN = Norm-Dir (Get-Location).Path
+    $srcLease = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
+  if (-not $srcLease) { $srcLease = Read-Leases $repo.Name | Where-Object { $_.session -eq $Session -and $_.role -in 'task', 'pinned' } | Sort-Object { "$(P $_ 'created' '')" } | Select-Object -First 1 }
+  $tc = if ($srcLease) { @(P $srcLease 'claims' @()) } else { @() }
+  try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
   $lease = $null; $hb = $null; $set = @(); $peersDone = $false
   $bdir = Join-Path (Join-Path $Root 'batches') $repo.Name
