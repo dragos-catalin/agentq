@@ -91,6 +91,19 @@ $snap = Get-Snapshot
 $desired = ConvertTo-Desired $snap
 $json = $desired | ConvertTo-Json -Depth 6
 if ($DesiredOnly) { $json; exit 0 }
+# the devbox suspends itself after 30 min idle: skip (exit 0) instead of failing the task every 15 min;
+# the Unix state on the devbox stays enforced and the next run while it is RUNNING converges it.
+# DEVBOX_TEAMS_STATUS overrides the probe (tests); an unknown status (gcloud error) falls through to the ssh.
+$st = if ($env:DEVBOX_TEAMS_STATUS) { $env:DEVBOX_TEAMS_STATUS } else {
+  $o0 = @(& gcloud compute instances describe $DevboxName --zone europe-west4-b --project codai-training --format='value(status)' 2>$null)
+  if ($LASTEXITCODE -eq 0) { "$($o0 | Select-Object -First 1)".Trim() }
+}
+if ($st -and $st -ne 'RUNNING') {
+  New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
+  Add-Content $Log ('{0:o} skip repos={1} status={2}' -f (Get-Date), $desired.repos.Count, $st)
+  "SKIP: $DevboxName is $st (devbox state stays enforced; applied on the next run while it is up)"
+  exit 0
+}
 $verb = if ($Plan) { 'plan' } else { 'apply' }
 # desired state over stdin of an IAP/Tailscale ssh as the provisioning user (sudo); never a secret in it
 $c = @('--zone', 'europe-west4-b', '--project', 'codai-training', '--tunnel-through-iap', '--quiet', '--strict-host-key-checking=no')

@@ -1190,6 +1190,8 @@ function Format-Entry($e) {
   foreach ($k in 'exit', 'durSec', 'sha', 'reason', 'state') { if ($e.PSObject.Properties.Name -contains $k -and "$($e.$k)") { $extra += "$k=$($e.$k)" } }
   $what = if ($e.PSObject.Properties.Name -contains 'purpose' -and $e.purpose) { $e.purpose } elseif ($e.PSObject.Properties.Name -contains 'message') { $e.message } else { '' }
   $sess = "$(JProp $e 'session')"
+  $ts = JProp $e 'ts'; $when = if ($ts) { (ParseUtc $ts).ToLocalTime().ToString('MM-dd HH:mm') } else { '?' }
+  '{0} {1,-8} {2,-30} {3,-14} {4} {5}' -f $when, "$(JProp $e 'event')", "$(JProp $e 'resource')", $sess.Substring(0, [math]::Min(14, $sess.Length)), $what, ($extra -join ' ')
 }
 
 function Show-Log {

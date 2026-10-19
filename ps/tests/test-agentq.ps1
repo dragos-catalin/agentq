@@ -207,7 +207,7 @@ Push-Location $repo
 $out = (& pwsh -NoProfile -File $aq since -Hours 1 2>&1) -join ' '
 Check 'since tolerates journal lines without resource' ($LASTEXITCODE -eq 0 -and $out -notmatch 'cannot be found' -and $out -match '== live queues') "exit $LASTEXITCODE $out"
 $out = (& pwsh -NoProfile -File $aq log -Last 20 2>&1) -join ' '
-Check 'log tolerates journal lines without resource' ($LASTEXITCODE -eq 0 -and $out -notmatch 'cannot be found') "exit $LASTEXITCODE $out"
+Check 'log tolerates journal lines without resource' ($LASTEXITCODE -eq 0 -and $out -notmatch 'cannot be found' -and $out -match 'shadow') "exit $LASTEXITCODE $out"
 Pop-Location
 git -C $repo worktree remove $wt 2>$null
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

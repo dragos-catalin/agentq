@@ -95,6 +95,14 @@ try {
   $v = & python $vf $py $df 2>&1 | Out-String
   Check 'team-sync: desired state passes devbox-teams validate' ($v -match 'VALID') $v
 
+  # a suspended devbox is a skip (exit 0, logged), never an ssh attempt or a failing task
+  $lg = Join-Path $tmp 'ts.log'
+  $env:DEVBOX_TEAMS_STATUS = 'SUSPENDED'
+  $so = & pwsh -NoProfile -File (Join-Path $Bin 'devbox-team-sync.ps1') -FromFile $snapFile -Log $lg 2>&1 | Out-String
+  $src = $LASTEXITCODE
+  Remove-Item Env:DEVBOX_TEAMS_STATUS
+  Check 'team-sync: suspended devbox -> exit 0 + SKIP, no ssh' (($src -eq 0) -and ($so -match 'SKIP: ws-devbox is SUSPENDED') -and -not ($so -match 'scp|ssh')) "rc=$src $so"
+  Check 'team-sync: skip is logged' ((Get-Content $lg -Raw) -match ' skip repos=2 status=SUSPENDED') (Get-Content $lg -Raw)
   # ---- agentq workspace verb (single store) + system store routing
   $Aq = Join-Path $Bin 'agentq.ps1'
   $o = & pwsh -NoProfile -File $Aq workspace take -Name codai -Purpose 'test take' 2>&1 | Out-String

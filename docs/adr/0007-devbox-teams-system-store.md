@@ -64,7 +64,7 @@ Before this ADR the git-first and devbox tools lived as ad-hoc copies in `~/.cod
 - One hub environment per devbox repo: provider `byo`, name `devbox:<vm>:<repo>` (project `devbox-<repo>`).
   The environment's owner maps to `dev`; members with a `linux_username` map to their account; others skipped.
 - `devbox-team-sync.ps1` runs on the owner's PC (the hub key stays in DPAPI) as task `devbox-team-sync`
-  every 15 min, and pushes the desired state (no secrets: names, roles, the hub SSH CA public key) to
+  every 15 min (a non-RUNNING devbox is a logged `skip`, exit 0 — it suspends itself after 30 min idle), and pushes the desired state (no secrets: names, roles, the hub SSH CA public key) to
   `sudo devbox-teams apply`. `devbox-teams` validates strictly (only the owner or `u-<8hex>` names, no root).
   The hub SSH CA public key goes into `TrustedUserCAKeys`, so hub-issued member certificates log in.
 
@@ -78,8 +78,8 @@ Before this ADR the git-first and devbox tools lived as ad-hoc copies in `~/.cod
 
 ## Verification
 
-- `ps/tests/test-devbox-tools.ps1` (29 checks: publish/wip on local bare remotes, devsync plan, team-sync
-  mapping, workspace lease, system-store routing), `ps/tests/test-devbox-teams.py` (16 planner cases),
+- `ps/tests/test-devbox-tools.ps1` (31 checks: publish/wip on local bare remotes, devsync plan, team-sync
+  mapping + skip while the devbox is suspended, workspace lease, system-store routing), `ps/tests/test-devbox-teams.py` (16 planner cases),
   mutation-checked.
 - Live on ws-devbox: a test member without access to a repo cannot list it, read a file, read its journal or
   queue on it — neither from their shell nor from a process they start (agent stand-in).
