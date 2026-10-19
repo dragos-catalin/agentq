@@ -677,7 +677,7 @@ function Get-CmdKind([string]$c) {
 function Assert-OverrideBudget([string]$verb) {
   if (-not $Reason -or $Reason.Trim().Length -lt 8) { throw "agentq ${verb}: -Reason '<why, >= 8 chars>' is required (journaled; other agents read it)" }
   $limit = [int](Get-Config).overridesPerHour
-  $mine = @(Read-Journal 400 ((Now).AddHours(-1)) $null | Where-Object { $_.event -in 'bump', 'burst', 'propose-applied' -and $_.session -eq $Session })
+  $mine = @(Read-Journal 400 ((Now).AddHours(-1)) $null | Where-Object { (JProp $_ 'event') -in 'bump', 'burst', 'propose-applied' -and (JProp $_ 'session') -eq $Session })
   if ($limit -gt 0 -and $mine.Count -ge $limit) { [Console]::Error.WriteLine("agentq: override budget spent ($($mine.Count)/$limit per hour for $Session). Ask the user, or wait."); exit 3 }
 }
 function Find-MyTickets {
@@ -759,7 +759,7 @@ function Invoke-Propose {
 # ---- metrics (DC-017): wait/hold distributions from the journal --------------------------
 function Show-Metrics {
   $from = (Now).AddHours(-$Hours)
-  $items = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'done', 'fail', 'cloud-done', 'cloud-fail' -and $_.PSObject.Properties['holdSec'] })
+  $items = @(Read-Journal 0 $from $null | Where-Object { (JProp $_ 'event') -in 'done', 'fail', 'cloud-done', 'cloud-fail' -and $_.PSObject.Properties['holdSec'] })
   $q = { param($a, [double]$p) if (-not $a) { return 0 }; $s = @($a | Sort-Object); $s[[math]::Min($s.Count - 1, [math]::Floor($p * $s.Count))] }
   $rows = $items | Group-Object { "{0}|{1}|{2}" -f ("$($_.resource)" -replace ',build:machine', ''), "$(P $_ 'lane' '?')", "$(P $_ 'kind' '?')" } | ForEach-Object {
     $w = @($_.Group | ForEach-Object { [double](P $_ 'waitSec' 0) }); $h = @($_.Group | ForEach-Object { [double]$_.holdSec })
@@ -767,7 +767,7 @@ function Show-Metrics {
     [pscustomobject]@{ resource = $k[0]; lane = $k[1]; kind = $k[2]; runs = $_.Count; fail = @($_.Group | Where-Object event -in 'fail', 'cloud-fail').Count
       waitP50 = (& $q $w 0.5); waitP90 = (& $q $w 0.9); holdP50 = (& $q $h 0.5); holdP90 = (& $q $h 0.9); holdMin = [math]::Round(($h | Measure-Object -Sum).Sum / 60, 1) }
   } | Sort-Object holdMin -Descending
-  $ev = @(Read-Journal 0 $from $null | Where-Object { $_.event -in 'idle-yield', 'bump', 'burst', 'propose-applied', 'timeout', 'reap', 'break' } | Group-Object event | ForEach-Object { "$($_.Name)=$($_.Count)" })
+  $ev = @(Read-Journal 0 $from $null | Where-Object { (JProp $_ 'event') -in 'idle-yield', 'bump', 'burst', 'propose-applied', 'timeout', 'reap', 'break' } | Group-Object event | ForEach-Object { "$($_.Name)=$($_.Count)" })
   $res = @($items | Where-Object { $_.event -like 'cloud-*' -and $_.PSObject.Properties['resumeSec'] } | ForEach-Object { [double]$_.resumeSec })
   $cloud = if ($res) { "resumes=$($res.Count) resumeP50=$(& $q $res 0.5)s resumeMax=$(($res | Measure-Object -Maximum).Maximum)s" } else { 'resumes=0' }
   if ($Json) { @{ hours = $Hours; rows = @($rows); events = $ev; cloud = $cloud } | ConvertTo-Json -Depth 4; return }
@@ -825,7 +825,7 @@ function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
   if ($live.Count -ge (Get-Capacity 'build:machine')) { return @{ where = 'cloud'; ws = $ws; why = "auto: build:machine full ($($live.Count) held)" } }
   if (-not (Test-FreeRam $MinFreeGB)) { return @{ where = 'cloud'; ws = $ws; why = 'auto: local RAM/commit below the gate' } }
   $minSec = if ($cfg.ContainsKey('cloudAutoMinSec')) { [double]$cfg['cloudAutoMinSec'] } else { 240.0 }
-  $holds = @(Read-Journal 0 ((Now).AddDays(-7)) $repo.Name | Where-Object { $_.event -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] -and (P $_ 'kind' '') -eq $kind } | ForEach-Object { [double]$_.holdSec } | Sort-Object)
+  $holds = @(Read-Journal 0 ((Now).AddDays(-7)) $repo.Name | Where-Object { (JProp $_ 'event') -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] -and (P $_ 'kind' '') -eq $kind } | ForEach-Object { [double]$_.holdSec } | Sort-Object)
   if ($holds.Count -ge 3) {
     $p50 = $holds[[math]::Floor($holds.Count / 2)]
     if ($p50 -ge $minSec) { return @{ where = 'cloud'; ws = $ws; why = "auto: local $kind p50 ${p50}s >= ${minSec}s" } }
@@ -1169,14 +1169,18 @@ function Show-Status {
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
 }
 
+# Journal lines come from several writers (agentq, guard hook: tool/paths/repo, no resource); StrictMode 3
+# throws on a missing property, so read journal fields through JProp.
+function JProp($o, [string]$k) { $p = $o.PSObject.Properties[$k]; if ($p) { $p.Value } else { $null } }
+
 function Read-Journal([int]$n, $since, [string]$repoName) {
   $files = @(Get-JournalFiles)
   if (-not $files) { return @() }
   $lines = foreach ($jf in $files) { if ($n -gt 0) { Get-Content $jf -Tail ([math]::Max($n * 8, 400)) } else { Get-Content $jf } }
   $items = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
-  if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$($_.ts)" }) }
-  if ($since) { $items = @($items | Where-Object { (ParseUtc $_.ts) -ge $since }) }
-  if ($repoName) { $items = @($items | Where-Object { ($_.PSObject.Properties.Name -contains 'repo' -and $_.repo -eq $repoName) -or ("$($_.resource)" -match "(^|:)$([regex]::Escape($repoName))(:|$)") }) }
+  if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$(JProp $_ 'ts')" }) }
+  if ($since) { $items = @($items | Where-Object { (JProp $_ 'ts') -and (ParseUtc (JProp $_ 'ts')) -ge $since }) }
+  if ($repoName) { $items = @($items | Where-Object { ($_.PSObject.Properties.Name -contains 'repo' -and $_.repo -eq $repoName) -or ("$(JProp $_ 'resource')" -match "(^|:)$([regex]::Escape($repoName))(:|$)") }) }
   if ($n -gt 0) { $items = @($items | Select-Object -Last $n) }
   $items
 }
@@ -1185,7 +1189,7 @@ function Format-Entry($e) {
   $extra = @()
   foreach ($k in 'exit', 'durSec', 'sha', 'reason', 'state') { if ($e.PSObject.Properties.Name -contains $k -and "$($e.$k)") { $extra += "$k=$($e.$k)" } }
   $what = if ($e.PSObject.Properties.Name -contains 'purpose' -and $e.purpose) { $e.purpose } elseif ($e.PSObject.Properties.Name -contains 'message') { $e.message } else { '' }
-  '{0} {1,-8} {2,-30} {3,-14} {4} {5}' -f ((ParseUtc $e.ts)).ToLocalTime().ToString('MM-dd HH:mm'), $e.event, "$($e.resource)", "$($e.session)".Substring(0, [math]::Min(14, "$($e.session)".Length)), $what, ($extra -join ' ')
+  $sess = "$(JProp $e 'session')"
 }
 
 function Show-Log {
@@ -1201,7 +1205,7 @@ function Show-Since {
   if (-not $repo) { throw 'agentq since: not in a git repo' }
   $from = (Now).AddHours(-$Hours)
   Write-Output "== agentq journal for $($repo.Name), last $Hours h"
-  $items = @(Read-Journal 0 $from $repo.Name) | Where-Object { $_.event -notin 'queued', 'reap' }
+  $items = @(Read-Journal 0 $from $repo.Name) | Where-Object { (JProp $_ 'event') -notin 'queued', 'reap' }
   if ($items) { $items | ForEach-Object { Format-Entry $_ } } else { Write-Output '(no entries)' }
   Write-Output "== git log origin (last $Hours h)"
   & git -C $repo.Top fetch -q 2>$null

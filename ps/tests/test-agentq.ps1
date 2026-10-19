@@ -197,6 +197,18 @@ Check 'lost race is merged and pushed' ($LASTEXITCODE -eq 0 -and $out -match 'pu
 Check 'remote has both commits' ((@(git -C $repo ls-tree --name-only origin/main) -contains 'peer.txt') -and (@(git -C $repo ls-tree --name-only origin/main) -contains 'p2.txt'))
 Pop-Location
 
+# since/log: journal lines written by other tools (guard: tool/paths/repo/event, no resource) must not
+# crash StrictMode property reads (2026-10-19: "The property 'resource' cannot be found").
+$jf = Join-Path $env:AGENTQ_HOME 'journal.jsonl'
+$nowIso = [DateTime]::UtcNow.ToString('o')
+Add-Content $jf (@{ tool = 'apply_patch'; paths = @('x.ps1'); repo = 'some-other-repo'; mode = 'warn'; ts = $nowIso; session = 's-foreign'; event = 'shadow' } | ConvertTo-Json -Compress)
+Add-Content $jf (@{ tool = 'apply_patch'; paths = @('y.ps1'); repo = (Split-Path -Leaf $repo); ts = $nowIso; event = 'shadow' } | ConvertTo-Json -Compress)
+Push-Location $repo
+$out = (& pwsh -NoProfile -File $aq since -Hours 1 2>&1) -join ' '
+Check 'since tolerates journal lines without resource' ($LASTEXITCODE -eq 0 -and $out -notmatch 'cannot be found' -and $out -match '== live queues') "exit $LASTEXITCODE $out"
+$out = (& pwsh -NoProfile -File $aq log -Last 20 2>&1) -join ' '
+Check 'log tolerates journal lines without resource' ($LASTEXITCODE -eq 0 -and $out -notmatch 'cannot be found') "exit $LASTEXITCODE $out"
+Pop-Location
 git -C $repo worktree remove $wt 2>$null
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }
