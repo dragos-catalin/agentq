@@ -1,7 +1,8 @@
-# guard-tooluse.ps1 devcloud D19: a plain build is DENIED with the exact `agentq run -Resource build
+# guard-tooluse.ps1 devcloud D19: a plain build is FLAGGED with the exact `agentq run -Resource build
 # -Where auto` command to run (an allow+updatedInput rewrite was verified ignored by the VS Code
-# harness, 2026-10-12). AGENTQ_WHERE=local keeps the run-build message; compound commands keep the
-# old block; the wrappers pass. Plus a mutation check.
+# harness, 2026-10-12). Since axiom D-40 (2026-10-19) a non-hard block is a WARNING: allowed, with the
+# guidance in additionalContext. AGENTQ_WHERE=local keeps the run-build message; compound commands keep
+# the run-build message; the wrappers pass. Plus a mutation check.
 param([string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'))
 $ErrorActionPreference = 'Stop'
 $Guard = (Resolve-Path $Guard).Path
@@ -18,22 +19,24 @@ Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue
 $build = 'pnpm --filter @codai/common ' + 'typecheck'
 
 $r = Hook $Guard $build
-$reason = if ($r.json) { "$($r.json.hookSpecificOutput.permissionDecisionReason)" } else { '' }
+$reason = if ($r.json) { "$($r.json.hookSpecificOutput.additionalContext)" } else { '' }
 if ($aqInstalled) {
-  Check 'plain build denied (no silent unqueued run)' ($r.json.hookSpecificOutput.permissionDecision -eq 'deny') $r.raw
-  Check 'deny hands back agentq -Where auto command' ($reason -match [regex]::Escape('run -Resource build -Where auto -Purpose') -and $reason.Contains("-- $build")) $reason
+  Check 'plain build flagged as a warning (no silent unqueued run)' ($reason -match '^WARNING \(allowed\)' -and $r.raw -notmatch '"deny"') $r.raw
+  Check 'warning hands back agentq -Where auto command' ($reason -match [regex]::Escape('run -Resource build -Where auto -Purpose') -and $reason.Contains("-- $build")) $reason
   Check 'no updatedInput emitted' ($r.raw -notmatch 'updatedInput') ''
 } else { Write-Host 'SKIP agentq cases (agentq not installed)' }
 
 $env:AGENTQ_WHERE = 'local'
 $r = Hook $Guard $build
 Remove-Item Env:AGENTQ_WHERE
-Check 'AGENTQ_WHERE=local -> run-build message' ($r.raw -match '"permissionDecision":"deny"' -and $r.raw -match 'run-build' -and $r.raw -notmatch 'Where auto') $r.raw
+Check 'AGENTQ_WHERE=local -> run-build message' ($r.raw -match 'WARNING \(allowed\)' -and $r.raw -match 'run-build' -and $r.raw -notmatch 'Where auto') $r.raw
 
 $r = Hook $Guard 'pnpm build; Remove-Item x'
-Check 'compound command keeps run-build block' ($r.raw -match '"permissionDecision":"deny"' -and $r.raw -notmatch 'Where auto') $r.raw
+Check 'compound command keeps run-build message' ($r.raw -match 'WARNING \(allowed\)' -and $r.raw -match 'run-build' -and $r.raw -notmatch 'Where auto') $r.raw
 $r = Hook $Guard 'pnpm build' -NoVsCode
-Check 'non-VS Code harness: exit-2 block' ($r.code -eq 2) "code=$($r.code)"
+Check 'non-VS Code harness: soft block allowed (exit 0)' ($r.code -eq 0) "code=$($r.code)"
+$r = Hook $Guard 'git push --force origin main' -NoVsCode
+Check 'non-VS Code harness: hard block still exit 2' ($r.code -eq 2) "code=$($r.code)"
 $r = Hook $Guard 'pwsh -NoProfile -File C:\x\agentq.ps1 run -Resource build -Where auto -Purpose p -- pnpm build'
 Check 'agentq wrapper passes untouched' (-not $r.raw) $r.raw
 $r = Hook $Guard 'git status'

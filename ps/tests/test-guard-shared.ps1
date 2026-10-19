@@ -40,7 +40,8 @@ $l = Lines
 Ok ($r.out -notmatch '"deny"' -and $l.Count -eq $n0 + 1 -and $l[-1].mode -eq 'warn' -and $l[-1].repo -eq 'repo' -and "$($l[-1].paths)" -eq 'src/a.ts') 'warn: allowed + shared-write journaled'
 '{"sharedCloneMode":"refuse"}' | Set-Content $cfg
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
-Ok ($r.out -match '"deny"' -and $r.out -match 'ADR 0004') 'refuse: denied with the lease recipe'
+# axiom D-40 (2026-10-19): refuse mode is a soft block -> allowed, recipe handed back as a warning.
+Ok ($r.out -notmatch '"deny"' -and $r.out -match 'WARNING \(allowed\)' -and $r.out -match 'ADR 0004') 'refuse: flagged with the lease recipe'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\docs\x.md"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch '"deny"') 'refuse: docs/markdown still writable'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\.wt\repo\task-1\src\a.ts"; oldString = 'x'; newString = 'y' }
