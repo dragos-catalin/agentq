@@ -88,6 +88,8 @@ $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $Do
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
 # devcloud F2: placement.
 $Where = $null; $Ws = $null
+# ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
+$script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
 $Rest = @()
 $argv = @($args)
@@ -511,6 +513,8 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
   $announced = [DateTime]::MinValue
   $ready = @{}; foreach ($t in $tickets) { $ready[$t.id] = $true }
   while ($true) {
+    # ADR 0003 W2-5: a land waiter absorbed into another holder's batch stops waiting once its result exists.
+    if ($script:WaitAbort -and (& $script:WaitAbort)) { $script:WaitAborted = $true; return }
     foreach ($t in $tickets) { Assert-NotMarked $t.resource; [IO.File]::SetLastWriteTimeUtc("$($t.file).hb", (Now)) }
     $m = [Threading.Mutex]::new($false, "Global\agentq-sched$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
     $granted = $false; $res = @{}

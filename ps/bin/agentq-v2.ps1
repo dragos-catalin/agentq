@@ -830,10 +830,217 @@ function Invoke-FlakesVerb {
   Write-Output '== recent land trees'
   foreach ($t in @($r.trees) | Select-Object -First 10) { Write-Output ("  {0} {1} green={2} attempts={3} lastFailed={4}" -f "$($t.ts)".Substring(0, 16), (Short $t.tree), $t.green, $t.attempts, $t.lastFailed) }
 }
+# ---- land batching (ADR 0003 W2-5) ----------------------------------------------------------------
+# Opt-in per repo (config landBatch { repo: true }; defaults codai + brivio; AGENTQ_LAND_BATCH=0 off).
+# The land holder absorbs up to landBatchMax-1 waiting land tickets for the same -Onto and the same
+# -Gate whose topic merges cleanly onto origin/<onto> (merge-tree, no working tree), picks all topics
+# in queue order, runs ONE gate and ONE push. A failed batch (gate 6, push 7, oversize 8, finalize 9)
+# is bisected: each half is rebuilt on the then-current tip and gated again, so a half that passes is
+# accepted (optimistic) and only the culprit fails. A topic that conflicts with an earlier topic of
+# the batch is dropped back to the queue and lands on its own turn. Absorbed waiters learn their
+# result from <AGENTQ_HOME>/batches/<repo>/<ticket>.json while still in Wait-Turn. Batch size drops to
+# 2 when more than 30 % of the last 10 batches of the repo needed a bisection.
+function Get-LandBatchOn([string]$repoName) {
+  if ($env:AGENTQ_LAND_BATCH -eq '0') { return $false }
+  $c = Get-Config
+  $b = if ($c.ContainsKey('landBatch')) { $c['landBatch'] } else { @{ codai = $true; brivio = $true } }
+  [bool]($b -is [System.Collections.IDictionary] -and $b.Contains($repoName) -and $b[$repoName])
+}
+function Get-LandBatchSize([string]$repoName) {
+  $c = Get-Config
+  $max = if ($c.ContainsKey('landBatchMax')) { [int]$c.landBatchMax } else { 4 }
+  $max = [math]::Max(2, [math]::Min(4, $max))
+  $recent = @(Get-Content -LiteralPath $Journal -Tail 4000 -ErrorAction SilentlyContinue | Where-Object { $_ -like '*"land-batch"*' } |
+      ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ -and $_.event -eq 'land-batch' -and "$($_.repo)" -eq $repoName } | Select-Object -Last 10)
+  if ($recent.Count -ge 4 -and (@($recent | Where-Object { $_.bisected }).Count / $recent.Count) -gt 0.3) { return 2 }
+  $max
+}
+function Resolve-LandRef([string]$main, [string]$b) {
+  if ((& git -C $main rev-parse --verify -q "refs/heads/$b" 2>$null)) { return "refs/heads/$b" }
+  if ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$b" 2>$null)) { return "refs/remotes/origin/$b" }
+  $null
+}
+# Commits of $ref not yet upstream: patch-id dedupe (--cherry-pick) plus `(cherry picked from commit X)`
+# trailers upstream (a pick whose CHANGELOG conflict was resolved has a different patch-id).
+function Get-LandPicks([string]$wt, [string]$ref) {
+  $picks = @(& git -C $wt rev-list --reverse --no-merges --cherry-pick --right-only "origin/$Onto...$ref" 2>$null | Where-Object { $_ })
+  $mb = "$(& git -C $wt merge-base "origin/$Onto" $ref 2>$null)".Trim()
+  $range = if ($mb) { "$mb..origin/$Onto" } else { "origin/$Onto" }
+  $done = @{}; foreach ($m in [regex]::Matches((@(& git -C $wt log --format=%B $range 2>$null) -join "`n"), 'cherry picked from commit ([0-9a-f]{40})')) { $done[$m.Groups[1].Value] = $true }
+  @($picks | Where-Object { -not $done.ContainsKey($_) })
+}
+# Cherry-picks $picks into the land slot, resolving the documented conflicts. Sets $script:PickBad to
+# @{ sha; paths } on an unresolvable conflict (pick aborted), else $null. Emits resolver output.
+function Add-LandPicks([string]$wt, [string[]]$picks) {
+  $script:PickBad = $null
+  foreach ($c in $picks) {
+    & git -C $wt cherry-pick -x --allow-empty $c 2>&1 | Out-Null
+    if (-not $LASTEXITCODE) { continue }
+    $conf = @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ })
+    if (-not $conf.Count) { & git -C $wt cherry-pick --skip 2>$null | Out-Null; continue }   # became empty
+    $resolver = Join-Path $wt 'scripts\land-resolve.ps1'
+    if (Test-Path -LiteralPath $resolver) { & pwsh -NoProfile -File $resolver -Paths ($conf -join ',') -Worktree $wt 2>&1 | ForEach-Object { Write-Output "  resolver: $_" } }
+    foreach ($p in @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ -match '(^|/)CHANGELOG\.md$' })) {
+      if (-not (Merge-UnionBytes $wt $p)) { break }
+    }
+    $left = @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ })
+    $markers = @(& git -C $wt diff --cached --name-only 2>$null | Where-Object { $_ } | Where-Object { $f = Join-Path $wt $_; (Test-Path -LiteralPath $f -PathType Leaf) -and (Select-String -LiteralPath $f -Pattern '^(<{7}|>{7})( |$)' -Quiet) })
+    if ($left.Count -or $markers.Count) {
+      & git -C $wt cherry-pick --abort 2>$null | Out-Null
+      $script:PickBad = @{ sha = $c; paths = @($left + $markers) }
+      return
+    }
+    # Resolution can make the pick empty (its change is already upstream, e.g. a union-merged
+    # CHANGELOG from an earlier landing): skip it instead of failing --continue.
+    & git -C $wt diff --cached --quiet 2>$null
+    if (-not $LASTEXITCODE) { & git -C $wt cherry-pick --skip 2>&1 | Out-Null; continue }
+    & git -C $wt -c core.editor=true cherry-pick --continue 2>&1 | Out-Null
+    if ($LASTEXITCODE) { & git -C $wt cherry-pick --abort 2>$null | Out-Null; throw "land: cherry-pick --continue failed for $c" }
+  }
+}
+# One attempt to land a set of topics as ONE push (up to 3 rounds when origin moves). Uses $repo,
+# $main, $wt, $res from Invoke-Land. Result in $script:LandSetOut:
+#   results[branch] = @{ exit; sha; nothing }, failExit (whole-set failure), failSet, dropped, sha.
+function Invoke-LandSet([object[]]$set) {
+  $o = @{ results = @{}; failExit = 0; failSet = @(); dropped = @(); sha = '' }
+  $script:LandSetOut = $o
+  $flakeRetried = $false
+  $active = @($set)
+  $label = ($set | ForEach-Object { $_.branch }) -join '+'
+  for ($round = 1; $round -le 3; $round++) {
+    & git -C $main fetch -q origin $Onto 2>$null
+    if (Test-Path -LiteralPath $wt) { [void](Backup-Slot $wt $repo.Name 'land' 'leftover in land slot') }
+    Initialize-Slot $main $wt "origin/$Onto" '' $true
+    $picked = @()
+    foreach ($tp in @($active)) {
+      $picks = @(Get-LandPicks $wt $tp.ref)
+      if (-not $picks.Count) {
+        Write-Output "land: $($tp.branch) is already on origin/$Onto (nothing to pick)"
+        $o.results[$tp.branch] = @{ exit = 0; sha = "$(& git -C $wt rev-parse HEAD)".Trim(); nothing = $true }
+        $active = @($active | Where-Object { $_.branch -ne $tp.branch }); continue
+      }
+      $before = "$(& git -C $wt rev-parse HEAD)".Trim()
+      Add-LandPicks $wt $picks
+      $bad = $script:PickBad
+      if ($bad) {
+        & git -C $wt reset -q --hard $before 2>$null
+        $active = @($active | Where-Object { $_.branch -ne $tp.branch })
+        if ($tp.own -or $set.Count -eq 1) {
+          Write-Journal @{ event = 'land-conflict'; resource = $res; sha = $bad.sha; paths = @($bad.paths); reason = "conflict picking $(Short $bad.sha) onto origin/$Onto"; repo = $repo.Name }
+          [Console]::Error.WriteLine("land: CONFLICT picking $(Short $bad.sha) onto origin/${Onto}: $(@($bad.paths) -join ', '). Nothing pushed. Rebase $($tp.branch) on origin/$Onto in your task slot, push it, and land again.")
+          $o.results[$tp.branch] = @{ exit = 5; sha = ''; nothing = $false }
+        } else {
+          Write-Journal @{ event = 'land-batch-drop'; resource = $res; sha = $bad.sha; paths = @($bad.paths); branch = $Onto; reason = "$($tp.branch) conflicts with an earlier topic of the batch; it lands on its own turn"; repo = $repo.Name }
+          Write-Output "land: $($tp.branch) conflicts with another topic of the batch - back to the queue"
+          $o.dropped += $tp
+        }
+        continue
+      }
+      $picked += $tp
+    }
+    $o.failSet = $picked
+    if (-not $picked.Count) { return }
+    $names = ($picked | ForEach-Object { $_.branch }) -join '+'
+    if ($Gate) {
+      $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
+      & pwsh -NoProfile -File $rb -Root $wt -Wait -TimeoutMin 120 -Purpose "land gate $names" -Command $Gate
+      $gx = $LASTEXITCODE
+      if ($gx) {
+        Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
+        [Console]::Error.WriteLine("land: gate failed ($gx) for $names - nothing pushed")
+        $o.failExit = 6; return
+      }
+    }
+    # Repo-owned land finalize (ADR 0003 W3, changelog fragments): assembles changes/*.md into ONE
+    # chore(release) commit on the CURRENT origin/<onto>, so two topics never claim the same version.
+    $finalizer = Join-Path $wt 'scripts\land-finalize.ps1'
+    if (Test-Path -LiteralPath $finalizer) {
+      $baseSha = "$(& git -C $wt rev-parse "origin/$Onto" 2>$null)".Trim()
+      $fo = @(& pwsh -NoProfile -File $finalizer -Worktree $wt -Onto $Onto -Base $baseSha -Branch $picked[0].branch 2>&1 | ForEach-Object { "$_" })
+      $frc = $LASTEXITCODE
+      $fo | ForEach-Object { Write-Output "  finalize: $_" }
+      if ($frc) {
+        $why2 = "$(@($fo | Select-Object -Last 3) -join ' | ')"
+        Write-Journal @{ event = 'land-finalize-failed'; resource = $res; exit = $frc; branch = $Onto; reason = $why2.Substring(0, [math]::Min(500, $why2.Length)); repo = $repo.Name }
+        [Console]::Error.WriteLine("land: scripts/land-finalize.ps1 exit $frc - nothing pushed. Fix the fragment(s) on $names and land again.")
+        Initialize-Slot $main $wt "origin/$Onto" '' $false
+        $o.failExit = 9; return
+      }
+    }
+    $big = @(Get-OversizedChangelogs $wt "origin/$Onto")
+    if ($big.Count) {
+      Write-Journal @{ event = 'land-oversized'; resource = $res; exit = 8; branch = $Onto; paths = $big; reason = "CHANGELOG grew past 1.5x origin/$Onto"; repo = $repo.Name }
+      [Console]::Error.WriteLine("land: REFUSED - CHANGELOG grew past 1.5x its size on origin/${Onto}: $($big -join '; '). Nothing pushed. Rebuild $names on origin/$Onto (take its CHANGELOG, re-add your entry) and land again.")
+      # Drop the bad result so the land-finished backup does not try to push it to origin.
+      Initialize-Slot $main $wt "origin/$Onto" '' $false
+      $o.failExit = 8; return
+    }
+    $pushed = $false; $noVerify = $false; $isRace = $false
+    $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+    if (-not $LASTEXITCODE) { $pushed = $true } else {
+      $isRace = [bool]($out -match $LandRaceRe)
+      if (-not $isRace -and -not $flakeRetried) {
+        $fr = Record-Flakes $repo.Name $wt $out 1
+        $flake = Test-InfraFlake $out
+        $retryWhy = if ($flake) { "infra: $flake" } elseif ($fr -and $fr.allQuarantined) { "only quarantined tests failed: $(@($fr.failed) -join '; ')" } else { $null }
+        if ($retryWhy) {
+          $flakeRetried = $true
+          Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push failure, retrying once ($retryWhy)"; repo = $repo.Name }
+          Write-Output "land: pre-push failed ($retryWhy) - retrying the push once"
+          $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+          if (-not $LASTEXITCODE) { $pushed = $true } else {
+            $isRace = [bool]($out -match $LandRaceRe)
+            if (-not $isRace) {
+              $fr2 = Record-Flakes $repo.Name $wt $out 2
+              if ($fr2 -and $fr2.allQuarantined) {
+                Write-Journal @{ event = 'flake-quarantined'; resource = $res; exit = 7; branch = $Onto; paths = @($fr2.failed); reason = 'pre-push failed twice on quarantined tests only; pushed with --no-verify'; repo = $repo.Name }
+                Write-Output "land: only quarantined tests failed again ($(@($fr2.failed) -join '; ')) - landing without the hook (agentq flakes lists them)"
+                $out = @(& git -C $wt push --no-verify origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+                if (-not $LASTEXITCODE) { $pushed = $true; $noVerify = $true } else { $isRace = [bool]($out -match $LandRaceRe) }
+              }
+            }
+          }
+        }
+      }
+    }
+    if ($pushed) {
+      $o.sha = "$(& git -C $wt rev-parse HEAD)".Trim()
+      if (-not $noVerify) { Pass-Flakes $repo.Name $wt }
+      foreach ($tp in $picked) { $o.results[$tp.branch] = @{ exit = 0; sha = $o.sha; nothing = $false } }
+      $o.failSet = @(); return
+    }
+    if ($isRace) { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
+    $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
+    $tail = (@($out | Select-Object -Last 6) -join ' | ')
+    Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
+    $o.failExit = 7; return
+  }
+  [Console]::Error.WriteLine("land: origin kept moving (3 rounds) - try again ($label)")
+  $o.failExit = 3
+}
+# Lands $set; a whole-set failure of more than one topic is split in halves and each half retried.
+function Invoke-LandBisect([object[]]$set) {
+  Invoke-LandSet $set
+  $r = $script:LandSetOut
+  foreach ($k in @($r.results.Keys)) { $script:LandAcc.results[$k] = $r.results[$k] }
+  $script:LandAcc.dropped += @($r.dropped)
+  if ($r.sha) { $script:LandAcc.shas += $r.sha }
+  if (-not $r.failExit) { return }
+  $fs = @($r.failSet)
+  if ($fs.Count -gt 1 -and $r.failExit -in 6, 7, 8, 9) {
+    $script:LandAcc.bisected = $true
+    $h = [int][math]::Ceiling($fs.Count / 2)
+    $left = @($fs[0..($h - 1)]); $right = @($fs[$h..($fs.Count - 1)])
+    Write-Output "land: batch of $($fs.Count) failed (exit $($r.failExit)) - bisecting: $(($left | ForEach-Object { $_.branch }) -join '+') | $(($right | ForEach-Object { $_.branch }) -join '+')"
+    Invoke-LandBisect $left
+    Invoke-LandBisect $right
+  } else { foreach ($tp in $fs) { $script:LandAcc.results[$tp.branch] = @{ exit = $r.failExit; sha = ''; nothing = $false } } }
+}
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
-# 9 repo land-finalize refused, 3 busy/remote kept moving.
+# 9 repo land-finalize refused, 3 busy/remote kept moving. With batching (above) the same codes apply
+# per topic; an absorbed waiter exits with its topic's code.
 function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -858,125 +1065,78 @@ function Invoke-Land {
     }
   }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
+  try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate" } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
-  $lease = $null; $hb = $null
+  $lease = $null; $hb = $null; $set = @(); $peersDone = $false
+  $bdir = Join-Path (Join-Path $Root 'batches') $repo.Name
+  $myResult = Join-Path $bdir "$($t.id).json"
   $script:LandExit = 1
   try {
+    $script:WaitAborted = $false
+    $script:WaitAbort = { Test-Path -LiteralPath $myResult }.GetNewClosure()
     Wait-Turn $t $TimeoutMin $null
+    $script:WaitAbort = $null
+    if ($script:WaitAborted -or (Test-Path -LiteralPath $myResult)) {
+      # Absorbed into another holder's batch (W2-5): its result is ours.
+      $r = Read-JsonFile $myResult
+      Remove-Item -LiteralPath $myResult -Force -ErrorAction SilentlyContinue
+      $x = [int](P $r 'exit' 1)
+      if ($x -eq 0) { Write-Output "landed $Branch -> origin/$Onto @ $(Short (P $r 'sha' '') 12) (in a batch by $(P $r 'by' '?'))" }
+      else { [Console]::Error.WriteLine("land: $Branch failed in a batch by $(P $r 'by' '?') (exit $x$(if (P $r 'reason' '') { ': ' + (P $r 'reason' '') })) - nothing of it was pushed") }
+      $script:LandExit = $x; return
+    }
     $lease = New-Lease $repo 'land' 'land' $why '' $PID 10 $false
     $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", "$($lease.file).hb")) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
     $wt = $lease.path
     & git -C $main fetch -q origin 2>$null
-    $topicRef = if ((& git -C $main rev-parse --verify -q "refs/heads/$Branch" 2>$null)) { "refs/heads/$Branch" } elseif ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$Branch" 2>$null)) { "refs/remotes/origin/$Branch" } else { throw "land: branch $Branch not found locally or on origin" }
-    $landed = $null; $nothing = $false; $flakeRetried = $false
-    for ($round = 1; $round -le 3 -and -not $landed; $round++) {
-      & git -C $main fetch -q origin $Onto 2>$null
-      if (Test-Path -LiteralPath $wt) { [void](Backup-Slot $wt $repo.Name 'land' 'leftover in land slot') }
-      Initialize-Slot $main $wt "origin/$Onto" '' $true
-      # Dedupe: commits whose patch is already upstream (cherry-picked / rebased copies) are skipped.
-      $picks = @(& git -C $wt rev-list --reverse --no-merges --cherry-pick --right-only "origin/$Onto...$topicRef" 2>$null | Where-Object { $_ })
-      # A pick whose conflicts were resolved (CHANGELOG union) has a different patch-id, so also skip
-      # commits named by a `(cherry picked from commit X)` trailer upstream (land picks with -x).
-      $mb = "$(& git -C $wt merge-base "origin/$Onto" $topicRef 2>$null)".Trim()
-      $range = if ($mb) { "$mb..origin/$Onto" } else { "origin/$Onto" }
-      $done = @{}; foreach ($m in [regex]::Matches((@(& git -C $wt log --format=%B $range 2>$null) -join "`n"), 'cherry picked from commit ([0-9a-f]{40})')) { $done[$m.Groups[1].Value] = $true }
-      $picks = @($picks | Where-Object { -not $done.ContainsKey($_) })
-      if (-not $picks.Count) { Write-Output "land: $Branch is already on origin/$Onto (nothing to pick)"; $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); $nothing = $true; break }
-      foreach ($c in $picks) {
-        & git -C $wt cherry-pick -x --allow-empty $c 2>&1 | Out-Null
-        if (-not $LASTEXITCODE) { continue }
-        $conf = @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ })
-        if (-not $conf.Count) { & git -C $wt cherry-pick --skip 2>$null | Out-Null; continue }   # became empty
-        $resolver = Join-Path $wt 'scripts\land-resolve.ps1'
-        if (Test-Path -LiteralPath $resolver) { & pwsh -NoProfile -File $resolver -Paths ($conf -join ',') -Worktree $wt 2>&1 | ForEach-Object { Write-Output "  resolver: $_" } }
-        foreach ($p in @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ -match '(^|/)CHANGELOG\.md$' })) {
-          if (-not (Merge-UnionBytes $wt $p)) { break }
-        }
-        $left = @(& git -C $wt diff --name-only --diff-filter=U 2>$null | Where-Object { $_ })
-        $markers = @(& git -C $wt diff --cached --name-only 2>$null | Where-Object { $_ } | Where-Object { $f = Join-Path $wt $_; (Test-Path -LiteralPath $f -PathType Leaf) -and (Select-String -LiteralPath $f -Pattern '^(<{7}|>{7})( |$)' -Quiet) })
-        if ($left.Count -or $markers.Count) {
-          & git -C $wt cherry-pick --abort 2>$null | Out-Null
-          Write-Journal @{ event = 'land-conflict'; resource = $res; sha = $c; paths = @($left + $markers); reason = "conflict picking $(Short $c) onto origin/$Onto"; repo = $repo.Name }
-          [Console]::Error.WriteLine("land: CONFLICT picking $(Short $c) onto origin/${Onto}: $(@($left + $markers) -join ', '). Nothing pushed. Rebase $Branch on origin/$Onto in your task slot, push it, and land again.")
-          $script:LandExit = 5; return
-        }
-        # Resolution can make the pick empty (its change is already upstream, e.g. a union-merged
-        # CHANGELOG from an earlier landing): skip it instead of failing --continue.
-        & git -C $wt diff --cached --quiet 2>$null
-        if (-not $LASTEXITCODE) { & git -C $wt cherry-pick --skip 2>&1 | Out-Null; continue }
-        & git -C $wt -c core.editor=true cherry-pick --continue 2>&1 | Out-Null
-        if ($LASTEXITCODE) { & git -C $wt cherry-pick --abort 2>$null | Out-Null; throw "land: cherry-pick --continue failed for $c" }
+    $topicRef = Resolve-LandRef $main $Branch
+    if (-not $topicRef) { throw "land: branch $Branch not found locally or on origin" }
+    $set = @(@{ branch = $Branch; ref = $topicRef; own = $true; session = $Session; purpose = $why; ticket = $null })
+    if (Get-LandBatchOn $repo.Name) {
+      $max = Get-LandBatchSize $repo.Name
+      $cand = @(Get-Live $res | Where-Object { $_.id -ne $t.id -and -not (P $_ 'held' $false) -and "$(P $_ 'landOnto' '')" -eq $Onto -and "$(P $_ 'landGate' '')" -eq "$Gate" -and (P $_ 'landBranch' '') -and -not (P $_ 'batchedBy' '') } | Sort-Object { [long]$_.seq })
+      foreach ($w in $cand) {
+        if ($set.Count -ge $max) { break }
+        $wb = "$($w.landBranch)"
+        if (@($set | Where-Object { $_.branch -eq $wb }).Count) { continue }
+        $wr = Resolve-LandRef $main $wb
+        if (-not $wr) { continue }
+        & git -C $main merge-tree --write-tree --name-only --no-messages "origin/$Onto" $wr 2>$null | Out-Null
+        if ($LASTEXITCODE) { continue }
+        try { Update-Ticket $w @{ batchedBy = $t.id } } catch { continue }
+        $set += @{ branch = $wb; ref = $wr; own = $false; session = "$($w.session)"; purpose = "$($w.purpose)"; ticket = $w }
       }
-      if ($Gate) {
-        $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
-        & pwsh -NoProfile -File $rb -Root $wt -Wait -TimeoutMin 120 -Purpose "land gate $Branch" -Command $Gate
-        if ($LASTEXITCODE) { Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $LASTEXITCODE; reason = $Gate; repo = $repo.Name }; [Console]::Error.WriteLine("land: gate failed ($LASTEXITCODE) - nothing pushed"); $script:LandExit = 6; return }
-      }
-      # Repo-owned land finalize (ADR 0003 W3, changelog fragments): assembles changes/*.md into ONE
-      # chore(release) commit on the CURRENT origin/<onto>, so two topics never claim the same version.
-      $finalizer = Join-Path $wt 'scripts\land-finalize.ps1'
-      if (Test-Path -LiteralPath $finalizer) {
-        $baseSha = "$(& git -C $wt rev-parse "origin/$Onto" 2>$null)".Trim()
-        $fo = @(& pwsh -NoProfile -File $finalizer -Worktree $wt -Onto $Onto -Base $baseSha -Branch $Branch 2>&1 | ForEach-Object { "$_" })
-        $frc = $LASTEXITCODE
-        $fo | ForEach-Object { Write-Output "  finalize: $_" }
-        if ($frc) {
-          $why2 = "$(@($fo | Select-Object -Last 3) -join ' | ')"
-          Write-Journal @{ event = 'land-finalize-failed'; resource = $res; exit = $frc; branch = $Onto; reason = $why2.Substring(0, [math]::Min(500, $why2.Length)); repo = $repo.Name }
-          [Console]::Error.WriteLine("land: scripts/land-finalize.ps1 exit $frc - nothing pushed. Fix the fragment(s) on $Branch and land again.")
-          Initialize-Slot $main $wt "origin/$Onto" '' $false
-          $script:LandExit = 9; return
-        }
-      }
-      $big = @(Get-OversizedChangelogs $wt "origin/$Onto")
-      if ($big.Count) {
-        Write-Journal @{ event = 'land-oversized'; resource = $res; exit = 8; branch = $Onto; paths = $big; reason = "CHANGELOG grew past 1.5x origin/$Onto"; repo = $repo.Name }
-        [Console]::Error.WriteLine("land: REFUSED - CHANGELOG grew past 1.5x its size on origin/${Onto}: $($big -join '; '). Nothing pushed. Rebuild $Branch on origin/$Onto (take its CHANGELOG, re-add your entry) and land again.")
-        # Drop the bad result so the land-finished backup does not try to push it to origin.
-        Initialize-Slot $main $wt "origin/$Onto" '' $false
-        $script:LandExit = 8; return
-      }
-      $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
-      if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); Pass-Flakes $repo.Name $wt; break }
-      $isRace = [bool]($out -match $LandRaceRe)
-      if (-not $isRace -and -not $flakeRetried) {
-        $fr = Record-Flakes $repo.Name $wt $out 1
-        $flake = Test-InfraFlake $out
-        $retryWhy = if ($flake) { "infra: $flake" } elseif ($fr -and $fr.allQuarantined) { "only quarantined tests failed: $(@($fr.failed) -join '; ')" } else { $null }
-        if ($retryWhy) {
-          $flakeRetried = $true
-          Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push failure, retrying once ($retryWhy)"; repo = $repo.Name }
-          Write-Output "land: pre-push failed ($retryWhy) - retrying the push once"
-          $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
-          if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); Pass-Flakes $repo.Name $wt; break }
-          $isRace = [bool]($out -match $LandRaceRe)
-          if (-not $isRace) {
-            $fr2 = Record-Flakes $repo.Name $wt $out 2
-            if ($fr2 -and $fr2.allQuarantined) {
-              Write-Journal @{ event = 'flake-quarantined'; resource = $res; exit = 7; branch = $Onto; paths = @($fr2.failed); reason = 'pre-push failed twice on quarantined tests only; pushed with --no-verify'; repo = $repo.Name }
-              Write-Output "land: only quarantined tests failed again ($(@($fr2.failed) -join '; ')) - landing without the hook (agentq flakes lists them)"
-              $out = @(& git -C $wt push --no-verify origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
-              if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
-              $isRace = [bool]($out -match $LandRaceRe)
-            }
-          }
-        }
-      }
-      if ($isRace) { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
-      $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
-      $tail = (@($out | Select-Object -Last 6) -join ' | ')
-      Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
-      $script:LandExit = 7; return
+      if ($set.Count -gt 1) { Write-Output "land: batching $($set.Count) topics onto origin/${Onto}: $(($set | ForEach-Object { $_.branch }) -join ', ')" }
     }
-    if (-not $landed) { [Console]::Error.WriteLine('land: origin kept moving (3 rounds) - try again'); $script:LandExit = 3; return }
-    if (-not $nothing) {
-      $acts = @(Notify-Landing $repo.Name $Onto $landed '')
-      Write-Journal @{ event = 'land'; resource = $res; sha = $landed; branch = $Onto; purpose = $why; reason = "$Branch -> $Onto; releases: $($acts -join ',')"; repo = $repo.Name }
-      Write-Output "landed $Branch -> origin/$Onto @ $(Short $landed 12)$(if ($acts) { " (releases: $($acts -join ', '))" })"
+    $script:LandAcc = @{ results = @{}; dropped = @(); bisected = $false; shas = @() }
+    Invoke-LandBisect $set
+    $acc = $script:LandAcc
+    $acts = @()
+    foreach ($s in @($acc.shas | Select-Object -Unique)) { $acts += @(Notify-Landing $repo.Name $Onto $s '') }
+    foreach ($tp in $set) {
+      $r = $acc.results[$tp.branch]
+      if ($r -and $r.exit -eq 0 -and -not $r.nothing) {
+        Write-Journal @{ event = 'land'; resource = $res; sha = $r.sha; branch = $Onto; purpose = $tp.purpose; session = $tp.session; reason = "$($tp.branch) -> $Onto$(if ($set.Count -gt 1) { " (batch of $($set.Count))" }); releases: $($acts -join ',')"; repo = $repo.Name }
+      }
     }
-    $script:LandExit = 0
+    if ($set.Count -gt 1) {
+      Write-Journal @{ event = 'land-batch'; resource = $res; branch = $Onto; size = $set.Count; bisected = [bool]$acc.bisected; paths = @($set | ForEach-Object { "$($_.branch)=$(if ($acc.results[$_.branch]) { $acc.results[$_.branch].exit } else { 'requeued' })" }); repo = $repo.Name }
+    }
+    foreach ($tp in @($set | Where-Object { -not $_.own })) {
+      $r = $acc.results[$tp.branch]
+      if ($r) { Write-JsonAtomic (Join-Path $bdir "$($tp.ticket.id).json") @{ exit = [int]$r.exit; sha = "$($r.sha)"; by = $Session; holder = $t.id; reason = "$(if ($r.exit) { 'failed on its own after bisection' })" } }
+      else { try { Update-Ticket $tp.ticket @{ batchedBy = '' } } catch {} }
+    }
+    $peersDone = $true
+    $own = $acc.results[$Branch]
+    if (-not $own) { throw "land: internal error - no result for $Branch" }
+    if ($own.exit -eq 0 -and -not $own.nothing) { Write-Output "landed $Branch -> origin/$Onto @ $(Short $own.sha 12)$(if ($acts) { " (releases: $($acts -join ', '))" })" }
+    $script:LandExit = [int]$own.exit
   } finally {
+    $script:WaitAbort = $null
+    # A holder that dies mid-batch hands every absorbed waiter back to the queue.
+    if (-not $peersDone) { foreach ($tp in @($set | Where-Object { -not $_.own })) { try { Update-Ticket $tp.ticket @{ batchedBy = '' } } catch {} } }
     if ($hb) { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }
     if ($lease) {
       $l = (Read-Leases $repo.Name | Where-Object { $_.slot -eq 'land' -and $_.leaseId -eq $lease.leaseId } | Select-Object -First 1)
