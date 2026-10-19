@@ -88,6 +88,8 @@ $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $Do
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
 # devcloud F2: placement.
 $Where = $null; $Ws = $null
+# ADR 0005 (W4-2): advisory path claims.
+$Claims = @()
 # ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
 $script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
@@ -114,6 +116,7 @@ while ($i -lt $argv.Count) {
       $Paths = @($vals | ForEach-Object { if ($_ -match ',') { $_ -split ',' } elseif ($_ -match '\s' -and -not (Test-Path -LiteralPath $_)) { $_ -split '\s+' } else { $_ } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
     'repo' { $Repo = & $next }
+    'claims' { $Claims = @((& $next) -split ',' | ForEach-Object { $_.Trim().Replace('\', '/') } | Where-Object { $_ }) }
     'expectrepo' { $ExpectRepo = & $next }
     'state' { $State = & $next }
     'reason' { $Reason = & $next }
@@ -424,6 +427,7 @@ function Test-Admissible($t, [scriptblock]$gate) {
   # do not reserve a slot here — backfill lets the next ready waiter use it (DC-013).
   $waiting = @($live | Where-Object { ($heldIds -notcontains $_.id) -and ($_.id -eq $t.id -or (P $_ 'ready' $true)) } |
       Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
+  if ($t.resource -like 'land:*' -and $waiting.Count -gt 1) { $waiting = @(Sort-ByClaims $waiting) }
   $lane = "$(P $t 'lane' 'gate')"
   $rank = [array]::IndexOf(@($waiting | ForEach-Object id), $t.id)
   $ok = ($rank -ge 0 -and $rank -lt ($cap - $held.Count))
@@ -1260,6 +1264,7 @@ switch ($Verb.ToLowerInvariant()) {
   'metrics' { Show-Metrics }
   'rotate' { Invoke-RotateJournal -Force }
   'lease' { Invoke-Lease }
+  'claim' { Invoke-Claim }
   'unlease' { Invoke-Unlease }
   'renew' { Invoke-Renew }
   'sweep' { Invoke-Sweep }
@@ -1274,6 +1279,9 @@ switch ($Verb.ToLowerInvariant()) {
   'publish' { Invoke-Publish; if ($DoLand) { exit $script:LandExit } }
   # ADR 0003 W4-4: SLO report from the journal (ready->landed p90, flake rate, lost work, queue waits, bypass).
   'flakes' { Invoke-FlakesVerb }
-  'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; & node @sa; exit $LASTEXITCODE }
+  'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; if (-not $env:AGENTQ_NO_STORE) { $sa += @('--store', $Root) }; & node @sa; exit $LASTEXITCODE }
+  # ADR 0006: SQLite index of the journal + job registry (rebuildable; JSONL stays the source of truth).
+    # agentq store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]
+    'store' { $sub = if ($State) { "$State" } else { 'status' }; $sa = @((Join-Path $PSScriptRoot 'agentq-store.mjs'), $sub, '--home', $Root); if ($Id) { $sa += @('--event', $Id) }; if ($Repo) { $sa += @('--repo', (Split-Path -Leaf $Repo)) }; if ($sub -eq 'query') { $sa += @('--hours', "$Hours") }; & node @sa; exit $LASTEXITCODE }
   default { Get-Help $PSCommandPath; exit 2 }
 }

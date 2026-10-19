@@ -35,7 +35,9 @@ $suites = [ordered]@{
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
   'flakes'         = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-flakes.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS flakes selftest' }")
   'land batch'     = @('-File', (Join-Path $PSScriptRoot 'test-land-batch.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'claims'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-claims.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land flakes'    = @('-File', (Join-Path $PSScriptRoot 'test-land-flakes.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'store'          = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-store.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS store selftest' }")
   'slo'            = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-slo.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo selftest' }")
 }
 $bad = @()

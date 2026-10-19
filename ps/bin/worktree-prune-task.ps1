@@ -7,3 +7,5 @@ $log = Join-Path $env:USERPROFILE '.codai\worktree-prune.log'
 & (Join-Path $PSScriptRoot 'worktree.ps1') migrate -All -OlderThanHours 24 *>> $log
 # ADR 0003 W1-6: the job registry grew to 2382 files in 7 days (nothing pruned it).
 & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'jobs.ps1') prune -Days 7 *>> $log
+# ADR 0006: keep the SQLite journal/jobs index current (incremental; never fatal).
+try { & node (Join-Path $PSScriptRoot 'agentq-store.mjs') sync 2>&1 | Out-Null } catch { }
