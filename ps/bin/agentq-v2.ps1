@@ -786,6 +786,50 @@ function Test-InfraFlake([string[]]$out) {
   foreach ($p in $InfraFlakePatterns) { if ($txt -match $p) { return $Matches[0] } }
   $null
 }
+# ADR 0003 W2-3 flake ledger (agentq-flakes.mjs, <AGENTQ_HOME>/flakes/<repo>.json): every pre-push
+# failure in land is recorded per tree hash; a test that failed and then passed on the same tree is
+# quarantined (14 d). A push whose only failures are quarantined tests is retried once and, if the
+# retry fails the same way, pushed with --no-verify (journal 'flake-quarantined'). AGENTQ_NO_FLAKES=1 off.
+$LandRaceRe = 'non-fast-forward|fetch first|Updates were rejected|cannot lock ref .* but expected'
+function Invoke-Flakes([string]$repoName, [string[]]$argv) {
+  if ($env:AGENTQ_NO_FLAKES) { return $null }
+  $ledger = Join-Path (Join-Path $Root 'flakes') "$repoName.json"
+  try {
+    $j = @(& node (Join-Path $PSScriptRoot 'agentq-flakes.mjs') @argv --ledger $ledger 2>$null)
+    if ($LASTEXITCODE -or -not $j) { return $null }
+    $j[-1] | ConvertFrom-Json
+  } catch { $null }
+}
+function Record-Flakes([string]$repoName, [string]$wt, [string[]]$out, [int]$attempt) {
+  $tree = "$(& git -C $wt rev-parse 'HEAD^{tree}' 2>$null)".Trim()
+  if (-not $tree) { return $null }
+  $log = Join-Path ([IO.Path]::GetTempPath()) ("aq-flk-" + [guid]::NewGuid().ToString('N') + '.log')
+  try { [IO.File]::WriteAllLines($log, [string[]]$out); Invoke-Flakes $repoName @('record', '--tree', $tree, '--log', $log, '--attempt', "$attempt") }
+  finally { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
+}
+function Pass-Flakes([string]$repoName, [string]$wt) {
+  $tree = "$(& git -C $wt rev-parse 'HEAD^{tree}' 2>$null)".Trim()
+  if (-not $tree) { return }
+  $r = Invoke-Flakes $repoName @('pass', '--tree', $tree)
+  if ($r -and @($r.flipped).Count) { Write-Journal @{ event = 'flake-flip'; resource = "land:$repoName"; paths = @($r.flipped); reason = "failed then passed on tree $(Short $tree)"; repo = $repoName } }
+}
+function Invoke-FlakesVerb {
+  $repo = Get-RepoInfo $RepoArg
+  if (-not $repo) { throw 'agentq flakes: not in a git repo (or pass -Repo <path>)' }
+  if ($Id) {
+    if (-not $Reason) { throw 'agentq flakes -Id <test key or substring> -Reason "why" lifts a quarantine' }
+    $r = Invoke-Flakes $repo.Name @('clear', '--test', $Id)
+    Write-Journal @{ event = 'flake-clear'; resource = "land:$($repo.Name)"; paths = @($r.cleared); reason = $Reason; repo = $repo.Name }
+    Write-Output "flakes: lifted $(@($r.cleared).Count) quarantine(s)"; @($r.cleared) | ForEach-Object { Write-Output "  $_" }; return
+  }
+  $r = Invoke-Flakes $repo.Name @('list')
+  if ($Json) { $r | ConvertTo-Json -Depth 5; return }
+  Write-Output "== quarantined tests ($($repo.Name)) - they still run; a land fails only on other failures"
+  if (-not $r -or -not @($r.quarantined).Count) { Write-Output '  (none)' }
+  foreach ($q in @($r.quarantined)) { Write-Output ("  {0}  flips={1} until={2}  ({3})" -f $q.test, $q.flips, "$($q.until)".Substring(0, 10), $q.reason) }
+  Write-Output '== recent land trees'
+  foreach ($t in @($r.trees) | Select-Object -First 10) { Write-Output ("  {0} {1} green={2} attempts={3} lastFailed={4}" -f "$($t.ts)".Substring(0, 16), (Short $t.tree), $t.green, $t.attempts, $t.lastFailed) }
+}
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
@@ -894,16 +938,32 @@ function Invoke-Land {
         $script:LandExit = 8; return
       }
       $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
-      if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
-      $flake = if (-not $flakeRetried -and -not ($out -match 'non-fast-forward|fetch first|Updates were rejected')) { Test-InfraFlake $out } else { $null }
-      if ($flake) {
-        $flakeRetried = $true
-        Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push infra failure, retrying once: $flake"; repo = $repo.Name }
-        Write-Output "land: pre-push failed on an infrastructure pattern ($flake) - retrying the push once"
-        $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
-        if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
+      if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); Pass-Flakes $repo.Name $wt; break }
+      $isRace = [bool]($out -match $LandRaceRe)
+      if (-not $isRace -and -not $flakeRetried) {
+        $fr = Record-Flakes $repo.Name $wt $out 1
+        $flake = Test-InfraFlake $out
+        $retryWhy = if ($flake) { "infra: $flake" } elseif ($fr -and $fr.allQuarantined) { "only quarantined tests failed: $(@($fr.failed) -join '; ')" } else { $null }
+        if ($retryWhy) {
+          $flakeRetried = $true
+          Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push failure, retrying once ($retryWhy)"; repo = $repo.Name }
+          Write-Output "land: pre-push failed ($retryWhy) - retrying the push once"
+          $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+          if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); Pass-Flakes $repo.Name $wt; break }
+          $isRace = [bool]($out -match $LandRaceRe)
+          if (-not $isRace) {
+            $fr2 = Record-Flakes $repo.Name $wt $out 2
+            if ($fr2 -and $fr2.allQuarantined) {
+              Write-Journal @{ event = 'flake-quarantined'; resource = $res; exit = 7; branch = $Onto; paths = @($fr2.failed); reason = 'pre-push failed twice on quarantined tests only; pushed with --no-verify'; repo = $repo.Name }
+              Write-Output "land: only quarantined tests failed again ($(@($fr2.failed) -join '; ')) - landing without the hook (agentq flakes lists them)"
+              $out = @(& git -C $wt push --no-verify origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+              if (-not $LASTEXITCODE) { $landed = "$(& git -C $wt rev-parse HEAD)".Trim(); break }
+              $isRace = [bool]($out -match $LandRaceRe)
+            }
+          }
+        }
       }
-      if ($out -match 'non-fast-forward|fetch first|Updates were rejected') { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
+      if ($isRace) { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
       $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
       $tail = (@($out | Select-Object -Last 6) -join ' | ')
       Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }

@@ -33,6 +33,8 @@ $suites = [ordered]@{
   'land precheck'  = @('-File', (Join-Path $PSScriptRoot 'test-land-precheck.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land reclaim'   = @('-File', (Join-Path $PSScriptRoot 'test-land-reclaim.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
+  'flakes'         = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-flakes.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS flakes selftest' }")
+  'land flakes'    = @('-File', (Join-Path $PSScriptRoot 'test-land-flakes.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'slo'            = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-slo.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo selftest' }")
 }
 $bad = @()

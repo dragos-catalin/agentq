@@ -1269,6 +1269,7 @@ switch ($Verb.ToLowerInvariant()) {
   'land' { Invoke-Land; exit $script:LandExit }
   'publish' { Invoke-Publish; if ($DoLand) { exit $script:LandExit } }
   # ADR 0003 W4-4: SLO report from the journal (ready->landed p90, flake rate, lost work, queue waits, bypass).
+  'flakes' { Invoke-FlakesVerb }
   'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; & node @sa; exit $LASTEXITCODE }
   default { Get-Help $PSCommandPath; exit 2 }
 }

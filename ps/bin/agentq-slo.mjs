@@ -71,7 +71,7 @@ function newRepo() {
     lands: 0, landFail: { conflict: 0, prePush: 0, pushRefused: 0, gate: 0, oversized: 0, finalize: 0 }, publish: 0, publishRefused: 0,
     waits: { build: [], commit: [], land: [] },
     commitAcquired: 0, commits: 0, commitFailed: 0, pushFailed: 0, pushDeferred: 0,
-    directPush: 0, branchPush: 0, flake: 0,
+    directPush: 0, branchPush: 0, flake: 0, quarantinedLands: 0,
     lost: { incidents: 0, cleanExpire: 0, recoveredExpire: 0, recoveredBreak: 0, foreignBreakBenign: 0, prevented: 0, details: [] },
     readyToLandedMin: [], unpairedLands: 0,
   };
@@ -148,6 +148,7 @@ export async function compute(lines, { days = 7, now = null } = {}) {
       case 'push-deferred': r.pushDeferred++; break;
       case 'push': if (INTEGRATION.has(String(o.branch))) r.directPush++; else r.branchPush++; break;
       case 'flake': r.flake++; break;
+      case 'flake-quarantined': r.quarantinedLands++; break;
       case 'lease-expire':
         // Backup-Slot runs first and fails closed (lease-expire-failed); ref '' = nothing unique (clean).
         if (o.ref) r.lost.recoveredExpire++; else r.lost.cleanExpire++;
@@ -180,7 +181,7 @@ function summarizeRepo(r) {
     queueWaitSec: { build: q(r.waits.build), commit: q(r.waits.commit), land: q(r.waits.land) },
     commitPath: { acquired: r.commitAcquired, commits: r.commits, commitFailed: r.commitFailed, pushFailed: r.pushFailed, pushDeferred: r.pushDeferred },
     bypass: { directPushIntegration: r.directPush, pushTopicBranch: r.branchPush, share: integ ? r.directPush / integ : null },
-    flake: { flakes: r.flake, shareOfPushFailures: r.flake + r.landFail.prePush + r.landFail.pushRefused ? r.flake / (r.flake + r.landFail.prePush + r.landFail.pushRefused) : null, rate: attempts ? r.flake / attempts : null },
+    flake: { flakes: r.flake, quarantinedLands: r.quarantinedLands, shareOfPushFailures: r.flake + r.landFail.prePush + r.landFail.pushRefused ? r.flake / (r.flake + r.landFail.prePush + r.landFail.pushRefused) : null, rate: attempts ? r.flake / attempts : null },
     lostWork: { incidents: r.lost.incidents, recoveredExpire: r.lost.recoveredExpire, recoveredBreak: r.lost.recoveredBreak, foreignBreakBenign: r.lost.foreignBreakBenign, prevented: r.lost.prevented, details: r.lost.details.slice(0, 20) },
     readyToLandedMin: { n: r.readyToLandedMin.length, p50: pct(r.readyToLandedMin, 50), p90: pct(r.readyToLandedMin, 90), unpaired: r.unpairedLands },
     _raw: r,
@@ -193,7 +194,7 @@ function summarize(repos, stats, win) {
     tot.lands += r.lands; tot.publish += r.publish; tot.publishRefused += r.publishRefused;
     for (const k of Object.keys(tot.landFail)) tot.landFail[k] += r.landFail[k];
     for (const k of Object.keys(tot.waits)) tot.waits[k].push(...r.waits[k]);
-    for (const k of ['commitAcquired', 'commits', 'commitFailed', 'pushFailed', 'pushDeferred', 'directPush', 'branchPush', 'flake', 'unpairedLands']) tot[k] += r[k];
+    for (const k of ['commitAcquired', 'commits', 'commitFailed', 'pushFailed', 'pushDeferred', 'directPush', 'branchPush', 'flake', 'quarantinedLands', 'unpairedLands']) tot[k] += r[k];
     for (const k of ['incidents', 'recoveredExpire', 'recoveredBreak', 'foreignBreakBenign', 'prevented']) tot.lost[k] += r.lost[k];
     tot.lost.details.push(...r.lost.details);
     tot.readyToLandedMin.push(...r.readyToLandedMin);
