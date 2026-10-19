@@ -53,6 +53,9 @@ const cfg = {
   turboSecret: await attr('devcloud-turbo-secret', 'devcloud-turbo-token'),
   turboApi: await attr('devcloud-turbo-api', ''),
   work: isWin ? await attr('devcloud-work', 'C:\\work') : '/work',
+  // extra `git clean -e` patterns kept between jobs (comma list), e.g. ws-watch-faces keeps Gradle `build`
+  // dirs + pinned tool jars so gates stay incremental. Default empty = only the warm caches below.
+  cleanKeep: (await attr('devcloud-clean-keep', '')).split(',').map((s) => s.trim()).filter(Boolean),
 };
 if (!cfg.secretProject) cfg.secretProject = cfg.project;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -147,7 +150,7 @@ async function runJob(spec) {
       if (exit) throw new Error('bundle fetch failed (prerequisite missing? the client re-sends a full bundle on retry)');
     }
     exit = await step('git', ['checkout', '-q', '-f', '--detach', spec.sha]); if (exit) throw new Error(`sha ${spec.sha} not in workspace (stale known list?)`);
-    exit = await step('git', ['clean', '-q', '-ffdx', '-e', 'node_modules', '-e', '.turbo', '-e', 'target', '-e', '.gradle', '-e', '.pnpm-store']);
+    exit = await step('git', ['clean', '-q', '-ffdx', '-e', 'node_modules', '-e', '.turbo', '-e', 'target', '-e', '.gradle', '-e', '.pnpm-store', ...cfg.cleanKeep.flatMap((k) => ['-e', k])]);
     if (spec.patch) {
       const p = await gs.get(cfg.bucket, `jobs/${spec.id}/patch`);
       if (p && p.length) {
@@ -175,7 +178,8 @@ async function runJob(spec) {
     phases.install = Math.round((Date.now() - s) / 100) / 10;
     // --- run
     s = Date.now();
-    const env = { ...process.env, CI: '1', FORCE_COLOR: '0', NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=16384', ...(spec.env || {}) };
+    // DEVCLOUD_JOB_ID / DEVCLOUD_BUCKET: a job script may upload artefacts to jobs/<id>/ (watch-faces cloud-job.ps1).
+    const env = { ...process.env, CI: '1', FORCE_COLOR: '0', NODE_OPTIONS: process.env.NODE_OPTIONS || '--max-old-space-size=16384', DEVCLOUD_JOB_ID: spec.id, DEVCLOUD_BUCKET: cfg.bucket, ...(spec.env || {}) };
     if (turboToken && !env.TURBO_TOKEN) Object.assign(env, { TURBO_API: cfg.turboApi, TURBO_TEAM: 'dragos', TURBO_TOKEN: turboToken });
     append(`\n[devcloud] run on ${cfg.name} (${os.cpus().length} vCPU): ${spec.cmd}\n`);
     if (isWin) {

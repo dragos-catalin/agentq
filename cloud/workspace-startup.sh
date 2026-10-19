@@ -53,6 +53,47 @@ if [ ! -f /opt/devcloud/.rust-$RUST_TOOLCHAIN ]; then
   touch /opt/devcloud/.rust-$RUST_TOOLCHAIN
 fi
 
+# --- optional toolchains (metadata devcloud-toolchains, comma list). android-jdk21 = Temurin 21 +
+# Android SDK + PowerShell 7 (watch-faces Gradle gates, ws-watch-faces). Job env goes to
+# /etc/devcloud/env (systemd EnvironmentFile of the agent) and /etc/profile.d (bash -lc).
+# Same picks as vmui infra/devcloud/images/image-setup.sh (jdk/android layers). The SDK is owned by
+# dev so AGP can auto-install a platform/build-tools a repo asks for later.
+TOOLCHAINS="$(md devcloud-toolchains)"
+mkdir -p /etc/devcloud
+: > /etc/devcloud/env.new
+case ",$TOOLCHAINS," in *,android-jdk21,*)
+  A=/opt/android-sdk; J=/usr/lib/jvm/temurin-21-jdk-amd64
+  if [ ! -f /opt/devcloud/.android-jdk21-v1 ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor --yes -o /usr/share/keyrings/adoptium.gpg
+    echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb noble main" > /etc/apt/sources.list.d/adoptium.list
+    curl -fsSL -o /tmp/msprod.deb https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb && dpkg -i /tmp/msprod.deb >/dev/null
+    apt-get update
+    apt-get install -y --no-install-recommends temurin-21-jdk powershell
+    mkdir -p "$A/cmdline-tools"
+    if [ ! -x "$A/cmdline-tools/latest/bin/sdkmanager" ]; then
+      curl -fsSL -o /tmp/clt.zip "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+      rm -rf "$A/cmdline-tools/cmdline-tools" && unzip -q /tmp/clt.zip -d "$A/cmdline-tools" && rm -rf "$A/cmdline-tools/latest" && mv "$A/cmdline-tools/cmdline-tools" "$A/cmdline-tools/latest" && rm /tmp/clt.zip
+    fi
+    SDKM="$A/cmdline-tools/latest/bin/sdkmanager"
+    export JAVA_HOME=$J
+    yes | "$SDKM" --sdk_root="$A" --licenses >/dev/null 2>&1 || true
+    LIST="$("$SDKM" --sdk_root="$A" --list 2>/dev/null)"
+    # Full package ids (platforms;android-37.0 since API 36.1); stable only.
+    PLAT="$(echo "$LIST" | grep -oE 'platforms;android-[0-9]+(\.[0-9]+)?( |$)' | tr -d ' ' | sort -V | uniq | tail -1)"
+    BT="$(echo "$LIST" | grep -oE 'build-tools;[0-9]+\.[0-9]+\.[0-9]+( |$)' | tr -d ' ' | sort -V | uniq | tail -1)"
+    echo "::android-pick plat=$PLAT bt=$BT"
+    [ -n "$PLAT" ] && [ -n "$BT" ]
+    "$SDKM" --sdk_root="$A" --install platform-tools "platforms;android-36" "$PLAT" "$BT" >/dev/null
+    chown -R dev:dev "$A"
+    touch /opt/devcloud/.android-jdk21-v1
+  fi
+  printf 'JAVA_HOME=%s\nANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$J" "$A" "$A" >> /etc/devcloud/env.new
+  ;;
+esac
+mv /etc/devcloud/env.new /etc/devcloud/env
+sed -e 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/' /etc/devcloud/env > /etc/profile.d/devcloud-env.sh
+
 # --- runner-agent from metadata (always the latest pushed by the provisioner)
 mkdir -p /opt/devcloud
 md runner-agent > /opt/devcloud/runner-agent.mjs.new && [ -s /opt/devcloud/runner-agent.mjs.new ] && mv /opt/devcloud/runner-agent.mjs.new /opt/devcloud/runner-agent.mjs
@@ -65,6 +106,7 @@ Wants=network-online.target
 User=dev
 WorkingDirectory=/work
 Environment=HOME=/home/dev
+EnvironmentFile=-/etc/devcloud/env
 ExecStart=/usr/local/bin/node /opt/devcloud/runner-agent.mjs
 Restart=always
 RestartSec=3
