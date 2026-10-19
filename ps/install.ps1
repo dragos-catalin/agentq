@@ -65,7 +65,11 @@ if (Test-Path $old) { New-Item -ItemType Directory -Force (Join-Path $bk 'hooks'
 # ADR 0007: the WIP snapshot task runs the agentq copy (was ~/.codai/git/wip-all.ps1)
 $wipTask = Get-ScheduledTask -TaskName 'codai-git-wip-snapshot' -ErrorAction SilentlyContinue
 if ($wipTask -and "$($wipTask.Actions[0].Arguments)" -notmatch 'git-wip-snapshot\.ps1') {
-  $a = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $dst 'bin\git-wip-snapshot.ps1')`" -All"
+  # hidden-run.vbs (wscript, window style 0): -WindowStyle Hidden still flashes a console under an
+  # interactive token (owner complaint 2026-10-19).
+  $wipArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Join-Path $dst 'bin\git-wip-snapshot.ps1')`" -All"
+  $vbs = 'E:\gh\vmui\scripts\hidden-run.vbs'
+  $a = if (Test-Path $vbs) { New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$((Get-Command pwsh).Source)`" $wipArgs" } else { New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-WindowStyle Hidden $wipArgs" }
   Set-ScheduledTask -TaskName 'codai-git-wip-snapshot' -Action $a | Out-Null
   'task codai-git-wip-snapshot -> bin\git-wip-snapshot.ps1 -All'
 }
