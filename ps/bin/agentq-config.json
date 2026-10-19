@@ -42,6 +42,7 @@
     "watch-faces": "watch-faces"
   },
   "cloudRegistry": {
+    "devbox": { "project": "codai-training", "zone": "europe-west4-b" },
     "codai": { "project": "codai-training", "zone": "europe-west4-a" },
     "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" },
     "watch-faces": { "project": "codai-training", "zone": "europe-west4-a" }
