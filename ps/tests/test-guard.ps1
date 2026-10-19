@@ -138,8 +138,13 @@ $deniedDir = Join-Path $env:TEMP 'copilot-guard-denied'
 New-Item -ItemType Directory -Force -Path $deniedDir | Out-Null
 $marker = Join-Path $deniedDir 'selftest.txt'
 [IO.File]::WriteAllText($marker, 'E:\x\.copilot-tmp\ship5.ps1')
-$staleBlock = Invoke-GuardTool 'run_in_terminal' @{ command = 'pwsh -NoProfile -File E:\x\.copilot-tmp\ship5.ps1'; explanation = 'x' }
-$stalePass = Invoke-GuardTool 'run_in_terminal' @{ command = 'pwsh -NoProfile -File E:\x\.copilot-tmp\ship6.ps1'; explanation = 'x' }
+# Since axiom D-40 (2026-10-19) this is a soft rule: allowed (exit 0) with a WARNING on stderr.
+$staleJson = @{ tool_name = 'run_in_terminal'; tool_input = @{ command = 'pwsh -NoProfile -File E:\x\.copilot-tmp\ship5.ps1'; explanation = 'x' } } | ConvertTo-Json -Compress
+$staleOut = ($staleJson | pwsh -NoProfile -File $guard 2>&1) -join "`n"; $staleCode = $LASTEXITCODE
+$staleBlock = if ($staleCode -eq 0 -and $staleOut -match 'WARNING \(allowed\)' -and $staleOut -match 'stale script') { 2 } else { $staleCode }
+$passJson = @{ tool_name = 'run_in_terminal'; tool_input = @{ command = 'pwsh -NoProfile -File E:\x\.copilot-tmp\ship6.ps1'; explanation = 'x' } } | ConvertTo-Json -Compress
+$passOut = ($passJson | pwsh -NoProfile -File $guard 2>&1) -join "`n"
+$stalePass = if ($passOut -match 'stale script') { 2 } else { 0 }
 Remove-Item $marker -EA SilentlyContinue
 $staleOk = ($staleBlock -eq 2) -and ($stalePass -ne 2)
 Write-Host ("stale-script trap         : block={0} pass={1} -> {2}" -f $staleBlock, $stalePass, $(if ($staleOk) { 'OK' } else { 'FAIL' }))

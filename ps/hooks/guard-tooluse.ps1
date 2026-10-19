@@ -30,7 +30,10 @@ function Deny-Exit {
   $text = $script:DenyWriter.ToString().TrimEnd()
   # 2026-10-19 owner decision (axiom D-40): WARN, do not block - except HARD (irreversible) actions.
   # An agent may also state why it proceeds: `axiom-override: <reason>` in explanation/goal/command.
-  $hard = '(?i)Force-push rewrites|git reset --hard destroys|git clean -f deletes|worktree remove --force\S* follows|is a LEASED worktree slot|Recursive (force )?delete'
+  # deploy from a DIRTY tree stays hard (owner, 2026-10-19): an image built in the shared clone ships
+  # other agents' half-finished files under a tag that names content it does not contain (2026-09-22).
+  # Destructive SQL and object-storage deletes stay hard too (owner, 2026-10-19): no undo.
+  $hard = '(?i)Force-push rewrites|git reset --hard destroys|git clean -f deletes|worktree remove --force\S* follows|is a LEASED worktree slot|Recursive (force )?delete|deploy/release from a DIRTY tree|Destructive SQL|DELETE with no WHERE|Object storage delete'
   # A raw `worktree remove` is soft, but a FORCED one follows junctions (irreversible) -> hard.
   if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+remove\b[^;|&]*(--force|-f\b)') { $text += "`n'git worktree remove --force' follows Windows junctions and deletes their targets." }
   if ($text -notmatch $hard) {
@@ -263,8 +266,12 @@ $blocked = [ordered]@{
   'git(\s+-C\s+\S+|\s+--git-dir=\S+|\s+--work-tree=\S+)*\s+stash\s+push\b.*\s--\s.*\s-(m|q|u|a|k|p)\b' = 'git stash push: flags after `--` are treated as PATHS, nothing is stashed. Put -m/-u/... BEFORE the `--`.'
   'git(\s+-C\s+\S+|\s+--git-dir=\S+|\s+--work-tree=\S+)*\s+stash\s+(pop|apply|drop)(\s|$)(?!\s*[''"]?stash@\{)' = 'Bare `git stash pop/apply/drop` acts on stash@{0}, which in a shared clone is usually ANOTHER agent''s stash. Name the entry explicitly (stash@{N}) after `git stash list`.'
   # Destructive SQL.
-  '\b(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b' = 'Destructive SQL. Ask the user before dropping or truncating.'
+  # Postgres accepts `TRUNCATE orders;` without TABLE, so TRUNCATE alone counts.
+  # (?-i): SQL keywords in capitals only, so `rg -n truncate src` or prose does not trip it.
+  '(?-i)\b(DROP\s+(TABLE|DATABASE|SCHEMA|VIEW)\b|TRUNCATE(\s+TABLE)?\s+[\w."]+(\s*,\s*[\w."]+)*\s*(;|$|\bCASCADE\b|\bRESTART\b))' = 'Destructive SQL. Ask the user before dropping or truncating.'
   'DELETE\s+FROM\s+\w+\s*(;|$)'       = 'DELETE with no WHERE clause. Ask the user first.'
+  # Object storage: no undo once a bucket object is gone (security rule: irreversible actions).
+  '\b(gsutil(\s+-\S+)*\s+(rm|rb)|gcloud\s+storage\s+(rm|buckets\s+delete))\b' = 'Object storage delete. Bucket objects have no undo. Ask the user first.'
   # Filesystem.
   'rm\s+-[a-z]*rf?\s+[/~]\s*$'        = 'Recursive delete of a root or home path.'
   'Remove-Item.*-Recurse.*-Force.*(C:\\|/)\s*$' = 'Recursive force delete at a drive root.'

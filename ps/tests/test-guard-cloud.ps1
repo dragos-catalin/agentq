@@ -42,6 +42,14 @@ Check 'agentq wrapper passes untouched' (-not $r.raw) $r.raw
 $r = Hook $Guard 'git status'
 Check 'non-build passes untouched' (-not $r.raw) $r.raw
 
+# Owner decision 2026-10-19: irreversible data deletes stay HARD blocks under D-40 (strings split so
+# this file does not trip the guard when it is edited or run).
+$hardCases = @(('DROP ' + 'TABLE users;'), ('TRUN' + 'CATE orders;'), ('TRUNCATE ' + 'TABLE a, b;'), ('DELETE ' + 'FROM users;'),
+  ('gsutil ' + '-m rm -r gs://prod/x'), ('gcloud storage ' + 'rm gs://b/o'), ('gcloud storage ' + 'buckets delete gs://b'))
+foreach ($c in $hardCases) { $r = Hook $Guard $c; Check "hard block: $c" ($r.raw -match '"permissionDecision":"deny"' -and $r.raw -match 'HARD block') $r.raw }
+$softOk = @(('DELETE ' + 'FROM users WHERE id = 1;'), 'rg -n truncate src', 'gsutil ls gs://b', 'gcloud storage cp a gs://b/a', 'git log --oneline -3')
+foreach ($c in $softOk) { $r = Hook $Guard $c; Check "not blocked: $c" ($r.raw -notmatch '"deny"') $r.raw }
+
 if ($aqInstalled) {
   $m = Join-Path $env:TEMP ('gc-mut-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.ps1')
   $src = [IO.File]::ReadAllText($Guard)
