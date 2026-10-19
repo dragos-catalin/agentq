@@ -231,7 +231,7 @@ async function main() {
   }
   await loadTurbo();
   log('agent up', JSON.stringify({ interactive: cfg.interactive, ws: cfg.ws, bucket: cfg.bucket, zone: cfg.zone, idleMin: cfg.idleMin, vcpu: os.cpus().length, secretProject: cfg.secretProject, turbo: !!turboToken }));
-  let lastWork = Date.now(); let lastHb = 0; let lastTick = Date.now(); let lastSelfCheck = Date.now();
+  let lastWork = Date.now(); let lastBusyCheck = 0; let lastHb = 0; let lastTick = Date.now(); let lastSelfCheck = Date.now();
   // Watchdog: timers still fire while the loop awaits. No loop pass for 5 min outside a job = something
   // hung -> exit; systemd (Restart=always) / agent-loop.ps1 start a fresh agent.
   let inJob = false; let loopAt = Date.now();
@@ -259,6 +259,8 @@ async function main() {
       }
     }
     if (Date.now() - lastHb > 30_000) { lastHb = Date.now(); await hb('idle'); }
+    // interactive devbox: every 30 s, a login session or load counts as work (idle clock restarts)
+    if (cfg.interactive && Date.now() - lastBusyCheck > 30_000) { lastBusyCheck = Date.now(); if (interactiveBusy()) lastWork = Date.now(); }
     // Windows has no `gcloud compute ssh` restart path: while idle, adopt a newer agent pushed to metadata by
     // workspace.ps1 -UpdateAgent and exit; the agent-loop.ps1 wrapper starts the new file.
     if (isWin && Date.now() - lastSelfCheck > 60_000) {
