@@ -28,5 +28,34 @@ $env:CODAI_SHARED_CLONE_WRITE_OK = '1'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch 'SHARED clone') 'opt-out env: silent'
 Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
+# ADR 0004 (W4-1): journal line in warn mode, deny in refuse mode, per-repo override, opt-out journaled.
+$jf = Join-Path $env:AGENTQ_HOME 'journal.jsonl'
+New-Item -ItemType Directory -Force $env:AGENTQ_HOME | Out-Null
+$cfg = Join-Path $root 'cfg.json'; $env:AGENTQ_CONFIG = $cfg
+function Lines { if (Test-Path $jf) { @(Get-Content $jf | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq 'shared-write') } else { @() } }
+'{"sharedCloneMode":"warn"}' | Set-Content $cfg
+$n0 = (Lines).Count
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+$l = Lines
+Ok ($r.out -notmatch '"deny"' -and $l.Count -eq $n0 + 1 -and $l[-1].mode -eq 'warn' -and $l[-1].repo -eq 'repo' -and "$($l[-1].paths)" -eq 'src/a.ts') 'warn: allowed + shared-write journaled'
+'{"sharedCloneMode":"refuse"}' | Set-Content $cfg
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -match '"deny"' -and $r.out -match 'ADR 0004') 'refuse: denied with the lease recipe'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\docs\x.md"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch '"deny"') 'refuse: docs/markdown still writable'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\.wt\repo\task-1\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch '"deny"') 'refuse: slot writable'
+$env:CODAI_SHARED_CLONE_WRITE_OK = '1'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch '"deny"' -and (Lines)[-1].override -eq $true) 'refuse + opt-out env: allowed, journaled as override'
+Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
+'{"sharedCloneMode":"refuse","sharedCloneModeRepos":{"repo":"warn"}}' | Set-Content $cfg
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch '"deny"' -and $r.out -match 'SHARED clone') 'per-repo warn beats global refuse'
+'{"sharedCloneModeRepos":{"repo":"off"}}' | Set-Content $cfg
+$n1 = (Lines).Count
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch 'SHARED clone' -and (Lines).Count -eq $n1) 'off: silent, not journaled'
+Remove-Item Env:AGENTQ_CONFIG
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

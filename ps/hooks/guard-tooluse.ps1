@@ -92,7 +92,7 @@ if ($isEditTool) { $cmd = '' }
 # dragoscatalin/dashy/vmui were 1-26 days behind on exactly that). Non-blocking advisory, emitted
 # by Flush-Stderr on the allow path. Scratch, docs/plan/markdown and non-repo paths are exempt.
 $script:SharedWarn = $null
-if ($isEditTool -and -not $env:CODAI_SHARED_CLONE_WRITE_OK) {
+if ($isEditTool) {
   $wp = $null
   foreach ($container in $payload.tool_input, $payload.toolInput) {
     if (-not $container -or $container -is [string]) { continue }
@@ -107,8 +107,34 @@ if ($isEditTool -and -not $env:CODAI_SHARED_CLONE_WRITE_OK) {
       $repoDir = Join-Path $ghRoot $Matches.repo; $rel = $Matches.rel
       $exempt = $rel -match '(?i)^(\.copilot-tmp|\.git|plan|docs|memories)\\' -or $rel -match '(?i)\.(md|mdx|txt|csv)$'
       if (-not $exempt -and (Test-Path -LiteralPath (Join-Path $repoDir '.git') -PathType Container)) {
+        # ADR 0004 (W4-1): mode from agentq-config.json (sharedCloneModeRepos.<repo> wins over sharedCloneMode).
+        $scRepo = Split-Path -Leaf $repoDir
+        $scMode = 'warn'
+        try {
+          $cfgF = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $env:USERPROFILE '.copilot\bin\agentq-config.json' }
+          if (Test-Path -LiteralPath $cfgF) {
+            $cj = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json -AsHashtable
+            if ($cj.ContainsKey('sharedCloneMode') -and $cj.sharedCloneMode) { $scMode = "$($cj.sharedCloneMode)" }
+            if ($cj.ContainsKey('sharedCloneModeRepos') -and $cj.sharedCloneModeRepos -and $cj.sharedCloneModeRepos.ContainsKey($scRepo)) { $scMode = "$($cj.sharedCloneModeRepos[$scRepo])" }
+          }
+        } catch { }
+        $scOverride = [bool]$env:CODAI_SHARED_CLONE_WRITE_OK
+        if ($scMode -ne 'off') {
+          try {
+            $jHome = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
+            $jl = @{ ts = [DateTime]::UtcNow.ToString('o'); event = 'shared-write'; repo = $scRepo; paths = @($rel.Replace('\', '/')); tool = $tool; mode = $scMode; override = $scOverride; session = "$($payload.session_id)" } | ConvertTo-Json -Compress
+            $jm = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
+            try { [void]$jm.WaitOne(2000); [IO.File]::AppendAllText((Join-Path $jHome 'journal.jsonl'), $jl + "`n", [Text.UTF8Encoding]::new($false)) } finally { try { $jm.ReleaseMutex() } catch {}; $jm.Dispose() }
+          } catch { }
+        }
+        if ($scMode -eq 'refuse' -and -not $scOverride) {
+          [Console]::Error.WriteLine("BLOCKED by guard (ADR 0004, sharedCloneMode=refuse): $rel is source in the SHARED clone $repoDir, which is read-only for agents. Lease a slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], edit + commit + push there, then unlease. Docs, plans, markdown and .copilot-tmp stay writable here. A deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1 (journaled).")
+          Deny-Exit
+        }
+        if ($scMode -eq 'off' -or $scOverride) { $script:SharedWarn = $null } else {
         $script:SharedWarn = "WARNING (shared clone): editing $rel directly in the SHARED clone $repoDir. Other agents work here too, and a draft left behind after the same work lands from a worktree blocks git-autosync (2026-10-17). Do source work in a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], commit + push from there, then unlease. A deliberate small fix committed right away via agentq commit is fine."
         [Console]::Error.WriteLine($script:SharedWarn)
+        }
       }
     }
   }
