@@ -3,7 +3,7 @@
 # agentq-sync daemon mirrors it next to tickets/leases. Every write is mutex-guarded and atomic.
 # Function names are prefixed (Job*) so dot-sourcing never shadows a caller's own helpers.
 
-function Get-JobCoordRoot { if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' } }
+function Get-JobCoordRoot { if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path (Join-Path $HOME '.codai') 'coord' } }
 function Get-JobDir {
   $d = Join-Path (Get-JobCoordRoot) 'jobs'
   if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
@@ -136,7 +136,15 @@ function Get-JobView([hashtable]$j, [double]$stallMin = 5) {
 
 # Process table once (pid -> object) + children map; used for trees and ancestry walks.
 function Get-JobProcTable {
-  $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine, KernelModeTime, UserModeTime, WorkingSetSize, CreationDate -ErrorAction SilentlyContinue)
+  $all = @(if ($IsWindows) { Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine, KernelModeTime, UserModeTime, WorkingSetSize, CreationDate -ErrorAction SilentlyContinue }
+  else {
+    # same field names as Win32_Process (times in 100 ns units) so every reader stays OS-agnostic
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+        $pp = try { [int]$_.Parent.Id } catch { 0 }
+        $k = try { [double]$_.PrivilegedProcessorTime.Ticks } catch { 0 }; $u = try { [double]$_.UserProcessorTime.Ticks } catch { 0 }
+        [pscustomobject]@{ ProcessId = $_.Id; ParentProcessId = $pp; Name = $_.ProcessName; CommandLine = $_.CommandLine; KernelModeTime = $k; UserModeTime = $u; WorkingSetSize = $_.WorkingSet64; CreationDate = $(try { $_.StartTime } catch { $null }) }
+      }
+  })
   $byId = @{}; $kids = @{}
   foreach ($p in $all) {
     $byId[[int]$p.ProcessId] = $p

@@ -90,6 +90,8 @@ $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
 $Where = $null; $Ws = $null
 # ADR 0005 (W4-2): advisory path claims.
 $Claims = @()
+# ADR 0007: `agentq workspace take|release|list -Name <ws>` (sub-verb is the first bare word after the verb).
+$WsName = $null; $Sub = $null
 # ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
 $script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
@@ -99,6 +101,7 @@ $dd = [array]::IndexOf($argv, '--')
 if ($dd -ge 0) { $Rest = @($argv | Select-Object -Skip ($dd + 1)); $argv = @($argv | Select-Object -First $dd) }
 $i = 0
 if ($argv.Count -and "$($argv[0])" -notlike '-*') { $Verb = "$($argv[0])"; $i = 1 }
+if ($Verb -eq 'workspace' -and $argv.Count -gt 1 -and "$($argv[1])" -notlike '-*') { $Sub = "$($argv[1])".ToLowerInvariant(); $i = 2 }
 while ($i -lt $argv.Count) {
   $a = "$($argv[$i])"
   $name = $a.TrimStart('-').ToLowerInvariant()
@@ -156,6 +159,7 @@ while ($i -lt $argv.Count) {
     'land' { $DoLand = $true }
     'force' { $Force = $true }
     'ws' { $Ws = & $next }
+    'name' { $WsName = & $next }
     default {
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
         throw "agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'."
@@ -167,11 +171,47 @@ while ($i -lt $argv.Count) {
 }$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 
-$Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
-$QDir = Join-Path $Root 'queues'
-$MDir = Join-Path $Root 'marks'
-$Journal = Join-Path $Root 'journal.jsonl'
+# Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
+# notices, agent registry, prep state - private to the person. $SysRoot = the SYSTEM store shared by every
+# user of a multi-user machine (devbox: /var/lib/agentq, root-provisioned, group agentq, default ACL g:rw):
+# queues, marks, leases, releases, workspaces and the journal live there, so build:machine and slot caps
+# are machine-wide across people. Repo-scoped queue dirs and per-repo journals (journal.d/<repo>.jsonl)
+# are owned by the repo's Unix group r-<repo> (2770): a user outside the group cannot read or join them.
+# No system store (Windows workstation, tests) -> $SysRoot = $Root, exactly the old single-store layout.
+$Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path (Join-Path $HOME '.codai') 'coord' }
+$SysRoot = if ($env:AGENTQ_SYSTEM_HOME) { $env:AGENTQ_SYSTEM_HOME } elseif (-not $IsWindows -and -not $env:AGENTQ_HOME -and (Test-Path -LiteralPath '/var/lib/agentq/system.json')) { '/var/lib/agentq' } else { $Root }
+$SystemMode = ($SysRoot -ne $Root)
+$QDir = Join-Path $SysRoot 'queues'
+$MDir = Join-Path $SysRoot 'marks'
+$Journal = Join-Path $SysRoot 'journal.jsonl'
+$JournalD = Join-Path $SysRoot 'journal.d'
 foreach ($d in $Root, $QDir, $MDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force $d | Out-Null } }
+# Journal file for one event: in system mode a repo's events go to journal.d/<repo>.jsonl (group r-<repo>)
+# when that file's directory exists, so their purposes/commands stay inside the repo's group.
+function Get-JournalFor([hashtable]$e) {
+  if ($SystemMode -and (Test-Path -LiteralPath $JournalD)) {
+    $rn = if ($e.ContainsKey('repo') -and $e.repo) { "$($e.repo)" } else { $null }
+    if (-not $rn -and $e.ContainsKey('resource') -and $e.resource) {
+      # 'build:codai,build:machine' / 'deploy:codai:gateway' / 'slot:codai:task-1' -> codai
+      $p = @(("$($e.resource)" -split ',')[0] -split ':'); if ($p.Count -ge 2 -and $p[1] -ne 'machine') { $rn = $p[1] }
+    }
+    if ($rn) {
+      $f = Join-Path $JournalD (($rn.ToLowerInvariant() -replace '[^a-z0-9._-]', '_') + '.jsonl')
+      if (Test-Path -LiteralPath $f) { return $f }
+    }
+  }
+  $Journal
+}
+# Every journal file this user may read (system journal + readable repo journals).
+function Get-JournalFiles {
+  $out = @(); if (Test-Path -LiteralPath $Journal) { $out += $Journal }
+  if ($SystemMode -and (Test-Path -LiteralPath $JournalD)) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $JournalD -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)) {
+      try { $s = [IO.File]::OpenRead($f.FullName); $s.Dispose(); $out += $f.FullName } catch {}
+    }
+  }
+  $out
+}
 
 # Machine-wide capacities for named resources (override with -Capacity on first use).
 $DefaultCapacity = @{ 'build:machine' = 2 }
@@ -197,7 +237,8 @@ function Get-RepoInfo([string]$path) {
   if (-not $top) { return $null }
   $common = (& git -C $p rev-parse --path-format=absolute --git-common-dir 2>$null)
   $name = Split-Path (Split-Path $common -Parent) -Leaf
-  [pscustomobject]@{ Top = ($top -replace '/', '\'); Common = ($common -replace '/', '\'); Name = $name.ToLowerInvariant() }
+  $ds = [IO.Path]::DirectorySeparatorChar
+  [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
 }
 
 # X-02 (2026-10-05): run_in_terminal sometimes DROPS a leading Set-Location, so a commit/build
@@ -208,7 +249,7 @@ function Assert-ExpectedRepo($repo) {
   if (-not $want) { return }
   $w = (Get-RepoInfo $want)
   $wTop = if ($w) { $w.Top } else { $want }
-  $norm = { param($p) ([IO.Path]::GetFullPath("$p").TrimEnd('\', '/')).ToLowerInvariant() }
+  $norm = { param($p) $n = [IO.Path]::GetFullPath("$p").TrimEnd('\', '/'); if ($IsWindows) { $n.ToLowerInvariant() } else { $n } }
   if (-not $repo -or (& $norm $repo.Top) -ne (& $norm $wTop)) {
     $got = if ($repo) { $repo.Top } else { '(no repo)' }
     [Console]::Error.WriteLine("agentq: REFUSED - expected repo '$wTop' but this runs in '$got' (cwd $((Get-Location).Path)). A dropped Set-Location? Pass -Repo '$wTop'.")
@@ -229,12 +270,22 @@ function Resolve-Resource([string]$r, $repo) {
 
 function Safe([string]$s) { ($s -replace '[^A-Za-z0-9._-]', '_') }
 function QPath([string]$res) { Join-Path $QDir (Safe $res) }
+# System mode: a repo-scoped dir created on demand (deploy:<repo>:<target>, a new slot dir) gets the repo's
+# group r-<repo> and mode 2770, like the ones devbox-teams pre-creates. The creator is in that group
+# (else the repo was unreadable to begin with), so chgrp is allowed. Best effort; no-op elsewhere.
+function Set-RepoGroupDir([string]$dir, [string]$repoName) {
+  if (-not $SystemMode -or $IsWindows -or -not $repoName -or $repoName -eq 'machine') { return }
+  $g = 'r-' + ($repoName.ToLowerInvariant() -replace '[^a-z0-9._-]', '-')
+  if ($g.Length -gt 32) { $g = $g.Substring(0, 32) }
+  try { & chgrp $g $dir 2>$null; & chmod 2770 $dir 2>$null } catch {}
+}
+function Get-ResourceRepo([string]$res) { $p = @($res -split ':'); if ($p.Count -ge 2) { $p[1] } else { $null } }
 
 function Write-Journal([hashtable]$e) {
   $e.ts = Iso (Now); if (-not $e.ContainsKey('session')) { $e.session = $Session }
   $line = ($e | ConvertTo-Json -Compress -Depth 6)
   $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
-  try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) }
+  try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText((Get-JournalFor $e), $line + "`n", [Text.UTF8Encoding]::new($false)) }
   finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
 
@@ -252,7 +303,7 @@ function Test-Alive($t) {
 function Read-Tickets([string]$res) {
   $dir = QPath $res
   if (-not (Test-Path $dir)) { return @() }
-  @(Get-ChildItem $dir -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Sort-Object Name | ForEach-Object {
+  @(Get-ChildItem $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Sort-Object Name | ForEach-Object {
       try {
         $raw = $null
         for ($r = 0; $r -lt 5; $r++) {
@@ -317,8 +368,27 @@ function Get-Capacity([string]$res) {
 # and PerfFormattedData ~14 s under load (measured 2026-10-17); PerfRawData answers in ~33 ms.
 # Raw PercentProcessorTime for _Total is cumulative IDLE time in 100 ns units.
 function Get-SysTimes {
+  if (-not $IsWindows) {
+    # /proc/stat first line: cpu user nice system idle iowait irq softirq steal ... (USER_HZ ticks)
+    $f = @((Get-Content -LiteralPath '/proc/stat' -TotalCount 1) -split '\s+' | Select-Object -Skip 1 | Where-Object { $_ } | ForEach-Object { [long]$_ })
+    $tot = [long]0; foreach ($x in $f) { $tot += $x }
+    return @{ idle = [long]($f[3] + $f[4]); total = $tot }
+  }
   $r = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'" -Property PercentProcessorTime, Timestamp_Sys100NS
   @{ idle = [long]$r.PercentProcessorTime; total = [long]$r.Timestamp_Sys100NS }
+}
+# Free RAM / commit headroom in KB, same fields as Win32_OperatingSystem. Linux: MemAvailable, and
+# CommitLimit - Committed_AS as the commit headroom (overcommit makes it advisory, like Windows' pagefile).
+function Get-MemInfo {
+  if (-not $IsWindows) {
+    $m = @{}; foreach ($l in Get-Content -LiteralPath '/proc/meminfo') { if ($l -match '^(\w+):\s+(\d+)') { $m[$Matches[1]] = [double]$Matches[2] } }
+    $commit = if ($m.ContainsKey('CommitLimit') -and $m.ContainsKey('Committed_AS')) { [math]::Max(0, $m['CommitLimit'] - $m['Committed_AS']) } else { $m['MemAvailable'] }
+    # vm.overcommit_memory=0 (Ubuntu default) never refuses on CommitLimit: report MemAvailable+swap as headroom
+    $mode = try { [int](Get-Content -LiteralPath '/proc/sys/vm/overcommit_memory' -Raw) } catch { 0 }
+    if ($mode -ne 2) { $commit = $m['MemAvailable'] + $(if ($m.ContainsKey('SwapFree')) { $m['SwapFree'] } else { 0 }) }
+    return [pscustomobject]@{ FreePhysicalMemory = $m['MemAvailable']; FreeVirtualMemory = $commit }
+  }
+  Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory, FreeVirtualMemory
 }
 function Get-AdaptiveMachineCap {
   $cfg = Get-Config
@@ -353,7 +423,7 @@ function Get-AdaptiveMachineCap {
       $dt = [double]([long]$t.total - [long]$prev.total); $di = [double]([long]$t.idle - [long]$prev.idle)
       $cpu = [math]::Round(100 * (1 - $di / $dt), 1)
     }
-    $os = Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory, FreeVirtualMemory
+    $os = Get-MemInfo
     $ram = [math]::Round($os.FreePhysicalMemory / 1MB, 1); $commit = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
     $cap = if ($prev -and $prev.cap) { [int]$prev.cap } else { $min }
     $why = 'hold'
@@ -472,7 +542,7 @@ function Assert-NotMarked([string]$res) {
 
 function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoTop) {
   $dir = QPath $res
-  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null; Set-RepoGroupDir $dir (Get-ResourceRepo $res) }
   if ($script:CapacityGiven -or -not (Test-Path (Join-Path $dir 'capacity'))) {
     $cap = if ($script:Capacity -gt 1) { $script:Capacity } else { Get-Capacity $res }
     [IO.File]::WriteAllText((Join-Path $dir 'capacity'), "$cap")
@@ -492,7 +562,7 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
     $owner = if ($env:AGENTQ_OWNER_PID) { [int]$env:AGENTQ_OWNER_PID } else { $PID }
     $t = [ordered]@{
       id = $id; seq = $seq; resource = $res; pid = $owner; procStart = (Iso (Get-ProcStart $owner))
-      session = $Session; purpose = $purpose; cmd = $cmd; repo = $repoTop; host = $env:COMPUTERNAME
+      session = $Session; purpose = $purpose; cmd = $cmd; repo = $repoTop; host = [Environment]::MachineName; user = [Environment]::UserName
       created = (Iso (Now))
       # v3: priority scheduling. held flips true when the scheduler grants the slot; ready=false
       # while the same run is still blocked on another resource (backfill skips it).
@@ -570,7 +640,7 @@ function Wait-Turn($ticket, [int]$timeoutMin, [scriptblock]$extraGate, [object[]
 }
 
 function Test-FreeRam([double]$gb) {
-  $os = Get-CimInstance Win32_OperatingSystem
+  $os = Get-MemInfo
   # Commit charge too: 2026-09-30 "memory allocation failed" with 50 GB RAM free because the commit
   # limit was exhausted (vmmemWSL). FreeVirtualMemory = commit limit - committed (KB).
   $commitGb = [double](Get-Config).minFreeCommitGB
@@ -613,7 +683,7 @@ function Assert-OverrideBudget([string]$verb) {
 function Find-MyTickets {
   $out = @()
   foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
     $out += @(Get-Live $res | Where-Object { (-not $Id -and $_.session -eq $Session) -or ($Id -and $_.id -eq $Id) })
@@ -901,7 +971,7 @@ function Invoke-Run {
     # with the holder (kill-on-close) and CPU is shared by lane weight when the machine is saturated.
     # Best effort: any failure runs the command exactly as before. AGENTQ_NO_JOBOBJ=1 disables it.
     $jobInfo = $null
-    if ($env:AGENTQ_NO_JOBOBJ -ne '1') {
+    if ($env:AGENTQ_NO_JOBOBJ -ne '1' -and $IsWindows) {
       $libJ = Join-Path $PSScriptRoot 'agentq-jobobject-lib.ps1'
       if (Test-Path -LiteralPath $libJ) {
         . $libJ
@@ -947,7 +1017,7 @@ function Invoke-Commit {
   if (-not $Message) { throw 'agentq commit: -Message is required' }
   $plist = @($Paths | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
   if (-not $plist) { throw 'agentq commit: -Paths a,b,c is required (explicit paths only — never the whole index)' }
-  $outside = @($plist | Where-Object { [IO.Path]::IsPathRooted($_) -and -not ([IO.Path]::GetFullPath($_).ToLowerInvariant().StartsWith($repo.Top.ToLowerInvariant() + '\')) })
+  $outside = @($plist | Where-Object { [IO.Path]::IsPathRooted($_) -and -not ([IO.Path]::GetFullPath($_).ToLowerInvariant().StartsWith($repo.Top.ToLowerInvariant() + [IO.Path]::DirectorySeparatorChar)) })
   if ($outside) { [Console]::Error.WriteLine("agentq: REFUSED - paths outside $($repo.Top): $($outside -join ', ')"); exit 3 }
   $res = "commit:$($repo.Name)"
   Assert-NotMarked $res
@@ -1055,7 +1125,7 @@ function Show-Status {
   $dirs = @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)
   $rows = @()
   foreach ($d in $dirs) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
@@ -1100,9 +1170,11 @@ function Show-Status {
 }
 
 function Read-Journal([int]$n, $since, [string]$repoName) {
-  if (-not (Test-Path $Journal)) { return @() }
-  $lines = if ($n -gt 0) { Get-Content $Journal -Tail ([math]::Max($n * 8, 400)) } else { Get-Content $Journal }
+  $files = @(Get-JournalFiles)
+  if (-not $files) { return @() }
+  $lines = foreach ($jf in $files) { if ($n -gt 0) { Get-Content $jf -Tail ([math]::Max($n * 8, 400)) } else { Get-Content $jf } }
   $items = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
+  if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$($_.ts)" }) }
   if ($since) { $items = @($items | Where-Object { (ParseUtc $_.ts) -ge $since }) }
   if ($repoName) { $items = @($items | Where-Object { ($_.PSObject.Properties.Name -contains 'repo' -and $_.repo -eq $repoName) -or ("$($_.resource)" -match "(^|:)$([regex]::Escape($repoName))(:|$)") }) }
   if ($n -gt 0) { $items = @($items | Select-Object -Last $n) }
@@ -1179,6 +1251,56 @@ function Invoke-Break {
   }
 }
 
+# ---- workspaces (ADR 0007, DEVBOX D6): a project is ACTIVE in one place at a time --------------
+# One record per workspace in <system store>/workspaces/<name>.json: holder user + host + purpose. take by
+# the same user@host renews; a different holder is refused (exit 3) unless -Force -Reason (journaled, the
+# previous holder is named). release by the holder (or -Force -Reason). The record is the arbiter devsync
+# and the devbox consult before syncing; it says nothing about files, git stays the source of truth.
+function Invoke-Workspace {
+  $wd = Join-Path $SysRoot 'workspaces'
+  if (-not (Test-Path -LiteralPath $wd)) { New-Item -ItemType Directory -Force $wd | Out-Null }
+  $who = "$([Environment]::UserName)@$(if ($env:AGENTQ_CLIENT_HOST) { $env:AGENTQ_CLIENT_HOST } else { [Environment]::MachineName })"
+  $sub = if ($Sub) { $Sub } else { 'list' }
+  if ($sub -eq 'list') {
+    $rows = @(Get-ChildItem -LiteralPath $wd -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { try { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
+    if ($Json) { ConvertTo-Json -InputObject @($rows) -Depth 4; return }
+    if (-not $rows) { Write-Output '== WORKSPACES: none active'; return }
+    Write-Output '== WORKSPACES'
+    $rows | Format-Table name, holder, purpose, since -AutoSize | Out-String -Width 200 | Write-Output
+    return
+  }
+  if (-not $WsName -or $WsName -notmatch '^[a-z0-9][a-z0-9._-]{0,63}$') { throw "agentq workspace ${sub}: -Name <lowercase workspace name> is required" }
+  $f = Join-Path $wd "$WsName.json"
+  With-Mutex "workspace-$WsName" {
+    $cur = if (Test-Path -LiteralPath $f) { try { Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -DateKind String } catch { $null } } else { $null }
+    switch ($sub) {
+      'take' {
+        if ($cur -and $cur.holder -ne $who) {
+          if (-not $Force -or -not $Reason -or $Reason.Length -lt 8) {
+            [Console]::Error.WriteLine("agentq: workspace $WsName is ACTIVE at $($cur.holder) since $($cur.since) ('$($cur.purpose)'). Flush + release it there first, or -Force -Reason '<why>'.")
+            exit 3
+          }
+          Write-Journal @{ event = 'workspace-steal'; resource = "workspace:$WsName"; from = $cur.holder; to = $who; reason = $Reason }
+        }
+        $rec = [ordered]@{ name = $WsName; holder = $who; purpose = $(if ($Purpose) { $Purpose } else { '' }); since = $(if ($cur -and $cur.holder -eq $who) { $cur.since } else { Iso (Now) }); renewed = (Iso (Now)); session = $Session }
+        Write-JsonAtomic $f $rec
+        if (-not $cur -or $cur.holder -ne $who) { Write-Journal @{ event = 'workspace-take'; resource = "workspace:$WsName"; holder = $who; purpose = $rec.purpose } }
+        Write-Output "workspace $WsName active at $who"
+      }
+      'release' {
+        if (-not $cur) { Write-Output "workspace $WsName was not active"; return }
+        if ($cur.holder -ne $who -and -not ($Force -and $Reason -and $Reason.Length -ge 8)) {
+          [Console]::Error.WriteLine("agentq: workspace $WsName is held by $($cur.holder), not $who (-Force -Reason '<why>' to release it anyway)"); exit 3
+        }
+        Remove-Item -LiteralPath $f -Force
+        Write-Journal @{ event = 'workspace-release'; resource = "workspace:$WsName"; holder = $cur.holder; by = $who; reason = $(if ($Reason) { $Reason } else { '' }) }
+        Write-Output "workspace $WsName released"
+      }
+      default { throw "agentq workspace: sub-verb must be take|release|list (got '$sub')" }
+    }
+  }
+}
+
 function Invoke-Acquire {
   $repo = Get-RepoInfo $Repo
   $res = Resolve-Resource $Resource $repo
@@ -1250,7 +1372,7 @@ function Register-Agent {
       firstSeen = $(if ($prev -and $prev.firstSeen) { "$($prev.firstSeen)" } else { Iso (Now) }); lastSeen = Iso (Now)
       calls = $(if ($prev -and $prev.calls) { [int]$prev.calls + 1 } else { 1 })
       lastVerb = $Verb.ToLowerInvariant(); lastPurpose = $(if ($Purpose) { $Purpose } elseif ($prev) { $prev.lastPurpose } else { $null })
-      host = $env:COMPUTERNAME
+      host = [Environment]::MachineName; user = [Environment]::UserName
     }
     $tmp = "$f.$PID.tmp"
     [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force -LiteralPath $tmp -Destination $f
@@ -1274,6 +1396,7 @@ switch ($Verb.ToLowerInvariant()) {
   }
   'acquire' { Invoke-Acquire }
   'release' { Invoke-Release }
+  'workspace' { Invoke-Workspace }
   'bump' { Invoke-Bump }
   'burst' { Invoke-Burst }
   'propose' { Invoke-Propose }

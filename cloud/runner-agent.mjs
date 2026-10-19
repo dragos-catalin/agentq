@@ -61,6 +61,9 @@ const cfg = {
   cleanKeep: (await attr('devcloud-clean-keep', '')).split(',').map((s) => s.trim()).filter(Boolean),
 };
 if (!cfg.secretProject) cfg.secretProject = cfg.project;
+// Job checkouts (git checkout -f + clean -ffdx every job). On an interactive devbox /work/<repo> is the TEAM
+// repo people edit (agentq ADR 0007), so jobs get their own tree: /work/.jobs/<repo>. Runners keep /work/<repo>.
+cfg.jobs = await attr('devcloud-jobs-dir', cfg.interactive ? path.join(cfg.work, '.jobs') : cfg.work);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 let turboToken = '';
 async function loadTurbo() {
@@ -101,7 +104,7 @@ function killTree(p) {
 // Shas this workspace has (and therefore all their ancestors): the client picks its bundle base from
 // these via merge-base, so only the commits the workspace lacks travel.
 async function publishKnown(repo, dir, sha) {
-  const f = path.join(cfg.work, `.known-${repo}.json`);
+  const f = path.join(cfg.jobs, `.known-${repo}.json`);
   let shas = [];
   try { shas = JSON.parse(fs.readFileSync(f, 'utf8')).shas || []; } catch {}
   shas = [sha, ...shas.filter((s) => s !== sha)].slice(0, 30);
@@ -114,7 +117,7 @@ async function publishKnown(repo, dir, sha) {
 async function runJob(spec) {
   const t0 = Date.now(); const phases = {};
   const repo = repoKey(spec.repo);
-  const dir = path.join(cfg.work, repo);
+  const dir = path.join(cfg.jobs, repo);
   const out = []; let dirty = true; let lastFlush = 0;
   const append = (s) => { out.push(s); dirty = true; };
   const flush = async (force = false) => {
@@ -137,10 +140,10 @@ async function runJob(spec) {
   try {
     // --- sync: fetch new commits from the bundle, checkout sha, clean (keep warm caches), apply patch
     let s = Date.now();
-    fs.mkdirSync(cfg.work, { recursive: true });
+    fs.mkdirSync(cfg.jobs, { recursive: true });
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'job-'));
     if (!fs.existsSync(path.join(dir, '.git'))) {
-      exit = await step('git', ['init', '-q', dir], { cwd: cfg.work }); if (exit) throw new Error('git init failed');
+      exit = await step('git', ['init', '-q', dir], { cwd: cfg.jobs }); if (exit) throw new Error('git init failed');
     }
     sh('git', ['-C', dir, 'config', 'core.autocrlf', 'false']);
     sh('git', ['-C', dir, 'config', 'gc.auto', '0']);

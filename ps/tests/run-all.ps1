@@ -38,6 +38,9 @@ $suites = [ordered]@{
   'claims'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-claims.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land flakes'    = @('-File', (Join-Path $PSScriptRoot 'test-land-flakes.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'store'          = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-store.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS store selftest' }")
+  # ADR 0007: git-first + devbox teams
+  'devbox tools'   = @('-File', (Join-Path $PSScriptRoot 'test-devbox-tools.ps1'), '-Bin', $bin)
+  'devbox teams'   = @('-Command', "python '$(Join-Path $PSScriptRoot 'test-devbox-teams.py')' '$(Join-Path $bin 'devbox-teams.py')' 2>&1; if (`$LASTEXITCODE) { 'FAIL devbox-teams planner'; exit `$LASTEXITCODE } else { 'PASS devbox-teams planner (16)' }")
   'slo'            = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-slo.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo selftest' }")
 }
 $bad = @()

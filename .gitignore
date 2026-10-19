@@ -4,3 +4,4 @@ coverage/
 .copilot-tmp/
 *.log
 .env*
+__pycache__/

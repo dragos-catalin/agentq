@@ -5,8 +5,9 @@
 # PowerShell variables are case-insensitive: `$repo = Get-RepoInfo `$Repo` inside a function REPLACES
 # the -Repo argument. v2 code reads the argument only through `$RepoArg`.
 $RepoArg = $Repo
-$LDir = Join-Path $Root 'leases'
-$RDir = Join-Path $Root 'releases'
+# leases + releases are machine state: the system store when one exists (ADR 0007), else the user store
+$LDir = Join-Path $SysRoot 'leases'
+$RDir = Join-Path $SysRoot 'releases'
 foreach ($d in $LDir, $RDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force $d | Out-Null } }
 
 # ---- policy -------------------------------------------------------------------------------
@@ -28,10 +29,19 @@ function Get-Config {
     $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable
     foreach ($k in $j.Keys) { $c[$k] = $j[$k] }
   }
+  # system policy (devbox): machine caps/slot counts are set once by root for every user and win over
+  # a user's copy, so nobody raises the machine cap for themselves (ADR 0007)
+  if ($SystemMode -and -not $env:AGENTQ_CONFIG) {
+    $sf = Join-Path $SysRoot 'system.json'
+    if (Test-Path -LiteralPath $sf) {
+      $s = Get-Content -LiteralPath $sf -Raw | ConvertFrom-Json -AsHashtable
+      if ($s.ContainsKey('policy') -and $s['policy']) { foreach ($k in $s['policy'].Keys) { $c[$k] = $s['policy'][$k] } }
+    }
+  }
   $script:Cfg = $c
   $c
 }
-function Get-WtRoot { if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' } }
+function Get-WtRoot { if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' } }
 function Get-ReleaseSlotCount([string]$repoName) { $r = (Get-Config).releaseSlots; if ($r -and $r.ContainsKey($repoName)) { [int]$r[$repoName] } else { 1 } }
 function Get-PinnedSlots([string]$repoName) { $p = (Get-Config).pinned; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
 # The ONLY slot names that exist. Anything else is legacy and gets migrated away.
@@ -48,7 +58,10 @@ function Get-SlotRole([string]$repoName, [string]$slot) {
 function P($o, [string]$n, $d = '') { if ($null -ne $o -and $o.PSObject.Properties.Name -contains $n -and $null -ne $o.$n) { $o.$n } else { $d } }
 function Write-JsonAtomic([string]$file, $obj) {
   $dir = Split-Path -Parent $file
-  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+  if (-not (Test-Path -LiteralPath $dir)) {
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    if ((Split-Path -Parent $dir) -eq $LDir) { Set-RepoGroupDir $dir (Split-Path -Leaf $dir) }
+  }
   $tmp = "$file.$PID.tmp"
   [IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
   [IO.File]::Move($tmp, $file, $true)
@@ -92,8 +105,10 @@ function Get-ExtraLeaseActivity {
         } catch {}
       }
     }
-    $jd = Join-Path $Root 'jobs'
-    if (Test-Path -LiteralPath $jd) {
+    # system sweep (root timer on the devbox) judges every user's leases: it must see every user's jobs
+    $jds = @(Join-Path $Root 'jobs')
+    if ($SystemMode -and -not $IsWindows -and [Environment]::UserName -eq 'root') { $jds += @(Get-ChildItem -Path '/home/*/.codai/coord/jobs' -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
+    foreach ($jd in $jds) { if (Test-Path -LiteralPath $jd) {
       $cut = (Now).AddDays(-2)
       foreach ($f in @(Get-ChildItem -LiteralPath $jd -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $cut } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 200)) {
         try {
@@ -104,7 +119,7 @@ function Get-ExtraLeaseActivity {
           $acts += [pscustomobject]@{ path = $(if (P $j 'cwd' '') { Norm-Dir "$($j.cwd)" } else { '' }); text = "$(P $j 'command' '')".ToLowerInvariant(); at = $at }
         } catch {}
       }
-    }
+    } }
   } catch {}
   $script:LeaseActivity = $acts
   $acts
@@ -135,19 +150,29 @@ function Renew-ForSession {
 # An expired or broken lease used to be discovered only by finding foreign files in "my" slot. The
 # holder's session now gets a notice that agentq prints (stderr) on its next call, and `status`
 # lists losses of the last 24 h with the backup ref to restore from.
+# System mode: the notice is for ANOTHER user, so it goes next to the lease (leases/<repo>, group r-<repo>)
+# where that user's agentq finds it; the user store would only ever be read by the writer.
+function Get-NoticeDirs { if ($SystemMode) { @(Get-ChildItem -LiteralPath $LDir -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) } else { @(Join-Path $Root 'notices') } }
 function Add-LeaseNotice($l, [string]$event, [string]$why, [string]$ref) {
   try {
-    $nd = Join-Path $Root 'notices'; if (-not (Test-Path -LiteralPath $nd)) { New-Item -ItemType Directory -Force $nd | Out-Null }
+    $nd = if ($SystemMode) { Join-Path $LDir "$($l.repo)" } else { Join-Path $Root 'notices' }
+    if (-not (Test-Path -LiteralPath $nd)) { New-Item -ItemType Directory -Force $nd | Out-Null }
     $n = [ordered]@{ ts = (Iso (Now)); event = $event; repo = $l.repo; slot = $l.slot; leaseId = (P $l 'leaseId'); purpose = (P $l 'purpose'); branch = (P $l 'branch'); reason = $why; ref = $ref; by = $Session }
-    [IO.File]::AppendAllText((Join-Path $nd ((Safe "$(P $l 'session')") + '.jsonl')), (($n | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
+    $nf = if ($SystemMode) { 'notice-' + (Safe "$(P $l 'session')") + '.jsonl' } else { (Safe "$(P $l 'session')") + '.jsonl' }
+    [IO.File]::AppendAllText((Join-Path $nd $nf), (($n | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
   } catch {}
 }
 function Show-LeaseNotices {
   try {
-    $f = Join-Path (Join-Path $Root 'notices') ((Safe $Session) + '.jsonl')
-    if (-not (Test-Path -LiteralPath $f)) { return }
-    $lines = @(Get-Content -LiteralPath $f | Where-Object { $_ })
-    Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+    $nf = if ($SystemMode) { 'notice-' + (Safe $Session) + '.jsonl' } else { (Safe $Session) + '.jsonl' }
+    $lines = @()
+    foreach ($nd in Get-NoticeDirs) {
+      $f = Join-Path $nd $nf
+      if (-not (Test-Path -LiteralPath $f)) { continue }
+      $lines += @(Get-Content -LiteralPath $f | Where-Object { $_ })
+      Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $lines) { return }
     foreach ($ln in $lines) {
       $n = $ln | ConvertFrom-Json
       $restore = if ($n.ref) { " Unsaved state is in $($n.ref): git diff --binary <base> $($n.ref) --output=x.patch, then git apply --3way x.patch in a NEW lease." } else { ' Nothing unsaved was in it.' }
@@ -158,7 +183,7 @@ function Show-LeaseNotices {
 function Get-RecentLeaseLosses([int]$hours = 24) {
   try {
     $cut = (Now).AddHours(-$hours)
-    @(Get-Content -LiteralPath $Journal -Tail 4000 -ErrorAction Stop | Where-Object { $_ -match '"event":"(lease-expire|lease-break)"' } | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ -and (ParseUtc $_.ts) -gt $cut })
+    @(Get-JournalFiles | ForEach-Object { Get-Content -LiteralPath $_ -Tail 4000 -ErrorAction Stop } | Where-Object { $_ -match '"event":"(lease-expire|lease-break)"' } | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ -and (ParseUtc $_.ts) -gt $cut })
   } catch { @() }
 }
 
@@ -172,7 +197,8 @@ function Read-Leases([string]$repoName) {
   $out = @()
   foreach ($d in $dirs) {
     if (-not (Test-Path -LiteralPath $d)) { continue }
-    foreach ($f in Get-ChildItem -LiteralPath $d -Filter '*.json' -File) {
+    # -ErrorAction: on a multi-user machine another group's repo dir is unreadable by design (skip it)
+    foreach ($f in @(Get-ChildItem -LiteralPath $d -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
       $l = Read-JsonFile $f.FullName
       if ($null -eq $l) { continue }
       if ($l -eq 'UNREADABLE') {
@@ -210,7 +236,8 @@ function Read-Leases([string]$repoName) {
   }
   $out
 }
-function Norm-Dir([string]$p) { ([IO.Path]::GetFullPath($p).TrimEnd('\', '/') + '\').ToLowerInvariant() }
+# Windows paths compare case-insensitively; Linux paths are case-sensitive, so no lowering there.
+function Norm-Dir([string]$p) { $ds = [IO.Path]::DirectorySeparatorChar; $n = [IO.Path]::GetFullPath($p).TrimEnd('\', '/') + $ds; if ($IsWindows) { $n.ToLowerInvariant() } else { $n } }
 function Get-SlotGitActivity([string]$slotPath) {
   if (-not $slotPath) { return $null }
   try {
@@ -261,7 +288,7 @@ function Backup-Slot([string]$path, [string]$repoName, [string]$slot, [string]$w
   if ($clean -and (Test-OnRemote $path $head)) { return '' }
   $commit = $head; $big = @()
   if (-not $clean) {
-    $gitDir = (& git -C $path rev-parse --path-format=absolute --git-dir).Replace('/', '\')
+    $gitDir = (& git -C $path rev-parse --path-format=absolute --git-dir).Replace('/', [IO.Path]::DirectorySeparatorChar)
     $tmpIdx = Join-Path ([IO.Path]::GetTempPath()) ("aq-idx-" + [guid]::NewGuid().ToString('N'))
     $idx = Join-Path $gitDir 'index'
     if (Test-Path -LiteralPath $idx) { Copy-Item -LiteralPath $idx $tmpIdx -Force }
@@ -345,7 +372,10 @@ function Clear-StaleIndexLock([string]$path) {
     $lock = Join-Path $gd 'index.lock'
     if (-not (Test-Path -LiteralPath $lock)) { return }
     $needle = $path.TrimEnd('\').ToLowerInvariant()
-    $busy = @(Get-CimInstance Win32_Process -Filter "Name='git.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)".ToLowerInvariant().Contains($needle) })
+    # @(...) around the if: an empty array returned by a statement becomes $null, and $null.Count throws
+    # under StrictMode 3 (swallowed by the catch below -> the stale lock was never removed)
+    $busy = @(if ($IsWindows) { Get-CimInstance Win32_Process -Filter "Name='git.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)".ToLowerInvariant().Contains($needle) } }
+      else { Get-Process -Name git -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)".ToLowerInvariant().Contains($needle) } })
     if ($busy.Count) { return }
     if (((Now) - (Get-Item -LiteralPath $lock).LastWriteTimeUtc).TotalSeconds -lt 30) { return }
     Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
@@ -403,13 +433,13 @@ function Prepare-Slot([string]$main, [string]$path, [string]$repoName) {
 # already backed up anything unique, so discarding inside THIS slot is safe by construction.
 function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$branch, [bool]$copyEnv) {
   & git -C $main worktree prune 2>$null
-  $registered = @(& git -C $main worktree list --porcelain | Where-Object { $_ -like 'worktree *' } | ForEach-Object { $_.Substring(9).Replace('/', '\').TrimEnd('\').ToLowerInvariant() })
-  $isReg = $registered -contains $path.TrimEnd('\').ToLowerInvariant()
+  $registered = @(& git -C $main worktree list --porcelain | Where-Object { $_ -like 'worktree *' } | ForEach-Object { Norm-Dir $_.Substring(9) })
+  $isReg = $registered -contains (Norm-Dir $path)
   if (-not $isReg) {
     if (Test-Path -LiteralPath $path) {
       $left = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'node_modules', '.copilot-tmp' })
       if ($left.Count) { throw "slot ${path}: directory exists but is not a worktree of $main ($($left.Count) entries) - run 'worktree.ps1 migrate' first" }
-      cmd /c rmdir /s /q "`"$path`"" 2>$null
+      if ($IsWindows) { cmd /c rmdir /s /q "`"$path`"" 2>$null } else { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
     & git -C $main worktree add -q --detach $path $ref 2>&1 | Out-Null
@@ -433,7 +463,7 @@ function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$br
   if ($copyEnv) {
     $cands = @(Get-ChildItem -LiteralPath $main -File -Force -Filter '.env*' -ErrorAction SilentlyContinue)
     foreach ($d in 'apps', 'packages') { $b = Join-Path $main $d; if (Test-Path $b) { $cands += Get-ChildItem -LiteralPath $b -Directory | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File -Force -Filter '.env*' -ErrorAction SilentlyContinue } } }
-    foreach ($f in $cands) { if ($f.Name -like '*.example') { continue }; $rel = $f.FullName.Substring($main.Length).TrimStart('\'); $t = Join-Path $path $rel; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t) | Out-Null; Copy-Item -LiteralPath $f.FullName -Destination $t -Force }
+    foreach ($f in $cands) { if ($f.Name -like '*.example') { continue }; $rel = $f.FullName.Substring($main.Length).TrimStart('\', '/'); $t = Join-Path $path $rel; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t) | Out-Null; Copy-Item -LiteralPath $f.FullName -Destination $t -Force }
   }
 }
 
@@ -918,7 +948,7 @@ function Get-LandBatchSize([string]$repoName) {
   $c = Get-Config
   $max = if ($c.ContainsKey('landBatchMax')) { [int]$c.landBatchMax } else { 4 }
   $max = [math]::Max(2, [math]::Min(4, $max))
-  $recent = @(Get-Content -LiteralPath $Journal -Tail 4000 -ErrorAction SilentlyContinue | Where-Object { $_ -like '*"land-batch"*' } |
+  $recent = @(Get-Content -LiteralPath (Get-JournalFor @{ repo = $repoName }) -Tail 4000 -ErrorAction SilentlyContinue | Where-Object { $_ -like '*"land-batch"*' } |
       ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ -and $_.event -eq 'land-batch' -and "$($_.repo)" -eq $repoName } | Select-Object -Last 10)
   if ($recent.Count -ge 4 -and (@($recent | Where-Object { $_.bisected }).Count / $recent.Count) -gt 0.3) { return 2 }
   $max
