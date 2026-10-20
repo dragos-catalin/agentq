@@ -45,7 +45,8 @@ function Start-Land([string]$branch, [string]$session) {
   @{ p = $p; out = $outF; branch = $branch }
 }
 function Wait-Queued([int]$n) { for ($i = 0; $i -lt 120; $i++) { if (@(Events 'queued').Count -ge $n) { return $true }; Start-Sleep -Milliseconds 500 }; $false }
-function Finish($l) { if (-not $l.p.WaitForExit(240000)) { try { $l.p.Kill($true) } catch {} ; return -1 }; $l.p.ExitCode }
+# 600 s: the bisection case runs several gates; 240 s timed out under machine load (run-all 2026-10-19 22:00, all -1).
+function Finish($l) { if (-not $l.p.WaitForExit(600000)) { try { $l.p.Kill($true) } catch {} ; return -1 }; $l.p.ExitCode }
 function Run-Scenario([string]$tag, [string[]]$files) {
   Set-Content $env:FAKE_GATE_HOLD 'x'
   Topic "blocker$tag" "blk$tag.txt"
