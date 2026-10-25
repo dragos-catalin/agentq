@@ -34,6 +34,9 @@
   "burstMax": 2,
   "burstMaxMin": 60,
   "overridesPerHour": 6,
+  "landGate": {
+    "brivio": "pnpm land:gate"
+  },
   "runBuildTimeoutMin": 240,
   "journalRotateMB": 64,
   "cloudWorkspaces": {

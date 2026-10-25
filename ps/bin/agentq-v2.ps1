@@ -1147,6 +1147,15 @@ function Invoke-Land {
   $main = Get-MainTop $repo
   $res = "land:$($repo.Name)"
   Assert-NotMarked $res
+  # ADR-0303 A (brivio): a repo may declare its default land gate in config (`landGate: { repo: cmd }`),
+  # so every land runs it without each agent remembering -Gate. `-Gate none` opts out, journaled.
+  if (-not $Gate) {
+    $lg = (Get-Config)['landGate']
+    if ($lg -and $lg.ContainsKey($repo.Name) -and "$($lg[$repo.Name])") { $Gate = "$($lg[$repo.Name])"; Write-Output "land: default gate for $($repo.Name): $Gate" }
+  } elseif ($Gate -eq 'none') {
+    Write-Journal @{ event = 'land-gate-skipped'; resource = $res; branch = $Branch; reason = $why; repo = $repo.Name }
+    $Gate = $null
+  }
   # W2-6: refuse BEFORE queueing when the topic cannot merge onto the current tip (outside the files the
   # land resolver/finalizer handle). Saves the whole queue wait + slot setup of a land that ends in exit 5.
   & git -C $main fetch -q origin $Onto 2>$null
