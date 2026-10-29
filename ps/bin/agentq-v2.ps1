@@ -1265,6 +1265,43 @@ function Invoke-Land {
 # base (= reverting work that landed meanwhile), pushes a fresh topic, verifies it on the remote, and
 # with -Land hands it to Invoke-Land. Blobs are written from the file bytes via the repo's own
 # clean filters (git hash-object --path), so EOL/attributes match what a normal commit would store.
+#
+# Batched (2026-10-28): the first version spawned ~6 git processes PER PATH (hash-object, ls-tree,
+# update-index, then 3x rev-parse in the revert guard). A 233-path codai publish took 45+ min on a busy
+# workstation (process start 0.5-4 s each). Now: one `hash-object --stdin-paths` (still applies the
+# path's clean filters), one `update-index --index-info`, and one `ls-tree -r` per tree compared.
+function Get-PubTreeMap([string]$top, [string]$rev) {
+  # path -> "mode sha" for every blob in $rev (one process). -z: no quoting, paths may contain spaces.
+  $map = @{}
+  if (-not $rev) { return $map }
+  $raw = (& git -C $top -c core.quotepath=off ls-tree -r -z --full-tree $rev 2>$null) -join "`n"
+  foreach ($e in ($raw -split "`0")) {
+    if (-not $e) { continue }
+    $tab = $e.IndexOf("`t"); if ($tab -lt 0) { continue }
+    $meta = $e.Substring(0, $tab).Trim() -split '\s+'
+    $map[$e.Substring($tab + 1).TrimStart("`n")] = "$($meta[0]) $($meta[2])"
+  }
+  $map
+}
+function Invoke-GitStdin([string]$top, [string[]]$gitArgs, [string[]]$lines) {
+  # PowerShell pipes native stdin with CRLF and the console code page; git plumbing needs LF + UTF-8 exactly
+  # ("Ignoring path a.txt\r"). Returns stdout lines; throws on a non-zero exit.
+  $psi = [Diagnostics.ProcessStartInfo]::new('git')
+  foreach ($a in @('-C', $top) + $gitArgs) { $psi.ArgumentList.Add($a) }
+  $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+  $psi.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
+  $pr = [Diagnostics.Process]::Start($psi)
+  $errTask = $pr.StandardError.ReadToEndAsync()
+  $outTask = $pr.StandardOutput.ReadToEndAsync()
+  $pr.StandardInput.NewLine = "`n"
+  foreach ($l in $lines) { $pr.StandardInput.Write($l + "`n") }
+  $pr.StandardInput.Close()
+  $pr.WaitForExit()
+  if ($pr.ExitCode) { throw "git $($gitArgs -join ' ') failed ($($pr.ExitCode)): $($errTask.Result)" }
+  @($outTask.Result -split "`n" | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ })
+}
 function Invoke-Publish {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -1283,31 +1320,49 @@ function Invoke-Publish {
   $idx = Join-Path ([IO.Path]::GetTempPath()) ("aq-pub-" + [guid]::NewGuid().ToString('N') + '.idx')
   $oldIdx = $env:GIT_INDEX_FILE
   $reverts = @(); $changed = @()
+  # ls-tree -z output is decoded as UTF-8 (non-ASCII paths); agentq runs in its own pwsh process.
+  [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+  $tipMap = Get-PubTreeMap $top $tip
   try {
     $env:GIT_INDEX_FILE = $idx
     & git -C $top read-tree $tip; if ($LASTEXITCODE) { throw 'read-tree failed' }
-    foreach ($p in $plist) {
-      $full = Join-Path $top $p
-      if (Test-Path -LiteralPath $full -PathType Leaf) {
-        $blob = "$(& git -C $top hash-object -w --path $p -- $full)".Trim()
-        if (-not $blob) { throw "hash-object failed for $p" }
-        $mode = "$(& git -C $top ls-tree $tip -- $p)".Trim() -split '\s+' | Select-Object -First 1
-        if (-not $mode) { $mode = "$(& git -C $top ls-files -s -- $p)".Trim() -split '\s+' | Select-Object -First 1 }
-        if (-not $mode) { $mode = '100644' }
-        & git -C $top update-index --add --cacheinfo "$mode,$blob,$p"; if ($LASTEXITCODE) { throw "update-index failed for $p" }
-      } else {
-        & git -C $top update-index --force-remove -- $p
-      }
+    $present = @($plist | Where-Object { Test-Path -LiteralPath (Join-Path $top $_) -PathType Leaf })
+    $absent = @($plist | Where-Object { $present -notcontains $_ })
+    $blobs = @()
+    if ($present.Count) {
+      # --stdin-paths hashes each file AS its path, so .gitattributes clean filters / eol apply like --path.
+      $blobs = @(Invoke-GitStdin $top @('hash-object', '-w', '--stdin-paths') $present)
+      if ($blobs.Count -ne $present.Count) { throw "hash-object --stdin-paths failed ($($blobs.Count)/$($present.Count) blobs)" }
     }
+    $wtModes = @{}
+    if ($present | Where-Object { -not $tipMap.ContainsKey($_) }) {
+      # New paths: take the mode the caller's own index has (exec bit), one process for all of them.
+      $raw = (& git -C $top -c core.quotepath=off ls-files -s -z 2>$null) -join "`n"
+      foreach ($e in ($raw -split "`0")) { $tab = $e.IndexOf("`t"); if ($tab -gt 0) { $wtModes[$e.Substring($tab + 1).TrimStart("`n")] = ($e.Substring(0, $tab).Trim() -split '\s+')[0] } }
+    }
+    $lines = [Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $present.Count; $i++) {
+      $p = $present[$i]
+      $mode = if ($tipMap.ContainsKey($p)) { ($tipMap[$p] -split ' ')[0] } elseif ($wtModes.ContainsKey($p)) { $wtModes[$p] } else { '100644' }
+      $lines.Add("$mode $($blobs[$i])`t$p")
+    }
+    foreach ($p in $absent) { $lines.Add("0 0000000000000000000000000000000000000000`t$p") }
+    if ($lines.Count) { Invoke-GitStdin $top @('update-index', '--index-info') $lines | Out-Null }
     $tree = "$(& git -C $top write-tree)".Trim()
-  } finally { if ($oldIdx) { $env:GIT_INDEX_FILE = $oldIdx } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }; Remove-Item -LiteralPath $idx -Force -ErrorAction SilentlyContinue }
+  } finally {
+    if ($oldIdx) { $env:GIT_INDEX_FILE = $oldIdx } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $idx -Force -ErrorAction SilentlyContinue
+  }
   if ($tree -eq "$(& git -C $top rev-parse "$tip^{tree}")".Trim()) { Write-Output "publish: nothing to publish - origin/$onto already has these $($plist.Count) path(s) as on disk"; return }
   # Revert guard: for every path, compare (base -> disk) with (tip -> result). Lines the tip has that
   # base did not have, and that our result drops, would be someone else's landed work being undone.
+  $baseMap = if ($base -eq $tip) { $tipMap } else { Get-PubTreeMap $top $base }
+  $oursMap = Get-PubTreeMap $top $tree
+  $blobOf = { param($m, $p) if ($m.ContainsKey($p)) { ($m[$p] -split ' ')[1] } else { '' } }
   foreach ($p in $plist) {
-    $onTip = "$(& git -C $top rev-parse --verify -q "$($tip):$p" 2>$null)".Trim()
-    $onBase = "$(& git -C $top rev-parse --verify -q "$($base):$p" 2>$null)".Trim()
-    $ours = "$(& git -C $top rev-parse --verify -q "$($tree):$p" 2>$null)".Trim()
+    $onTip = & $blobOf $tipMap $p
+    $onBase = & $blobOf $baseMap $p
+    $ours = & $blobOf $oursMap $p
     if ($onTip -ne $ours) { $changed += $p }
     if ($onTip -and $onBase -and $onTip -ne $onBase -and $ours -ne $onTip) {
       $tipAdds = @(& git -C $top diff --no-color --unified=0 $onBase $onTip 2>$null | Where-Object { $_ -match '^\+[^+]' } | ForEach-Object { $_.Substring(1) })

@@ -110,6 +110,39 @@ try {
   Check '8 flake journaled once' (([regex]::Matches($j8, '"event":"flake"')).Count -eq 1)
 
   # 7 journal has publish + publish-refused
+  # 9 batched publish: 150 new files + a path with spaces + a non-ASCII path + a delete + an exec-bit file,
+  #   all in ONE publish; content, modes and deletion must be exact, and it must not scale per path.
+  git -C $repo fetch -q origin; git -C $repo checkout -q -f -B main origin/main 2>$null
+  New-Item -ItemType Directory -Force "$repo\many", "$repo\sp ace" | Out-Null
+  W "$repo\x.sh" "#!/bin/sh`n"; git -C $repo add x.sh; git -C $repo update-index --chmod=+x x.sh
+  git -C $repo commit -qm 'exec'; git -C $repo push -q origin main 2>$null
+  $many = 1..150 | ForEach-Object { "many/f$_.txt" }
+  foreach ($m in $many) { W "$repo\$m" "$m`n" }
+  W "$repo\sp ace\a b.txt" "spaced`n"
+  W "$repo\many\ăîșț.txt" "diacritice`n"
+  W "$repo\x.sh" "#!/bin/sh`necho 2`n"
+  Remove-Item "$repo\d.txt"
+  $plist9 = @($many) + @('sp ace/a b.txt', 'many/ăîșț.txt', 'x.sh', 'd.txt')
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $o = AQ publish -Paths ($plist9 -join ',') -Message 'feat: many' -Purpose 'test batch' -Onto main -NoPush
+  $sw.Stop()
+  $sha9 = ([regex]::Match($o, 'publish: ([0-9a-f]{12})')).Groups[1].Value
+  Check '9 exit 0' ($code -eq 0 -and [bool]$sha9) $o
+  $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+  $names9 = if ($sha9) { @(git -C $repo -c core.quotepath=off ls-tree -r --name-only $sha9) } else { @() }
+  [Console]::OutputEncoding = $prevEnc
+  Write-Host "INFO 9 publish of $($plist9.Count) paths took $([int]$sw.Elapsed.TotalSeconds) s"
+  Check '9 all 150 files present' (@($many | Where-Object { $names9 -contains $_ }).Count -eq 150)
+  Check '9 file content exact' ($sha9 -and ((git -C $repo show "$($sha9):many/f77.txt") -join '') -eq 'many/f77.txt')
+  Check '9 path with spaces' ($names9 -contains 'sp ace/a b.txt')
+  Check '9 non-ASCII path' ($names9 -contains 'many/ăîșț.txt') (($names9 | Where-Object { $_ -match 'diac|many/[^f]' }) -join ',')
+  Check '9 deletion applied' ($names9 -notcontains 'd.txt')
+  $mode9 = if ($sha9) { ("$(git -C $repo ls-tree $sha9 -- x.sh)" -split '\s+')[0] } else { '' }
+  Check '9 exec bit kept' ($mode9 -eq '100755') $mode9
+  # Measured 2026-10-28 on a loaded box: per-path code 3638 s, batched 134 s (incl. fetch + process start).
+  Check '9 154 paths batched, not per path (< 600 s; per-path code took 3638 s)' ($sw.Elapsed.TotalSeconds -lt 600) "$([int]$sw.Elapsed.TotalSeconds) s"
+
+  # 7 journal has publish + publish-refused
   $j = Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') -Raw
   Check '7 journal publish' ($j -match '"event":"publish"')
   Check '7 journal publish-refused' ($j -match '"event":"publish-refused"')
