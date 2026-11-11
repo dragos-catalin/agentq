@@ -1,0 +1,51 @@
+id,stage,title,status,acceptance,notes
+OQ-001,0,Lease kept alive by the per-tool-call hook (chat session id + slot path),todo,"7 days with 0 lease-expire or foreign lease-break on a slot whose chat made a tool call in the last 30 min",Hook edit needs the owner's rules ticket
+OQ-002,0,Land gate runs in the slot on the rebased tip before the land ticket is taken,todo,"Busiest repo: land wait under 5 h a week, land failures under 10 %",Baseline 18.7 h and 23 %
+OQ-003,0,Skip the in-queue gate for a tree hash that already passed,todo,"A re-land of an unchanged green tree spends under 1 min in land",
+OQ-004,0,Agent admission by load: no new task lease or build grant while the machine is saturated,todo,"Process-start probe median under 500 ms in 95 % of 5-minute buckets on a working day",Probe = start latency of a trivial process
+OQ-005,0,Admission follows owner presence and a night schedule,todo,"Agent limit changes with input idle time and with the schedule; both visible in status",
+OQ-006,0,"Prune agents, jobs, notices, releases and empty queue folders",todo,"State folder file count stable over 7 days",3899 agent files and 3201 job files at baseline
+OQ-007,0,status is read-only (no reaping or capacity rewrite on a read),todo,"status leaves every file in the state folder unchanged (hash before = after)",
+OQ-008,0,Shared clone on refuse for repos that have slots (ADR 0004),todo,"shared-write events for those repos drop to 0, overrides journaled",6220 writes in 7 days at baseline
+OQ-009,0,PowerShell suites run in CI,todo,"Every push runs run-all on a Windows runner; red blocks the merge",
+OQ-010,0,hook-pre.ps1 and its suite live in this repo and install from it,todo,"Installed copy is byte-equal to the repo copy after install",Today the file exists only in the installed folder
+OQ-011,0,agentq doctor,todo,"Reports stale index locks, empty package-store folders, config drift between repo and installed copy, dead keepers",
+OQ-012,0,Queue-time and hook-cost numbers in agentq slo,todo,"slo prints total wait hours, waits over 10 min and hook cost per day",Scratch script exists
+OQ-020,1,ADR for the daemon protocol (local API, SQLite schema, events),todo,ADR accepted,Carries out ADR 0002 and ADR 0006 phase 2
+OQ-021,1,"Daemon core: tickets, lanes, caps, grants",todo,"Both cores pass one parity suite; status under 300 ms",
+OQ-022,1,PowerShell verbs become thin clients of the daemon,todo,"Every verb returns the same output and exit code as before",
+OQ-023,1,Hook as a client of the daemon,todo,"Hook median under 700 ms with identical guard decisions on the recorded payload set",Needs the owner's rules ticket
+OQ-024,1,"Leases, slots and jobs in the daemon",todo,"Slot loss incidents stay at 0",
+OQ-025,1,Warm slot pool,todo,"Lease to ready under 20 s for the two busiest repos",
+OQ-026,1,Daemon runs on Linux and macOS,todo,"Suite green on the cloud dev box",
+OQ-030,2,Tracker mapping file and index,todo,"Every tracker of the two busiest repos indexed with the four common states",.agentq/trackers.json per repo
+OQ-031,2,"Atomic claim, next, block, done verbs",todo,"Two agents asking at once never get the same task",
+OQ-032,2,Dependencies between tasks,todo,"next never returns a task with an open dependency",
+OQ-033,2,Conflict forecast from path claims,todo,"Two ready tasks that claim overlapping paths are not handed out together",
+OQ-034,2,Handoff as an object,todo,"A handoff prompt is stored with its task and shown in status",
+OQ-035,2,Task timeline and flight recorder,todo,"For any task: what was asked, what ran, what landed, what is uncertain",
+OQ-036,2,Independent landing lanes for changes that do not overlap,todo,"Two non-overlapping lands finish without waiting for each other",Large
+OQ-037,2,Auto-rebase helper for a branch that conflicts,todo,"A conflicting land is retried on a rebased branch without a person when the conflict is mechanical",
+OQ-040,3,Verify an agent can run a task unattended under the same guards,todo,"One tracker task landed by a headless agent with the hook log showing every guard ran",Blocks OQ-042
+OQ-041,3,Dispatcher in propose-only mode for a week,todo,"A list of proposed launches with measured cost per landed task",
+OQ-042,3,"Automatic launch with an agent limit, a daily budget and pause-all",todo,"Budget never exceeded; pause-all stops new launches within 5 s",Budget set from OQ-041
+OQ-043,3,Needs-you inbox ordered by priority,todo,"Every question or approval from any agent is in one list and can be answered there",Includes actions only the owner can take
+OQ-044,3,Stuck-chat detector,todo,"A chat silent for 10 min after a tool call appears in the inbox",
+OQ-045,3,Cost per task and per agent from gateway usage,todo,"Cost shown on every finished task",
+OQ-046,3,Overflow to cloud workspaces when the local limit is full,todo,"A waiting build moves to the cloud after the configured wait",
+OQ-047,3,Registry of cloud resources started by agents with expiry and cost,todo,"No resource alive past its expiry for 30 days",
+OQ-048,3,Arena: one task to two agents,todo,"Both results shown side by side; one is chosen and the other discarded",Double cost
+OQ-049,3,Scorecards per model and per agent,todo,"Land rate, rework and cost per landed task per model",
+OQ-050,3,Emergency lane that pauses background agents,todo,"One command pauses batch and gate lanes and restores them",
+OQ-051,3,Why-waiting and expected time on every waiting item,todo,"Each waiter shows its blocker and an estimate from past durations",
+OQ-060,4,"Gateway: read API, event stream, command route (operator only)",todo,"State on screen within 5 s of the event; every command journaled",codai repo
+OQ-061,4,Hub page extended,todo,"Tasks, agents, inbox, costs and all commands",codai repo
+OQ-062,4,Desktop panel shows other machines,todo,"Remote host state and commands",codai repo
+OQ-063,4,"Phone: screen, widget, quick tile, push",todo,"Inbox answered and pause-all triggered from the phone",codai repo
+OQ-064,4,Watch: tile and approve,todo,"An approval answered from the wrist",codai repo
+OQ-065,4,TV: ambient board,todo,"Queues, agents and alerts readable from across a room",codai repo
+OQ-066,4,iOS widget and editor status bar item,todo,"Counts of running, waiting and needs-you",codai repo
+OQ-067,4,Daily mail report,todo,"One mail a day: landed, failed, waited, cost",Sent through the existing mail path
+OQ-068,4,Flaky-test board,todo,"Quarantined tests with age and owner",
+OQ-069,4,Voice and wrist commands,todo,"Freeze and pause-all by voice with confirmation",
+OQ-070,5,"ADR: organisations, authenticated identity, billing",todo,ADR accepted,Before any customer use
