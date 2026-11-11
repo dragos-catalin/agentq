@@ -14,6 +14,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
 - Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
 - Config knobs in `agentq-config.json` (machineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
+- Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
 
 ### Changed
 

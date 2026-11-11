@@ -30,6 +30,7 @@ $suites = [ordered]@{
   'args'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # ADR 0003 wave 2/4
   'land finalize'  = @('-File', (Join-Path $PSScriptRoot 'test-land-finalize.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'post-land hook' = @('-File', (Join-Path $PSScriptRoot 'test-post-land.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land precheck'  = @('-File', (Join-Path $PSScriptRoot 'test-land-precheck.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land reclaim'   = @('-File', (Join-Path $PSScriptRoot 'test-land-reclaim.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
