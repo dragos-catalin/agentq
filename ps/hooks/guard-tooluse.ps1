@@ -113,6 +113,112 @@ foreach ($container in $payload.tool_input, $payload.toolInput) {
 }
 if ($isEditTool) { $cmd = '' }
 
+# ---- slot leases: shared plumbing (ADR 0001) + chat keep-alive (ADR 0009 stage 0, OQ-001) -----------
+# Runs BEFORE every early exit of this script, on every tool call, in Windows PowerShell 5.1 (VS Code)
+# and PowerShell 7 alike. Never blocks and never fails the call: all of it is best effort.
+$script:WtRootG = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
+$script:CoordG = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
+$script:LeaseRootG = Join-Path $script:CoordG 'leases'
+$script:GL = $null
+function Get-GuardLeases {
+  if ($null -ne $script:GL) { return $script:GL }
+  $out = @()
+  foreach ($f in Get-ChildItem $script:LeaseRootG -Recurse -Filter '*.json' -File -EA SilentlyContinue) {
+    $j = $null; try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { }
+    $p = if ($j -and $j.path) { "$($j.path)" } else { Join-Path (Join-Path $script:WtRootG $f.Directory.Name) $f.BaseName }
+    $out += [pscustomobject]@{ path = $p.TrimEnd('\'); file = $f.FullName; who = $(if ($j) { "$($j.session) ($($j.leaseId)) '$($j.purpose)'" } else { 'unreadable lease' }); id = $(if ($j) { "$($j.leaseId)" } else { '' }) }
+  }
+  $script:GL = @($out)
+  $script:GL
+}
+# Does $text name $dir itself or something inside it? ('...\task-1' must not match '...\task-10'.)
+function Test-NamesDir([string]$text, [string]$dir) {
+  $i = 0
+  while ($true) {
+    $i = $text.IndexOf($dir, $i, [StringComparison]::OrdinalIgnoreCase)
+    if ($i -lt 0) { return $false }
+    $e = $i + $dir.Length
+    if ($e -ge $text.Length -or $text[$e] -notmatch '[A-Za-z0-9._-]') { return $true }
+    $i = $e
+  }
+}
+# Everything in this call that names a path: the command, path-like arguments, apply_patch file headers.
+$touchText = "$cmd"
+foreach ($container in $payload.tool_input, $payload.toolInput) {
+  if (-not $container -or $container -is [string]) { continue }
+  foreach ($k in 'filePath', 'path', 'file', 'dirPath', 'cwd') { if ($container.PSObject.Properties.Name -contains $k -and $container.$k) { $touchText += " $($container.$k)" } }
+  if ($isEditTool -and $container.PSObject.Properties.Name -contains 'input' -and $container.input) {
+    foreach ($m in [regex]::Matches("$($container.input)", '\*\*\* (?:Update|Add|Delete) File: ([^\r\n]+)')) { $touchText += " $($m.Groups[1].Value.Trim())" }
+  }
+}
+$touchNorm = $touchText.Replace('/', '\')
+# A literal \.wt\ segment (the default root, as before) OR the configured slot root (CODAI_WT_ROOT):
+# with a root not named ".wt" nothing matched, so neither the heartbeat nor the chat binding ran.
+# For the default root both tests select exactly the same calls.
+$wtRootN = $script:WtRootG.Replace('/', '\').TrimEnd('\') + '\'
+$touchesWt = (($touchNorm -match '(?i)\\\.wt\\') -or ($touchNorm.IndexOf($wtRootN, [StringComparison]::OrdinalIgnoreCase) -ge 0)) -and (Test-Path $script:LeaseRootG)
+
+# The chat (not a shell) is what works in a slot. A chat that WORKS in a leased slot - an edit inside
+# it, or a command that names it - is bound to that lease: <coord>/chats/<chat>.json lists the leases,
+# and <lease>.json.chat lists the chats. From then on EVERY tool call of that chat, whatever it is
+# about (a deploy, a queue wait, a subagent's read), touches <lease>.json.chat, and agentq counts a
+# recent touch like a live owner process (agentq-v2.ps1 Read-Leases). 185 lease-break + 40 lease-expire
+# in 7 days came from leases whose owner shell had ended while the chat was still working elsewhere.
+# Reads never bind (looking at another agent's slot is not working in it), nor do agentq's own
+# inspection and maintenance verbs. AGENTQ_NO_CHAT_KEEPALIVE=1 turns it off.
+$chatId = ''
+foreach ($k in 'session_id', 'sessionId') { if (-not $chatId -and $payload.PSObject.Properties.Name -contains $k -and $payload.$k) { $chatId = "$($payload.$k)" } }
+if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
+  try {
+    $utf8G = New-Object Text.UTF8Encoding $false
+    $nowG = [DateTime]::UtcNow
+    $chatDir = Join-Path $script:CoordG 'chats'
+    $chatFile = Join-Path $chatDir (($chatId -replace '[^A-Za-z0-9._-]', '_') + '.json')
+    $bound = @{}   # lease file -> lease id
+    if ([IO.File]::Exists($chatFile)) {
+      try { foreach ($b in @((([IO.File]::ReadAllText($chatFile)) | ConvertFrom-Json).leases)) { if ($b -and $b.file -and $b.id) { $bound["$($b.file)"] = "$($b.id)" } } } catch { }
+    }
+    $dirty = $false
+    # (1) bind: this call works in a leased slot
+    $works = $isEditTool -or ($cmd -and $cmd -notmatch '(?i)agentq(-v2)?(\.ps1)?[''"]?\s+(status|log|since|lease-check|doctor|unlease|sweep|break|metrics|slo|prune|probe)\b')
+    if ($touchesWt -and $works) {
+      foreach ($l in @(Get-GuardLeases)) {
+        if (-not $l.id -or -not (Test-NamesDir $touchNorm $l.path)) { continue }
+        if ($bound[$l.file] -ne $l.id) { $bound[$l.file] = $l.id; $dirty = $true }
+        $cf = "$($l.file).chat"
+        $chats = @()
+        if ([IO.File]::Exists($cf)) { try { $cj = ([IO.File]::ReadAllText($cf)) | ConvertFrom-Json; if ("$($cj.leaseId)" -eq $l.id) { $chats = @($cj.chats | ForEach-Object { "$_" } | Where-Object { $_ }) } } catch { } }
+        if ($chats -notcontains $chatId) {
+          $chats = @(@($chats) + $chatId | Select-Object -Last 8)
+          [IO.File]::WriteAllText($cf, (@{ leaseId = $l.id; chats = @($chats) } | ConvertTo-Json -Compress), $utf8G)
+        }
+      }
+    }
+    # (2) keep alive: every lease this chat is bound to, as long as it is still the same lease
+    foreach ($lf in @($bound.Keys)) {
+      $same = $false
+      if ([IO.File]::Exists($lf)) { try { $same = ([IO.File]::ReadAllText($lf)) -match ('"leaseId"\s*:\s*"' + [regex]::Escape($bound[$lf]) + '"') } catch { $same = $true } }
+      if (-not $same) { $bound.Remove($lf); $dirty = $true; continue }
+      $cf = "$lf.chat"
+      if ([IO.File]::Exists($cf)) { [IO.File]::SetLastWriteTimeUtc($cf, $nowG) }
+      else { [IO.File]::WriteAllText($cf, (@{ leaseId = $bound[$lf]; chats = @($chatId) } | ConvertTo-Json -Compress), $utf8G) }
+    }
+    if ($dirty) {
+      if ($bound.Count) {
+        [void][IO.Directory]::CreateDirectory($chatDir)
+        $rows = @(foreach ($lf in $bound.Keys) { @{ id = $bound[$lf]; file = $lf } })
+        [IO.File]::WriteAllText($chatFile, (@{ chat = $chatId; leases = @($rows) } | ConvertTo-Json -Compress -Depth 4), $utf8G)
+      } elseif ([IO.File]::Exists($chatFile)) { [IO.File]::Delete($chatFile) }
+    } elseif ($bound.Count) { [IO.File]::SetLastWriteTimeUtc($chatFile, $nowG) }
+    # (3) who releases: `agentq unlease -LeaseId x` typed by a chat is recorded next to the lease, so the
+    # journal can tell "the worker gave its slot back from another shell" from "someone else took it".
+    if ($cmd -match '(?i)\bunlease\b' -and $cmd -match '(?i)-LeaseId\s+[''"]?([0-9a-f]{6,})') {
+      $rid = $Matches[1]
+      foreach ($l in @(Get-GuardLeases)) { if ($l.id -eq $rid) { [IO.File]::WriteAllText("$($l.file).release", $chatId, $utf8G) } }
+    }
+  } catch { }
+}
+
 # ---- shared-clone source writes (2026-10-17) -----------------------------------------------
 # Drafts edited directly in the shared clone (E:\gh\<repo>) stay behind after the same work lands
 # from a worktree slot in another form; git-autosync then cannot fast-forward (codai/brivio/
@@ -140,9 +246,12 @@ if ($isEditTool) {
         try {
           $cfgF = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $env:USERPROFILE '.copilot\bin\agentq-config.json' }
           if (Test-Path -LiteralPath $cfgF) {
-            $cj = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json -AsHashtable
-            if ($cj.ContainsKey('sharedCloneMode') -and $cj.sharedCloneMode) { $scMode = "$($cj.sharedCloneMode)" }
-            if ($cj.ContainsKey('sharedCloneModeRepos') -and $cj.sharedCloneModeRepos -and $cj.sharedCloneModeRepos.ContainsKey($scRepo)) { $scMode = "$($cj.sharedCloneModeRepos[$scRepo])" }
+            # No -AsHashtable: VS Code runs this hook in Windows PowerShell 5.1, where that switch does
+            # not exist, so the configured mode was silently ignored there (always 'warn').
+            $cj = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json
+            if ($cj.PSObject.Properties['sharedCloneMode'] -and $cj.sharedCloneMode) { $scMode = "$($cj.sharedCloneMode)" }
+            $scRepos = if ($cj.PSObject.Properties['sharedCloneModeRepos']) { $cj.sharedCloneModeRepos } else { $null }
+            if ($scRepos -and $scRepos.PSObject.Properties[$scRepo]) { $scMode = "$($scRepos.PSObject.Properties[$scRepo].Value)" }
           }
         } catch { }
         $scOverride = [bool]$env:CODAI_SHARED_CLONE_WRITE_OK
@@ -171,23 +280,11 @@ if ($isEditTool) {
 # (1) Renew: any tool call whose command or file path touches a leased slot is activity for that
 #     lease (cheap: a dir scan of ~/.codai/coord/leases + one file timestamp).
 # (2) Protect: deleting / removing a leased slot (or a parent of one) is refused, whatever the tool.
-$script:WtRootG = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
-$script:LeaseRootG = Join-Path $(if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }) 'leases'
-function Get-GuardLeases {
-  $out = @()
-  foreach ($f in Get-ChildItem $script:LeaseRootG -Recurse -Filter '*.json' -File -EA SilentlyContinue) {
-    $j = $null; try { $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { }
-    $p = if ($j -and $j.path) { "$($j.path)" } else { Join-Path (Join-Path $script:WtRootG $f.Directory.Name) $f.BaseName }
-    $out += [pscustomobject]@{ path = $p.TrimEnd('\'); file = $f.FullName; who = $(if ($j) { "$($j.session) ($($j.leaseId)) '$($j.purpose)'" } else { 'unreadable lease' }); id = $(if ($j) { "$($j.leaseId)" } else { '' }) }
-  }
-  $out
-}
-$touchText = "$cmd"
-foreach ($container in $payload.tool_input, $payload.toolInput) { if ($container -and $container -isnot [string]) { foreach ($k in 'filePath', 'path', 'file', 'dirPath', 'cwd') { if ($container.PSObject.Properties.Name -contains $k -and $container.$k) { $touchText += " $($container.$k)" } } } }
-if ($touchText -match '(?i)[\\/]\.wt[\\/]' -and (Test-Path $script:LeaseRootG)) {
-  $norm = $touchText.Replace('/', '\')
+# The lease plumbing ($script:WtRootG, Get-GuardLeases, $touchNorm, $touchesWt) is set up further up.
+if ($touchesWt) {
+  $norm = $touchNorm
   $gl = @(Get-GuardLeases)
-  foreach ($l in $gl) { if ($norm.IndexOf($l.path, [StringComparison]::OrdinalIgnoreCase) -ge 0) { try { [IO.File]::SetLastWriteTimeUtc("$($l.file).hb", [DateTime]::UtcNow) } catch { } } }
+  foreach ($l in $gl) { if (Test-NamesDir $norm $l.path) { try { [IO.File]::SetLastWriteTimeUtc("$($l.file).hb", [DateTime]::UtcNow) } catch { } } }
   if ($cmd) {
     $isDelete = $cmd -match '(?i)\b(Remove-Item|rm|rmdir|rd|del|ri|erase)\b' -or $cmd -match '(?i)\bgit\b[^;|&]*\bworktree\s+(remove|move|prune)\b' -or $cmd -match '(?i)\[IO\.Directory\]::Delete|Directory\.Delete|rmSync|rimraf'
     # The sanctioned tools check the lease themselves (and back up); everything else is refused.

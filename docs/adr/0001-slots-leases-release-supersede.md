@@ -9,7 +9,7 @@
 Several agents work on the same machine and often in the same repo. Before this decision:
 
 - Worktrees had ad-hoc names (`v3-dmarc`, `org-move`, `sentry11`, `deploy-mjs`, `deploy-1..6`). 14 worktrees in 11 repos, plus orphan non-git dirs.
-- Nothing recorded who was *using* a worktree. On 2026-10-06 an owner-requested cleanup deleted a live worktree of another agent and the `deploy-1` slot in the middle of a staging release (`git rev-parse --git-common-dir: not a git repository`).
+- Nothing recorded who was _using_ a worktree. On 2026-10-06 an owner-requested cleanup deleted a live worktree of another agent and the `deploy-1` slot in the middle of a staging release (`git rev-parse --git-common-dir: not a git repository`).
 - Release scripts had side locks agentq could not see (brivio `deploy-mjs.lock`, its own worktree). A release always ran to completion on the sha it started with, even when a newer landing made it obsolete.
 - Landing (rebase, CHANGELOG/version conflicts, push) was improvised per agent, in the shared clone or in a random worktree.
 - Known agentq bug classes: a waiter's heartbeat went stale while waiting, phantom holds, `break` without an id removing a live holder (fixed 2026-09-30, kept under test).
@@ -20,12 +20,12 @@ Several agents work on the same machine and often in the same repo. Before this 
 
 Every worktree lives at `E:\gh\.wt\<repo>\<slot>` (`<repo>` = folder of the common git dir, lower case). Only these slot names exist:
 
-| Slot | Count | Role | Created by | Typical holder |
-|---|---|---|---|---|
-| `release` | 1 per repo (configurable, e.g. codai 2: `release`, `release-2`) | `release` | `deploy-clean.ps1` | a deploy/release run |
-| `land` | 1 per repo | `land` | `agentq land` | the landing queue |
-| `task-1..3` | 3 per repo, **10 machine-wide** | `task` | `worktree.ps1 lease` | a feature agent |
-| pinned (`db-live`, `qa-prod`, ...) | listed in `agentq-config.json` | `pinned` | `worktree.ps1 lease -Slot <name>` | long-lived tools |
+| Slot                               | Count                                                           | Role      | Created by                        | Typical holder       |
+| ---------------------------------- | --------------------------------------------------------------- | --------- | --------------------------------- | -------------------- |
+| `release`                          | 1 per repo (configurable, e.g. codai 2: `release`, `release-2`) | `release` | `deploy-clean.ps1`                | a deploy/release run |
+| `land`                             | 1 per repo                                                      | `land`    | `agentq land`                     | the landing queue    |
+| `task-1..3`                        | 3 per repo, **10 machine-wide**                                 | `task`    | `worktree.ps1 lease`              | a feature agent      |
+| pinned (`db-live`, `qa-prod`, ...) | listed in `agentq-config.json`                                  | `pinned`  | `worktree.ps1 lease -Slot <name>` | long-lived tools     |
 
 A slot is **created on demand and reused**. A leased task slot is reset to the requested ref before it is handed over (after the previous holder's state was released clean or backed up). Disk cost per slot: pnpm's store is on the same volume (`E:\.pnpm-store`), so `node_modules` are hardlinks. The real per-slot cost is the checkout plus build output (measured in the migration report).
 
@@ -36,8 +36,19 @@ Raw `git worktree add/remove`, `rmdir`/`Remove-Item` of a leased slot, and clean
 A lease is `~/.codai/coord/leases/<repo>/<slot>.json` plus a heartbeat file `<slot>.json.hb`:
 
 ```json
-{ "leaseId":"a1b2c3d4", "repo":"brivio", "slot":"task-2", "role":"task", "path":"E:\\gh\\.wt\\brivio\\task-2",
-  "branch":"feat/x", "purpose":"why", "session":"term-1234", "pid":1234, "procStart":"ISO", "created":"ISO" }
+{
+  "leaseId": "a1b2c3d4",
+  "repo": "brivio",
+  "slot": "task-2",
+  "role": "task",
+  "path": "E:\\gh\\.wt\\brivio\\task-2",
+  "branch": "feat/x",
+  "purpose": "why",
+  "session": "term-1234",
+  "pid": 1234,
+  "procStart": "ISO",
+  "created": "ISO"
+}
 ```
 
 - **Owner** = the agent's terminal shell (the nearest ancestor shell that is not an agentq or worktree script). Agents have no long-lived process of their own, so liveness combines pid and activity.
@@ -61,16 +72,16 @@ A release run holds `deploy:<repo>:<target>` and the `release` slot. Its state i
 
 **Phases and checkpoints.** The release script calls `agentq release-phase -Phase <name> [-Unsafe]` on entering each phase. The call is a no-op exit 0 outside a release run, so scripts still work standalone.
 
-| Phase | Preemptible | Example (brivio `release.mjs`) |
-|---|---|---|
-| `prepare` | yes | deploy-clean checkout, env copy, `pnpm install` |
-| `preflight` | yes | preconditions, freeze, contract guard, `pnpm preflight` |
-| `build` / `test` | yes | image builds that are not yet pushed, unit/e2e against nothing shared |
-| `staging` | **no** (`-Unsafe`) | staging migrate + traffic |
-| `e2e-staging` | no | writes fixtures to the staging DB |
-| `tag` | no | annotated tag push |
-| `migrate` / `prod` / `promote` | no | prod migrate, traffic shift |
-| `verify` / `record` | no | attest, manifest, GitHub deployment |
+| Phase                          | Preemptible        | Example (brivio `release.mjs`)                                        |
+| ------------------------------ | ------------------ | --------------------------------------------------------------------- |
+| `prepare`                      | yes                | deploy-clean checkout, env copy, `pnpm install`                       |
+| `preflight`                    | yes                | preconditions, freeze, contract guard, `pnpm preflight`               |
+| `build` / `test`               | yes                | image builds that are not yet pushed, unit/e2e against nothing shared |
+| `staging`                      | **no** (`-Unsafe`) | staging migrate + traffic                                             |
+| `e2e-staging`                  | no                 | writes fixtures to the staging DB                                     |
+| `tag`                          | no                 | annotated tag push                                                    |
+| `migrate` / `prod` / `promote` | no                 | prod migrate, traffic shift                                           |
+| `verify` / `record`            | no                 | attest, manifest, GitHub deployment                                   |
 
 `committed` becomes true on the first `-Unsafe` phase and never goes back.
 
@@ -114,22 +125,22 @@ Parallel agents work in parallel task slots; only landing is serial.
 
 ## Failure modes
 
-| Failure | Detection | Handling |
-|---|---|---|
-| Agent dies mid-task in a slot | pid dead + idle 2 h | auto backup to `refs/backup/wt/...`, lease released, slot reused |
-| Agent alive but forgot the slot | idle 24 h | same as above |
-| Cleanup deletes a slot in use | guard blocks `rmdir`/`Remove-Item`/`worktree remove` on leased paths; prune checks the lease first | refused with the holder's name |
-| Two agents in one slot | lease is exclusive; `lease` refuses a held slot | second agent gets another task slot or waits |
-| Release preempted mid-migrate | impossible: `committed` is sticky after the first unsafe phase | landing becomes `pendingSha` |
-| Ten landings during one release | coalesced to one `pendingSha` | exactly one follow-up run |
-| Release process killed | pid dead | release file marked `failed` on the next read, deploy ticket reaped; no auto-restart |
-| Waiter heartbeat stale while queued | `Wait-Turn` beats its own and every held ticket | covered by tests 8–9 |
-| Phantom hold (ticket created before its turn) | sequential acquisition | test 8 |
-| `break` hits the wrong ticket | `-Id` required when ambiguous | test 10 |
-| Landing conflict | cherry-pick conflict | repo resolver, union CHANGELOG, else exit 5 with files, nothing pushed |
-| Remote moved during landing | push rejected | re-fetch and re-pick, max 3 |
-| Commit charge exhausted | gate before `build:machine` | waits, journaled reason |
-| Lease file corrupt | parse fails | treated as held (fail closed), shown as `unreadable` |
+| Failure                                       | Detection                                                                                          | Handling                                                                             |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Agent dies mid-task in a slot                 | pid dead + idle 2 h                                                                                | auto backup to `refs/backup/wt/...`, lease released, slot reused                     |
+| Agent alive but forgot the slot               | idle 24 h                                                                                          | same as above                                                                        |
+| Cleanup deletes a slot in use                 | guard blocks `rmdir`/`Remove-Item`/`worktree remove` on leased paths; prune checks the lease first | refused with the holder's name                                                       |
+| Two agents in one slot                        | lease is exclusive; `lease` refuses a held slot                                                    | second agent gets another task slot or waits                                         |
+| Release preempted mid-migrate                 | impossible: `committed` is sticky after the first unsafe phase                                     | landing becomes `pendingSha`                                                         |
+| Ten landings during one release               | coalesced to one `pendingSha`                                                                      | exactly one follow-up run                                                            |
+| Release process killed                        | pid dead                                                                                           | release file marked `failed` on the next read, deploy ticket reaped; no auto-restart |
+| Waiter heartbeat stale while queued           | `Wait-Turn` beats its own and every held ticket                                                    | covered by tests 8–9                                                                 |
+| Phantom hold (ticket created before its turn) | sequential acquisition                                                                             | test 8                                                                               |
+| `break` hits the wrong ticket                 | `-Id` required when ambiguous                                                                      | test 10                                                                              |
+| Landing conflict                              | cherry-pick conflict                                                                               | repo resolver, union CHANGELOG, else exit 5 with files, nothing pushed               |
+| Remote moved during landing                   | push rejected                                                                                      | re-fetch and re-pick, max 3                                                          |
+| Commit charge exhausted                       | gate before `build:machine`                                                                        | waits, journaled reason                                                              |
+| Lease file corrupt                            | parse fails                                                                                        | treated as held (fail closed), shown as `unreadable`                                 |
 
 ## Consequences
 

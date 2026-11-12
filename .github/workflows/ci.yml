@@ -25,6 +25,69 @@ jobs:
         node dist/cli.mjs --help &&
         echo '{"tool_name":"Bash","tool_input":{"command":"pnpm build"},"cwd":"."}' | node dist/cli.mjs hook claude | tee /dev/stderr | grep -q 'agentq run' &&
         pnpm audit --audit-level high
+  # The PowerShell implementation under ps/ (see ps/tests/README.md). One suite after another, each in
+  # its own process with a time limit; the full output of every suite is uploaded as an artifact.
+  ps:
+    name: PowerShell suites
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Suites to leave out on the hosted runner: comma-separated names from `run-all.ps1 -List`.
+      # Empty on purpose: a suite is not skipped on suspicion. What the image lacks is installed below
+      # (ripgrep). Add a name only with the failing line from a real run, and list it with its reason
+      # in ps/tests/README.md.
+      AGENTQ_TEST_SKIP: ""
+      RIPGREP_VERSION: "15.2.0"
+      RIPGREP_SHA256: "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      # flakes, store and slo are node scripts; store needs node:sqlite (Node 22.5 or newer).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      # The suites create throwaway repositories and commit in them.
+      - name: Git settings for the test repositories
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          git config --global init.defaultBranch main
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      # git-publish.ps1 and git-wip-snapshot.ps1 list files with ripgrep (suite "devbox tools").
+      - name: Install ripgrep (pinned release, checksum verified)
+        run: |
+          $name = "ripgrep-$env:RIPGREP_VERSION-x86_64-pc-windows-msvc"
+          $zip = Join-Path $env:RUNNER_TEMP 'ripgrep.zip'
+          Invoke-WebRequest "https://github.com/BurntSushi/ripgrep/releases/download/$env:RIPGREP_VERSION/$name.zip" -OutFile $zip
+          $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($got -ne $env:RIPGREP_SHA256) { throw "ripgrep archive: SHA-256 $got, expected $env:RIPGREP_SHA256" }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ripgrep')
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP "ripgrep\$name")
+      - name: Tool versions
+        run: |
+          "pwsh   $($PSVersionTable.PSVersion)"
+          "node   $(node --version)"
+          "python $(python --version 2>&1)"
+          "git    $(git --version)"
+          "rg     $(rg --version | Select-Object -First 1)"
+          "temp   $([IO.Path]::GetTempPath())"
+          "drives $((Get-PSDrive -PSProvider FileSystem | ForEach-Object Name) -join ',')"
+      - name: Run the suites
+        run: pwsh -NoProfile -File ps/tests/run-all.ps1 -LogDir "$env:RUNNER_TEMP/ps-logs" -TimeoutMin 25
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ps-logs
+          path: ${{ runner.temp }}/ps-logs
+          if-no-files-found: warn
+          retention-days: 7
   security:
     uses: dragos-catalin/workflows/.github/workflows/security.yml@v1
     with:

@@ -2,10 +2,21 @@
   Install the ps/ tooling into ~/.copilot (the live location every hook and agent uses).
   Runs every test suite against THIS checkout first; refuses to install on red. Keeps a timestamped
   backup of each file it replaces in ~/.copilot/.backup/<ts>/. -Check = report drift only.
+
+  -Suites a,b   run only these suites (names from tests/run-all.ps1 -List) instead of all of them:
+                the full set takes hours on a busy workstation, so a small fix is gated by the suites
+                that cover it. -SkipTests installs without any gate (say why in the commit / tracker).
+  agentq-config.json is MERGED, never replaced: keys the installed copy already has keep their local
+  value (slot counts, workspaces), new keys are added from the checkout (2026-10-19, twice: an install
+  silently shrank the live slot caps).
+  bin/agentq-install.json records what was installed (source dir, commit, SHA-256 per file);
+  `agentq doctor` compares the live files against it.
+  AGENTQ_INSTALL_DIR overrides the destination (tests).
 #>
-param([switch]$Check, [switch]$SkipTests)
+param([switch]$Check, [switch]$SkipTests, [string[]]$Suites)
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
+$cfgKey = 'bin\agentq-config.json'
 $map = [ordered]@{
   'bin\agentq.ps1' = 'bin\agentq.ps1'; 'bin\agentq-v2.ps1' = 'bin\agentq-v2.ps1'; 'bin\agentq-config.json' = 'bin\agentq-config.json'
   'bin\worktree.ps1' = 'bin\worktree.ps1'; 'bin\worktree-prune-task.ps1' = 'bin\worktree-prune-task.ps1'; 'bin\agentq-sync.ps1' = 'bin\agentq-sync.ps1'
@@ -41,25 +52,85 @@ $map = [ordered]@{
   'bin\devsync.ps1' = 'bin\devsync.ps1'; 'bin\devbox-bootstrap.ps1' = 'bin\devbox-bootstrap.ps1'; 'bin\devbox-team-sync.ps1' = 'bin\devbox-team-sync.ps1'
   'bin\devbox-teams.py' = 'bin\devbox-teams.py'; 'devbox\devbox-root.sh' = 'bin\devbox-root.sh'; 'devbox\devbox-user.sh' = 'bin\devbox-user.sh'
   'tests\test-devbox-tools.ps1' = 'bin\test-devbox-tools.ps1'; 'tests\test-devbox-teams.py' = 'bin\test-devbox-teams.py'
+  # ADR 0009 stage 0 (2026-11): load probe + admission, prune, doctor, chat keep-alive, land pre-gate,
+  # read-only status; hook-pre.ps1 now lives in this repository (OQ-010).
+  'bin\agentq-probe.ps1' = 'bin\agentq-probe.ps1'; 'bin\agentq-prune.ps1' = 'bin\agentq-prune.ps1'; 'bin\agentq-doctor.ps1' = 'bin\agentq-doctor.ps1'
+  'hooks\hook-pre.ps1' = 'hooks\hook-pre.ps1'; 'tests\test-hook-pre.ps1' = 'hooks\test-hook-pre.ps1'
+  'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'
+  'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
+  'tests\test-agentq-prune.ps1' = 'bin\test-agentq-prune.ps1'; 'tests\test-agentq-doctor.ps1' = 'bin\test-agentq-doctor.ps1'
+  'tests\test-slo.mjs' = 'bin\test-slo.mjs'
 }
-$dst = Join-Path $env:USERPROFILE '.copilot'
+$dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
+# Config merge: the installed file keeps every key it has; keys only the checkout has are appended.
+# Returns the merged text, or $null when nothing is missing (file left untouched).
+function Get-MergedConfig([string]$from, [string]$to) {
+  $s = Get-Content -LiteralPath $from -Raw | ConvertFrom-Json -AsHashtable
+  $d = Get-Content -LiteralPath $to -Raw | ConvertFrom-Json -AsHashtable
+  $add = @($s.Keys | Where-Object { -not $d.ContainsKey($_) })
+  if (-not $add.Count) { return $null }
+  $o = [ordered]@{}
+  foreach ($k in $d.Keys) { $o[$k] = $d[$k] }
+  foreach ($k in $add) { $o[$k] = $s[$k] }
+  $script:CfgAdded = $add
+  ($o | ConvertTo-Json -Depth 8) + "`n"
+}
 $drift = @()
 foreach ($k in $map.Keys) {
   $a = Join-Path $src $k; $b = Join-Path $dst $map[$k]
+  if (-not (Test-Path -LiteralPath $a)) { throw "install: $k is in the map but not in this checkout" }
+  if ($k -eq $cfgKey -and (Test-Path $b)) { if ($null -ne (Get-MergedConfig $a $b)) { $drift += $k }; continue }
   if (-not (Test-Path $b) -or (Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash) { $drift += $k }
 }
 if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; exit 0 }
 if (-not $SkipTests) {
-  & pwsh -NoProfile -File (Join-Path $src 'tests\run-all.ps1')
+  $ra = @('-NoProfile', '-File', (Join-Path $src 'tests\run-all.ps1'))
+  if ($Suites) { $ra += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
+  & pwsh @ra
   if ($LASTEXITCODE) { throw 'install: tests are red - not installing' }
 }
 $bk = Join-Path $dst ".backup\$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+# Files the destination does not have yet go first: agentq.ps1 dot-sources its companions at start, so a
+# new agentq.ps1 must never be live before the new files it loads (an agentq call in that gap would fail).
+$drift = @($drift | Where-Object { -not (Test-Path (Join-Path $dst $map[$_])) }) + @($drift | Where-Object { Test-Path (Join-Path $dst $map[$_]) })
 foreach ($k in $drift) {
   $a = Join-Path $src $k; $b = Join-Path $dst $map[$k]
   if (Test-Path $b) { $t = Join-Path $bk $map[$k]; New-Item -ItemType Directory -Force (Split-Path $t) | Out-Null; Copy-Item $b $t }
+  New-Item -ItemType Directory -Force (Split-Path $b) | Out-Null
+  if ($k -eq $cfgKey -and (Test-Path $b)) {
+    $merged = Get-MergedConfig $a $b
+    if ($null -ne $merged) {
+      [IO.File]::WriteAllText("$b.new", $merged, [Text.UTF8Encoding]::new($false)); Move-Item "$b.new" $b -Force
+      "merged $($map[$k]): added $($script:CfgAdded -join ', ') (existing keys keep their local value)"
+    }
+    continue
+  }
   # atomic replace: a hook firing mid-copy must never see half a file
   Copy-Item $a "$b.new" -Force; Move-Item "$b.new" $b -Force
   "installed $($map[$k])"
+}
+# What was installed, for `agentq doctor` (a hand edit of an installed file shows up as a hash mismatch).
+$files = [ordered]@{}
+foreach ($k in $map.Keys) { if ($k -ne $cfgKey) { $files[$map[$k]] = (Get-FileHash -LiteralPath (Join-Path $dst $map[$k]) -Algorithm SHA256).Hash } }
+$sha = "$(& git -C $src rev-parse HEAD 2>$null)".Trim()
+$dirty = [bool]@(& git -C $src status --porcelain -- . 2>$null | Where-Object { $_ }).Count
+$manifest = [ordered]@{ src = $src; sha = $sha; dirty = $dirty; at = [DateTime]::UtcNow.ToString('o'); files = $files }
+$mf = Join-Path $dst 'bin\agentq-install.json'
+[IO.File]::WriteAllText("$mf.new", ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false)); Move-Item "$mf.new" $mf -Force
+if ($env:AGENTQ_INSTALL_DIR) { "install: $($drift.Count) file(s) into $dst; backup in $bk"; exit 0 }
+# The sync loop is a long-running process: it keeps running the OLD code until restarted (2026-10-12).
+if ($drift | Where-Object { $_ -in 'bin\agentq-sync.ps1', 'bin\agentq-probe.ps1', 'bin\agentq-jobs-lib.ps1' }) {
+  try {
+    $syncTask = Get-ScheduledTask -TaskName 'agentq-sync' -ErrorAction SilentlyContinue
+    if ($syncTask) {
+      $needle = (Join-Path $dst 'bin\agentq-sync.ps1').ToLowerInvariant()
+      foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue | Where-Object { "$($_.CommandLine)".ToLowerInvariant().Contains($needle) -and "$($_.CommandLine)" -match '-Loop\b' })) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+      }
+      Start-ScheduledTask -TaskName 'agentq-sync'
+      'restarted the agentq-sync loop (it was running the previous code)'
+    }
+  } catch { "WARNING: could not restart agentq-sync: $($_.Exception.Message) - restart the scheduled task by hand" }
 }
 # legacy test that encoded the retired ad-hoc naming
 $old = Join-Path $dst 'hooks\test-worktree-tools.ps1'

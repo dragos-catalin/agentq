@@ -7,6 +7,8 @@ if (-not (Test-Path $aq)) { $aq = Join-Path (Split-Path $PSScriptRoot) 'bin\agen
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentq-v3-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:AGENTQ_NO_SIGNAL = '1'
+# These cases assert the scheduler's order, whatever the machine load is; admission by load has its own suite.
+$env:AGENTQ_NO_ADMISSION = '1'
 $env:AGENTQ_SESSION = 'v3test'
 $cfgFile = Join-Path $tmp 'agentq-config.json'
 New-Item -ItemType Directory -Force $tmp | Out-Null

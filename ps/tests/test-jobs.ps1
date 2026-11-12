@@ -211,7 +211,7 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match [regex]::Es
 $h | Stop-Process -Force -ErrorAction SilentlyContinue
 $h.WaitForExit(10000) | Out-Null
 Start-Sleep 1
-& pwsh -NoProfile -File $aq status -Repo $repo | Out-Null  # reaps the dead holder
+& pwsh -NoProfile -File $aq sweep | Out-Null  # reaps the dead holder (status only reads since ADR 0009 stage 0)
 $left = @(Get-ChildItem (Join-Path $env:AGENTQ_HOME 'queues') -Recurse -Filter '*.wedged' -File -ErrorAction SilentlyContinue)
 Check 'reaping the holder removes the wedged sidecar' ($left.Count -eq 0) ($left.FullName -join ',')
 

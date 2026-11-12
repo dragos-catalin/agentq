@@ -6,17 +6,18 @@ Status: accepted, 2026-10-11. Program: devcloud (`E:\gh\vmui\docs\devcloud\PLAN.
 
 This ADR is based on an audit of 15 days of journal (2026-09-27 → 10-11, 33.8k events). The scripts are in `E:\gh\codai\.copilot-tmp\aq-audit\`.
 
-| Problem | Measured |
-|---|---|
-| `build:<repo>` held while its run waited for `build:machine` | 969 runs, 96.5 h |
-| `build:machine` waits > 10 s | 102 h total |
-| …of which with fewer than 2 holders (RAM/commit gate, reap lag) | 49 h |
-| Timeouts caused by run-build's default `-TimeoutMin 25` | 58 of 71 timeouts |
-| Commit tickets that ended without a commit and without a journaled reason | ~30 % |
-| Land failures with exit 7 (push refused) that were journaled | none |
-| Leases expired while the work was still alive in another shell | 24 |
+| Problem                                                                   | Measured          |
+| ------------------------------------------------------------------------- | ----------------- |
+| `build:<repo>` held while its run waited for `build:machine`              | 969 runs, 96.5 h  |
+| `build:machine` waits > 10 s                                              | 102 h total       |
+| …of which with fewer than 2 holders (RAM/commit gate, reap lag)           | 49 h              |
+| Timeouts caused by run-build's default `-TimeoutMin 25`                   | 58 of 71 timeouts |
+| Commit tickets that ended without a commit and without a journaled reason | ~30 %             |
+| Land failures with exit 7 (push refused) that were journaled              | none              |
+| Leases expired while the work was still alive in another shell            | 24                |
 
 Root causes in the design:
+
 - The queue was strict FIFO: a 5 s lint waited behind a 3 h gate.
 - Tickets were held incrementally, one resource at a time.
 - Liveness meant "the pid is alive", so a hung or idle child was never detected.

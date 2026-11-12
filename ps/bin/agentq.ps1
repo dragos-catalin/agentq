@@ -70,6 +70,27 @@ CLOUD PLACEMENT (devcloud F2, DC-037)
   Default = env AGENTQ_WHERE, else local. AGENTQ_WHERE=local is the opt-out everywhere.
   Journal: cloud-queued / cloud-done / cloud-fail (resource cloud:<ws>) + placement(where, why).
 
+STAGE 0 OF THE ORCHESTRATOR PLAN (ADR 0009, tracker OQ-001..012, 2026-11)
+  status / log / metrics / doctor only READ the state folder (no reaping, no capacity rewrite, no notice
+  consumed, no registry write). Reaping happens in working verbs and in `agentq sweep`.
+  agentq probe [-Force] [-Json]   take a load sample now: start latency of a trivial process + seconds since
+                  the last keyboard/mouse input. `status` prints it as == LOAD and == AGENTS.
+  Admission by load (config `admission`): while the probe median is above probeMs, no new task lease and no
+  second gate/heavy/batch build; quick/interactive are never held; held longer than maxHoldMin = admitted
+  anyway (journal admission-hold / admission-override). AGENTQ_NO_ADMISSION=1 opts one call out.
+  Agent limit (config `agentLimit`): the machine-wide limit on task leases follows owner presence and a
+  night window (present / away / night); a value that is not set = taskSlotsMachine. Never stops a running
+  lease. AGENTQ_NO_AGENT_LIMIT=1 opts one call out.
+  Chat keep-alive: the per-tool-call hook binds a chat to the lease of a slot it works in and refreshes it on
+  every later tool call of that chat; a chat active within leaseDeadIdleMin counts like a live owner shell.
+  Land pre-gate: `agentq land` from a leased task slot runs the gate on the rebased result in that slot BEFORE
+  taking the land ticket (exit 6 before the queue on failure); a tree that already passed a gate command is
+  not gated again (green ledger, greenTtlHours). Config `landPregate`; AGENTQ_LAND_NO_PREGATE=1 off.
+  agentq prune [-WhatIf] [-Days n] [-All] [-Json]   remove state nobody needs (also run by sweep).
+  agentq doctor [-All] [-Src <checkout>/ps] [-Json] health report; exit 1 when a check fails.
+  agentq slo [-Hours 168] [-Json]  adds queue time, waits over 10 min, hook cost per day, start-probe buckets
+                  and slots lost with a live chat.
+
 EXIT CODES: 0 ok; command's own exit code for `run`; 3 = frozen/blocked or timed out;
 2 = usage error.
 #>
@@ -92,6 +113,8 @@ $Where = $null; $Ws = $null
 $Claims = @()
 # ADR 0007: `agentq workspace take|release|list -Name <ws>` (sub-verb is the first bare word after the verb).
 $WsName = $null; $Sub = $null
+# ADR 0009 stage 0: prune (-WhatIf, -Days), doctor (-Src <checkout>/ps).
+$WhatIf = $false; $Src = $null; $Days = 0
 # ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
 $script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
@@ -160,6 +183,9 @@ while ($i -lt $argv.Count) {
     'force' { $Force = $true }
     'ws' { $Ws = & $next }
     'name' { $WsName = & $next }
+    'whatif' { $WhatIf = $true }
+    'src' { $Src = & $next }
+    'days' { $Days = [double](& $next) }
     default {
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
         throw "agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'."
@@ -170,6 +196,13 @@ while ($i -lt $argv.Count) {
   $i++
 }$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
+
+# ADR 0009 stage 0 (OQ-007): these verbs only READ the state folder. Before, `status` reaped dead
+# tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
+# consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
+# happens where work happens (run/commit/lease/land) and in `sweep`.
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'metrics', 'doctor'
+$script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
 # notices, agent registry, prep state - private to the person. $SysRoot = the SYSTEM store shared by every
@@ -335,7 +368,7 @@ function Remove-Ticket($t, [string]$why, [string]$kind = 'reap') {
 function Get-Live([string]$res) {
   $out = @()
   foreach ($t in Read-Tickets $res) {
-    if (-not (Test-Alive $t)) { Remove-Ticket $t "holder pid $($t.pid) is gone"; continue }
+    if (-not (Test-Alive $t)) { if (-not $script:ReadOnly) { Remove-Ticket $t "holder pid $($t.pid) is gone" }; continue }
     $age = ((Now) - (ParseUtc $t.beat)).TotalMinutes
     $t | Add-Member -NotePropertyName stale -NotePropertyValue ($age -gt $StaleMin) -Force
     $t | Add-Member -NotePropertyName beatAgeMin -NotePropertyValue ([math]::Round($age, 1)) -Force
@@ -349,6 +382,7 @@ function Get-Capacity([string]$res) {
   # file, which is rewritten so the hub/sync readers see the effective value (DC-014).
   if ($res -eq 'build:machine') {
     $cap = (Get-AdaptiveMachineCap) + (Get-BurstExtra $res)
+    if ($script:ReadOnly) { return $cap }
     $f = Join-Path (QPath $res) 'capacity'
     try { if (-not (Test-Path $f) -or [int](Get-Content $f -Raw) -ne $cap) { New-Item -ItemType Directory -Force (QPath $res) | Out-Null; [IO.File]::WriteAllText($f, "$cap") } } catch {}
     return $cap
@@ -409,6 +443,8 @@ function Get-AdaptiveMachineCap {
   if ($prev -and $prev.at) {
     $prevAt = if ($prev.at -is [datetime]) { $prev.at.ToUniversalTime() } else { try { [DateTime]::Parse("$($prev.at)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() } catch { $null } }
   }
+  # A read-only verb reports the last shared decision; it never samples or writes one.
+  if ($script:ReadOnly) { return $(if ($prev -and $prev.cap) { [math]::Max($min, [math]::Min($max, [int]$prev.cap)) } else { $min }) }
   if ($prevAt -and ($now - $prevAt).TotalSeconds -lt $every) {
     return [math]::Max($min, [math]::Min($max, [int]$prev.cap))
   }
@@ -459,6 +495,7 @@ function Get-BurstExtra([string]$res) {
   try {
     $b = Get-Content $f -Raw | ConvertFrom-Json -DateKind String
     if ((ParseUtc $b.until) -gt (Now)) { return [int]$b.by }
+    if ($script:ReadOnly) { return 0 }
     Remove-Item $f -Force -ErrorAction SilentlyContinue
     Write-Journal @{ event = 'burst-expired'; resource = $res; reason = "$($b.reason)" }
   } catch {}
@@ -484,6 +521,94 @@ function Update-Ticket($t, [hashtable]$set) {
   foreach ($k in $set.Keys) { $raw[$k] = $set[$k] }
   [IO.File]::WriteAllText("$($t.file).tmp", ($raw | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
   [IO.File]::Move("$($t.file).tmp", $t.file, $true)
+}
+
+# ---- admission by load (ADR 0009 stage 0, OQ-004) -----------------------------------------------
+# The caps count builds and slots, not how the machine feels. The load probe (agentq-probe.ps1) is the
+# start latency of a trivial process; when its recent median is above `admission.probeMs` the machine
+# is saturated and agentq stops ADDING load: a gate/heavy/batch build is not granted while another
+# build already holds build:machine, and a new task lease waits. Progress is guaranteed: with no
+# holder a build still starts, quick/interactive lanes are never gated, and a waiter held back only by
+# load for `admission.maxHoldMin` is admitted anyway (journal `admission-override`).
+# Config `admission`: { enabled, probeMs 400, window 5, everySec 20, staleSec 300, maxHoldMin 20 }.
+# AGENTQ_NO_ADMISSION=1 turns it off for one call.
+. (Join-Path $PSScriptRoot 'agentq-probe.ps1')
+function Get-AdmissionConfig {
+  if ($script:AdmCfg) { return $script:AdmCfg }
+  $d = @{ enabled = $true; probeMs = 400; window = 5; everySec = 20; staleSec = 300; maxHoldMin = 20 }
+  $c = Get-Config
+  if ($c.ContainsKey('admission') -and $c['admission'] -is [Collections.IDictionary]) { foreach ($k in @($c['admission'].Keys)) { $d["$k"] = $c['admission'][$k] } }
+  if ($env:AGENTQ_NO_ADMISSION -eq '1') { $d.enabled = $false }
+  $script:AdmCfg = $d
+  $d
+}
+# -NoSample (and every read-only verb): judge the shared record, never take a sample.
+function Get-AdmissionLoad([switch]$NoSample) {
+  $a = Get-AdmissionConfig
+  if (-not $a.enabled) { return @{ enabled = $false; saturated = $false; median = $null; last = $null; ageSec = $null; n = 0; thresholdMs = [double]$a.probeMs; src = '' } }
+  $p = if ($NoSample -or $script:ReadOnly) { Read-LoadProbe $Root } else { Invoke-LoadProbe $Root ([double]$a.everySec) 12 'agentq' }
+  $v = Get-LoadVerdict $p ([double]$a.probeMs) ([int]$a.window) ([double]$a.staleSec)
+  $v.enabled = $true
+  $v
+}
+# Called each time a waiter is held back by load. Journals the hold once and returns $true when the
+# waiter has been held long enough to be admitted anyway.
+function Test-AdmissionOverride([string]$res, [string]$purpose, $load) {
+  if ($script:LoadOverride) { return $true }
+  if (-not $script:LoadHoldSince) {
+    $script:LoadHoldSince = Now
+    Write-Journal @{ event = 'admission-hold'; resource = $res; purpose = $purpose; probeMs = $load.median; thresholdMs = $load.thresholdMs; reason = "machine saturated: start probe median $($load.median) ms > $($load.thresholdMs) ms" }
+  }
+  $max = [double](Get-AdmissionConfig).maxHoldMin
+  if (((Now) - $script:LoadHoldSince).TotalMinutes -ge $max) {
+    $script:LoadOverride = $true
+    Write-Journal @{ event = 'admission-override'; resource = $res; purpose = $purpose; probeMs = $load.median; thresholdMs = $load.thresholdMs; reason = "held $max min by load; admitted anyway" }
+    return $true
+  }
+  $false
+}
+function Get-LoadWaitSec { if ($script:LoadHoldSince) { [int][math]::Round(((Now) - $script:LoadHoldSince).TotalSeconds) } else { 0 } }
+
+# ---- agent limit by owner presence and schedule (ADR 0009 stage 0, OQ-005) ----------------------
+# taskSlotsMachine is one number for every hour of the day. `agentLimit` lets the machine-wide limit on
+# task leases follow the owner:
+#   present   while the last keyboard or mouse input is younger than awayAfterMin (default 15)
+#   night     owner away and the local time is inside night.from..night.to (may wrap midnight)
+#   away      owner away, outside the night window
+# A value that is not set means taskSlotsMachine, so a config without numbers changes nothing. Presence is
+# read from the shared load record (agentq-probe.ps1; the resident sync loop samples once a minute); a
+# record older than admission.staleSec, or one without an idle value, is "unknown" = taskSlotsMachine.
+# The limit only gates NEW task leases; nothing that runs is ever stopped. Release, land and pinned slots
+# are not counted. AGENTQ_NO_AGENT_LIMIT=1 turns it off for one call.
+function Get-AgentLimit {
+  $c = Get-Config
+  $base = [int]$c.taskSlotsMachine
+  $r = @{ limit = $base; base = $base; state = 'off'; idleSec = $null; ageSec = $null; night = $false; nightWindow = ''; why = 'agentLimit is off' }
+  $al = if ($c.ContainsKey('agentLimit') -and $c['agentLimit'] -is [Collections.IDictionary]) { $c['agentLimit'] } else { $null }
+  if (-not $al -or -not $al['enabled'] -or $env:AGENTQ_NO_AGENT_LIMIT -eq '1') { return $r }
+  $num = { param($v) if ($null -ne $v -and "$v" -ne '') { [math]::Max(1, [int]$v) } else { $base } }
+  $awayAfterSec = 60 * $(if ($null -ne $al['awayAfterMin'] -and "$($al['awayAfterMin'])" -ne '') { [double]$al['awayAfterMin'] } else { 15.0 })
+  $n = $al['night']
+  $nightLimit = $base
+  if ($n -is [Collections.IDictionary] -and $n['from'] -and $n['to']) {
+    try {
+      $from = [TimeSpan]::Parse("$($n['from'])", [Globalization.CultureInfo]::InvariantCulture); $to = [TimeSpan]::Parse("$($n['to'])", [Globalization.CultureInfo]::InvariantCulture)
+      $nowT = if ($env:AGENTQ_FAKE_LOCALTIME) { [TimeSpan]::Parse($env:AGENTQ_FAKE_LOCALTIME, [Globalization.CultureInfo]::InvariantCulture) } else { (Get-Date).TimeOfDay }
+      $r.night = if ($from -le $to) { $nowT -ge $from -and $nowT -lt $to } else { $nowT -ge $from -or $nowT -lt $to }
+      $r.nightWindow = "$($n['from'])-$($n['to'])"
+      $nightLimit = & $num $n['limit']
+    } catch { $r.night = $false }
+  }
+  $p = Read-LoadProbe $Root
+  $at = if ($p) { ConvertTo-ProbeUtc $p['at'] } else { $null }
+  if ($at) { $r.ageSec = [math]::Round(((Now) - $at).TotalSeconds) }
+  $known = $p -and $at -and $null -ne $p['idleSec'] -and $r.ageSec -le [double](Get-AdmissionConfig).staleSec
+  if (-not $known) { $r.state = 'unknown'; $r.why = 'owner presence unknown (no fresh sample)'; return $r }
+  $r.idleSec = [double]$p['idleSec']
+  if ($r.idleSec -lt $awayAfterSec) { $r.state = 'present'; $r.limit = & $num $al['present']; $r.why = "owner present (last input $([int]$r.idleSec) s ago)" }
+  elseif ($r.night) { $r.state = 'night'; $r.limit = $nightLimit; $r.why = "owner away, night schedule $($r.nightWindow)" }
+  else { $r.state = 'away'; $r.limit = & $num $al['away']; $r.why = "owner away (no input for $([int][math]::Floor($r.idleSec / 60)) min)" }
+  $r
 }
 # Can ticket $t take a slot on its resource NOW? Returns @{ ok; why }.
 function Test-Admissible($t, [scriptblock]$gate) {
@@ -521,6 +646,16 @@ function Test-Admissible($t, [scriptblock]$gate) {
       if ($ok) { $script:PreemptNote = "beside $heldBatch batch holder(s)" }
     }
   }
+  # OQ-004: a saturated machine does not get a second gate/heavy/batch build. One build always runs, and
+  # it is the FIRST in rank: without the rank test a lower-priority waiter that polled right after the
+  # holder ended started first and the higher-priority one was then held by load behind it.
+  if ($ok -and $t.resource -eq 'build:machine' -and $lane -notin 'interactive', 'quick' -and ($held.Count -ge 1 -or $rank -ge 1)) {
+    # -NoSample: this runs under the scheduler mutex; Wait-All refreshes the sample before taking it.
+    $ld = Get-AdmissionLoad -NoSample
+    if ($ld.saturated -and -not (Test-AdmissionOverride $t.resource "$(P $t 'purpose' '')" $ld)) {
+      return @{ ok = $false; why = 'load'; load = $ld; live = $live; held = $held; cap = $cap; rank = $rank }
+    }
+  }
   if (-not $ok) { return @{ ok = $false; why = 'queue'; live = $live; held = $held; cap = $cap; rank = $rank } }
   if ($gate -and -not (& $gate)) { return @{ ok = $false; why = 'ram'; live = $live; held = $held; cap = $cap; rank = $rank } }
   @{ ok = $true; why = ''; live = $live; held = $held; cap = $cap; rank = $rank }
@@ -542,14 +677,17 @@ function Assert-NotMarked([string]$res) {
 
 function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoTop) {
   $dir = QPath $res
-  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null; Set-RepoGroupDir $dir (Get-ResourceRepo $res) }
-  if ($script:CapacityGiven -or -not (Test-Path (Join-Path $dir 'capacity'))) {
-    $cap = if ($script:Capacity -gt 1) { $script:Capacity } else { Get-Capacity $res }
-    [IO.File]::WriteAllText((Join-Path $dir 'capacity'), "$cap")
-  }
   $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $res)$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try {
-    [void]$m.WaitOne(10000)
+    try { [void]$m.WaitOne(10000) } catch [Threading.AbandonedMutexException] {}
+    # The folder is created UNDER the queue mutex: `agentq prune` removes an idle, ticket-less queue
+    # folder while holding the same mutex, so a folder can no longer vanish between this check and
+    # the seq write below (reproduced 2026-11-11: "Could not find a part of the path ...\seq").
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null; Set-RepoGroupDir $dir (Get-ResourceRepo $res) }
+    if ($script:CapacityGiven -or -not (Test-Path (Join-Path $dir 'capacity'))) {
+      $cap = if ($script:Capacity -gt 1) { $script:Capacity } else { Get-Capacity $res }
+      [IO.File]::WriteAllText((Join-Path $dir 'capacity'), "$cap")
+    }
     $seqFile = Join-Path $dir 'seq'
     $seq = if (Test-Path $seqFile) { [long](Get-Content $seqFile -Raw) + 1 } else { 1 }
     # NOT `Set-Content -NoNewline <path> <v>`: in pwsh 7.6 that positional form writes NOTHING,
@@ -590,6 +728,9 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
     # ADR 0003 W2-5: a land waiter absorbed into another holder's batch stops waiting once its result exists.
     if ($script:WaitAbort -and (& $script:WaitAbort)) { $script:WaitAborted = $true; return }
     foreach ($t in $tickets) { Assert-NotMarked $t.resource; [IO.File]::SetLastWriteTimeUtc("$($t.file).hb", (Now)) }
+    # OQ-004: refresh the load sample (at most every admission.everySec, one sampler at a time) BEFORE
+    # the scheduler mutex, so a slow process start on a saturated machine never holds the scheduler.
+    if (@($tickets | Where-Object { $_.resource -eq 'build:machine' }).Count) { $null = Get-AdmissionLoad }
     $m = [Threading.Mutex]::new($false, "Global\agentq-sched$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
     $granted = $false; $res = @{}
     try {
@@ -610,7 +751,7 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
     } finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
     if ($granted) {
       $wait = [math]::Round(((Now) - (ParseUtc $tickets[0].created)).TotalSeconds)
-      Write-Journal @{ event = 'acquired'; resource = (($tickets | ForEach-Object resource) -join ','); tickets = @($tickets | ForEach-Object id); lane = $tickets[0].lane; waitSec = $wait; purpose = $tickets[0].purpose; note = "$script:PreemptNote" }
+      Write-Journal @{ event = 'acquired'; resource = (($tickets | ForEach-Object resource) -join ','); tickets = @($tickets | ForEach-Object id); lane = $tickets[0].lane; waitSec = $wait; loadWaitSec = (Get-LoadWaitSec); purpose = $tickets[0].purpose; note = "$script:PreemptNote" }
       $script:WaitSec = $wait
       return
     }
@@ -618,7 +759,7 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
       $msgs = foreach ($t in $tickets) {
         $r = $res[$t.id]; if ($r.ok) { continue }
         $who = ($r.held | ForEach-Object { "$($_.session) '$($_.purpose)' [$(P $_ 'lane' '?')] $([math]::Round(((Now) - (ParseUtc $_.created)).TotalMinutes,1))m$(if ($_.stale) { ' STALE' })" }) -join '; '
-        $why = if ($r.why -eq 'ram') { 'waiting for free RAM/commit' } else { "rank $($r.rank + 1) by priority, cap $($r.cap)" }
+        $why = if ($r.why -eq 'ram') { 'waiting for free RAM/commit' } elseif ($r.why -eq 'load') { "machine saturated (start probe median $($r.load.median) ms > $($r.load.thresholdMs) ms): no second build until it recovers or $([double](Get-AdmissionConfig).maxHoldMin) min pass" } else { "rank $($r.rank + 1) by priority, cap $($r.cap)" }
         "$($t.resource) [$($t.lane)] $why; held by: $who"
       }
       [Console]::Error.WriteLine("agentq: waiting — $($msgs -join ' | ')")
@@ -895,6 +1036,7 @@ function Invoke-Run {
       $gates[$t.id] = if ($t.resource -eq 'build:machine' -and $MinFreeGB -gt 0) { { Test-FreeRam $MinFreeGB } } else { $null }
     }
     if ($NoWait) {
+      if ($resList -contains 'build:machine') { $null = Get-AdmissionLoad }
       $busy = @($tickets | Where-Object { -not (Test-Admissible $_ $gates[$_.id]).ok })
       if ($busy) {
         $h = @(Get-Live $busy[0].resource)[0]
@@ -1155,11 +1297,30 @@ function Show-Status {
   }
   $marks = @(Get-ChildItem $MDir -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String })
   $v2 = Get-V2Status $(if (-not $All -and $repo) { $repo.Name } else { $null })
-  if ($Json) { $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks; $o | ConvertTo-Json -Depth 5; return }
+  # OQ-004: the load probe and what admission does with it (read from the shared record, never sampled here).
+  $ld = Get-AdmissionLoad -NoSample
+  # OQ-005: the agent limit in force and why (owner presence + schedule, from the same shared record).
+  $agl = Get-AgentLimit
+  # machine-wide count; with -All (or outside a repo) the leases were just read, so they are not read twice
+  $leasedTasks = if ($All -or -not $repo) { @($v2.leases | Where-Object { "$($_.role)" -eq 'task' }).Count } else { Get-TaskLeaseCount }
+  if ($Json) {
+    $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks
+    $o.load = [ordered]@{ enabled = [bool]$ld.enabled; saturated = [bool]$ld.saturated; probeMs = $ld.last; medianMs = $ld.median; samples = $ld.n; ageSec = $ld.ageSec; thresholdMs = $ld.thresholdMs; src = "$($ld.src)" }
+    $o.agents = [ordered]@{ limit = [int]$agl.limit; base = [int]$agl.base; state = "$($agl.state)"; inputIdleSec = $agl.idleSec; sampleAgeSec = $agl.ageSec; night = [bool]$agl.night; nightWindow = "$($agl.nightWindow)"; leased = [int]$leasedTasks }
+    $o | ConvertTo-Json -Depth 5; return
+  }
   if ($marks) {
     Write-Output '== MARKS'
     $marks | ForEach-Object { Write-Output ("{0,-34} {1,-8} since {2} by {3}: {4}" -f $_.resource, $_.state.ToUpper(), $_.at, $_.session, $_.reason) }
   }
+  if (-not $ld.enabled) { Write-Output '== LOAD admission by load is off (config admission.enabled / AGENTQ_NO_ADMISSION)' }
+  elseif ($null -eq $ld.last) { Write-Output "== LOAD no start probe yet (a sample is taken by agentq run/lease and by the sync loop); admission OPEN" }
+  else {
+    $verdict = if ($ld.saturated) { 'SATURATED: no new task slot and no second gate/heavy/batch build until it recovers' } elseif ($ld.n -lt 3) { 'OPEN (fewer than 3 fresh samples)' } else { 'OPEN' }
+    Write-Output ("== LOAD start probe {0} ms ({1} s ago, by {2}); median of last {3}: {4} ms; limit {5} ms -> admission {6}" -f $ld.last, $ld.ageSec, $(if ($ld.src) { $ld.src } else { '?' }), $ld.n, $(if ($null -ne $ld.median) { $ld.median } else { '-' }), $ld.thresholdMs, $verdict)
+  }
+  $nightTxt = if ($agl.nightWindow) { "; night $($agl.nightWindow): $(if ($agl.night) { 'now' } else { 'not now' })" } else { '' }
+  Write-Output ("== AGENTS limit {0} of {1} task slots ({2}{3}); {4} leased" -f $agl.limit, $agl.base, $agl.why, $(if ($agl.state -eq 'off') { '' } else { $nightTxt }), $leasedTasks)
   Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'
@@ -1331,11 +1492,13 @@ function Invoke-Release {
 }
 
 . (Join-Path $PSScriptRoot 'agentq-v2.ps1')
-if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'renew', 'lease-check') { Renew-ForCwd }
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'renew', 'lease-check', 'prune', 'probe', 'slo') { Renew-ForCwd }
 # Session renewal only for verbs that mean "this agent is working"; maintenance verbs (sweep, break,
 # unlease, metrics, rotate) from the same session must not keep a lease alive they are judging.
 if ($Verb.ToLowerInvariant() -in 'run', 'commit', 'publish', 'land', 'note', 'acquire', 'release', 'bump', 'propose', 'lease', 'backup', 'since') { Renew-ForSession }
-if ($Verb.ToLowerInvariant() -notin 'lease-check') { Show-LeaseNotices }
+# A notice is consumed when shown, so a read-only verb leaves it for the next working call
+# (`status` lists the losses of the last 24 h from the journal anyway).
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'lease-check') { Show-LeaseNotices }
 
 # Agent registry (S18-09, 2026-10-17). Every agentq call records WHO called: the session, the AI
 # client (from env + the process ancestry), the app that owns the shell, the repo and the last
@@ -1384,7 +1547,7 @@ function Register-Agent {
     [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force -LiteralPath $tmp -Destination $f
   } catch {}
 }
-if ($Verb.ToLowerInvariant() -notin 'status', 'log', 'metrics', 'since', 'help') { Register-Agent }
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'since', 'help', 'prune', 'probe', 'slo', 'sweep') { Register-Agent }
 
 switch ($Verb.ToLowerInvariant()) {
   'run' { Invoke-Run }
@@ -1408,6 +1571,15 @@ switch ($Verb.ToLowerInvariant()) {
   'propose' { Invoke-Propose }
   'metrics' { Show-Metrics }
   'rotate' { Invoke-RotateJournal -Force }
+  # OQ-004: take a load sample now (the sync loop calls this path once a minute) and print the verdict.
+  'probe' {
+    $a = Get-AdmissionConfig
+    $p = Invoke-LoadProbe $Root $(if ($Force) { 0 } else { [double]$a.everySec }) 12 $(if ($env:AGENTQ_PROBE_SRC) { $env:AGENTQ_PROBE_SRC } else { 'agentq' })
+    $v = Get-LoadVerdict $p ([double]$a.probeMs) ([int]$a.window) ([double]$a.staleSec)
+    $idle = if ($p) { $p['idleSec'] } else { $null }
+    if ($Json) { [ordered]@{ probeMs = $v.last; medianMs = $v.median; samples = $v.n; ageSec = $v.ageSec; thresholdMs = $v.thresholdMs; saturated = [bool]$v.saturated; inputIdleSec = $idle } | ConvertTo-Json -Compress }
+    else { Write-Output ("start probe {0} ms; median of last {1}: {2} ms; limit {3} ms; {4}; input idle {5}" -f $v.last, $v.n, $v.median, $v.thresholdMs, $(if ($v.saturated) { 'SATURATED' } else { 'ok' }), $(if ($null -ne $idle) { "$idle s" } else { 'unknown' })) }
+  }
   'lease' { Invoke-Lease }
   'claim' { Invoke-Claim }
   'unlease' { Invoke-Unlease }
@@ -1422,6 +1594,9 @@ switch ($Verb.ToLowerInvariant()) {
   'notify-landing' { Invoke-NotifyLanding }
   'land' { Invoke-Land; exit $script:LandExit }
   'publish' { Invoke-Publish; if ($DoLand) { exit $script:LandExit } }
+  # ADR 0009 stage 0 (OQ-006, OQ-011): state pruning and a health report, each in its own file.
+  'prune' { . (Join-Path $PSScriptRoot 'agentq-prune.ps1'); Invoke-Prune }
+  'doctor' { . (Join-Path $PSScriptRoot 'agentq-doctor.ps1'); Invoke-Doctor; exit $script:DoctorExit }
   # ADR 0003 W4-4: SLO report from the journal (ready->landed p90, flake rate, lost work, queue waits, bypass).
   'flakes' { Invoke-FlakesVerb }
   'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; if (-not $env:AGENTQ_NO_STORE) { $sa += @('--store', $Root) }; & node @sa; exit $LASTEXITCODE }

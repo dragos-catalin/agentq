@@ -10,33 +10,35 @@
 // Each database is copied first: the live file is held open by VS Code. Exit 0 always; a
 // workspace whose database cannot be read is skipped (fewer protected PIDs is the caller's
 // cue to be conservative, see reap-terminals.ps1 -NoAssocMeansStop).
-import { readdirSync, existsSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { readdirSync, existsSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
-process.removeAllListeners('warning');
-const { DatabaseSync } = await import('node:sqlite');
-const root = process.argv[2] ?? join(process.env.APPDATA ?? '', 'Code - Insiders', 'User', 'workspaceStorage');
-const tmp = mkdtempSync(join(tmpdir(), 'vct-'));
+process.removeAllListeners("warning");
+const { DatabaseSync } = await import("node:sqlite");
+const root = process.argv[2] ?? join(process.env.APPDATA ?? "", "Code - Insiders", "User", "workspaceStorage");
+const tmp = mkdtempSync(join(tmpdir(), "vct-"));
 let read = 0;
 try {
-  for (const ws of existsSync(root) ? readdirSync(root) : []) {
-    const db = join(root, ws, 'state.vscdb');
-    if (!existsSync(db)) continue;
-    const copy = join(tmp, `${ws}.vscdb`);
-    try {
-      copyFileSync(db, copy);
-      const d = new DatabaseSync(copy, { readOnly: true });
-      const row = d.prepare("SELECT value FROM ItemTable WHERE key = 'chat.terminalSessions'").get();
-      d.close();
-      read++;
-      if (!row) continue;
-      for (const [pid, a] of Object.entries(JSON.parse(String(row.value)))) {
-        if (/^\d+$/.test(pid)) console.log(`${pid} ${a && a.isBackground ? 'bg' : 'fg'}`);
-      }
-    } catch { /* locked, not sqlite, or bad JSON: skip this workspace */ }
-  }
+    for (const ws of existsSync(root) ? readdirSync(root) : []) {
+        const db = join(root, ws, "state.vscdb");
+        if (!existsSync(db)) continue;
+        const copy = join(tmp, `${ws}.vscdb`);
+        try {
+            copyFileSync(db, copy);
+            const d = new DatabaseSync(copy, { readOnly: true });
+            const row = d.prepare("SELECT value FROM ItemTable WHERE key = 'chat.terminalSessions'").get();
+            d.close();
+            read++;
+            if (!row) continue;
+            for (const [pid, a] of Object.entries(JSON.parse(String(row.value)))) {
+                if (/^\d+$/.test(pid)) console.log(`${pid} ${a && a.isBackground ? "bg" : "fg"}`);
+            }
+        } catch {
+            /* locked, not sqlite, or bad JSON: skip this workspace */
+        }
+    }
 } finally {
-  rmSync(tmp, { recursive: true, force: true });
+    rmSync(tmp, { recursive: true, force: true });
 }
 console.log(`#read ${read}`);

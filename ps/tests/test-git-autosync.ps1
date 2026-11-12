@@ -188,9 +188,11 @@ Ok (@(Get-ChildItem -Recurse $env:GIT_AUTOSYNC_PARK -Filter MANIFEST.tsv | Where
 Ok (-not (git -C $r.o for-each-ref refs/heads/autosync)) '10 no replay started'
 
 # 10b same author+subject upstream, but the local commit ALSO writes a file the twin never touched -> refused
+# (the twin gets its own date: made in the same second as the local commit it has the same author, date and
+#  subject, which is the "replayed by hand" case of test 6 and is skipped instead of refused - seen in CI)
 $r = Fresh; Push-B $r 'x.txt' "other`n"
 W "$($r.a)\t.md" "row: mine`n"; W "$($r.a)\x.txt" "mine-x`n"; git -C $r.a add -A; git -C $r.a commit -qm 'feat: L-37 thing'; $h = git -C $r.a rev-parse HEAD
-git -C $r.b pull -q 2>$null; W "$($r.b)\t.md" "row: theirs`n"; git -C $r.b add -A; git -C $r.b commit -qm 'feat: L-37 thing'; git -C $r.b push -q origin main 2>$null
+git -C $r.b pull -q 2>$null; W "$($r.b)\t.md" "row: theirs`n"; git -C $r.b add -A; git -C $r.b commit -qm 'feat: L-37 thing' --date '2026-01-01T00:00:00'; git -C $r.b push -q origin main 2>$null
 Ok ((Run $r) -eq 3) '10b refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '10b HEAD unchanged'
 
 # 11 conflicting draft idle 2 h (> 1 h default) but a live session owns it -> held, not parked

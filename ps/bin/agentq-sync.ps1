@@ -41,6 +41,17 @@ $DefaultCapacity = @{ 'build:machine' = 2 }
 # simply sends jobs = [] and a gateway that does not know `jobs` ignores the field.
 $JobsLib = Join-Path $PSScriptRoot 'agentq-jobs-lib.ps1'
 if (Test-Path -LiteralPath $JobsLib) { . $JobsLib }
+# ADR 0009 stage 0 (OQ-004): this loop is the one resident agentq process, so it also takes the load
+# sample (start latency of a trivial process) once a minute. Optional: without the file nothing changes.
+$ProbeLib = Join-Path $PSScriptRoot 'agentq-probe.ps1'
+if (Test-Path -LiteralPath $ProbeLib) { . $ProbeLib }
+$script:ProbeAt = [DateTime]::MinValue
+function Invoke-ProbeTick {
+  if (-not (Get-Command Invoke-LoadProbe -ErrorAction SilentlyContinue)) { return }
+  if (([DateTime]::UtcNow - $script:ProbeAt).TotalSeconds -lt 55) { return }
+  $script:ProbeAt = [DateTime]::UtcNow
+  try { $null = Invoke-LoadProbe $Root 50 12 'sync' } catch { }
+}
 function Get-Jobs {
   if (-not (Get-Command Get-JobsForSync -ErrorAction SilentlyContinue)) { return @() }
   try { @(Get-JobsForSync) } catch { [Console]::Error.WriteLine("agentq-sync: jobs skipped: $_"); @() }
@@ -270,6 +281,7 @@ if ($Loop) {
   $mx = [Threading.Mutex]::new($false, "Global\agentq-sync-loop$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   if (-not $mx.WaitOne(0)) { 'agentq-sync: loop already running'; exit 0 }
   while ($true) {
+    Invoke-ProbeTick
     try { Invoke-Push | Out-Null } catch { [Console]::Error.WriteLine("$_") }
     Start-Sleep -Seconds $IntervalSec
   }

@@ -5,12 +5,8 @@
     "codai": 2
   },
   "pinned": {
-    "codai": [
-      "db-live"
-    ],
-    "brivio": [
-      "qa-prod"
-    ]
+    "codai": ["db-live"],
+    "brivio": ["qa-prod"]
   },
   "leaseDeadIdleMin": 120,
   "leaseMaxIdleMin": 1440,
@@ -37,8 +33,42 @@
   "landGate": {
     "brivio": "pnpm land:gate"
   },
+  "sharedCloneMode": "warn",
+  "sharedCloneModeRepos": {
+    "codai": "refuse",
+    "brivio": "refuse"
+  },
   "runBuildTimeoutMin": 240,
   "journalRotateMB": 64,
+  "admission": {
+    "enabled": true,
+    "probeMs": 400,
+    "window": 5,
+    "everySec": 20,
+    "staleSec": 300,
+    "maxHoldMin": 20
+  },
+  "agentLimit": {
+    "enabled": true,
+    "awayAfterMin": 15,
+    "present": null,
+    "away": null,
+    "night": {
+      "from": "23:00",
+      "to": "07:00",
+      "limit": null
+    }
+  },
+  "landPregate": true,
+  "landPregateRounds": 2,
+  "greenTtlHours": 168,
+  "prune": {
+    "agentsDays": 3,
+    "jobsDays": 3,
+    "noticesDays": 7,
+    "releasesDays": 7,
+    "queueIdleHours": 24
+  },
   "cloudWorkspaces": {
     "codai": "codai",
     "vitals": "vitals-win",

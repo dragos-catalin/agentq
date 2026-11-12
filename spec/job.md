@@ -7,24 +7,36 @@ Objects under `jobs/` expire after 7 days (bucket lifecycle).
 
 ## Objects
 
-| object | writer | when | content |
-|---|---|---|---|
-| `jobs/<id>/bundle` | client | before the spec | `git bundle` of `HEAD` minus the newest known sha that is an ancestor of HEAD (full HEAD bundle when none) |
-| `jobs/<id>/patch` | client | before the spec | `git diff --cached --binary HEAD` of the working tree, untracked included, built in a temp index |
-| `ws/<ws>/queue/<id>.json` | client | **last** | the spec (below); its arrival makes the job claimable |
-| `jobs/<id>/claimed` | runner | on claim | `{at, host}` |
-| `jobs/<id>/log` | runner | every ~2 s | the whole log so far (rewritten, not appended) |
-| `jobs/<id>/result.json` | runner | **last** | `{v, id, exit, durSec, phases:{sync,install,run}, host, vcpu, finishedAt}` |
-| `ws/<ws>/heartbeat` | runner | every 30 s | `{at, host, state: idle\|busy\|suspending, idleSec}` |
-| `ws/<ws>/repos/<repo>.json` | runner | after each sync | `{repo, shas[≤30], at, host}` — commits this workspace has |
+| object                      | writer | when            | content                                                                                                    |
+| --------------------------- | ------ | --------------- | ---------------------------------------------------------------------------------------------------------- |
+| `jobs/<id>/bundle`          | client | before the spec | `git bundle` of `HEAD` minus the newest known sha that is an ancestor of HEAD (full HEAD bundle when none) |
+| `jobs/<id>/patch`           | client | before the spec | `git diff --cached --binary HEAD` of the working tree, untracked included, built in a temp index           |
+| `ws/<ws>/queue/<id>.json`   | client | **last**        | the spec (below); its arrival makes the job claimable                                                      |
+| `jobs/<id>/claimed`         | runner | on claim        | `{at, host}`                                                                                               |
+| `jobs/<id>/log`             | runner | every ~2 s      | the whole log so far (rewritten, not appended)                                                             |
+| `jobs/<id>/result.json`     | runner | **last**        | `{v, id, exit, durSec, phases:{sync,install,run}, host, vcpu, finishedAt}`                                 |
+| `ws/<ws>/heartbeat`         | runner | every 30 s      | `{at, host, state: idle\|busy\|suspending, idleSec}`                                                       |
+| `ws/<ws>/repos/<repo>.json` | runner | after each sync | `{repo, shas[≤30], at, host}` — commits this workspace has                                                 |
 
 ## Spec
 
 ```json
-{ "v": 1, "id": "20261012-020511-a1b2c3", "repo": "codai", "sha": "<HEAD sha>",
-  "bundle": true, "patch": true, "cmd": "pnpm --filter @codai/common typecheck",
-  "timeoutSec": 3600, "lane": "gate", "purpose": "why", "session": "term-123",
-  "noInstall": false, "submittedAt": "2026-10-12T02:05:11Z", "client": "HOST" }
+{
+  "v": 1,
+  "id": "20261012-020511-a1b2c3",
+  "repo": "codai",
+  "sha": "<HEAD sha>",
+  "bundle": true,
+  "patch": true,
+  "cmd": "pnpm --filter @codai/common typecheck",
+  "timeoutSec": 3600,
+  "lane": "gate",
+  "purpose": "why",
+  "session": "term-123",
+  "noInstall": false,
+  "submittedAt": "2026-10-12T02:05:11Z",
+  "client": "HOST"
+}
 ```
 
 - `id` = `yyyyMMdd-HHmmss-<6 hex>`; queue order is lexical, i.e. FIFO by submit time.

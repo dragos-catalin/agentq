@@ -191,6 +191,32 @@ function Get-RecentLeaseLosses([int]$hours = 24) {
 # Liveness for AGENTS (no long-lived process): owner shell pid + activity heartbeat (guard hook on
 # every tool call touching the slot, agentq calls from inside it, renew).
 # Stale = (owner dead AND idle > leaseDeadIdleMin, 3 min for the land slot) OR idle > leaseMaxIdleMin.
+#
+# ADR 0009 stage 0 (OQ-001): the CHAT is the unit that works, not a shell. 185 lease-break and 40
+# lease-expire in 7 days came from leases whose owner shell had ended (a keeper reaped with its terminal,
+# a one-shot lease job) while the chat kept working outside the slot: deploys, queue waits, subagents.
+# The per-tool-call hook (hooks/guard-tooluse.ps1) knows the chat id. When a chat WORKS in a slot (an edit
+# inside it, or a working command that names it) the hook binds the chat to the lease in <lease>.json.chat
+# ({ leaseId, chats: [ids] }) and from then on touches that file on EVERY tool call of the chat, whatever
+# the call is about. A chat whose last tool call is younger than leaseDeadIdleMin counts exactly like a
+# live owner shell: the lease is stale only when the SLOT has been idle longer than leaseMaxIdleMin
+# (24 h), the same limit a lease with a live keeper has. idleMin keeps meaning "slot idle"; chatIdleMin
+# is the chat. A chat that stops (or moves on for more than leaseDeadIdleMin) gives no protection.
+function Read-LeaseChat([string]$leaseFile) {
+  $r = @{ chats = @(); at = $null; releaseBy = ''; releaseAt = $null }
+  try {
+    $cf = "$leaseFile.chat"
+    if ([IO.File]::Exists($cf)) {
+      $r.at = [IO.File]::GetLastWriteTimeUtc($cf)
+      $j = [IO.File]::ReadAllText($cf) | ConvertFrom-Json
+      $r.chats = @(P $j 'chats' @() | ForEach-Object { "$_" } | Where-Object { $_ })
+    }
+    # <lease>.json.release: written by the hook when a chat runs `unlease` for this lease (who released it).
+    $rf = "$leaseFile.release"
+    if ([IO.File]::Exists($rf)) { $r.releaseAt = [IO.File]::GetLastWriteTimeUtc($rf); $r.releaseBy = "$([IO.File]::ReadAllText($rf))".Trim() }
+  } catch {}
+  $r
+}
 function Read-Leases([string]$repoName) {
   $dirs = if ($repoName) { @(Join-Path $LDir $repoName) } else { @(Get-ChildItem $LDir -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
   $cfg = Get-Config
@@ -219,18 +245,23 @@ function Read-Leases([string]$repoName) {
       $idle = ((Now) - $beat).TotalMinutes
       # The land lease owner is the agentq land process itself (20 s heartbeat): dead owner = land over.
       $deadIdle = if ((P $l 'role' '') -eq 'land') { 3 } else { $cfg.leaseDeadIdleMin }
-      $stale = ((-not $alive) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin)
+      # OQ-001: a chat bound to this lease that made a tool call within leaseDeadIdleMin = a live owner.
+      $chatAt = $null
+      if ((P $l 'role' '') -in 'task', 'pinned') { try { $chatF = "$($f.FullName).chat"; if ([IO.File]::Exists($chatF)) { $chatAt = [IO.File]::GetLastWriteTimeUtc($chatF) } } catch {} }
+      $chatLive = [bool]($chatAt -and ((Now) - $chatAt).TotalMinutes -le $deadIdle)
+      $stale = ((-not ($alive -or $chatLive)) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin)
       # W1-3: the ticket/job scan costs seconds on a big registry, so only a lease that would be
       # stale pays for it (most calls see no stale lease and never scan).
       if ($stale) {
         $xa = Get-LeaseExtraBeat $l
-        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not $alive) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin) }
+        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not ($alive -or $chatLive)) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin) }
       }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
       $l | Add-Member -NotePropertyName beat -NotePropertyValue $beat -Force
       $l | Add-Member -NotePropertyName alive -NotePropertyValue $alive -Force
       $l | Add-Member -NotePropertyName idleMin -NotePropertyValue ([math]::Round($idle, 1)) -Force
       $l | Add-Member -NotePropertyName stale -NotePropertyValue $stale -Force
+      $l | Add-Member -NotePropertyName chatIdleMin -NotePropertyValue $(if ($chatAt) { [math]::Round(((Now) - $chatAt).TotalMinutes, 1) } else { $null }) -Force
       $out += $l
     }
   }
@@ -472,9 +503,16 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   # makes deleting the branch impossible. State is already backed up (or clean) at this point.
   $p = "$(P $l 'path')"
   if ($event -notin 'lease-failed', 'lease-expire-failed' -and $p -and (Test-Path -LiteralPath (Join-Path $p '.git'))) { & git -C $p checkout -q --detach 2>$null | Out-Null }
-  Remove-Item -LiteralPath $l.file, "$($l.file).hb" -Force -ErrorAction SilentlyContinue
+  # OQ-001: what the chat side looked like when the lease ended. `byChat` = the release was run by a
+  # chat bound to this lease (the hook records who ran `unlease`), i.e. the worker gave its own slot back
+  # from another shell; that is not a loss. chatIdleMin <= 30 on anything else is the metric to drive to 0.
+  $ch = Read-LeaseChat $l.file
+  $chatIdle = if ($ch.at) { [math]::Round(((Now) - $ch.at).TotalMinutes, 1) } else { $null }
+  $byChat = [bool]($ch.releaseBy -and $ch.releaseAt -and ((Now) - $ch.releaseAt).TotalMinutes -le 15 -and (@($ch.chats) -contains $ch.releaseBy))
+  if ($event -eq 'lease-expire-failed') { Remove-Item -LiteralPath "$($l.file).release" -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item -LiteralPath $l.file, "$($l.file).hb", "$($l.file).chat", "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   if ($event -in 'lease-expire', 'lease-break' -and (P $l 'session') -ne $Session) { Add-LeaseNotice $l $event $why $backupRef }
-  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo }
+  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($ch.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
 # Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed).
 function Expire-Lease($l, [string]$why) {
@@ -496,7 +534,25 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   } elseif (-not $role) { $role = 'task' }
   $deadline = (Now).AddMinutes($timeoutMin)
   $announced = $false
+  $loadSaid = $false
+  $limitSaid = $false
   while ($true) {
+    # OQ-004: a saturated machine takes no NEW task agent. Release/land/pinned slots are never gated (they
+    # finish work already admitted); after admission.maxHoldMin the lease is granted anyway.
+    $loadHeld = $false
+    if ($role -eq 'task') {
+      $ld = Get-AdmissionLoad
+      if ($ld.saturated -and -not (Test-AdmissionOverride "slot:$repoName" $purpose $ld)) {
+        $loadHeld = $true
+        if (-not $loadSaid) { [Console]::Error.WriteLine("agentq: machine saturated (start probe median $($ld.median) ms > $($ld.thresholdMs) ms): no new task slot until it recovers or $([double](Get-AdmissionConfig).maxHoldMin) min pass (agentq status shows the probe)"); $loadSaid = $true }
+      }
+    }
+    if ($loadHeld) {
+      if ($noWait -or (Now) -gt $deadline) { [Console]::Error.WriteLine("agentq: no task slot granted - the machine is saturated$(if (-not $noWait) { " (waited $timeoutMin min)" })"); exit 3 }
+      Start-Sleep -Seconds 5; continue
+    }
+    # OQ-005: the machine-wide limit on task leases in force right now (owner presence + night schedule).
+    $agl = Get-AgentLimit
     $got = With-Mutex "lease-$repoName" {
       $leases = @(Read-Leases $repoName)
       $cands = if ($slot) { @($slot) }
@@ -508,7 +564,7 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
         $cur = $leases | Where-Object { $_.slot -eq $s } | Select-Object -First 1
         if ($cur -and $cur.stale) { if (-not (Expire-Lease $cur "stale (idle $($cur.idleMin) min, owner alive=$($cur.alive)) - reclaimed by $Session")) { continue }; $cur = $null }
         if ($cur) { continue }
-        if ($role -eq 'task' -and (Get-TaskLeaseCount) -ge $cfg.taskSlotsMachine) { $capHit = $true; break }
+        if ($role -eq 'task' -and (Get-TaskLeaseCount) -ge $agl.limit) { $capHit = $true; break }
         $p = Get-SlotPath $repoName $s
         $st = Get-ProcStart $owner
         $l = [ordered]@{
@@ -517,16 +573,22 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
           claims = @($(if ($role -in 'task', 'pinned') { $Claims } else { @() }))
         }
         $f = Get-LeaseFile $repoName $s
+        # a chat binding left by a previous lease of this slot must not keep the new one alive
+        Remove-Item -LiteralPath "$f.chat", "$f.release" -Force -ErrorAction SilentlyContinue
         Write-JsonAtomic $f $l
         [IO.File]::WriteAllText("$f.hb", '')
-        Write-Journal @{ event = 'lease'; resource = "slot:${repoName}:$s"; ticket = $l.leaseId; purpose = $purpose; branch = "$branch"; repo = $repoName }
+        Write-Journal @{ event = 'lease'; resource = "slot:${repoName}:$s"; ticket = $l.leaseId; purpose = $purpose; branch = "$branch"; repo = $repoName; loadWaitSec = (Get-LoadWaitSec) }
         return ([pscustomobject]$l | Add-Member -NotePropertyName file -NotePropertyValue $f -PassThru)
       }
       if ($capHit) { 'MACHINE-CAP' } else { $null }
     }
     if ($got -and $got -isnot [string]) { return $got }
+    if ($got -eq 'MACHINE-CAP' -and $agl.limit -lt $agl.base -and -not $limitSaid) {
+      $limitSaid = $true
+      Write-Journal @{ event = 'agent-limit-hold'; resource = "slot:$repoName"; purpose = $purpose; limit = [int]$agl.limit; base = [int]$agl.base; reason = $agl.why; repo = $repoName }
+    }
     if ($noWait -or (Now) -gt $deadline) {
-      $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($cfg.taskSlotsMachine)) reached" } else { "no free $role slot in $repoName" }
+      $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" } else { "no free $role slot in $repoName" }
       $held = (@(Read-Leases $repoName) | ForEach-Object { "$($_.slot)=$($_.session) '$($_.purpose)' idle $($_.idleMin)m" }) -join '; '
       [Console]::Error.WriteLine("agentq: $why. Held: $held")
       exit 3
@@ -626,7 +688,8 @@ function Invoke-Lease {
   $res = [pscustomobject]@{ leaseId = $l.leaseId; repo = $l.repo; slot = $l.slot; role = $l.role; path = $l.path; branch = "$Branch"; head = "$(& git -C $l.path rev-parse --short HEAD)".Trim() }
   if ($Json) { $res | ConvertTo-Json -Compress } else {
     Write-Output "leased $($l.repo)/$($l.slot) ($($l.leaseId)) -> $($l.path) @ $($res.head)$(if ($Branch) { " on $Branch" })"
-    Write-Output "release when done: pwsh -NoProfile -File `"$PSCommandPath`" unlease -Repo `"$($l.path)`" -LeaseId $($l.leaseId)"
+    # $PSCommandPath here is agentq-v2.ps1 (dot-sourced), which cannot be run on its own.
+    Write-Output "release when done: pwsh -NoProfile -File `"$(Join-Path $PSScriptRoot 'agentq.ps1')`" unlease -Repo `"$($l.path)`" -LeaseId $($l.leaseId)"
   }
 }
 
@@ -665,8 +728,25 @@ function Invoke-Sweep {
     else { $kept++; Write-Output "KEPT $($l.repo)/$($l.slot): backup failed (journal: lease-expire-failed)" }
   }
   [void](Read-Releases $null)   # side effect: dead runs are recorded as failed
+  # OQ-007: `status` no longer reaps; dead tickets of resources nobody queues on are reaped here.
+  $reaped = 0
+  foreach ($qd in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
+    foreach ($tf in @(Get-ChildItem -LiteralPath $qd.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'adaptive.json', 'burst.json' })) {
+      try {
+        $t = Get-Content -LiteralPath $tf.FullName -Raw | ConvertFrom-Json -DateKind String
+        if (-not (P $t 'resource' '') -or (Test-Alive $t)) { continue }
+        $t | Add-Member -NotePropertyName file -NotePropertyValue $tf.FullName -Force
+        Remove-Ticket $t "holder pid $($t.pid) is gone"; $reaped++
+      } catch {}
+    }
+  }
   try { Invoke-RotateJournal } catch { Write-Output "rotate skipped: $_" }
-  Write-Output "sweep: expired=$n kept=$kept"
+  # OQ-006: prune state nobody needs (agents, jobs, notices, releases, idle queue folders).
+  $pruned = 0
+  if ($env:AGENTQ_NO_PRUNE -ne '1') {
+    try { . (Join-Path $PSScriptRoot 'agentq-prune.ps1'); $pr = Invoke-Prune -Quiet; if ($pr -and $pr.ContainsKey('total')) { $pruned = [int]$pr.total } } catch { Write-Output "prune skipped: $_" }
+  }
+  Write-Output "sweep: expired=$n kept=$kept reaped=$reaped pruned=$pruned"
 }
 
 # For scripts and guards: exit 3 + holder when -Path is (inside, or a parent of) a leased slot.
@@ -699,8 +779,11 @@ function Read-Releases([string]$repoName) {
     if (-not $alive -and (P $r 'state') -in 'running', 'preempting') {
       # The release process died without release-end: record it as failed (never auto-restarted).
       $r.state = 'failed'; $r | Add-Member -NotePropertyName endedReason -NotePropertyValue 'process died' -Force
-      Write-JsonAtomic $f.FullName $r
-      Write-Journal @{ event = 'release-dead'; resource = "deploy:$($r.repo):$($r.target)"; sha = $r.sha; reason = 'release process died'; repo = $r.repo }
+      # A read-only verb (status) reports it as failed without recording it; sweep and working verbs record.
+      if (-not $script:ReadOnly) {
+        Write-JsonAtomic $f.FullName $r
+        Write-Journal @{ event = 'release-dead'; resource = "deploy:$($r.repo):$($r.target)"; sha = $r.sha; reason = 'release process died'; repo = $r.repo }
+      }
     }
     $r | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
     $r | Add-Member -NotePropertyName alive -NotePropertyValue $alive -Force
@@ -958,6 +1041,148 @@ function Resolve-LandRef([string]$main, [string]$b) {
   if ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$b" 2>$null)) { return "refs/remotes/origin/$b" }
   $null
 }
+# ---- green trees + land pre-gate (ADR 0009 stage 0, OQ-002 / OQ-003) -------------------------------
+# Baseline, busiest repo, 7 days: the land ticket was HELD 80.8 h, 41.8 h of it running the land gate
+# (p50 7.2 min), 12.8 h in the 45 gate runs that then failed - every one of them made the whole queue
+# wait. Two changes:
+#  * Green ledger (<AGENTQ_HOME>/green/<repo>.json): a tree that passed a gate command is remembered by
+#    (tree hash, gate command) for greenTtlHours (168). The in-queue gate is skipped for such a tree
+#    (journal `land-gate-skipped-green`). The key is the exact tree, so a land whose result differs by
+#    one byte runs the gate as before.
+#  * Pre-gate: `agentq land` run from a leased task slot first builds the REBASED result (merge-tree of
+#    the topic onto the current origin/<onto>, no working tree involved), puts it in the slot (a
+#    temporary detached checkout of a local, never-pushed merge commit; the slot's branch and HEAD are
+#    restored afterwards), runs the gate there through run-build and records the tree as green. Only
+#    then is the land ticket taken. A failing gate ends the land with exit 6 BEFORE the queue
+#    (`land-pregate-failed`). When origin moved while the gate ran, one more round is tried
+#    (landPregateRounds, default 2); after that the land queues anyway and the in-queue gate decides.
+#    Skipped, with the reason journaled (`land-pregate-skipped`), when: not run from a leased task slot,
+#    the slot has uncommitted or untracked files, the merge needs the land resolver, or a lockfile
+#    differs between the slot and the rebased result (its node_modules would be stale).
+#    Config `landPregate`: true | false | { <repo>: bool } (default true); AGENTQ_LAND_NO_PREGATE=1 off.
+# The gate runs in a different directory (the slot) than the in-queue gate did (the land slot); the
+# repo's pre-push hook still runs at the push, in the land slot, as before.
+function Get-GateKey([string]$tree, [string]$gate) {
+  $h = [BitConverter]::ToString([Security.Cryptography.SHA1]::HashData([Text.Encoding]::UTF8.GetBytes("$gate"))).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+  "$tree|$h"
+}
+function Get-GreenFile([string]$repoName) { Join-Path (Join-Path $Root 'green') ((Safe $repoName) + '.json') }
+function Test-GreenTree([string]$repoName, [string]$tree, [string]$gate) {
+  if (-not $tree -or -not $gate -or $env:AGENTQ_NO_GREEN -eq '1') { return $null }
+  try {
+    $f = Get-GreenFile $repoName
+    if (-not [IO.File]::Exists($f)) { return $null }
+    $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String
+    $k = Get-GateKey $tree $gate
+    if (-not $j -or -not $j.ContainsKey($k)) { return $null }
+    $e = $j[$k]
+    $c = Get-Config
+    $ttl = if ($c.ContainsKey('greenTtlHours')) { [double]$c['greenTtlHours'] } else { 168.0 }
+    if (((Now) - (ParseUtc $e['at'])).TotalHours -gt $ttl) { return $null }
+    $e
+  } catch { $null }
+}
+function Set-GreenTree([string]$repoName, [string]$tree, [string]$gate, [int]$sec, [string]$where) {
+  if (-not $tree -or -not $gate -or $env:AGENTQ_NO_GREEN -eq '1') { return }
+  try {
+    With-Mutex "green-$repoName" {
+      $f = Get-GreenFile $repoName
+      $j = @{}
+      if ([IO.File]::Exists($f)) { try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String } catch { $j = @{} } }
+      if (-not $j) { $j = @{} }
+      $j[(Get-GateKey $tree $gate)] = [ordered]@{ at = (Iso (Now)); sec = $sec; where = $where; by = $Session; gate = "$gate" }
+      # keep the 300 newest (ISO strings sort by time)
+      if ($j.Count -gt 300) { foreach ($old in @($j.Keys | Sort-Object { "$($j[$_]['at'])" } | Select-Object -First ($j.Count - 300))) { $j.Remove($old) } }
+      Write-JsonAtomic $f $j
+    }
+  } catch {}
+}
+function Get-LandPregateOn([string]$repoName) {
+  if ($env:AGENTQ_LAND_NO_PREGATE -eq '1') { return $false }
+  $c = Get-Config
+  if (-not $c.ContainsKey('landPregate')) { return $true }
+  $v = $c['landPregate']
+  if ($v -is [Collections.IDictionary]) { if ($v.Contains($repoName)) { return [bool]$v[$repoName] }; return $true }
+  [bool]$v
+}
+# Runs the land gate through run-build in $dir. Sets $script:GateExit / $script:GateSec; output flows on.
+function Invoke-GateRun([string]$dir, [string]$purpose) {
+  $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate
+  $script:GateExit = [int]$LASTEXITCODE
+  $script:GateSec = [int][math]::Round($sw.Elapsed.TotalSeconds)
+}
+# Result in $script:PregateResult: ok | failed | skipped. Uses $Gate, $Onto, $Branch from Invoke-Land.
+function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
+  $script:PregateResult = 'skipped'
+  $res = "land:$($repo.Name)"
+  if (-not (Get-LandPregateOn $repo.Name)) { return }
+  $skip = {
+    param([string]$why)
+    Write-Journal @{ event = 'land-pregate-skipped'; resource = $res; branch = $Branch; reason = $why; repo = $repo.Name }
+    Write-Output "land: pre-gate skipped ($why); the gate runs in the queue as before"
+  }
+  $cwdN = Norm-Dir (Get-Location).Path
+  $slot = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and -not $_.stale -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
+  if (-not $slot) { & $skip 'not run from a leased task slot'; return }
+  $sp = "$(P $slot 'path')"
+  $topicSha = "$(& git -C $main rev-parse --verify -q "$topicRef^{commit}" 2>$null)".Trim()
+  if (-not $topicSha) { & $skip 'the topic does not resolve to a commit'; return }
+  if (-not (Test-GitClean $sp)) { & $skip 'the slot has uncommitted or untracked files'; return }
+  $c = Get-Config
+  $rounds = if ($c.ContainsKey('landPregateRounds')) { [math]::Max(1, [int]$c['landPregateRounds']) } else { 2 }
+  for ($round = 1; $round -le $rounds; $round++) {
+    & git -C $main fetch -q origin $Onto 2>$null
+    $tip = "$(& git -C $main rev-parse "origin/$Onto" 2>$null)".Trim()
+    $mt = @(& git -C $main merge-tree --write-tree --no-messages "origin/$Onto" $topicSha 2>$null | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -or -not $mt.Count) { & $skip 'the merge onto the tip needs the land resolver'; return }
+    $tree = $mt[0].Trim()
+    if ($tree -eq "$(& git -C $main rev-parse "$tip^{tree}" 2>$null)".Trim()) { $script:PregateResult = 'ok'; return }   # nothing to land
+    $green = Test-GreenTree $repo.Name $tree $Gate
+    if ($green) {
+      Write-Journal @{ event = 'land-pregate-ok'; resource = $res; branch = $Branch; tree = $tree; durSec = 0; cached = $true; reason = "tree $(Short $tree 12) already passed this gate at $($green['at'])"; repo = $repo.Name }
+      Write-Output "land: pre-gate not needed - tree $(Short $tree 12) already passed '$Gate' ($($green['where']), $($green['at']))"
+      $script:PregateResult = 'ok'; return
+    }
+    $head = "$(& git -C $sp rev-parse HEAD 2>$null)".Trim()
+    $headTree = "$(& git -C $sp rev-parse 'HEAD^{tree}' 2>$null)".Trim()
+    $branchNow = "$(& git -C $sp symbolic-ref -q --short HEAD 2>$null)".Trim()
+    $moved = $false
+    if ($headTree -ne $tree) {
+      $locks = @(& git -C $sp diff --name-only $headTree $tree 2>$null | Where-Object { $_ -match '(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?|Cargo\.lock|uv\.lock|poetry\.lock|gradle\.lockfile)$' })
+      if ($locks.Count) { & $skip "a lockfile differs between the slot and the rebased result ($($locks -join ', ')): rebase the slot on origin/$Onto and install to get the pre-gate"; return }
+      $m = "$(& git -C $sp -c user.name=agentq -c user.email=agentq@localhost commit-tree $tree -p $tip -p $topicSha -m "agentq pre-gate: $Branch onto $Onto (local only)" 2>$null)".Trim()
+      if ($LASTEXITCODE -or -not $m) { & $skip 'could not build the rebased result'; return }
+      & git -C $sp checkout -q --detach $m 2>$null
+      if ($LASTEXITCODE) { & $skip 'could not check out the rebased result in the slot'; return }
+      $moved = $true
+    }
+    Write-Output "land: pre-gate round $round - '$Gate' on $Branch rebased onto origin/$Onto @ $(Short $tip) (tree $(Short $tree 12)) in $sp, before the land ticket"
+    $script:GateExit = 1; $script:GateSec = 0
+    try { Invoke-GateRun $sp "land pregate $Branch" }
+    finally {
+      if ($moved) {
+        if ($branchNow) { & git -C $sp checkout -q $branchNow 2>$null } else { & git -C $sp checkout -q --detach $head 2>$null }
+        if ($LASTEXITCODE -or "$(& git -C $sp rev-parse HEAD 2>$null)".Trim() -ne $head) {
+          Write-Journal @{ event = 'land-pregate-restore-failed'; resource = $res; branch = $Branch; sha = $head; reason = "slot $sp was left on the pre-gate commit"; repo = $repo.Name }
+          [Console]::Error.WriteLine("land: WARNING could not put $sp back on $(if ($branchNow) { $branchNow } else { $head }). Run: git -C `"$sp`" checkout $(if ($branchNow) { $branchNow } else { "--detach $head" })")
+        }
+      }
+    }
+    if ($script:GateExit) {
+      Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = $Gate; repo = $repo.Name }
+      [Console]::Error.WriteLine("land: gate failed ($($script:GateExit)) for $Branch rebased onto origin/$Onto, BEFORE the queue - nothing queued, nothing pushed. Fix it in the slot and land again. (AGENTQ_LAND_NO_PREGATE=1 runs the gate in the queue instead.)")
+      $script:PregateResult = 'failed'; return
+    }
+    Set-GreenTree $repo.Name $tree $Gate $script:GateSec 'pre-gate'
+    Write-Journal @{ event = 'land-pregate-ok'; resource = $res; branch = $Branch; tree = $tree; durSec = $script:GateSec; cached = $false; reason = $Gate; repo = $repo.Name }
+    $script:PregateResult = 'ok'
+    & git -C $main fetch -q origin $Onto 2>$null
+    if ("$(& git -C $main rev-parse "origin/$Onto" 2>$null)".Trim() -eq $tip) { return }
+    if ($round -lt $rounds) { Write-Output "land: origin/$Onto moved while the pre-gate ran - checking the new tip" }
+  }
+}
 # Commits of $ref not yet upstream: patch-id dedupe (--cherry-pick) plus `(cherry picked from commit X)`
 # trailers upstream (a pick whose CHANGELOG conflict was resolved has a different patch-id).
 function Get-LandPicks([string]$wt, [string]$ref) {
@@ -1128,13 +1353,23 @@ function Invoke-LandSet([object[]]$set) {
     if (-not $picked.Count) { return }
     $names = ($picked | ForEach-Object { $_.branch }) -join '+'
     if ($Gate) {
-      $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
-      & pwsh -NoProfile -File $rb -Root $wt -Wait -TimeoutMin 120 -Purpose "land gate $names" -Command $Gate
-      $gx = $LASTEXITCODE
-      if ($gx) {
-        Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
-        [Console]::Error.WriteLine("land: gate failed ($gx) for $names - nothing pushed")
-        $o.failExit = 6; return
+      # OQ-003: the exact tree about to be pushed already passed this gate (in the caller's slot, or in
+      # an earlier land attempt): do not hold the land ticket for a second run of the same check.
+      $gateTree = "$(& git -C $wt rev-parse 'HEAD^{tree}' 2>$null)".Trim()
+      $green = Test-GreenTree $repo.Name $gateTree $Gate
+      if ($green) {
+        Write-Journal @{ event = 'land-gate-skipped-green'; resource = $res; branch = $Onto; tree = $gateTree; paths = @($picked | ForEach-Object { $_.branch }); reason = "tree $(Short $gateTree 12) passed '$Gate' at $($green['at']) ($($green['where']))"; repo = $repo.Name }
+        Write-Output "land: gate skipped for $names - tree $(Short $gateTree 12) already passed '$Gate' ($($green['where']), $($green['at']))"
+      } else {
+        $script:GateExit = 1; $script:GateSec = 0
+        Invoke-GateRun $wt "land gate $names"
+        $gx = $script:GateExit
+        if ($gx) {
+          Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
+          [Console]::Error.WriteLine("land: gate failed ($gx) for $names - nothing pushed")
+          $o.failExit = 6; return
+        }
+        Set-GreenTree $repo.Name $gateTree $Gate $script:GateSec 'land'
       }
     }
     # Repo-owned land finalize (ADR 0003 W3, changelog fragments): assembles changes/*.md into ONE
@@ -1262,6 +1497,14 @@ function Invoke-Land {
         [Console]::Error.WriteLine("land: $Branch does not merge onto origin/$Onto (conflicts: $($hard -join ', ')). Nothing queued. Rebase it in your slot, push, and land again.")
         $script:LandExit = 5; return
       }
+    }
+  }
+  # OQ-002: run the gate on the rebased result in the caller's slot BEFORE taking the land ticket.
+  if ($Gate) {
+    $pgRef = Resolve-LandRef $main $Branch
+    if ($pgRef) {
+      Invoke-LandPregate $repo $main $pgRef
+      if ($script:PregateResult -eq 'failed') { $script:LandExit = 6; return }
     }
   }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
@@ -1512,12 +1755,14 @@ function Format-V2Status($v) {
   }
   if ($v.leases) {
     Write-Output '== SLOTS (leases)'
-    $v.leases | Sort-Object repo, slot | Format-Table @{n = 'slot'; e = { "$($_.repo)/$($_.slot)" } }, role, @{n = 'state'; e = { if ($_.stale) { 'STALE' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' } } }, idleMin, branch, session, purpose, leaseId -AutoSize | Out-String -Width 220 | Write-Output
+    # chatMin = minutes since the last tool call of a chat bound to the slot (OQ-001); '-' = no chat bound.
+    # 'chat' state = the owner shell is gone and a live chat is what keeps the lease.
+    $v.leases | Sort-Object repo, slot | Format-Table @{n = 'slot'; e = { "$($_.repo)/$($_.slot)" } }, role, @{n = 'state'; e = { if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le 30) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' } } }, idleMin, @{n = 'chatMin'; e = { if ($null -ne $_.chatIdleMin) { $_.chatIdleMin } else { '-' } } }, branch, session, purpose, leaseId -AutoSize | Out-String -Width 230 | Write-Output
   }
 }
 function ConvertTo-V2Json($v) {
   @{
-    leases = @($v.leases | ForEach-Object { [pscustomobject]@{ leaseId = $_.leaseId; repo = $_.repo; slot = $_.slot; role = $_.role; path = $_.path; branch = $_.branch; purpose = $_.purpose; session = $_.session; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); idleMin = $_.idleMin; alive = $_.alive; stale = $_.stale } })
+    leases = @($v.leases | ForEach-Object { [pscustomobject]@{ leaseId = $_.leaseId; repo = $_.repo; slot = $_.slot; role = $_.role; path = $_.path; branch = $_.branch; purpose = $_.purpose; session = $_.session; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); idleMin = $_.idleMin; alive = $_.alive; stale = $_.stale; chatIdleMin = $_.chatIdleMin } })
     releases = @($v.releases | ForEach-Object { $_ | Select-Object * -ExcludeProperty file })
   }
 }

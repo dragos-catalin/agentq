@@ -5,6 +5,8 @@ $aq = Join-Path $PSScriptRoot 'agentq.ps1'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentq-test-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:AGENTQ_NO_SIGNAL = '1'
+# These cases assert the queue's order, whatever the machine load is; admission by load has its own suite.
+$env:AGENTQ_NO_ADMISSION = '1'
 # Pin the policy: the installed config may enable machineCapAdaptive, which makes capacity depend
 # on live CPU/RAM and turned queue-shape assertions into load-dependent flakes (2026-10-17).
 New-Item -ItemType Directory -Force $tmp | Out-Null

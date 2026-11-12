@@ -2,13 +2,13 @@
 param([string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'))
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('gsc-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-New-Item -ItemType Directory "$root\repo\.git", "$root\repo\src", "$root\.wt\repo\task-1\src" -Force | Out-Null
+New-Item -ItemType Directory "$root\repo\.git", "$root\repo\src", "$root\other\.git", "$root\other\src", "$root\.wt\repo\task-1\src" -Force | Out-Null
 $env:CODAI_GH_ROOT = $root; $env:CODAI_WT_ROOT = "$root\.wt"; $env:AGENTQ_HOME = "$root\coord"
 $fail = 0
 function Ok([bool]$c, [string]$m) { if ($c) { "PASS $m" } else { "FAIL $m"; $script:fail++ } }
-function Call([string]$tool, $ti) {
+function Call([string]$tool, $ti, [string]$Exe = 'pwsh') {
   $j = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = $ti } | ConvertTo-Json -Compress -Depth 5
-  $out = $j | & pwsh -NoProfile -File $Guard 2>$null
+  $out = $j | & $Exe -NoProfile -ExecutionPolicy Bypass -File $Guard 2>$null
   [pscustomobject]@{ code = $LASTEXITCODE; out = ($out -join "`n") }
 }
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
@@ -53,6 +53,21 @@ Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
 '{"sharedCloneMode":"refuse","sharedCloneModeRepos":{"repo":"warn"}}' | Set-Content $cfg
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch '"deny"' -and $r.out -match 'SHARED clone') 'per-repo warn beats global refuse'
+# ADR 0009 stage 0 (OQ-008): refuse only for the repos that have slots; every other repo keeps the advisory.
+'{"sharedCloneMode":"warn","sharedCloneModeRepos":{"repo":"refuse"}}' | Set-Content $cfg
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -match 'ADR 0004' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse' -and (Lines)[-1].repo -eq 'repo') 'per-repo refuse: flagged with the lease recipe, journaled as refuse'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\other\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -match 'SHARED clone' -and $r.out -notmatch 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'warn' -and (Lines)[-1].repo -eq 'other') 'per-repo refuse: another repo keeps the advisory'
+# The editor starts this hook with Windows PowerShell 5.1. The mode was read with ConvertFrom-Json
+# -AsHashtable, which 5.1 does not have: the read failed silently and every repo stayed on "warn".
+$ps51 = if ($IsWindows) { (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source } else { $null }
+if ($ps51) {
+  $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' } $ps51
+  Ok ($r.out -match 'ADR 0004' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse') 'per-repo refuse is honoured under Windows PowerShell 5.1'
+  $r = Call 'replace_string_in_file' @{ filePath = "$root\other\src\a.ts"; oldString = 'x'; newString = 'y' } $ps51
+  Ok ($r.out -match 'SHARED clone' -and (Lines)[-1].mode -eq 'warn') 'Windows PowerShell 5.1: another repo keeps the advisory'
+} else { 'PASS (Windows PowerShell 5.1 not on this machine: the 5.1 cases did not run)' }
 '{"sharedCloneModeRepos":{"repo":"off"}}' | Set-Content $cfg
 $n1 = (Lines).Count
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
