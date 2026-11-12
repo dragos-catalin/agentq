@@ -12,6 +12,10 @@ evidence and what is still open for each row.
   neither do the inspection verbs of agentq.
 - `status` shows `chatMin` and the state `chat`. The journal events `lease-expire` and `lease-break` carry `chats`,
   `chatIdleMin` and `byChat`.
+- `byChat` is true when the chat that worked in the slot released it itself, also from another shell. The hook sees
+  the `unlease -LeaseId <id>` line in the command, and, for a chat that holds a lease, in a script file the command
+  runs (up to three files of at most 64 KB). A release that the hook cannot see is counted as a slot taken from a
+  live chat, so release a slot with a command or a script that names the lease id.
 - `AGENTQ_NO_CHAT_KEEPALIVE=1` turns it off.
 - The `release when done` line printed by `lease` names `agentq.ps1`. The old line named a file that cannot run on its
   own.

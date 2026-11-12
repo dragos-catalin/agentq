@@ -21,6 +21,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 - `agentq status`, `log`, `metrics` and `doctor` only read the state folder; dead tickets are reaped by working verbs and by `sweep`.
 - The guard honours `sharedCloneMode` under Windows PowerShell 5.1 (it was ignored in the editor).
+- A chat that releases its own slot from a script file is recorded as the releasing chat (`byChat`); before, only an `unlease` typed in the command counted.
 - The repository passes `prettier --check .` again (formatting only).
 - run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).

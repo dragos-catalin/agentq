@@ -212,9 +212,30 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
     } elseif ($bound.Count) { [IO.File]::SetLastWriteTimeUtc($chatFile, $nowG) }
     # (3) who releases: `agentq unlease -LeaseId x` typed by a chat is recorded next to the lease, so the
     # journal can tell "the worker gave its slot back from another shell" from "someone else took it".
-    if ($cmd -match '(?i)\bunlease\b' -and $cmd -match '(?i)-LeaseId\s+[''"]?([0-9a-f]{6,})') {
-      $rid = $Matches[1]
-      foreach ($l in @(Get-GuardLeases)) { if ($l.id -eq $rid) { [IO.File]::WriteAllText("$($l.file).release", $chatId, $utf8G) } }
+    # A chat that holds a lease often releases it from a script file (a cleanup or handoff script), and
+    # then the command text names only the script: such a release was journaled as a slot taken from a
+    # live chat. For a chat bound to a lease, the small script files the command runs are read as well.
+    $relText = "$cmd"
+    if ($cmd -and $bound.Count -and $cmd -match '(?i)\.ps1') {
+      $cwdG = ''
+      foreach ($container in $payload, $payload.tool_input, $payload.toolInput) {
+        if (-not $cwdG -and $container -and $container -isnot [string] -and $container.PSObject.Properties.Name -contains 'cwd' -and $container.cwd) { $cwdG = "$($container.cwd)" }
+      }
+      $nRead = 0
+      foreach ($m in [regex]::Matches($cmd, '(?i)"([^"]+\.ps1)"|''([^'']+\.ps1)''|([^\s"''`;|&<>()]+\.ps1)')) {
+        if ($nRead -ge 3) { break }
+        $sp = "$($m.Groups[1].Value)$($m.Groups[2].Value)$($m.Groups[3].Value)"
+        try {
+          if (-not [IO.Path]::IsPathRooted($sp)) { if ($cwdG) { $sp = Join-Path $cwdG $sp } else { continue } }
+          $fi = New-Object IO.FileInfo $sp
+          # agentq's own scripts are far larger than this; a release script is a few lines
+          if ($fi.Exists -and $fi.Length -le 65536) { $nRead++; $relText += "`n" + [IO.File]::ReadAllText($fi.FullName) }
+        } catch { }
+      }
+    }
+    if ($relText -match '(?i)\bunlease\b') {
+      $rids = @([regex]::Matches($relText, '(?i)-LeaseId\s+[''"]?([0-9a-f]{6,})') | ForEach-Object { $_.Groups[1].Value })
+      if ($rids.Count) { foreach ($l in @(Get-GuardLeases)) { if ($l.id -and $rids -contains $l.id) { [IO.File]::WriteAllText("$($l.file).release", $chatId, $utf8G) } } }
     }
   } catch { }
 }

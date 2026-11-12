@@ -162,6 +162,29 @@ try {
   $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Reason 'i need a slot'
   $br = Journal 'lease-break' | Select-Object -Last 1
   Check '8 broken by someone else while its chat is live -> byChat=false, chatIdleMin small (the SLO counts it)' ($br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1) ($br | ConvertTo-Json -Compress)
+
+  # 9 the release runs from a SCRIPT FILE: the command names only the script. The hook reads the script for a
+  # chat that is bound to a lease (seen live: a cleanup script released the slot and the journal said byChat=false)
+  $env:AGENTQ_SESSION = 'owner-D'
+  $o = AQ lease -Slot $la.slot -Purpose 'work D' -Json; $ld = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  $null = Edit 'chat-7' (Join-Path $ld.path 'a.txt')
+  $rel = Join-Path $tmp 'release slot.ps1'
+  [IO.File]::WriteAllText($rel, "# end of the task`n& pwsh -NoProfile -File '$Aq' unlease -Repo '$($ld.path)' -LeaseId $($ld.leaseId) -Reason 'done, landed'`n")
+  $null = Cmd 'chat-8' "pwsh -NoProfile -File `"$rel`""
+  Check '9 a chat that is NOT bound to a lease: the script it runs is not read' (-not (Test-Path "$lf.release"))
+  $null = Cmd 'chat-7' "pwsh -NoProfile -File `"$rel`""
+  Check '9 a bound chat runs a script that holds the unlease line -> recorded as the releasing chat' ((Test-Path "$lf.release") -and (Get-Content "$lf.release" -Raw).Trim() -eq 'chat-7')
+  $env:AGENTQ_SESSION = 'another-shell'
+  $o = AQ unlease -Repo $ld.path -LeaseId $ld.leaseId -Reason 'done, landed'
+  $br = Journal 'lease-break' | Select-Object -Last 1
+  Check '9 ... and the lease-break carries byChat=true (not a loss)' ($code -eq 0 -and $br.ticket -eq $ld.leaseId -and $br.byChat -eq $true) "$o | $($br | ConvertTo-Json -Compress)"
+  # a script that does not exist, or that says nothing about a release, changes nothing and does not fail the call
+  $env:AGENTQ_SESSION = 'owner-E'
+  $o = AQ lease -Slot $la.slot -Purpose 'work E' -Json; $le = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  $null = Edit 'chat-9' (Join-Path $le.path 'a.txt')
+  $other = Join-Path $tmp 'build.ps1'; [IO.File]::WriteAllText($other, "'building'`n")
+  $r = Cmd 'chat-9' "pwsh -NoProfile -File `"$other`"; pwsh -NoProfile -File `"$tmp\missing.ps1`""
+  Check '9 a script without a release, and a missing script: allowed, nothing recorded' ($r.code -eq 0 -and $r.out -notmatch '"deny"' -and -not (Test-Path "$lf.release"))
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'CODAI_GH_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_PRUNE', 'AGENTQ_NO_CHAT_KEEPALIVE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
