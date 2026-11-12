@@ -37,6 +37,11 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - The `release when done` line printed by `lease` names `agentq.ps1` (the old line named a file that cannot run on its own).
 - `run-all.ps1` sets `AGENTQ_NO_ADMISSION=1` for every suite: a suite must not depend on how busy the machine is. The suites that test admission clear it and fake the probe.
 - Tests: the `jobs` suite reaps a dead holder with `sweep` (it relied on `status` doing it); case 10b of `git-autosync` gives the upstream commit its own date (made in the same second as the local one it took the "replayed by hand" path and failed on a fast runner).
+- The whole repository passes `prettier --check .` again (11 files were reformatted, no other change), so the `lint` step of CI is green.
+
+### Security
+
+- `zod` 4.6.5 → 4.6.7 (GHSA-mrhx-c7xc-m3w5), and the lockfile moves five transitive packages to their fixed releases: `vite` 8.3.8, `body-parser` 2.4.0, `qs` 6.17.1, `fast-uri` 3.1.9, `ip-address` 10.7.6. `pnpm audit` reports no known vulnerability (it reported 14, three of them high).
 - run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
 - agentq-sync publishes v3 holders first so the hub's position model stays correct.
