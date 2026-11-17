@@ -91,6 +91,32 @@ try {
   $bk = @(git -C $repo --git-dir=$bare for-each-ref --format='%(objectname)' refs/backup/wt/repo/land)
   Check 'oversized: the bad result is not backed up to origin' (-not @($bk | Where-Object { (git --git-dir=$bare cat-file -s "${_}:CHANGELOG.md") -gt 1.5 * $before }).Count)
 
+  # --- 2b. a SMALL per-package CHANGELOG may grow by one entry (the factor alone refused it) -----
+  # github 2026-11-17: five kit packages of ~200 bytes could not land a one-line release entry, because
+  # 1.5x of 200 bytes is 300 and any entry is bigger. The allowance is now max(1.5x, old + 4 KB).
+  $pkg = Join-Path $repo 'packages\webhooks'
+  New-Item -ItemType Directory -Force $pkg | Out-Null
+  [IO.File]::WriteAllText((Join-Path $pkg 'CHANGELOG.md'), "# @codai/webhooks`n`n## 0.1.0`n`n- Initial release.`n", $utf8)
+  # land moved dev on origin in the cases above, so start the fixture from what origin actually has
+  git -C $repo fetch -q origin
+  git -C $repo checkout -q -B dev origin/dev 2>$null
+  $fixture = @()
+  $fixture += @(& git -C $repo add packages 2>&1 | ForEach-Object { "$_" })
+  $fixture += @(& git -C $repo commit -qm 'small package changelog on dev' 2>&1 | ForEach-Object { "$_" })
+  $fixture += @(& git -C $repo push origin dev 2>&1 | ForEach-Object { "$_" })
+  Check 'small CHANGELOG: the fixture commit reached origin' ((git -C $bare rev-parse dev) -eq (git -C $repo rev-parse HEAD)) ($fixture -join ' | ')
+  git -C $tw fetch -q origin
+  $co = @(& git -C $tw checkout -q -B topic4 origin/dev 2>&1 | ForEach-Object { "$_" }) -join ' '
+  $sp = Join-Path $tw 'packages\webhooks\CHANGELOG.md'
+  Check 'small CHANGELOG: fixture present in the topic worktree' (Test-Path $sp) $co
+  $st = [IO.File]::ReadAllText($sp, $utf8)
+  [IO.File]::WriteAllText($sp, $st.Replace("## 0.1.0", "## 0.1.1`n`n- Metadata release: no behaviour changes.`n`n## 0.1.0"), $utf8)
+  git -C $tw commit -qam 'small changelog entry'; git -C $tw push -q origin topic4 2>$null
+  $o = AQ land -Branch topic4 -Onto dev -Purpose 'land a small changelog entry'
+  Check 'small CHANGELOG + one entry -> exit 0' ($code -eq 0) $o
+  git -C $repo fetch -q origin
+  Check 'small CHANGELOG: the entry is on dev' ((BlobText 'origin/dev:packages/webhooks/CHANGELOG.md').Contains('0.1.1'))
+
   # --- 3. backup refused by origin -> verified local bundle, nothing wedged -----------------
   $hook = Join-Path $bare 'hooks\pre-receive'
   $hookText = @'

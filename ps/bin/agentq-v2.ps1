@@ -942,14 +942,19 @@ function Merge-UnionBytes([string]$wt, [string]$p) {
 
 # A CHANGELOG blob that grows past 1.5x its size on origin is a resolver bug, never a real entry
 # (a real one adds KBs to a 24 MB file). Returns 'path: old -> new' strings for offenders.
-function Get-OversizedChangelogs([string]$wt, [string]$baseRef, [double]$factor = 1.5) {
+function Get-OversizedChangelogs([string]$wt, [string]$baseRef, [double]$factor = 1.5, [int]$floorBytes = 4096) {
   $out = @()
   foreach ($p in @(& git -C $wt diff --name-only $baseRef HEAD 2>$null | Where-Object { $_ -match '(^|/)CHANGELOG\.md$' })) {
     $old = "$(& git -C $wt cat-file -s "${baseRef}:$p" 2>$null)".Trim()
     if ($LASTEXITCODE -or -not $old) { continue }   # new file: nothing to compare against
     $new = "$(& git -C $wt cat-file -s "HEAD:$p" 2>$null)".Trim()
     if ($LASTEXITCODE -or -not $new) { continue }   # deleted
-    if ([double]$new -gt $factor * [double]$old) { $out += "${p}: $old -> $new bytes" }
+    # The factor alone is calibrated for the multi-MB root CHANGELOG. Small per-package changelogs
+    # (200-300 bytes) exceed 1.5x on every legitimate release entry, so the allowance is the LARGER of
+    # the factor and a fixed floor: a resolver duplicating a small file still blows past both
+    # (github 2026-11-17: five kit packages of ~200 bytes could not land a one-line entry).
+    $limit = [Math]::Max($factor * [double]$old, [double]$old + $floorBytes)
+    if ([double]$new -gt $limit) { $out += "${p}: $old -> $new bytes" }
   }
   $out
 }
