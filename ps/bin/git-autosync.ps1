@@ -59,6 +59,10 @@ param(
   [string[]]$LocalCommitRepos = @('vitals'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
   [switch]$ParkNow, [double]$ParkIdleHours = 1, [switch]$Report,
+  # Opt-in (or fleet config `autosync.parkConflictingCommits`): a local commit whose patch CONFLICTS
+  # with upstream is parked - backed up, dumped as a patch, dropped from the local branch - instead of
+  # refusing until the registered owner rebases. Off = today's refusal.
+  [switch]$ParkConflictingCommits,
   # Recovery: drop unpushed commit(s) whose content is already upstream (see the -Superseded block).
   [string[]]$Superseded = @(), [switch]$Apply,
   [string]$BackupUrl = 'https://github.com/dragos-catalin/shared-clone-backups.git',
@@ -101,6 +105,8 @@ if ($autoCfg) {
   if (-not $PSBoundParameters.ContainsKey('ReplayBackoffMin') -and $cfgBackoff) { $ReplayBackoffMin = [int]$cfgBackoff }
   $cfgFetch = PropOf $autoCfg 'fetchThrottle'
   if (-not $PSBoundParameters.ContainsKey('FetchThrottle') -and $cfgFetch) { $FetchThrottle = [int]$cfgFetch }
+  $cfgParkC = PropOf $autoCfg 'parkConflictingCommits'
+  if (-not $PSBoundParameters.ContainsKey('ParkConflictingCommits') -and $cfgParkC) { $ParkConflictingCommits = [bool]$cfgParkC }
 }
 $Repo = @($Repo | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $ReplayRepos = @($ReplayRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
@@ -342,6 +348,7 @@ function Sync-Repo([string]$r) {
     # push the result, and fast-forward to it below. A real content conflict -> refuse.
     $base = $target
     $replayed = 0
+    $conflicts = @()
     # An owner who replayed a conflicting commit onto upstream by hand (worktree cherry-pick with
     # resolved conflicts) publishes the SAME author/date/subject with a different patch; the
     # original then conflicts forever and strands the clone (2026-09-29, f36becc8 vs b34abc2e).
@@ -379,7 +386,14 @@ function Sync-Repo([string]$r) {
       if (-not $parent) { return @{ code = 3; msg = "refuse: unpushed commit $($c.Substring(0,8)) has no readable parent" } }
       $mt = @(G $r merge-tree --write-tree --merge-base $parent $base $c 2>$null); $mtCode = $LASTEXITCODE
       $tree = if ($mt.Count) { $mt[0] } else { $null }
-      if ($mtCode -ne 0 -or -not $tree) { return @{ code = 3; msg = "refuse: unpushed commit $($c.Substring(0,8)) conflicts with $up; its owner must rebase" } }
+      if ($mtCode -ne 0 -or -not $tree) {
+        if (-not $ParkConflictingCommits) { return @{ code = 3; msg = "refuse: unpushed commit $($c.Substring(0,8)) conflicts with $up; its owner must rebase" } }
+        # 2026-11-18: with the opt-in on, a conflicting commit is parked exactly like a twin (backed
+        # up, dumped as a patch, dropped) instead of wedging the clone for days. codai's shared main
+        # sat 15 commits ahead with autosync refusing, and the only fix was a hand rebase nobody owned.
+        $conflicts += [pscustomobject]@{ c = $c }
+        continue
+      }
       # Already upstream with a different patch-id (e.g. re-committed with other line endings from a
       # worktree): the replay changes nothing. Pushing it created one EMPTY duplicate commit per
       # 2-min cycle forever (2026-09-29, 4822c74a -> 6+ copies on origin/main). Skip it.
@@ -406,6 +420,28 @@ function Sync-Repo([string]$r) {
       $tman = @("commit`ttwin`tsubject`tfiles_only_in_original`tbackup_ref") + @($twins | ForEach-Object { "$($_.c)`t$($_.twin)`t$((G $r log -1 --format=%s $_.c) -join '')`t$($_.own -join ' ')`t$($tdest):$tref" })
       [IO.File]::WriteAllText((Join-Path $tdir 'MANIFEST.tsv'), ($tman -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
       $published += "dropped $($twins.Count) local commit(s) already republished upstream [$tdesc], originals backed up as $($tdest -replace '^https://github\.com/', ''):$tref; "
+    }
+    if ($conflicts.Count) {
+      # Same guarantees as the twins path: the commits stay reachable (local ref + a push to the backup
+      # destination, verified with ls-remote before anything is dropped) AND a readable patch per commit
+      # lands in the park root, so a human can re-apply the work without the object store.
+      $cdesc = ($conflicts | ForEach-Object { $_.c.Substring(0, 8) }) -join ', '
+      if ($WhatIf) { return @{ code = 0; msg = "would park $($conflicts.Count) conflicting local commit(s) [$cdesc] after backing them up, then move" } }
+      $prev = @(G $r for-each-ref --format='%(refname)' --points-at $head 'refs/backup/shared-clone/' | Where-Object { $_ -like "*/$name-conflicts-*" })
+      $cts = if ($prev.Count) { ($prev[0] -split "$name-conflicts-")[1] } else { [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') }
+      if ((Get-Visibility $r $remote) -eq 'private') { $cdest = $remote; $cref = "backup/shared-clone/$name-conflicts-$cts" } else { $cdest = $BackupUrl; $cref = "$name/conflicts-$cts" }
+      G $r update-ref "refs/backup/shared-clone/$name-conflicts-$cts" $head | Out-Null
+      G $r push -q --no-verify $cdest "$($head):refs/heads/$cref" 2>&1 | Out-Null
+      if ((((G $r ls-remote $cdest "refs/heads/$cref") -split '\s+') | Select-Object -First 1) -ne $head) { return @{ code = 3; msg = "refuse: backup push of the conflicting local commit(s) failed; nothing parked [$cdesc]" } }
+      $cdir = Join-Path $ParkRoot "$name\$cts-conflicts"; New-Item -ItemType Directory -Force $cdir | Out-Null
+      $cman = @("commit`tsubject`tpatch`tbackup_ref")
+      foreach ($cf in $conflicts) {
+        $cs = $cf.c.Substring(0, 8)
+        cmd /c "git -C `"$r`" format-patch --stdout -1 $($cf.c) > `"$(Join-Path $cdir "$cs.patch")`"" | Out-Null
+        $cman += "$($cf.c)`t$((G $r log -1 --format=%s $cf.c) -join '')`t$cs.patch`t$($cdest):$cref"
+      }
+      [IO.File]::WriteAllText((Join-Path $cdir 'MANIFEST.tsv'), ($cman -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+      $published += "parked $($conflicts.Count) conflicting local commit(s) [$cdesc] (backed up as $($cdest -replace '^https://github\.com/', ''):$cref, patches in $cdir); "
     }
     if ($replayed -eq 0) { $unique = @() }
   }

@@ -123,6 +123,36 @@ Check 'X-03 rejected commit exits non-zero' ($x3exit -ne 0) "got $x3exit"
 Check 'X-03 own path unstaged after rejection' (-not ($x3staged -contains 'new.txt')) ($x3staged -join ',')
 Check 'X-03 previously staged path stays staged' ($x3staged -contains 'pre.txt') ($x3staged -join ',')
 
+# 14. shared-clone refusal (2026-11-18): with `sharedCloneModeRepos: { repo: refuse }` a commit in the
+#     SHARED clone is refused (exit 3, nothing committed, nothing staged), a leased slot is still
+#     allowed, and the journaled env opt-out allows a deliberate one-off. Cause: codai's shared main had
+#     15 unpushed commits and git-autosync refused for days.
+$cfgPath = $env:AGENTQ_CONFIG
+$cfgText = Get-Content $cfgPath -Raw
+@{ machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10; minFreeCommitGB = 0; sharedCloneMode = 'warn'; sharedCloneModeRepos = @{ repo = 'refuse' } } | ConvertTo-Json | Set-Content $cfgPath
+New-Item -ItemType Directory -Force (Join-Path $tmp '.wt\repo') | Out-Null
+Set-Content (Join-Path $repo 'shared.txt') 's'
+$commitsBefore = @(git -C $repo log --oneline).Count
+Push-Location $repo
+& pwsh -NoProfile -File $aq commit -Purpose 'shared' -Message 'test: shared clone' -Paths shared.txt -NoPush 2>$null | Out-Null
+$sharedExit = $LASTEXITCODE
+Pop-Location
+Check 'shared-clone commit refused (exit 3)' ($sharedExit -eq 3) "got $sharedExit"
+Check 'refusal committed nothing' (@(git -C $repo log --oneline).Count -eq $commitsBefore)
+Check 'refusal staged nothing' (-not (@(git -C $repo diff --cached --name-only) -contains 'shared.txt'))
+Push-Location $wt
+Set-Content (Join-Path $wt 'slot.txt') 'q'
+& pwsh -NoProfile -File $aq commit -Purpose 'slot' -Message 'test: slot commit' -Paths slot.txt -NoPush 2>$null | Out-Null
+Check 'slot commit still allowed' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
+Pop-Location
+$env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'
+Push-Location $repo
+& pwsh -NoProfile -File $aq commit -Purpose 'escape' -Message 'test: deliberate one-off' -Paths shared.txt -NoPush 2>$null | Out-Null
+Check 'journaled opt-out allows a deliberate one-off' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
+Pop-Location
+Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
+Set-Content $cfgPath $cfgText
+
 # 7. break removes a live ticket with a reason and journals it.
 $holder = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'deploy:api', '-Purpose', 'stuck', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 8') -WorkingDirectory $repo -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 2

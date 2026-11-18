@@ -1476,6 +1476,7 @@ function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
   if (-not $repo -or -not $Branch -or -not $Onto) { throw 'agentq land -Branch <topic> -Onto <dev|main> [-Gate "<cmd>"] -Purpose "why"' }
+  Assert-SharedCloneWriteAllowed $repo 'land'
   $why = if ($Purpose) { $Purpose } else { "land $Branch -> $Onto" }
   $main = Get-MainTop $repo
   $res = "land:$($repo.Name)"

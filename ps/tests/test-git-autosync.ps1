@@ -58,6 +58,22 @@ Ok (-not (git -C $r.o for-each-ref refs/heads/autosync)) '3 replay topic cleaned
 $r = Fresh; W "$($r.a)\x.txt" "mine`n"; git -C $r.a commit -qam 'mine'; $h = git -C $r.a rev-parse HEAD; Push-B $r 'x.txt' "theirs`n"
 Ok ((Run $r) -eq 3) '3b refused'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '3b HEAD unchanged'
 
+# 3c same conflict, opt-in parking (-ParkConflictingCommits / config autosync.parkConflictingCommits):
+#    the commit is backed up (ref + push), dumped as a patch with a MANIFEST, and dropped, so the clone
+#    moves instead of refusing until its owner rebases (2026-11-18: codai's shared main sat 15 commits
+#    ahead for days and the only fix was a hand rebase nobody owned).
+$r = Fresh; W "$($r.a)\x.txt" "mine`n"; git -C $r.a commit -qam 'mine'; $h = git -C $r.a rev-parse HEAD; Push-B $r 'x.txt' "theirs`n"
+Ok ((Run $r @('-WhatIf', '-ParkConflictingCommits')) -eq 0) '3c what-if reports the park'
+Ok ((git -C $r.a rev-parse HEAD) -eq $h) '3c what-if changes nothing'
+Ok ((Run $r @('-ParkConflictingCommits')) -eq 0) '3c exit 0 with the opt-in'
+Ok ((git -C $r.a rev-parse HEAD) -eq (git -C $r.a rev-parse origin/main)) '3c moved to upstream'
+Ok ((git -C $r.a cat-file -t $h) -eq 'commit') '3c parked commit still in the object store'
+Ok (@(git -C $r.o for-each-ref --format='%(refname)' | Where-Object { $_ -match 'conflicts' }).Count -ge 1) '3c backup ref pushed to the remote'
+$cpatches = @(Get-ChildItem -Recurse -File $env:GIT_AUTOSYNC_PARK -Filter '*.patch' | Where-Object { $_.FullName -like "*$(Split-Path $r.a -Leaf)*" })
+Ok ($cpatches.Count -eq 1) '3c one patch per parked commit'
+Ok ((Get-Content $cpatches[0].FullName -Raw) -match 'mine') '3c the patch carries the commit'
+Ok (@(Get-ChildItem -Recurse -File $env:GIT_AUTOSYNC_PARK -Filter 'MANIFEST.tsv' | Where-Object { $_.FullName -like '*conflicts*' }).Count -ge 1) '3c MANIFEST written next to the patch'
+
 # 4 local edit collides with incoming, edited recently -> refuse (idle gate), edit intact
 $r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; $h = git -C $r.a rev-parse HEAD
 Ok ((Run $r) -eq 3) '4 refused'; Ok ((Get-Content "$($r.a)\x.txt" -Raw) -eq "ours`n") '4 edit intact'; Ok ((git -C $r.a rev-parse HEAD) -eq $h) '4 HEAD unchanged'

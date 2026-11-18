@@ -274,6 +274,33 @@ function Get-RepoInfo([string]$path) {
   [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
 }
 
+# A commit or a land made IN the SHARED clone of a repo the owner marked read-only
+# (agentq-config.json `sharedCloneModeRepos: { "<repo>": "refuse" }`, with the global `sharedCloneMode`
+# as the default) is what makes git-autosync refuse. Measured 2026-11-18: codai's shared main carried 15
+# unpushed local commits - 7 already upstream by patch-id, 8 parked on a WIP ref - and autosync refused
+# for days with "its owner must rebase", while nothing was actually at risk except the readable state of
+# the clone. The PreToolUse guard covers editor writes; this covers the agentq verbs that create the
+# commits and the landings. Work belongs in a leased slot. Deliberate one-off (say why in the purpose):
+# AGENTQ_SHARED_CLONE_COMMIT_OK=1.
+function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
+  if (-not $repo -or -not $repo.Top -or -not $repo.Common) { return }
+  if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1') { return }
+  $norm = { param($p) ([IO.Path]::GetFullPath("$p")).TrimEnd('\', '/').ToLowerInvariant() }
+  # Top is the worktree path, Common the shared .git: they are equal only in the shared clone itself.
+  $commonRoot = Split-Path $repo.Common -Parent
+  if ((& $norm $repo.Top) -ne (& $norm $commonRoot)) { return }   # a leased slot (linked worktree): fine
+  $cfg = Get-Config
+  $mode = if ($cfg.ContainsKey('sharedCloneMode')) { "$($cfg['sharedCloneMode'])" } else { 'warn' }
+  $map = if ($cfg.ContainsKey('sharedCloneModeRepos')) { $cfg['sharedCloneModeRepos'] } else { $null }
+  if ($map -and $map.ContainsKey($repo.Name)) { $mode = "$($map[$repo.Name])" }
+  if ($mode -ne 'refuse') { return }
+  $slotsDir = Join-Path (Split-Path $repo.Top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $repo.Name)
+  if (-not (Test-Path -LiteralPath $slotsDir)) { return }        # repo without slots: nothing to protect
+  [Console]::Error.WriteLine("agentq: REFUSED - $($repo.Top) is the SHARED clone of $($repo.Name), which agentq-config.json marks sharedCloneMode=refuse. A $verb here is what leaves the clone dirty and makes git-autosync refuse (2026-11-18: 15 unpushed commits on codai). Lease a slot: agentq lease -Purpose <why> [-Branch <topic>], work + commit + push there, then unlease. Deliberate one-off: set AGENTQ_SHARED_CLONE_COMMIT_OK=1 (journaled).")
+  Write-Journal @{ event = 'shared-clone-refused'; repo = $repo.Name; verb = $verb; note = 'shared clone of a repo marked read-only' }
+  exit 3
+}
+
 # X-02 (2026-10-05): run_in_terminal sometimes DROPS a leading Set-Location, so a commit/build
 # meant for a worktree ran in the shared clone (twice: brivio SW-0302, codai). -ExpectRepo <dir>
 # (or env AGENTQ_EXPECT_REPO) refuses unless the resolved repo top equals it.
@@ -1161,6 +1188,7 @@ function Invoke-Commit {
   if (-not $plist) { throw 'agentq commit: -Paths a,b,c is required (explicit paths only — never the whole index)' }
   $outside = @($plist | Where-Object { [IO.Path]::IsPathRooted($_) -and -not ([IO.Path]::GetFullPath($_).ToLowerInvariant().StartsWith($repo.Top.ToLowerInvariant() + [IO.Path]::DirectorySeparatorChar)) })
   if ($outside) { [Console]::Error.WriteLine("agentq: REFUSED - paths outside $($repo.Top): $($outside -join ', ')"); exit 3 }
+  Assert-SharedCloneWriteAllowed $repo 'commit'
   $res = "commit:$($repo.Name)"
   Assert-NotMarked $res
   $t = New-Ticket $res $Purpose "commit $($plist -join ' ')" $repo.Top
