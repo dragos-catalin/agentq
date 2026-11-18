@@ -59,6 +59,8 @@ param(
   [string[]]$LocalCommitRepos = @('vitals'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
   [switch]$ParkNow, [double]$ParkIdleHours = 1, [switch]$Report,
+  # Recovery: drop unpushed commit(s) whose content is already upstream (see the -Superseded block).
+  [string[]]$Superseded = @(), [switch]$Apply,
   [string]$BackupUrl = 'https://github.com/dragos-catalin/shared-clone-backups.git',
   [int]$ReplayBackoffMin = 60, [int]$FetchThrottle = 8
 )
@@ -77,6 +79,21 @@ if ($env:GIT_AUTOSYNC_BACKUP_URL) { $BackupUrl = $env:GIT_AUTOSYNC_BACKUP_URL }
 $script:NoFetch = $false
 $LastMsg = @{}
 $CoordQ = Join-Path $HOME '.codai\coord\queues'
+#---- per-repo policy comes from agentq-config.json ----
+# "Which repos, which may replay an unpushed commit, who never pushes, how fast do we fetch" is fleet
+# policy, not tool code: onboarding a repo or changing its policy is one config edit. The parameter
+# defaults above stay as the fallback when the config has no `autosync` section, and an explicit -Repo
+# on the command line still wins ($PSBoundParameters).
+$CfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $HOME '.copilot\bin\agentq-config.json' }
+$autoCfg = $null
+if (Test-Path $CfgPath) { try { $autoCfg = (Get-Content $CfgPath -Raw | ConvertFrom-Json).autosync } catch { } }
+if ($autoCfg) {
+  if (-not $PSBoundParameters.ContainsKey('Repo') -and $autoCfg.repos) { $Repo = @($autoCfg.repos) }
+  if (-not $PSBoundParameters.ContainsKey('ReplayRepos') -and $autoCfg.replay) { $ReplayRepos = @($autoCfg.replay) }
+  if (-not $PSBoundParameters.ContainsKey('LocalCommitRepos') -and $autoCfg.localCommit) { $LocalCommitRepos = @($autoCfg.localCommit) }
+  if (-not $PSBoundParameters.ContainsKey('ReplayBackoffMin') -and $autoCfg.replayBackoffMin) { $ReplayBackoffMin = [int]$autoCfg.replayBackoffMin }
+  if (-not $PSBoundParameters.ContainsKey('FetchThrottle') -and $autoCfg.fetchThrottle) { $FetchThrottle = [int]$autoCfg.fetchThrottle }
+}
 $Repo = @($Repo | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $ReplayRepos = @($ReplayRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
 $LocalCommitRepos = @($LocalCommitRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
@@ -87,7 +104,31 @@ function Write-Log([string]$repo, [string]$msg) {
   $line
 }
 
-function G([string]$repo) { & git -C $repo --no-optional-locks @args }
+# ROOT CAUSE FIXED 2026-11-18: this helper used to be `function G([string]$repo) { ... @args }`, and
+# PowerShell's parameter binder PREFIX-MATCHES named parameters - so a bare `-r` (as in `diff-tree -r`)
+# was bound to `-repo` and the NEXT token was taken as the repository path: every call containing `-r`
+# silently ran against a garbage repo and returned nothing. That is why the twin detection below
+# produced no lines (`$safe` false -> fallthrough) and why a clone could refuse "its owner must rebase"
+# for days while the content was already upstream. With NO declared parameters nothing can be matched
+# by prefix and every argument reaches git verbatim (proved side by side: `-r`, `-c core.x=y`, plain).
+function G {
+  $a = @($args)
+  if (-not $a.Count) { throw 'G: missing repository path' }
+  $repo = $a[0]
+  $rest = @(); if ($a.Count -gt 1) { $rest = @($a[1..($a.Count - 1)]) }
+  & git -C $repo --no-optional-locks @rest
+}
+# `G` returns NOTHING when git itself fails to run (loaded machine: bursts on 09-29, 10-05, 10-14,
+# 11-15), and a bare `.Trim()` on that result becomes "You cannot call a method on a null-valued
+# expression" - naming neither the repo nor the cause (it cost a 2026-11-18 diagnosis). Use this at
+# every site where an empty answer means failure: it returns $null instead of crashing, and keeps
+# git's own words for the caller to report.
+function GitLine([string]$repo, [string[]]$gitArgs) {
+  $out = @(G $repo @gitArgs 2>&1 | ForEach-Object { "$_" })
+  $keep = @($out | Where-Object { $_ -and $_ -notmatch '^(fatal|error|usage|warning)' })
+  if ($keep.Count) { return $keep[0].Trim() }
+  return $null
+}
 
 function Get-State { if (Test-Path $StateFile) { try { return (Get-Content $StateFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }; @{} }
 function Set-State($s) { [IO.File]::WriteAllText($StateFile, ($s | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false)) }
@@ -265,7 +306,8 @@ function Sync-Repo([string]$r) {
 
   $remote = ($up -split '/')[0]
   if (-not $script:NoFetch) { G $r fetch -q $remote 2>&1 | Out-Null }
-  $head = (G $r rev-parse HEAD).Trim(); $target = (G $r rev-parse $up).Trim()
+  $head = GitLine $r @('rev-parse', 'HEAD'); $target = GitLine $r @('rev-parse', $up)
+  if (-not $head -or -not $target) { return @{ code = 3; msg = 'skip: could not read HEAD or the upstream tip (git returned nothing)' } }
   if ($head -eq $target) { return @{ code = 0; msg = 'in sync' } }
   $unique = @(G $r cherry $up HEAD | Where-Object { $_ -like '+*' } | ForEach-Object { ($_ -split ' ')[1] })
   # A finished detached land is collected first: once it succeeded nothing is unique any more, so this
@@ -301,7 +343,8 @@ function Sync-Repo([string]$r) {
     # -> conflicts forever (codai 2026-10-17 13:42-19:33, 88f1f08e vs 2e42f797). Twin = same author email
     # + subject in merge-base..upstream AND every file it touches is either a blob upstream already wrote
     # or a file the twin itself rewrote. The original is backed up (and its unique files listed) first.
-    $mbase = (G $r merge-base HEAD $up | Select-Object -First 1).Trim()
+    $mbase = GitLine $r @('merge-base', 'HEAD', $up)
+    if (-not $mbase) { return @{ code = 3; msg = "refuse: no merge base with $up (shallow or unrelated history)" } }
     $twinKeys = @{}
     foreach ($ln in @(G $r log --format='%H%x1f%ae%x1f%s' "$mbase..$up")) { $tp = $ln -split [char]0x1f, 3; if ($tp.Count -eq 3 -and -not $twinKeys.ContainsKey("$($tp[1])$([char]0x1f)$($tp[2])")) { $twinKeys["$($tp[1])$([char]0x1f)$($tp[2])"] = $tp[0] } }
     $upBlobs = @{}
@@ -324,14 +367,15 @@ function Sync-Repo([string]$r) {
         }
         if ($safe) { $twins += [pscustomobject]@{ c = $c; twin = $tw; own = $own }; continue }
       }
-      $parent = (G $r rev-parse --verify --quiet "$c^").Trim()
+      $parent = GitLine $r @('rev-parse', '--verify', '--quiet', "$c^")
+      if (-not $parent) { return @{ code = 3; msg = "refuse: unpushed commit $($c.Substring(0,8)) has no readable parent" } }
       $mt = @(G $r merge-tree --write-tree --merge-base $parent $base $c 2>$null); $mtCode = $LASTEXITCODE
       $tree = if ($mt.Count) { $mt[0] } else { $null }
       if ($mtCode -ne 0 -or -not $tree) { return @{ code = 3; msg = "refuse: unpushed commit $($c.Substring(0,8)) conflicts with $up; its owner must rebase" } }
       # Already upstream with a different patch-id (e.g. re-committed with other line endings from a
       # worktree): the replay changes nothing. Pushing it created one EMPTY duplicate commit per
       # 2-min cycle forever (2026-09-29, 4822c74a -> 6+ copies on origin/main). Skip it.
-      if ($tree.Trim() -eq (G $r rev-parse --verify --quiet "$base^{tree}").Trim()) { continue }
+      if ($tree.Trim() -eq (GitLine $r @('rev-parse', '--verify', '--quiet', "$base^{tree}"))) { continue }
       $replayed++
       $meta = G $r log -1 --format='%an%x00%ae%x00%aI' $c
       $an, $ae, $ad = $meta -split "`0"
@@ -613,6 +657,96 @@ if ($Status) {
   } else { '(no status snapshot yet - run a pass: git-autosync.ps1 -Repo <repo>)'; '' }
   if (Test-Path $Log) { Get-Content $Log -Tail 10 }
   exit 0
+}
+if ($Superseded.Count) {
+  # RECOVERY (2026-11-18): a shared clone gets stuck when an unpushed commit's CONTENT is already
+  # upstream but its PATCH conflicts on every replay - upstream reworked the same region through
+  # rebased twins, so `merge-tree` fails forever and autosync, which never resolves conflicts by
+  # design, can no longer move the clone. It recurred 2026-09-29, 10-17, 11-15 and twice on 11-18;
+  # each time an agent spent ~1 h on forensics. This is that procedure with its proofs built in:
+  # every path of each dropped commit must be byte-identical upstream (else REFUSE and name the
+  # paths), every KEPT commit keeps its own tree byte-for-byte (so the worktree and the index are
+  # untouched - that is what makes it safe with live sessions editing), the rebuilt tip's tree must
+  # equal HEAD's tree, and the old tip is backed up to refs/backup/shared-clone/ before any ref
+  # moves. Dry-run by default; -Apply moves the ref. Usage:
+  #   git-autosync.ps1 -Repo E:\gh\codai -Superseded 339e365e [-Apply]
+  $rcDrop = 0
+  foreach ($r in $Repo) {
+    Write-Output "== $r"
+    if (-not (Test-Path (Join-Path $r '.git'))) { Write-Output '   not a repo'; continue }
+    $branch = (G $r symbolic-ref --quiet --short HEAD 2>$null); if (-not $branch) { Write-Output '   skip: detached HEAD'; continue }
+    $up = (G $r rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null); if (-not $up) { Write-Output '   skip: no upstream'; continue }
+    G $r fetch -q 2>&1 | Out-Null
+    $head = GitLine $r @('rev-parse', 'HEAD'); $upTip = GitLine $r @('rev-parse', $up)
+    if (-not $head -or -not $upTip) { Write-Output '   skip: could not read HEAD or the upstream tip'; continue }
+    if ($head -eq $upTip) { Write-Output '   in sync, nothing to do'; continue }
+    $chain = @(G $r rev-list --reverse "$up..HEAD")
+    $dropSet = @()
+    foreach ($want in $Superseded) {
+      $sha = (G $r rev-parse --verify --quiet $want 2>$null)
+      if (-not $sha) { Write-Output ("   {0}: unknown revision" -f $want); $rcDrop = 3; continue }
+      $sha = "$sha".Trim()
+      if ($chain -notcontains $sha) { Write-Output ("   {0}: not an unpushed commit of this clone (ignored)" -f $sha.Substring(0, 10)); continue }
+      $paths = @(G $r -c core.quotepath=off diff-tree --no-commit-id -r --name-only --no-renames $sha)
+      $mismatch = @()
+      foreach ($p in $paths) {
+        $b = GitLine $r @('rev-parse', '--verify', '--quiet', "$sha`:$p")
+        $u = GitLine $r @('rev-parse', '--verify', '--quiet', "$up`:$p")
+        if ("$b" -ne "$u") {
+          $bs = if ($b) { $b.Substring(0, 8) } else { 'deleted' }
+          $us = if ($u) { $u.Substring(0, 8) } else { 'absent' }
+          $mismatch += ("{0} (in the commit {1}, upstream {2})" -f $p, $bs, $us)
+        }
+      }
+      if ($mismatch.Count) {
+        Write-Output ("   {0}: REFUSED - its content is NOT upstream, dropping it would lose work:" -f $sha.Substring(0, 10))
+        foreach ($m in $mismatch) { Write-Output ("      " + $m) }
+        $rcDrop = 3
+        continue
+      }
+      Write-Output ("   {0}: content fully upstream ({1} path(s) identical) -> droppable" -f $sha.Substring(0, 10), $paths.Count)
+      $dropSet += $sha
+    }
+    if (-not $dropSet.Count) { Write-Output '   nothing droppable'; continue }
+    $parent = $upTip; $made = 0; $ok = $true
+    foreach ($c in $chain) {
+      if ($dropSet -contains $c) { continue }
+      $tree = GitLine $r @('rev-parse', "$c^{tree}")
+      if (-not $tree) { Write-Output ("   FAILED: no tree for {0}" -f $c.Substring(0, 8)); $ok = $false; break }
+      $saved = @($env:GIT_AUTHOR_NAME, $env:GIT_AUTHOR_EMAIL, $env:GIT_AUTHOR_DATE, $env:GIT_COMMITTER_NAME, $env:GIT_COMMITTER_EMAIL, $env:GIT_COMMITTER_DATE)
+      $env:GIT_AUTHOR_NAME = ((G $r log -1 --format=%an $c) -join '')
+      $env:GIT_AUTHOR_EMAIL = ((G $r log -1 --format=%ae $c) -join '')
+      $env:GIT_AUTHOR_DATE = ((G $r log -1 --format=%aI $c) -join '')
+      $env:GIT_COMMITTER_NAME = ((G $r log -1 --format=%cn $c) -join '')
+      $env:GIT_COMMITTER_EMAIL = ((G $r log -1 --format=%ce $c) -join '')
+      $env:GIT_COMMITTER_DATE = ((G $r log -1 --format=%cI $c) -join '')
+      $mf = [IO.Path]::GetTempFileName()
+      [IO.File]::WriteAllText($mf, ((G $r log -1 --format=%B $c) -join "`n"), [Text.UTF8Encoding]::new($false))
+      try { $parent = "$((G $r commit-tree $tree -p $parent -F $mf) -join '')".Trim() }
+      finally {
+        $env:GIT_AUTHOR_NAME = $saved[0]; $env:GIT_AUTHOR_EMAIL = $saved[1]; $env:GIT_AUTHOR_DATE = $saved[2]
+        $env:GIT_COMMITTER_NAME = $saved[3]; $env:GIT_COMMITTER_EMAIL = $saved[4]; $env:GIT_COMMITTER_DATE = $saved[5]
+        Remove-Item $mf -ErrorAction SilentlyContinue
+      }
+      $made++
+    }
+    if (-not $ok -or -not $parent) { Write-Output '   REFUSED: the rebuild failed; nothing moved'; $rcDrop = 3; continue }
+    $headTree = GitLine $r @('rev-parse', 'HEAD^{tree}'); $newTree = GitLine $r @('rev-parse', "$parent^{tree}")
+    if ($headTree -ne $newTree) {
+      Write-Output ("   REFUSED: the rebuild changed the tree ({0} vs {1}); nothing moved" -f $headTree, $newTree)
+      $rcDrop = 3
+      continue
+    }
+    Write-Output ("   rebuilt without {0} commit(s): {1} -> {2}   tree {3} unchanged, {4} commit(s) kept" -f $dropSet.Count, $head.Substring(0, 8), $parent.Substring(0, 8), $headTree.Substring(0, 12), $made)
+    if (-not $Apply) { Write-Output '   dry run: re-run with -Apply to move the ref (a backup ref is written first)'; continue }
+    $ts = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'); $nm = (Split-Path $r -Leaf).ToLowerInvariant()
+    G $r update-ref "refs/backup/shared-clone/$nm-drop-$ts" $head | Out-Null
+    Write-Output ("   backup refs/backup/shared-clone/$nm-drop-$ts -> " + $head.Substring(0, 8))
+    G $r update-ref -m "git-autosync: drop superseded commit(s) $($dropSet -join ', ')" "refs/heads/$branch" $parent $head
+    if ($LASTEXITCODE) { Write-Output '   update-ref lost a race with another writer; nothing moved'; $rcDrop = 3; continue }
+    Write-Output ("   refs/heads/$branch -> " + $parent.Substring(0, 8) + "   (next pass completes the move to $up)")
+  }
+  exit $rcDrop
 }
 if ($Install) {
   $vbs = 'E:\gh\vmui\scripts\hidden-run.vbs'

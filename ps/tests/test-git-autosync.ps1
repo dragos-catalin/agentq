@@ -81,12 +81,14 @@ Ok (@(Backups $r).Count -eq 1) '4m backup branch on origin'
 
 # 4s local change already contained upstream (landed later in a bigger commit) -> superseded, no park dir
 $r = Fresh; Push-B $r 'x.txt' "1`nmine`nmore`n"; W "$($r.a)\x.txt" "1`nmine`n"
-Ok ((Run $r) -eq 0) '4s exit 0'; Ok (((Get-Content "$($r.a)\x.txt" -Raw) -replace "`r", '') -eq "1`nmine`nmore`n") '4s took upstream'
+# Guarded read: an assertion value read from a MISSING file used to throw and kill the whole suite at
+# this point, hiding every later case (10/10b twins included) - a real bug could then never be caught.
+Ok ((Run $r) -eq 0) '4s exit 0'; Ok ($(if (Test-Path "$($r.a)\x.txt") { (Get-Content "$($r.a)\x.txt" -Raw) -replace "`r", '' } else { '<missing>' }) -eq "1`nmine`nmore`n") '4s took upstream'
 Ok (-not (git -C $r.a status --porcelain)) '4s tree clean'
 
 # 4x local delete vs upstream modify, idle -> parked (restored from upstream), backup present
 $r = Fresh; Push-B $r 'x.txt' "up`n"; Remove-Item "$($r.a)\x.txt"
-Ok ((Run $r -x '-ParkNow') -eq 0) '4x exit 0'; Ok (((Get-Content "$($r.a)\x.txt" -Raw) -replace "`r", '') -eq "up`n") '4x restored upstream'
+Ok ((Run $r -x '-ParkNow') -eq 0) '4x exit 0'; Ok ($(if (Test-Path "$($r.a)\x.txt") { (Get-Content "$($r.a)\x.txt" -Raw) -replace "`r", '' } else { '<missing>' }) -eq "up`n") '4x restored upstream'
 
 # 4n dirty edit at a path upstream RENAMED away (rename detection hid it -> read-tree "not uptodate") -> parked, moved
 $r = Fresh; W "$($r.a)\old.txt" "l1`nl2`nl3`nl4`nl5`nl6`n"; git -C $r.a add old.txt; git -C $r.a commit -qm o; git -C $r.a push -q origin main 2>$null; git -C $r.b pull -q 2>$null
