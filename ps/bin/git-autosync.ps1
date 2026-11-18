@@ -67,6 +67,12 @@ Set-StrictMode -Version 3
 $Log = if ($env:GIT_AUTOSYNC_LOG) { $env:GIT_AUTOSYNC_LOG } else { Join-Path $HOME '.codai\git-autosync.log' }
 $ParkRoot = if ($env:GIT_AUTOSYNC_PARK) { $env:GIT_AUTOSYNC_PARK } else { Join-Path $HOME '.codai\parked' }
 $StateFile = if ($env:GIT_AUTOSYNC_STATE) { $env:GIT_AUTOSYNC_STATE } else { Join-Path $HOME '.codai\git-autosync-state.json' }
+# Per-repo verdict of the last pass, overwritten every pass (see the write site). Derived from the
+# state file's directory so a test that isolates the state isolates this too.
+$StatusFile = if ($env:GIT_AUTOSYNC_STATUS) { $env:GIT_AUTOSYNC_STATUS } else {
+  $sd = Split-Path $StateFile -Parent
+  Join-Path $(if ($sd) { $sd } else { Join-Path $HOME '.codai' }) 'git-autosync-status.json'
+}
 if ($env:GIT_AUTOSYNC_BACKUP_URL) { $BackupUrl = $env:GIT_AUTOSYNC_BACKUP_URL }
 $script:NoFetch = $false
 $LastMsg = @{}
@@ -85,6 +91,13 @@ function G([string]$repo) { & git -C $repo --no-optional-locks @args }
 
 function Get-State { if (Test-Path $StateFile) { try { return (Get-Content $StateFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }; @{} }
 function Set-State($s) { [IO.File]::WriteAllText($StateFile, ($s | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false)) }
+function Get-StatusMap { if (Test-Path $StatusFile) { try { return (Get-Content $StatusFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }; @{} }
+function Save-StatusMap($m) {
+  # Atomic: -Status (or a human) must never read a half-written table.
+  $tmp = "$StatusFile.new"
+  [IO.File]::WriteAllText($tmp, ($m | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+  Move-Item -Force $tmp $StatusFile
+}
 
 # 'private' | 'public' | 'unknown', cached 24 h. GIT_AUTOSYNC_VISIBILITY overrides (tests).
 function Get-Visibility([string]$r, [string]$remote) {
@@ -227,7 +240,18 @@ function Test-ActiveOwner([string]$r, [string]$p) {
 
 function Sync-Repo([string]$r) {
   if (-not (Test-Path (Join-Path $r '.git'))) { return @{ code = 3; msg = 'not a repo' } }
-  $gd = (G $r rev-parse --absolute-git-dir).Trim()
+  # Guarded probe. `G` returns NOTHING when git itself fails to run (loaded machine: bursts on
+  # 2026-09-29, 10-05, 10-14, 11-15), and the bare `.Trim()` turned that into
+  # "error: You cannot call a method on a null-valued expression" - naming neither the repo nor the
+  # cause (cost a 2026-11-18 diagnosis). One retry, then a skip that carries git's own words.
+  $gdOut = @(G $r rev-parse --absolute-git-dir 2>&1 | ForEach-Object { "$_" })
+  if (-not @($gdOut | Where-Object { $_ -and $_ -notmatch '^(fatal|error|usage|warning)' }).Count) {
+    Start-Sleep -Milliseconds 200
+    $gdOut = @(G $r rev-parse --absolute-git-dir 2>&1 | ForEach-Object { "$_" })
+  }
+  $gd = @($gdOut | Where-Object { $_ -and $_ -notmatch '^(fatal|error|usage|warning)' } | Select-Object -First 1)
+  if (-not $gd) { return @{ code = 3; msg = "skip: could not read the git dir (git said: " + (($gdOut | Select-Object -First 2) -join ' | ') + ')' } }
+  $gd = "$gd".Trim()
   foreach ($m in 'index.lock', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply') {
     if (Test-Path (Join-Path $gd $m)) { return @{ code = 3; msg = "skip: $m present (operation in flight)" } }
   }
@@ -548,6 +572,7 @@ if ($Report) {
   # Daily drift report: every repo that is behind its upstream, with the last autosync reason.
   $rows = @()
   $tail = if (Test-Path $Log) { @(Get-Content $Log -Tail 4000) } else { @() }
+  $smap = Get-StatusMap
   foreach ($r in $Repo) {
     if (-not (Test-Path (Join-Path $r '.git'))) { continue }
     $n = Split-Path $r -Leaf
@@ -556,7 +581,9 @@ if ($Report) {
     $ab = ((G $r rev-list --left-right --count "HEAD...$u") -split '\s+')
     if ([int]$ab[1] -eq 0) { continue }
     $last = $tail | Where-Object { $_ -match "^\S+ $([regex]::Escape($n)) " } | Select-Object -Last 1
-    $why = if ($last) { ($last -split ' ', 3)[2] } else { 'no autosync log line' }
+    # The status snapshot knows the repo's CURRENT verdict; the log only knows what was worth logging.
+    $why = if ($smap[$n]) { "$($smap[$n].msg) [last pass $($smap[$n].at)]" }
+    elseif ($last) { ($last -split ' ', 3)[2] } else { 'no autosync log line' }
     $rows += "$n behind $($ab[1]) ahead $($ab[0]): $($why.Substring(0, [Math]::Min(240, $why.Length)))"
   }
   $msg = if ($rows.Count) { "git-autosync drift report: $($rows.Count) repo(s) behind upstream - " + ($rows -join ' | ') } else { 'git-autosync drift report: every repo is at its upstream' }
@@ -568,6 +595,22 @@ if ($Report) {
 if ($Status) {
   $t = Get-ScheduledTask -TaskName 'git-autosync' -ErrorAction SilentlyContinue
   if ($t) { "task: $($t.State)" } else { 'task: not installed' }
+  # The daemon has died twice unnoticed (2026-11-15, 2026-11-18): a task in "Ready" says nothing.
+  $loopN = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync.*-Loop' }).Count
+  "loop: $(if ($loopN) { "running ($loopN)" } else { 'NOT RUNNING - start it: schtasks /run /tn git-autosync' })"
+  $sm = Get-StatusMap
+  if ($sm.Count) {
+    "repos ($($sm.Count)) - verdict of the last pass (the log deliberately omits the steady in-sync state):"
+    foreach ($k in ($sm.Keys | Sort-Object)) {
+      $e = $sm[$k]
+      $age = try { [int](([DateTime]::UtcNow - [DateTime]$e.at).TotalMinutes) } catch { -1 }
+      $m = "$($e.msg)"; if ($m.Length -gt 104) { $m = $m.Substring(0, 104) + '...' }
+      "{0,-14} {1,5}m  {2}" -f $k, $age, $m
+    }
+    ''
+    'journal (actions and refusals only):'
+  } else { '(no status snapshot yet - run a pass: git-autosync.ps1 -Repo <repo>)'; '' }
   if (Test-Path $Log) { Get-Content $Log -Tail 10 }
   exit 0
 }
@@ -604,6 +647,7 @@ do {
       Get-ChildItem $ld -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
   }
+  $pass = @{}
   foreach ($r in $Repo) {
     # One pass at a time machine-wide: the -Loop task and a manual run must never interleave.
     $pm = [Threading.Mutex]::new($false, $(if ($env:GIT_AUTOSYNC_MUTEX) { $env:GIT_AUTOSYNC_MUTEX } else { 'Global\git-autosync-pass' }))
@@ -611,11 +655,19 @@ do {
       if (-not $pm.WaitOne(60000)) { $res = @{ code = 3; msg = 'skip: another git-autosync pass is running' } }
       else { try { $res = Sync-Repo $r } catch { $res = @{ code = 3; msg = "error: $_ (line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim()))" } } finally { $pm.ReleaseMutex() } }
     } finally { $pm.Dispose() }
-    # Log only actions and refusals, not the steady "in sync" state.
-    # Log actions and refusals, not the steady "in sync" state; in -Loop a repeated message is logged once.
+    # The log holds only actions and refusals, never the steady "in sync" state (a 24-repo pass every
+    # 2 min would drown it). So a repo's LAST LOG LINE is not its state - for a healthy repo it is
+    # whatever happened days ago, which is exactly how a 2026-11-18 diagnosis read 17 in-sync repos as
+    # broken. $StatusFile (written once below) is the per-repo answer; -Status renders it.
     $repeat = $Loop -and $LastMsg[$r] -eq $res.msg; $LastMsg[$r] = $res.msg
     if ($res.msg -ne 'in sync' -and -not $repeat -and -not ($Loop -and $res.msg -like 'skip:*')) { Write-Log $r $res.msg } elseif (-not $Loop) { "$((Split-Path $r -Leaf)) $($res.msg)" }
+    $pass[(Split-Path $r -Leaf)] = @{ at = [DateTime]::UtcNow.ToString('o'); code = [int]$res.code; msg = "$($res.msg)" }
     if ($res.code) { $rc = $res.code }
+  }
+  if ($pass.Count) {
+    $sm = Get-StatusMap
+    foreach ($k in $pass.Keys) { $sm[$k] = $pass[$k] }
+    Save-StatusMap $sm
   }
   if ($Loop) { $rc = 0; Start-Sleep -Seconds $IntervalSec }
 } while ($Loop)
