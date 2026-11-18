@@ -77,6 +77,28 @@ if ($ps51) {
 $n1 = (Lines).Count
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch 'SHARED clone' -and (Lines).Count -eq $n1) 'off: silent, not journaled'
+
+# 2026-11-18: a `git commit` run from a SHELL in the shared clone of a refuse repo. The edit-tool rule
+# above cannot see a command, and this is the path that wedged codai (15 unpushed commits, autosync
+# refusing for days). A slot and a non-commit git command stay allowed.
+function CallCmd([string]$command) {
+  $j = @{ hook_event_name = 'PreToolUse'; tool_name = 'run_in_terminal'; tool_input = @{ command = $command } } | ConvertTo-Json -Compress -Depth 5
+  $out = $j | & pwsh -NoProfile -ExecutionPolicy Bypass -File $Guard 2>$null
+  [pscustomobject]@{ code = $LASTEXITCODE; out = ($out -join "`n") }
+}
+'{"sharedCloneModeRepos":{"repo":"refuse"}}' | Set-Content $cfg
+$r = CallCmd "Set-Location $root\repo; git commit -m x -- a.ts"
+Ok ($r.out -match '"permissionDecision":"deny"') 'shell: git commit in the shared clone denied'
+$r = CallCmd "git -C $root\repo commit -m x"
+Ok ($r.out -match '"permissionDecision":"deny"') 'shell: git -C <shared clone> commit denied'
+$r = CallCmd "Set-Location $root\.wt\repo\task-1; git commit -m x"
+Ok ($r.out -notmatch '"deny"') 'shell: commit in a slot allowed'
+$r = CallCmd "Set-Location $root\repo; git log --grep commit"
+Ok ($r.out -notmatch '"deny"') 'shell: another git command (log) allowed'
+$env:CODAI_SHARED_CLONE_WRITE_OK = '1'
+$r = CallCmd "Set-Location $root\repo; git commit -m x"
+Ok ($r.out -notmatch '"deny"') 'shell: journaled opt-out allows the commit'
+Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
 Remove-Item Env:AGENTQ_CONFIG
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

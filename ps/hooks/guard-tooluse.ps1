@@ -307,6 +307,52 @@ if ($isEditTool) {
   }
 }
 
+# ---- shared-clone commits from a shell (2026-11-18) ------------------------------------------
+# The block above only sees edit tools, so a `git commit` typed into a terminal walked straight past it -
+# and that is the path that actually wedged codai: 15 unpushed commits on the shared main left it 93 behind
+# with git-autosync refusing for days, while the guard's edit-tool rule never fired for any of them. Same
+# config, same opt-out, hard denial: a commit belongs in a leased slot. The command text is matched, so a
+# commit buried inside a .ps1/.sh script is NOT covered here - for that case the agentq verbs themselves
+# refuse (Assert-SharedCloneWriteAllowed in agentq.ps1).
+# `git -C <path> commit` and `git commit` both match; `git log --grep commit` does not (the tokens before
+# `commit` must be flags, optionally with their value).
+if (-not $isEditTool -and $cmd -and $cmd -match '(?i)(^|[;&|]\s*)git\s+(?:-[^;&|\s]+(?:\s+[^;&|\s]+)?\s+)*commit\b') {
+  $ghRootC = if ($env:CODAI_GH_ROOT) { $env:CODAI_GH_ROOT } else { 'E:\gh' }
+  $targetC = $null
+  $mC = [regex]::Match($cmd, '(?i)\s-C\s+["'']?([^"''\s;|&]+)')
+  if ($mC.Success) { $targetC = $mC.Groups[1].Value }
+  if (-not $targetC) {
+    $mC = [regex]::Match($cmd, '(?i)(?:set-location|cd)\s+["'']?([A-Za-z]:\\[^"''\s;|&]+|[^"''\s;|&]+)')
+    if ($mC.Success) { $targetC = $mC.Groups[1].Value }
+  }
+  if (-not $targetC) {
+    foreach ($container in $payload.tool_input, $payload.toolInput) {
+      if (-not $targetC -and $container -and $container -isnot [string] -and $container.PSObject.Properties.Name -contains 'cwd') { $targetC = "$($container.cwd)" }
+    }
+  }
+  if (-not $targetC -and $payload.cwd) { $targetC = "$($payload.cwd)" }
+  if ($targetC) {
+    $tnC = $targetC.Replace('/', '\') -replace '^(?i)file:\\+', ''
+    $rxC = '(?i)^' + [regex]::Escape($ghRootC.TrimEnd('\')) + '\\(?<repo>[^\\]+)'
+    if ($tnC -match $rxC -and $Matches.repo -ne '.wt') {
+      $scRepoC = $Matches.repo; $scModeC = 'warn'
+      try {
+        $cfgFC = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $env:USERPROFILE '.copilot\bin\agentq-config.json' }
+        if (Test-Path -LiteralPath $cfgFC) {
+          $cjC = Get-Content -LiteralPath $cfgFC -Raw | ConvertFrom-Json
+          if ($cjC.PSObject.Properties['sharedCloneMode'] -and $cjC.sharedCloneMode) { $scModeC = "$($cjC.sharedCloneMode)" }
+          $scReposC = if ($cjC.PSObject.Properties['sharedCloneModeRepos']) { $cjC.sharedCloneModeRepos } else { $null }
+          if ($scReposC -and $scReposC.PSObject.Properties[$scRepoC]) { $scModeC = "$($scReposC.PSObject.Properties[$scRepoC].Value)" }
+        }
+      } catch { }
+      if ($scModeC -eq 'refuse' -and -not $env:CODAI_SHARED_CLONE_WRITE_OK) {
+        [Console]::Error.WriteLine("BLOCKED by guard (HARD, ADR 0004, sharedCloneMode=refuse): a git commit run in the SHARED clone $targetC leaves unpushed commits behind, which is exactly what makes git-autosync refuse (2026-11-18: codai's shared main carried 15 and sat 93 commits behind). Commit from a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], then `agentq commit -ExpectRepo <slot>`. Deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1.")
+        Deny-Exit -HardBlock -HardBlockNote 'a git commit in the shared clone; commit from a leased slot (or set CODAI_SHARED_CLONE_WRITE_OK=1 for a journaled one-off)'
+      }
+    }
+  }
+}
+
 # ---- ADR 0001: slot leases (E:\gh\.wt\<repo>\<slot>) --------------------------------------
 # (1) Renew: any tool call whose command or file path touches a leased slot is activity for that
 #     lease (cheap: a dir scan of ~/.codai/coord/leases + one file timestamp).
