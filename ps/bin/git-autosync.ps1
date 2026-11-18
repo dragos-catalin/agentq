@@ -352,7 +352,22 @@ function Sync-Repo([string]$r) {
         G $r fetch -q $remote 2>&1 | Out-Null
         $target = (G $r rev-parse $up).Trim()
         $twinSet = @($twins | ForEach-Object { $_.c })
-        if (@(G $r cherry $up HEAD | Where-Object { $_ -like '+*' } | Where-Object { $twinSet -notcontains ($_ -split ' ')[1] }).Count) { return @{ code = 3; msg = "refuse: agentq land reported success but some commits are still not on $up; nothing moved" } }
+        # A land can be followed by local commits that needed no landing at all: an (A)-skip (same
+        # author date + subject upstream) or a replay that landed as a no-op leaves a commit whose
+        # patch-id upstream holds under a different shape, so `git cherry` still prints '+'. That is
+        # not evidence the land failed - 2026-11-18 codai: a chain of six such commits refused the
+        # move after every successful land, forever. Only a commit whose own paths are NOT upstream at
+        # HEAD is evidence of an unlanded change.
+        $stillOut = @()
+        foreach ($lc in @(G $r cherry $up HEAD | Where-Object { $_ -like '+*' })) {
+          $lcSha = ($lc -split ' ')[1]
+          if ($twinSet -contains $lcSha) { continue }
+          $lcPaths = @(G $r -c core.quotepath=off diff-tree --no-commit-id -r --name-only --no-renames $lcSha)
+          if (-not $lcPaths.Count) { continue }
+          G $r diff --quiet $up HEAD -- $lcPaths 2>$null
+          if ($LASTEXITCODE -ne 0) { $stillOut += $lcSha }
+        }
+        if ($stillOut.Count) { return @{ code = 3; msg = "refuse: agentq land reported success but $($stillOut.Count) commit(s) are still not on $up ($($stillOut -join ', ')); nothing moved" } }
         $published = "landed $($unique.Count) deferred commit(s) via agentq land; "
       } else {
         $st['replayFail'][$job.key] = @{ at = [DateTime]::UtcNow.ToString('o'); why = "agentq land exit $rcv (log $($job.log); topic $($job.topic) kept on $remote)" }
