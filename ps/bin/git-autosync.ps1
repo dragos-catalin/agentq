@@ -85,14 +85,22 @@ $CoordQ = Join-Path $HOME '.codai\coord\queues'
 # defaults above stay as the fallback when the config has no `autosync` section, and an explicit -Repo
 # on the command line still wins ($PSBoundParameters).
 $CfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $HOME '.copilot\bin\agentq-config.json' }
+# Set-StrictMode is on, so reading a property the JSON does not have THROWS - yet a config may set any
+# subset of the keys. Every read goes through this.
+function PropOf($o, [string]$name) { if ($o -and ($o.PSObject.Properties.Name -contains $name)) { return $o.$name } return $null }
 $autoCfg = $null
-if (Test-Path $CfgPath) { try { $autoCfg = (Get-Content $CfgPath -Raw | ConvertFrom-Json).autosync } catch { } }
+if (Test-Path $CfgPath) { try { $autoCfg = PropOf (Get-Content $CfgPath -Raw | ConvertFrom-Json) 'autosync' } catch { } }
 if ($autoCfg) {
-  if (-not $PSBoundParameters.ContainsKey('Repo') -and $autoCfg.repos) { $Repo = @($autoCfg.repos) }
-  if (-not $PSBoundParameters.ContainsKey('ReplayRepos') -and $autoCfg.replay) { $ReplayRepos = @($autoCfg.replay) }
-  if (-not $PSBoundParameters.ContainsKey('LocalCommitRepos') -and $autoCfg.localCommit) { $LocalCommitRepos = @($autoCfg.localCommit) }
-  if (-not $PSBoundParameters.ContainsKey('ReplayBackoffMin') -and $autoCfg.replayBackoffMin) { $ReplayBackoffMin = [int]$autoCfg.replayBackoffMin }
-  if (-not $PSBoundParameters.ContainsKey('FetchThrottle') -and $autoCfg.fetchThrottle) { $FetchThrottle = [int]$autoCfg.fetchThrottle }
+  $cfgRepos = PropOf $autoCfg 'repos'
+  if (-not $PSBoundParameters.ContainsKey('Repo') -and $cfgRepos) { $Repo = @($cfgRepos) }
+  $cfgReplay = PropOf $autoCfg 'replay'
+  if (-not $PSBoundParameters.ContainsKey('ReplayRepos') -and $cfgReplay) { $ReplayRepos = @($cfgReplay) }
+  $cfgLocal = PropOf $autoCfg 'localCommit'
+  if (-not $PSBoundParameters.ContainsKey('LocalCommitRepos') -and $cfgLocal) { $LocalCommitRepos = @($cfgLocal) }
+  $cfgBackoff = PropOf $autoCfg 'replayBackoffMin'
+  if (-not $PSBoundParameters.ContainsKey('ReplayBackoffMin') -and $cfgBackoff) { $ReplayBackoffMin = [int]$cfgBackoff }
+  $cfgFetch = PropOf $autoCfg 'fetchThrottle'
+  if (-not $PSBoundParameters.ContainsKey('FetchThrottle') -and $cfgFetch) { $FetchThrottle = [int]$cfgFetch }
 }
 $Repo = @($Repo | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $ReplayRepos = @($ReplayRepos | ForEach-Object { $_ -split ',' } | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
