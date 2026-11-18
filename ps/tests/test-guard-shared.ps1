@@ -1,4 +1,5 @@
-# Shared-clone write advisory: fires for source in E:\gh\<repo>, never blocks, silent for slots/docs/scratch.
+# Shared-clone writes: advisory in warn mode, HARD deny in refuse mode (ADR 0004 §4, wired 2026-11-18 -
+# the D-40 soft path had silently turned the documented deny into a warning), silent for slots/docs/scratch.
 param([string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'))
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('gsc-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
@@ -40,8 +41,12 @@ $l = Lines
 Ok ($r.out -notmatch '"deny"' -and $l.Count -eq $n0 + 1 -and $l[-1].mode -eq 'warn' -and $l[-1].repo -eq 'repo' -and "$($l[-1].paths)" -eq 'src/a.ts') 'warn: allowed + shared-write journaled'
 '{"sharedCloneMode":"refuse"}' | Set-Content $cfg
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
-# axiom D-40 (2026-10-19): refuse mode is a soft block -> allowed, recipe handed back as a warning.
-Ok ($r.out -notmatch '"deny"' -and $r.out -match 'WARNING \(allowed\)' -and $r.out -match 'ADR 0004') 'refuse: flagged with the lease recipe'
+# 2026-11-18: refuse denies. The soft path let 710 journaled shared-write events through for codai
+# between 11-12 and 11-18, which is exactly why the shared clone kept drifting.
+Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'ADR 0004') 'refuse: denied (ADR 0004 recipe in the reason)'
+Ok ($r.out -notmatch 'WARNING \(allowed\)') 'refuse: no longer downgraded to a warning'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y'; explanation = 'axiom-override: I want to edit the shared clone anyway' }
+Ok ($r.out -match '"permissionDecision":"deny"') 'refuse: an axiom-override does NOT lift a hard refusal'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\docs\x.md"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch '"deny"') 'refuse: docs/markdown still writable'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\.wt\repo\task-1\src\a.ts"; oldString = 'x'; newString = 'y' }
@@ -56,7 +61,7 @@ Ok ($r.out -notmatch '"deny"' -and $r.out -match 'SHARED clone') 'per-repo warn 
 # ADR 0009 stage 0 (OQ-008): refuse only for the repos that have slots; every other repo keeps the advisory.
 '{"sharedCloneMode":"warn","sharedCloneModeRepos":{"repo":"refuse"}}' | Set-Content $cfg
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
-Ok ($r.out -match 'ADR 0004' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse' -and (Lines)[-1].repo -eq 'repo') 'per-repo refuse: flagged with the lease recipe, journaled as refuse'
+Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse' -and (Lines)[-1].repo -eq 'repo') 'per-repo refuse: denied, journaled as refuse'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\other\src\a.ts"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -match 'SHARED clone' -and $r.out -notmatch 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'warn' -and (Lines)[-1].repo -eq 'other') 'per-repo refuse: another repo keeps the advisory'
 # The editor starts this hook with Windows PowerShell 5.1. The mode was read with ConvertFrom-Json
@@ -64,7 +69,7 @@ Ok ($r.out -match 'SHARED clone' -and $r.out -notmatch 'sharedCloneMode=refuse' 
 $ps51 = if ($IsWindows) { (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source } else { $null }
 if ($ps51) {
   $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' } $ps51
-  Ok ($r.out -match 'ADR 0004' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse') 'per-repo refuse is honoured under Windows PowerShell 5.1'
+  Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'sharedCloneMode=refuse' -and (Lines)[-1].mode -eq 'refuse') 'per-repo refuse denies under Windows PowerShell 5.1 too'
   $r = Call 'replace_string_in_file' @{ filePath = "$root\other\src\a.ts"; oldString = 'x'; newString = 'y' } $ps51
   Ok ($r.out -match 'SHARED clone' -and (Lines)[-1].mode -eq 'warn') 'Windows PowerShell 5.1: another repo keeps the advisory'
 } else { 'PASS (Windows PowerShell 5.1 not on this machine: the 5.1 cases did not run)' }

@@ -27,6 +27,15 @@ $script:RealStderr = [Console]::Error
 $script:DenyWriter = [System.IO.StringWriter]::new()
 [Console]::SetError([System.IO.TextWriter]::Synchronized($script:DenyWriter))
 function Deny-Exit {
+  # -HardBlock: this site is an explicit, config-driven refusal (not a heuristic), so the D-40 downgrade
+  # to "WARNING (allowed)" must not apply. Added 2026-11-18 for sharedCloneMode=refuse: ADR 0004 §4
+  # has always said "the guard denies the edit", but the D-40 soft path silently turned it into an
+  # advisory (710 journaled `shared-write` events for codai between 11-12 and 11-18 prove writes
+  # went through), which is why the shared clone kept drifting and git-autosync kept refusing.
+  # NOTE: the parameter must NOT be named $Hard - PowerShell variable names are case-insensitive, so the
+  # local regex assigned to $hard below would overwrite the switch ("Cannot convert the ... value of type
+  # System.String to type System.Management.Automation.SwitchParameter", met 2026-11-18).
+  param([switch]$HardBlock, [string]$HardBlockNote)
   $text = $script:DenyWriter.ToString().TrimEnd()
   # 2026-10-19 owner decision (axiom D-40): WARN, do not block - except HARD (irreversible) actions.
   # An agent may also state why it proceeds: `axiom-override: <reason>` in explanation/goal/command.
@@ -36,7 +45,7 @@ function Deny-Exit {
   $hard = '(?i)Force-push rewrites|git reset --hard destroys|git clean -f deletes|worktree remove --force\S* follows|is a LEASED worktree slot|Recursive (force )?delete|deploy/release from a DIRTY tree|Destructive SQL|DELETE with no WHERE|Object storage delete'
   # A raw `worktree remove` is soft, but a FORCED one follows junctions (irreversible) -> hard.
   if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+remove\b[^;|&]*(--force|-f\b)') { $text += "`n'git worktree remove --force' follows Windows junctions and deletes their targets." }
-  if ($text -notmatch $hard) {
+  if (-not $HardBlock -and $text -notmatch $hard) {
     $ti = $payload.tool_input; if (-not $ti) { $ti = $payload.toolInput }
     $ov = $null
     foreach ($field in @("$($ti.explanation)", "$($ti.goal)", "$cmd")) {
@@ -55,9 +64,10 @@ function Deny-Exit {
     }
     exit 0
   }
-  $script:RealStderr.Write($text + [Environment]::NewLine)
+    $script:RealStderr.Write($text + [Environment]::NewLine)
   if ($payload.PSObject.Properties.Name -contains 'hook_event_name') {
-    @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'deny'; permissionDecisionReason = ($text + ' (HARD block: irreversible - ask the user)') } } |
+      $note = if ($HardBlockNote) { $HardBlockNote } else { 'irreversible - ask the user' }
+      @{ hookSpecificOutput = @{ hookEventName = 'PreToolUse'; permissionDecision = 'deny'; permissionDecisionReason = ($text + " (HARD block: $note)") } } |
       ConvertTo-Json -Compress -Depth 4 | Write-Output
     exit 0
   }
@@ -285,8 +295,8 @@ if ($isEditTool) {
           } catch { }
         }
         if ($scMode -eq 'refuse' -and -not $scOverride) {
-          [Console]::Error.WriteLine("BLOCKED by guard (ADR 0004, sharedCloneMode=refuse): $rel is source in the SHARED clone $repoDir, which is read-only for agents. Lease a slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], edit + commit + push there, then unlease. Docs, plans, markdown and .copilot-tmp stay writable here. A deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1 (journaled).")
-          Deny-Exit
+          [Console]::Error.WriteLine("BLOCKED by guard (HARD, ADR 0004, sharedCloneMode=refuse): $rel is source in the SHARED clone $repoDir, which is read-only for agents. Lease a slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], edit + commit + push there, then unlease. Docs, plans, markdown and .copilot-tmp stay writable here. A deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1 (journaled).")
+          Deny-Exit -HardBlock -HardBlockNote 'source edit in a shared clone that has slots; lease one, or set CODAI_SHARED_CLONE_WRITE_OK=1 for a journaled one-off'
         }
         if ($scMode -eq 'off' -or $scOverride) { $script:SharedWarn = $null } else {
         $script:SharedWarn = "WARNING (shared clone): editing $rel directly in the SHARED clone $repoDir. Other agents work here too, and a draft left behind after the same work lands from a worktree blocks git-autosync (2026-10-17). Do source work in a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], commit + push from there, then unlease. A deliberate small fix committed right away via agentq commit is fine."

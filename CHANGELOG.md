@@ -17,6 +17,17 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
 - Orchestrator stage 0 ([ADR 0009](docs/adr/0009-orchestrator-daemon-tasks-control-plane.md), tracker OQ-001 to OQ-012; details in [docs/orchestrator-stage-0.md](docs/orchestrator-stage-0.md)): chat keep-alive for slot leases, land pre-gate in the slot and a green ledger, admission by load and by owner presence, `agentq probe`, `prune` and `doctor`, more numbers in `agentq slo`, `hook-pre.ps1` installed from this repository, an installer that merges the config, and the suites in CI.
 
+### Fixed
+
+- Shared-clone guard (ADR 0004): `sharedCloneMode: refuse` now **really denies** a source write instead of
+	returning `WARNING (allowed)`. The axiom D-40 soft path downgraded the documented refusal, and the journal
+	proves the writes went through anyway: 710 `shared-write` events for codai (mode `refuse`) between
+	2026-11-12 and 2026-11-18 - which is exactly what kept the shared clone drifting and `git-autosync`
+	refusing (2026-11-18: 15 unpushed commits, 174 dirty files behind a "refuse" that did nothing). The
+	refusal now uses `Deny-Exit -HardBlock` (skips the D-40 downgrade); an `axiom-override:` no longer lifts
+	it, and the journaled `CODAI_SHARED_CLONE_WRITE_OK=1` is the only one-off escape. `warn` and `off` are
+	unchanged, and docs/plan/markdown/.copilot-tmp stay writable in the shared clone.
+
 ### Changed
 
 - `agentq status`, `log`, `metrics` and `doctor` only read the state folder; dead tickets are reaped by working verbs and by `sweep`.
