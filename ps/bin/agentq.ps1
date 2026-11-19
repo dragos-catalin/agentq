@@ -33,13 +33,38 @@ COMMANDS (all accept -Repo <path>; default = current dir's repo. -ExpectRepo <pa
   agentq commit  -Purpose "why" -Message "type(scope): msg" -Paths a,b [-NoPush]
                   under commit:<repo>: add+commit ONLY those paths, trailers
                   Agent-Session / Agent-Purpose, then fetch+merge+push with retry.
-  agentq status  [-All]            holders, waiters, stale, marks (this repo or all)
+  agentq status  [-All] [-Json]    holders, waiters, stale, marks (this repo or all);
+                                  -Json/--json prints the SAME data as JSON (see JSON OUTPUT)
   agentq log     [-Last 30] [-All] recent journal entries
   agentq since   [-Hours 12]       what changed in this repo: journal + git log
   agentq mark    -Resource R -State frozen|blocked -Reason "..."   (unmark: -State clear)
   agentq break   -Resource R [-Id <ticket>] -Reason "..."          remove a stale/stuck ticket
   agentq note    -Message "..."    free-form journal entry (handoffs, "don't touch X")
   agentq acquire / release         low-level (scripts): acquire prints the ticket id
+  agentq lease   -Purpose "why" [-Slot task-2] [-Branch b] [-Ref r] [-Wait [-MaxMin n]]
+                                  take a slot lease (ADR 0001); prints the slot path (exit 0).
+                                  -Wait: poll for a free slot, bounded to -MaxMin minutes
+                                  (default 5, never unbounded) -> exit 0 leased, 7 bound
+                                  expired without a slot, 3 the slot is frozen/blocked.
+                                  -Wait also works as a bounded "is a slot free?" probe: with -Wait,
+                                  -Purpose may be omitted (a plain lease still requires it).
+
+JSON OUTPUT (-Json / --json; `status --json` is the machine form of the == table. Keys are
+  stable; other agents parse them. The plain table output is UNCHANGED when the flag is absent.)
+    { agents, leases, releases, marks, tickets, load, bursts }
+      agents   = the == AGENTS line: { limit, base, state (present|away|night|unknown|off), why,
+                 inputIdleSec, sampleAgeSec, night, nightWindow, leased }
+      leases   = the == SLOTS rows: { leaseId, repo, slot, role (the kind), state
+                 (ok|chat|owner-gone|STALE), idleMin, chatIdleMin, branch, session (holder
+                 terminal), purpose, path, pid, created, beat, alive, stale }
+      releases = the == RELEASES rows: the release record (repo, target, state, sha, phase,
+                 committed, follow, session, purpose, supersedeSha, pendingSha, ...)
+      marks    = the == MARKS rows: { resource, state, at, session, reason }
+      tickets  = the == QUEUES rows: { resource, role, lane, prio, state, ageMin, session,
+                 purpose, id }
+      load     = the == LOAD line: { enabled, saturated, probeMs, medianMs, samples, ageSec,
+                 thresholdMs, src }
+      bursts   = the == BURST lines: { resource, by, until, session, reason }
 
 v3 SCHEDULER (devcloud F1, 2026-10-11)
   -Lane interactive|quick|gate|heavy|batch  (build default gate, others quick); -Priority -50..50.
@@ -92,7 +117,7 @@ STAGE 0 OF THE ORCHESTRATOR PLAN (ADR 0009, tracker OQ-001..012, 2026-11)
                   and slots lost with a live chat.
 
 EXIT CODES: 0 ok; command's own exit code for `run`; 3 = frozen/blocked or timed out;
-2 = usage error.
+2 = usage error; 7 = `lease -Wait` bound expired without a free slot.
 #>
 # Hand-rolled argument parsing: `pwsh -File agentq.ps1 run ... -- cmd -x` passes `--` and
 # the command's own dashed flags to the script, which PowerShell's binder rejects
@@ -101,6 +126,8 @@ $Verb = 'status'; $Resource = $null; $Purpose = $null; $Message = $null; $Paths 
 $Repo = $null; $ExpectRepo = $null; $State = $null; $Reason = $null; $Id = $null
 $Capacity = 1; $TimeoutMin = 60; $StaleMin = 10; $Last = 30; $Hours = 12; $MinFreeGB = 6
 $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGiven = $false
+# bounded slot acquisition for `lease -Wait` (exit 7 on the bound; 0/3 otherwise).
+$Wait = $false; $MaxMin = $null; $MaxMinGiven = $false
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
 $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
@@ -156,6 +183,8 @@ while ($i -lt $argv.Count) {
     'all' { $All = $true }
     'nopush' { $NoPush = $true }
     'nowait' { $NoWait = $true }
+    'wait' { $Wait = $true }
+    'maxmin' { $MaxMin = [double](& $next); $MaxMinGiven = $true }
     'json' { $Json = $true }
     'slot' { $Slot = & $next }
     'role' { $Role = & $next }
@@ -1331,10 +1360,11 @@ function Show-Status {
   $agl = Get-AgentLimit
   # machine-wide count; with -All (or outside a repo) the leases were just read, so they are not read twice
   $leasedTasks = if ($All -or -not $repo) { @($v2.leases | Where-Object { "$($_.role)" -eq 'task' }).Count } else { Get-TaskLeaseCount }
+  $bursts = @(Get-ChildItem $QDir -Recurse -Filter 'burst.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String } | Where-Object { (ParseUtc $_.until) -gt (Now) })
   if ($Json) {
-    $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks
+    $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks; $o.bursts = $bursts
     $o.load = [ordered]@{ enabled = [bool]$ld.enabled; saturated = [bool]$ld.saturated; probeMs = $ld.last; medianMs = $ld.median; samples = $ld.n; ageSec = $ld.ageSec; thresholdMs = $ld.thresholdMs; src = "$($ld.src)" }
-    $o.agents = [ordered]@{ limit = [int]$agl.limit; base = [int]$agl.base; state = "$($agl.state)"; inputIdleSec = $agl.idleSec; sampleAgeSec = $agl.ageSec; night = [bool]$agl.night; nightWindow = "$($agl.nightWindow)"; leased = [int]$leasedTasks }
+    $o.agents = [ordered]@{ limit = [int]$agl.limit; base = [int]$agl.base; state = "$($agl.state)"; why = "$($agl.why)"; inputIdleSec = $agl.idleSec; sampleAgeSec = $agl.ageSec; night = [bool]$agl.night; nightWindow = "$($agl.nightWindow)"; leased = [int]$leasedTasks }
     $o | ConvertTo-Json -Depth 5; return
   }
   if ($marks) {
@@ -1354,7 +1384,6 @@ function Show-Status {
     Write-Output '== QUEUES'
     $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
-  $bursts = @(Get-ChildItem $QDir -Recurse -Filter 'burst.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String } | Where-Object { (ParseUtc $_.until) -gt (Now) })
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
 }
 

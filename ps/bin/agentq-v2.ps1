@@ -524,18 +524,47 @@ function Expire-Lease($l, [string]$why) {
 function Get-TaskLeaseCount { @(Read-Leases $null | Where-Object { (P $_ 'role') -eq 'task' }).Count }
 
 # Take a slot lease (exclusive). Task role picks the first free task-N. Returns the lease object.
-function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [string]$branch, [int]$owner, [int]$timeoutMin, [bool]$noWait) {
+function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [string]$branch, [int]$owner, [int]$timeoutMin, [bool]$noWait, [bool]$wait, $maxMin, [bool]$maxMinGiven) {
   $repoName = $repo.Name
   $cfg = Get-Config
+  # `-Wait` (2026-11-18): the bound is -MaxMin (default 5 min) and expiry exits 7 with one stdout line.
+  # Without it the legacy -TimeoutMin (default 60) applies and expiry exits 3, exactly as before.
+  $boundMin = if ($wait) { if ($maxMinGiven) { [double]$maxMin } else { 5 } } else { $timeoutMin }
+  # $slotValid: ADR 0001 says only standard slots exist. An unknown -Slot is NEVER leased; it is either a
+  # hard error (no -Wait) or a slot that never frees (with -Wait), so -Wait cannot invent a bogus slot.
+  $slotValid = $true
   if ($slot) {
     $r = Get-SlotRole $repoName $slot
-    if (-not $r) { throw "agentq lease: '$slot' is not a standard slot for $repoName (task-1..$($cfg.taskSlotsPerRepo), release$(if ((Get-ReleaseSlotCount $repoName) -gt 1) { ', release-2..' + (Get-ReleaseSlotCount $repoName) }), land$(if (Get-PinnedSlots $repoName) { ', pinned: ' + ((Get-PinnedSlots $repoName) -join ',') })) - ADR 0001" }
-    $role = $r
-  } elseif (-not $role) { $role = 'task' }
-  $deadline = (Now).AddMinutes($timeoutMin)
+    if ($r) { $role = $r } else { $slotValid = $false }
+    # -Wait: an unknown slot simply never frees; the bound decides (exit 7), so no throw.
+    if (-not $r -and -not $wait) { throw "agentq lease: '$slot' is not a standard slot for $repoName (task-1..$($cfg.taskSlotsPerRepo), release$(if ((Get-ReleaseSlotCount $repoName) -gt 1) { ', release-2..' + (Get-ReleaseSlotCount $repoName) }), land$(if (Get-PinnedSlots $repoName) { ', pinned: ' + ((Get-PinnedSlots $repoName) -join ',') })) - ADR 0001" }
+  }
+  if (-not $role) { $role = 'task' }
+  # -MaxMin 0 = give up at once: a deadline a moment in the past makes the first check expire.
+  $deadline = if ($wait -and $boundMin -le 0) { (Now).AddSeconds(-1) } else { (Now).AddMinutes($boundMin) }
   $announced = $false
   $loadSaid = $false
   $limitSaid = $false
+  # One exit for both expiry sites: -Wait prints ONE line to stdout and exits 7; otherwise the legacy
+  # stderr message + exit 3 (byte-identical to what callers parsed before).
+  $expire = {
+    param([string]$whyWait, [string]$whyLegacy)
+    $held = (@(Read-Leases $repoName) | ForEach-Object { "$($_.slot)=$($_.session) '$($_.purpose)' idle $($_.idleMin)m" }) -join '; '
+    if ($wait) {
+      Write-Output ("agentq: no free {0} in {1} within {2} min - {3}{4}" -f $(if ($slot) { "slot $slot" } else { "$role slot" }), $repoName, $boundMin, $whyWait, $(if ($held) { "; held: $held" } else { '' }))
+      Write-Journal @{ event = 'lease-timeout'; resource = "slot:${repoName}:$(if ($slot) { $slot } else { $role })"; purpose = $purpose; reason = $whyWait; repo = $repoName; waitedMin = $boundMin }
+      exit 7
+    }
+    [Console]::Error.WriteLine("agentq: $whyLegacy. Held: $held")
+    exit 3
+  }
+  # A frozen/blocked slot is a hard stop (exit 3). Only -Wait checks it, so the plain lease is unchanged.
+  if ($wait) {
+    foreach ($mk in @("slot:${repoName}:$(if ($slot) { $slot } else { $role })", "slot:$repoName")) {
+      $m = Get-Mark $mk
+      if ($m) { Write-Output ("agentq: refused - {0} is {1}: {2}" -f $mk, "$($m.state)".ToUpper(), $m.reason); exit 3 }
+    }
+  }
   while ($true) {
     # OQ-004: a saturated machine takes no NEW task agent. Release/land/pinned slots are never gated (they
     # finish work already admitted); after admission.maxHoldMin the lease is granted anyway.
@@ -548,14 +577,18 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       }
     }
     if ($loadHeld) {
-      if ($noWait -or (Now) -gt $deadline) { [Console]::Error.WriteLine("agentq: no task slot granted - the machine is saturated$(if (-not $noWait) { " (waited $timeoutMin min)" })"); exit 3 }
+      if ($noWait -or (Now) -gt $deadline) {
+        if ($wait) { & $expire "the machine is saturated (start probe median $($ld.median) ms > $($ld.thresholdMs) ms)" '' }
+        [Console]::Error.WriteLine("agentq: no task slot granted - the machine is saturated$(if (-not $noWait) { " (waited $timeoutMin min)" })"); exit 3
+      }
       Start-Sleep -Seconds 5; continue
     }
     # OQ-005: the machine-wide limit on task leases in force right now (owner presence + night schedule).
     $agl = Get-AgentLimit
     $got = With-Mutex "lease-$repoName" {
       $leases = @(Read-Leases $repoName)
-      $cands = if ($slot) { @($slot) }
+      $cands = if (-not $slotValid) { @() }
+      elseif ($slot) { @($slot) }
       elseif ($role -eq 'task') { @(1..$cfg.taskSlotsPerRepo | ForEach-Object { "task-$_" }) }
       elseif ($role -eq 'release') { @('release') + @(2..([math]::Max(2, (Get-ReleaseSlotCount $repoName))) | Where-Object { $_ -le (Get-ReleaseSlotCount $repoName) } | ForEach-Object { "release-$_" }) }
       else { @($role) }
@@ -589,9 +622,8 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
     }
     if ($noWait -or (Now) -gt $deadline) {
       $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" } else { "no free $role slot in $repoName" }
-      $held = (@(Read-Leases $repoName) | ForEach-Object { "$($_.slot)=$($_.session) '$($_.purpose)' idle $($_.idleMin)m" }) -join '; '
-      [Console]::Error.WriteLine("agentq: $why. Held: $held")
-      exit 3
+      $whyWait = if ($got -eq 'MACHINE-CAP') { "the machine-wide task slot cap ($($agl.limit)) is reached" } else { 'it is still held' }
+      & $expire $whyWait $why
     }
     if (-not $announced) { [Console]::Error.WriteLine("agentq: waiting for a free $role slot in $repoName ..."); $announced = $true }
     Start-Sleep -Seconds 3
@@ -668,10 +700,13 @@ function Invoke-Lease {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
   if (-not $repo) { throw 'agentq lease: not in a git repo (pass -Repo)' }
-  if (-not $Purpose) { throw 'agentq lease: -Purpose is required (other agents read it)' }
+  if (-not $Purpose -and -not $Wait) { throw 'agentq lease: -Purpose is required (other agents read it)' }
+  # -Wait is also a bounded "is a slot free?" probe (usually with -MaxMin 0), so a missing -Purpose is
+  # not an error there: record an explicit placeholder rather than refuse. Plain lease: still required.
+  if (-not $Purpose) { $script:Purpose = '(no -Purpose: agentq lease -Wait probe)' }
   $main = Get-MainTop $repo
   $owner = Get-DefaultOwner
-  $l = New-Lease $repo $Slot $Role $Purpose $Branch $owner $TimeoutMin $NoWait
+  $l = New-Lease $repo $Slot $Role $Purpose $Branch $owner $TimeoutMin $NoWait $Wait $MaxMin $MaxMinGiven
   try {
     & git -C $main fetch -q origin 2>$null
     $refToUse = if ($Ref) { $Ref } else { $up = (& git -C $main rev-parse --abbrev-ref '@{u}' 2>$null); if ($up) { $up } else { 'HEAD' } }
@@ -1046,6 +1081,38 @@ function Resolve-LandRef([string]$main, [string]$b) {
   if ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$b" 2>$null)) { return "refs/remotes/origin/$b" }
   $null
 }
+# The land slot is rebased and the topic merged onto it, but its node_modules are whatever the previous
+# land left: when the merged result changes a lockfile the slot's deps are stale, and only the pre-push
+# typecheck notices, with type errors that look like code errors (brivio 2026-11-18/19, CS-56: stripe
+# 23.0.0 in the slot vs 23.1.0 in the branch -> TS2322 on the ApiVersion literal; the land gate does not
+# typecheck, so it ran 103/103 green). Install the merged lockfile in the land slot before the gate.
+# AGENTQ_NO_LAND_INSTALL=1 opts out (journaled), like the other land escapes.
+function Restore-LandDeps([object]$repo, [string]$wt, [string]$baseRev) {
+  if ($env:AGENTQ_NO_LAND_INSTALL -eq '1' -or -not $baseRev) { return $true }
+  $res = "land:$($repo.Name)"
+  $locks = @(& git -C $wt diff --name-only "$baseRev" HEAD 2>$null | Where-Object { $_ -match '(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$' })
+  if (-not $locks.Count) { return $true }
+  $argv = if (@($locks | Where-Object { $_ -match '(^|/)pnpm-lock\.yaml$' }).Count) { @('pnpm', 'install', '--frozen-lockfile', '--prefer-offline') }
+    elseif (@($locks | Where-Object { $_ -match '(^|/)package-lock\.json$' }).Count) { @('npm', 'ci') }
+    else { @('yarn', 'install', '--immutable') }
+  $cmd = $argv -join ' '
+  [Console]::Out.WriteLine("land: lockfile changed ($($locks -join ', ')) - running '$cmd' in the land slot before the gate")
+  Write-Journal @{ event = 'land-install'; resource = $res; reason = "$cmd ($($locks -join ', '))"; repo = $repo.Name }
+  $exe = $argv[0]; $rest = @($argv | Select-Object -Skip 1)
+  $sw = [Diagnostics.Stopwatch]::StartNew(); $code = 0; $out = @()
+  Push-Location -LiteralPath $wt
+  try { $out = @(& $exe @rest 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } finally { Pop-Location }
+  $sec = [int][math]::Round($sw.Elapsed.TotalSeconds)
+  if ($code) {
+    $tail = (@($out | Select-Object -Last 8) -join ' | ')
+    Write-Journal @{ event = 'land-install-failed'; resource = $res; exit = $code; durSec = $sec; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
+    [Console]::Error.WriteLine("land: '$cmd' failed ($code) in the land slot - nothing gated, nothing pushed. Fix the lockfile on the topic and land again (AGENTQ_NO_LAND_INSTALL=1 skips this).")
+    $out | Select-Object -Last 8 | ForEach-Object { [Console]::Error.WriteLine("  install: $_") }
+    return $false
+  }
+  Write-Journal @{ event = 'land-install-ok'; resource = $res; durSec = $sec; reason = $cmd; repo = $repo.Name }
+  return $true
+}
 # ---- green trees + land pre-gate (ADR 0009 stage 0, OQ-002 / OQ-003) -------------------------------
 # Baseline, busiest repo, 7 days: the land ticket was HELD 80.8 h, 41.8 h of it running the land gate
 # (p50 7.2 min), 12.8 h in the 45 gate runs that then failed - every one of them made the whole queue
@@ -1327,6 +1394,7 @@ function Invoke-LandSet([object[]]$set) {
     & git -C $main fetch -q origin $Onto 2>$null
     if (Test-Path -LiteralPath $wt) { [void](Backup-Slot $wt $repo.Name 'land' 'leftover in land slot') }
     Initialize-Slot $main $wt "origin/$Onto" '' $true
+    $baseRev = "$(& git -C $wt rev-parse HEAD)".Trim()
     $picked = @()
     foreach ($tp in @($active)) {
       $picks = @(Get-LandPicks $wt $tp.ref)
@@ -1357,6 +1425,7 @@ function Invoke-LandSet([object[]]$set) {
     $o.failSet = $picked
     if (-not $picked.Count) { return }
     $names = ($picked | ForEach-Object { $_.branch }) -join '+'
+    if (-not (Restore-LandDeps $repo $wt $baseRev)) { $o.failExit = 10; return }
     if ($Gate) {
       # OQ-003: the exact tree about to be pushed already passed this gate (in the caller's slot, or in
       # an earlier land attempt): do not hold the land ticket for a second run of the same check.
@@ -1456,7 +1525,7 @@ function Invoke-LandBisect([object[]]$set) {
   if ($r.sha) { $script:LandAcc.shas += $r.sha }
   if (-not $r.failExit) { return }
   $fs = @($r.failSet)
-  if ($fs.Count -gt 1 -and $r.failExit -in 6, 7, 8, 9) {
+  if ($fs.Count -gt 1 -and $r.failExit -in 6, 7, 8, 9, 10) {
     $script:LandAcc.bisected = $true
     $h = [int][math]::Ceiling($fs.Count / 2)
     $left = @($fs[0..($h - 1)]); $right = @($fs[$h..($fs.Count - 1)])
@@ -1468,7 +1537,8 @@ function Invoke-LandBisect([object[]]$set) {
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
-# 9 repo land-finalize refused, 3 busy/remote kept moving. With batching (above) the same codes apply
+# 9 repo land-finalize refused, 10 the merged result's lockfile could not be installed in the land slot,
+# 3 busy/remote kept moving. With batching (above) the same codes apply
 # per topic; an absorbed waiter exits with its topic's code.
 # After each push the pushed tree's scripts/post-land.ps1 is started detached (Start-PostLand, ADR 0008);
 # it never changes these codes.
@@ -1768,7 +1838,12 @@ function Format-V2Status($v) {
 }
 function ConvertTo-V2Json($v) {
   @{
-    leases = @($v.leases | ForEach-Object { [pscustomobject]@{ leaseId = $_.leaseId; repo = $_.repo; slot = $_.slot; role = $_.role; path = $_.path; branch = $_.branch; purpose = $_.purpose; session = $_.session; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); idleMin = $_.idleMin; alive = $_.alive; stale = $_.stale; chatIdleMin = $_.chatIdleMin } })
+    leases = @($v.leases | ForEach-Object { [pscustomobject]@{
+        leaseId = $_.leaseId; repo = $_.repo; slot = $_.slot; role = $_.role
+        # state mirrors Format-V2Status' == SLOTS column (the table and the JSON must agree).
+        state = $(if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le 30) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' })
+        idleMin = $_.idleMin; chatIdleMin = $_.chatIdleMin; branch = $_.branch; session = $_.session; purpose = $_.purpose
+        path = $_.path; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); alive = $_.alive; stale = $_.stale } })
     releases = @($v.releases | ForEach-Object { $_ | Select-Object * -ExcludeProperty file })
   }
 }

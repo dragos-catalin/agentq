@@ -56,6 +56,7 @@ $suites = [ordered]@{
   # ADR 0009 (tracker OQ-*): a suite whose file is not there yet is a SKIP, not a failure
   'lease chat'      = @('-File', (Join-Path $PSScriptRoot 'test-lease-chat.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'land pregate'    = @('-File', (Join-Path $PSScriptRoot 'test-land-pregate.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'land install'   = @('-File', (Join-Path $PSScriptRoot 'test-land-install.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'admission'       = @('-File', (Join-Path $PSScriptRoot 'test-agentq-admission.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'prune'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-prune.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))

@@ -180,17 +180,29 @@ function Format-JobTree([int]$root) {
 
 # Shape mirrored to the hub (contract: id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,
 # startedAt,endedAt,lastOutputAt,log). command <= 500 chars; never env values.
-function Get-JobsForSync([int]$days = 7) {
+# The mirror is a WINDOW, not an archive: a 7-day backlog reached ~3000 rows on this machine and the
+# gateway's schema rejected the WHOLE push (400 jobs>500) for a full day (2026-11-13), so the hub
+# mirrored nothing. Keep every non-terminal job (the ones the hub can act on) and the newest
+# terminal ones up to -max.
+function Get-JobsForSync([int]$days = 7, [int]$max = 500) {
   $cut = [DateTime]::UtcNow.AddDays(-$days)
-  @(foreach ($j in Get-AllJobs) {
-      $st = ConvertTo-JobUtc $j['startedAt']
-      if ($st -and $st -lt $cut) { continue }
-      $v = Get-JobView $j
-      $cmd = "$($j['command'])"; if ($cmd.Length -gt 500) { $cmd = $cmd.Substring(0, 500) }
-      [ordered]@{
-        id = "$($j['id'])"; label = "$($j['label'])"; command = $cmd; cwd = "$($j['cwd'])"; repo = "$($j['repo'])"; host = "$($j['host'])"
-        pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
-        startedAt = $j['startedAt']; endedAt = $j['endedAt']; lastOutputAt = $v.lastOutputAt; log = "$($j['log'])"
-      }
-    })
+  $rows = [Collections.Generic.List[object]]::new()
+  foreach ($j in Get-AllJobs) {
+    $st = ConvertTo-JobUtc $j['startedAt']
+    if ($st -and $st -lt $cut) { continue }
+    $v = Get-JobView $j
+    $cmd = "$($j['command'])"; if ($cmd.Length -gt 500) { $cmd = $cmd.Substring(0, 500) }
+    $rows.Add([pscustomobject]@{
+        active  = ($v.state -in 'running', 'suspect', 'starting')
+        started = $(if ($st) { $st } else { [DateTime]::MinValue })
+        row     = [ordered]@{
+          id = "$($j['id'])"; label = "$($j['label'])"; command = $cmd; cwd = "$($j['cwd'])"; repo = "$($j['repo'])"; host = "$($j['host'])"
+          pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
+          startedAt = $j['startedAt']; endedAt = $j['endedAt']; lastOutputAt = $v.lastOutputAt; log = "$($j['log'])"
+        }
+      })
+  }
+  $ordered = @($rows | Sort-Object -Property @{ Expression = 'active'; Descending = $true }, @{ Expression = 'started'; Descending = $true })
+  if ($max -gt 0 -and $ordered.Count -gt $max) { $ordered = @($ordered[0..($max - 1)]) }
+  @($ordered | ForEach-Object { $_.row })
 }
