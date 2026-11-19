@@ -13,14 +13,18 @@ in ~/.codai/agentq-sync.key. Never printed.
   agentq-sync.ps1 -SetKey              read the key from STDIN (pipe it; never echo it)
   agentq-sync.ps1 -Once [-DryRun]      one push (DryRun: print the payload summary, no POST)
   agentq-sync.ps1 -Loop [-IntervalSec 15]
-  agentq-sync.ps1 -Install             scheduled task 'agentq-sync' at logon (wscript hidden, no console)
+  agentq-sync.ps1 -Install             scheduled task 'agentq-sync': ONE PUSH PER TICK (1-min repetition
+                                       + at-logon, IgnoreNew, bounded run) so every tick loads the current
+                                       code (a -Loop process keeps the copy it loaded at start; see the
+                                       git-autosync DAEMON note, ADR 0010). Replaces any running model first.
+  agentq-sync.ps1 -InstallLoop         the old long-lived -Loop task (warm, but the code is FROZEN at start)
   agentq-sync.ps1 -Status              state file + task state
 
 Env: AGENTQ_HOME (like agentq.ps1), AGENTQ_SYNC_URL (default https://ai.codai.ro),
 AGENTQ_SYNC_STATE (default ~/.codai/agentq-sync.state.json).
 #>
 param(
-  [switch]$Once, [switch]$Loop, [switch]$Install, [switch]$SetKey, [switch]$Status, [switch]$DryRun,
+  [switch]$Once, [switch]$Loop, [switch]$Install, [switch]$InstallLoop, [switch]$SetKey, [switch]$Status, [switch]$DryRun,
   [int]$IntervalSec = 15, [string]$Url
 )
 $ErrorActionPreference = 'Stop'
@@ -60,6 +64,10 @@ function Get-Jobs {
 function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
 function ParseUtc($s) { if ($s -is [datetime]) { return $s.ToUniversalTime() }; [DateTimeOffset]::Parse("$s", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
 function Safe([string]$s) { ($s -replace '[^A-Za-z0-9._-]', '_') }
+# Clip to the gateway's agentqPushSchema limits. An over-long ticket `cmd` (a whole pwsh
+# one-liner) made the schema reject the ENTIRE push with 400 and the hub mirrored nothing
+# (2026-11-13); the mirror is a window, so clipping beats losing the whole update.
+function Clip([string]$s, [int]$n) { if ($s.Length -gt $n) { $s.Substring(0, $n) } else { $s } }
 
 function Read-State {
   if (Test-Path $StateFile) {
@@ -106,11 +114,11 @@ function Get-Tickets {
       }
       $hb = "$($f.FullName).hb"
       $beat = if (Test-Path $hb) { (Get-Item $hb).LastWriteTimeUtc } else { ParseUtc $t.created }
-      $prop = { param($n) if ($t.PSObject.Properties[$n] -and $null -ne $t.$n) { "$($t.$n)" } else { '' } }
+      $prop = { param($n, $max = 200) if ($t.PSObject.Properties[$n] -and $null -ne $t.$n) { (Clip "$($t.$n)" $max) } else { '' } }
       $lanePrefix = if ($t.PSObject.Properties['lane'] -and $t.lane) { "[$($t.lane)] " } else { '' }
       $out.Add([ordered]@{
-          id = "$($t.id)"; resource = "$($t.resource)"; seq = $seq; capacity = [math]::Min(64, [math]::Max(1, $cap))
-          pid = [int]$t.pid; session = (& $prop 'session'); purpose = ($lanePrefix + (& $prop 'purpose')); cmd = (& $prop 'cmd'); repo = (& $prop 'repo')
+          id = (Clip "$($t.id)" 64); resource = (Clip "$($t.resource)" 160); seq = $seq; capacity = [math]::Min(64, [math]::Max(1, $cap))
+          pid = [int]$t.pid; session = (& $prop 'session' 200); purpose = (Clip ($lanePrefix + (& $prop 'purpose' 1900)) 2000); cmd = (& $prop 'cmd' 4000); repo = (& $prop 'repo' 300)
           created = (Iso (ParseUtc $t.created)); beat = (Iso $beat); alive = (Test-Alive $t)
         })
     }
@@ -124,7 +132,7 @@ function Get-Marks {
   foreach ($f in Get-ChildItem $MDir -Filter '*.json' -File) {
     try { $m = Get-Content $f.FullName -Raw | ConvertFrom-Json -DateKind String } catch { continue }
     if (-not $m -or -not $m.PSObject.Properties['resource']) { continue }
-    $out.Add([ordered]@{ resource = "$($m.resource)"; state = $(if ($m.state -eq 'blocked') { 'blocked' } else { 'frozen' }); reason = "$($m.reason)"; session = "$($m.session)"; at = (Iso (ParseUtc $m.at)) })
+    $out.Add([ordered]@{ resource = (Clip "$($m.resource)" 160); state = $(if ($m.state -eq 'blocked') { 'blocked' } else { 'frozen' }); reason = (Clip "$($m.reason)" 2000); session = (Clip "$($m.session)" 200); at = (Iso (ParseUtc $m.at)) })
   }
   $out
 }
@@ -143,8 +151,8 @@ function Get-Leases {
     $idle = ([DateTime]::UtcNow - $beat).TotalMinutes
     $stale = ((-not $alive) -and $idle -gt 120) -or $idle -gt 1440
     $out.Add([ordered]@{
-        repo = "$($l.repo)"; slot = "$($l.slot)"; role = $(if ("$($l.role)" -in 'task', 'release', 'land', 'pinned') { "$($l.role)" } else { 'task' }); path = "$($l.path)"
-        branch = "$($l.branch)"; purpose = "$($l.purpose)"; session = "$($l.session)"; pid = [int]$l.pid
+        repo = (Clip "$($l.repo)" 80); slot = (Clip "$($l.slot)" 60); role = $(if ("$($l.role)" -in 'task', 'release', 'land', 'pinned') { "$($l.role)" } else { 'task' }); path = (Clip "$($l.path)" 300)
+        branch = (Clip "$($l.branch)" 200); purpose = (Clip "$($l.purpose)" 2000); session = (Clip "$($l.session)" 120); pid = [int]$l.pid
         created = (Iso (ParseUtc $l.created)); beat = (Iso $beat); state = $(if ($stale) { 'stale' } else { 'leased' }); alive = [bool]$alive
       })
   }
@@ -158,9 +166,9 @@ function Get-Releases {
     $alive = Test-Alive ([pscustomobject]@{ pid = [int]$r.pid; procStart = $r.procStart })
     $state = "$($r.state)"; if (-not $alive -and $state -in 'running', 'preempting') { $state = 'failed' }
     $out.Add([ordered]@{
-        repo = "$($r.repo)"; target = "$($r.target)"; runId = "$($r.runId)"; sha = "$($r.sha)"; ref = "$($r.ref)"; follow = "$($r.follow)"
+        repo = (Clip "$($r.repo)" 80); target = (Clip "$($r.target)" 80); runId = (Clip "$($r.runId)" 64); sha = (Clip "$($r.sha)" 64); ref = (Clip "$($r.ref)" 200); follow = (Clip "$($r.follow)" 200)
         phase = "$($r.phase)".Substring(0, [math]::Min(40, "$($r.phase)".Length)); preemptible = (-not [bool]$r.committed); phaseAt = (Iso (ParseUtc $r.phaseAt)); state = $state
-        supersedeSha = "$($r.supersedeSha)"; pendingSha = "$($r.pendingSha)"; session = "$($r.session)"; pid = [int]$r.pid; started = (Iso (ParseUtc $r.started)); alive = [bool]$alive
+        supersedeSha = (Clip "$($r.supersedeSha)" 64); pendingSha = (Clip "$($r.pendingSha)" 64); session = (Clip "$($r.session)" 120); pid = [int]$r.pid; started = (Iso (ParseUtc $r.started)); alive = [bool]$alive
       })
   }
   $out
@@ -268,12 +276,37 @@ if ($Install) {
   $vbs = 'E:\gh\vmui\scripts\hidden-run.vbs'
   if (-not (Test-Path $vbs)) { throw "missing $vbs (hidden launcher; a bare pwsh task flashes a console)" }
   $pwsh = (Get-Command pwsh).Source
-  $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Loop"
-  $trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-  Register-ScheduledTask -TaskName 'agentq-sync' -Action $act -Trigger $trg -Settings $set -Description 'agentq -> hub.codai.ro mirror' -Force | Out-Null
+  # Replace whichever model is live, including a -Loop started OUTSIDE the task: an old -Loop keeps the
+  # script it loaded at start (a mid-life edit is silently ignored) and would double-push beside the new
+  # tick (exactly the git-autosync failure, ADR 0010: the 2026-11-18 loop ran 20 h on stale code).
+  try { Stop-ScheduledTask -TaskName 'agentq-sync' -ErrorAction Stop } catch { }
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'agentq-sync' -and $_.CommandLine -match '-Loop' } |
+    ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; "stopped the old long-lived loop (pid $($_.ProcessId))" } catch { } }
+  $common = '-NoProfile -ExecutionPolicy Bypass -File ' + "`"$PSCommandPath`""
+  if ($InstallLoop) {
+    # Long-lived model (kept for anyone who wants warmth): the code is FROZEN at load time.
+    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common -Loop"
+    $trg = @(New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $desc = 'agentq -> hub.codai.ro mirror (long-lived -Loop, code frozen at start)'
+  } else {
+    # One push per tick: the code is always current. IgnoreNew skips a tick whose predecessor still
+    # runs (the in-loop mutex + the HTTP timeout bound a normal pass well under the cap); the 5-minute
+    # cap ends a wedged push instead of blocking every later tick via IgnoreNew; StartWhenAvailable runs
+    # a tick missed to a reboot or sleep. 1 min = the Task Scheduler repetition floor (the old loop
+    # slept 15 s, shorter than the scheduler allows).
+    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common"
+    $trg = @(
+      (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1))
+    )
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+    $desc = 'agentq -> hub.codai.ro mirror (one push per 1 min tick)'
+  }
+  Register-ScheduledTask -TaskName 'agentq-sync' -Action $act -Trigger $trg -Settings $set -Description $desc -Force | Out-Null
   Start-ScheduledTask -TaskName 'agentq-sync'
-  'installed + started scheduled task agentq-sync'
+  "installed + started scheduled task agentq-sync ($desc)"
   exit 0
 }
 if ($Loop) {

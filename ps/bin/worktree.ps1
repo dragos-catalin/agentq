@@ -11,7 +11,7 @@
 
     worktree.ps1 new   -Name <n> [-Ref <sha|branch>] [-Branch <new-branch>] [-Purpose <text>] [-Install] [-NoEnvCopy]
     worktree.ps1 list  [-All]
-    worktree.ps1 prune [-OlderThanHours 12] [-WhatIf] [-All]
+    worktree.ps1 prune [-OlderThanHours 12] [-ParkedIdleDays 3] [-WhatIf] [-All]
     worktree.ps1 remove -Path <dir> [-Force]
     worktree.ps1 relocate [-All] [-OlderThanHours 3] [-WhatIf]
 
@@ -42,12 +42,26 @@
   no process references it. `.cargo-target-*` build caches count as orphans with
   no source files. Anything else is kept and listed with the reason.
 
+  PARKED SLOTS (prune -ParkedIdleDays, default 3): an UNLEASED standard slot that
+  still holds unsaved work (tracked modifications or untracked non-ignored files)
+  is otherwise kept forever, and the NEXT lease of that slot may reset it - silent
+  loss. Once such a slot has been idle >= -ParkedIdleDays and no live process
+  references it, prune backs the WHOLE state (tracked + untracked) up on an
+  isolated temp index to refs/backup/wt/<repo>/<slot>/<ts>, VERIFIES the ref path
+  by path (rev-parse ref:<path> == hash-object <file>), also writes a thin bundle
+  under ~/.codai/parked/<repo>/<slot>/bundles/<ts>.bundle, and only then removes
+  the worktree. A leased/locked/main slot, a slot with a live process, a slot
+  younger than the bound and a slot whose backup could not be proven are all left
+  untouched (and the reason is printed).
+
   Run from inside the repo, or pass -Repo. -All = every repo under E:\gh that
   has worktrees (used by the scheduled task).
 
     v2 (ADR 0001, E:\gh\agentq\docs\adr\0001-*.md): only STANDARD SLOTS exist - task-1..N,
     release[-2..], land, and pinned names from agentq-config.json. Agents get one with
-      worktree.ps1 lease [-Slot task-2] -Purpose '<why>' [-Branch b] [-Ref r]   (= agentq lease)
+      worktree.ps1 lease [-Slot task-2] -Purpose '<why>' [-Branch b] [-Ref r] [-Wait [-MaxMin n]]
+          (= agentq lease; -Wait polls for a free slot, bounded to n min, default 5:
+           exit 0 leased, 7 bound expired, 3 frozen/blocked)
       worktree.ps1 unlease -Path <slot dir> -LeaseId <id>
     A LEASED slot is never removed/pruned/migrated, whatever its git state. `migrate` backs up
     every non-standard (legacy) worktree and orphan dir to refs/backup/wt/... on origin, then
@@ -66,11 +80,14 @@ param(
   [string]$Purpose = '',
   [string]$Path,
   [double]$OlderThanHours = 12,
+  [double]$ParkedIdleDays = 3,
   [switch]$Install,
   [switch]$NoEnvCopy,
   [switch]$All,
   [switch]$Force,
-  [switch]$KeepBranch
+  [switch]$KeepBranch,
+  [switch]$Wait,
+  [double]$MaxMin
 )
 $ErrorActionPreference = 'Stop'
 $WtRoot = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
@@ -140,6 +157,22 @@ function Get-Worktrees([string]$main) {
   return $list
 }
 
+# Idle hours of a worktree: the LAST real use, from the reflog entry's own timestamp + the HEAD and
+# copilot-meta.json mtimes. Explicitly NOT the index (any `git status` rewrites it) and NOT file
+# mtimes under logs/ (gc and reflog-expire rewrite them). $null when the git dir cannot be resolved.
+function Get-WtIdleHours([string]$wtPath) {
+  $gitdir = (git -C $wtPath rev-parse --path-format=absolute --git-dir 2>$null)
+  if (-not $gitdir) { return $null }
+  $gitdir = $gitdir.Replace('/', '\')
+  $stamps = @()
+  $ct = git -C $wtPath log -g -1 --format=%ct 2>$null
+  if ($ct) { $stamps += [DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime }
+  foreach ($f in 'HEAD', 'copilot-meta.json') { $p = Join-Path $gitdir $f; if (Test-Path -LiteralPath $p) { $stamps += (Get-Item -LiteralPath $p).LastWriteTime } }
+  if (-not $stamps.Count) { $stamps = @((Get-Item -LiteralPath $gitdir).LastWriteTime) }
+  $last = ($stamps | Sort-Object -Descending | Select-Object -First 1)
+  return [Math]::Round(((Get-Date) - $last).TotalHours, 1)
+}
+
 function Get-Assessment($wt, [string]$main) {
   $r = [ordered]@{ Path = $wt.Path; Branch = $(if ($wt.Branch) { $wt.Branch } else { '(detached)' }); Head = $wt.Head.Substring(0, [Math]::Min(9, $wt.Head.Length)); IdleHours = $null; Removable = $false; Reason = '' }
   if ($wt.Main) { $r.Reason = 'main working tree'; return [pscustomobject]$r }
@@ -147,19 +180,7 @@ function Get-Assessment($wt, [string]$main) {
   if ($holder) { $r.Reason = "LEASED by $holder"; return [pscustomobject]$r }
   if ($wt.Locked) { $r.Reason = 'locked (git worktree lock)'; return [pscustomobject]$r }
   if (-not (Test-Path -LiteralPath $wt.Path)) { $r.Removable = $true; $r.Reason = 'missing on disk (stale registration)'; return [pscustomobject]$r }
-  $gitdir = (git -C $wt.Path rev-parse --path-format=absolute --git-dir 2>$null)
-  if ($gitdir) {
-    $gitdir = $gitdir.Replace('/', '\')
-    # NOT the index (any `git status` rewrites it) and NOT file mtimes under logs/ (gc and
-    # reflog-expire rewrite them). The last reflog ENTRY's own timestamp = last real use.
-    $stamps = @()
-    $ct = git -C $wt.Path log -g -1 --format=%ct 2>$null
-    if ($ct) { $stamps += [DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime }
-    foreach ($f in 'HEAD', 'copilot-meta.json') { $p = Join-Path $gitdir $f; if (Test-Path -LiteralPath $p) { $stamps += (Get-Item -LiteralPath $p).LastWriteTime } }
-    if (-not $stamps.Count) { $stamps = @((Get-Item -LiteralPath $gitdir).LastWriteTime) }
-    $last = ($stamps | Sort-Object -Descending | Select-Object -First 1)
-    $r.IdleHours = [Math]::Round(((Get-Date) - $last).TotalHours, 1)
-  }
+  $r.IdleHours = Get-WtIdleHours $wt.Path
   $tracked = @(git --no-optional-locks -C $wt.Path status --porcelain --untracked-files=no 2>$null | Where-Object { $_ })
   if ($tracked.Count) { $r.Reason = "$($tracked.Count) tracked change(s)"; return [pscustomobject]$r }
   $untracked = @(git --no-optional-locks -C $wt.Path status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ -like '??*' })
@@ -180,6 +201,108 @@ function Get-Assessment($wt, [string]$main) {
   if ($role -and $null -ne $r.IdleHours -and $r.IdleHours -lt $script:CfgCache.unleasedRemoveIdleHours) { $r.Reason = "standard $role slot, idle $($r.IdleHours)h (< $($script:CfgCache.unleasedRemoveIdleHours) h)"; return [pscustomobject]$r }
   $r.Removable = $true; $r.Reason = 'clean, pushed, idle'
   return [pscustomobject]$r
+}
+
+# Prune deletes only provably disposable worktrees; an UNLEASED standard slot that still holds unsaved
+# work (tracked modifications or untracked non-ignored files) is otherwise kept forever, and the NEXT
+# lease of that slot may reset it -> silent work loss. Such a slot is PARKED once idle >= -ParkedIdleDays
+# and no live process references it. Returns @{ Park; Reason; IdleHours }. Never matches a leased slot,
+# the main tree, a locked worktree, a slot with a live process, a non-standard slot or a slot younger
+# than the bound.
+function Get-ParkDecision($wt, [string]$main, [double]$IdleDays) {
+  $d = [ordered]@{ Park = $false; Reason = ''; IdleHours = $null }
+  if (-not (Get-SlotRoleLocal (Split-Path -Leaf $main) (Split-Path -Leaf $wt.Path))) { $d.Reason = 'not a standard slot'; return [pscustomobject]$d }
+  if (Get-LeaseHolder $wt.Path) { $d.Reason = 'LEASED'; return [pscustomobject]$d }
+  if ($wt.Locked) { $d.Reason = 'locked'; return [pscustomobject]$d }
+  if (-not (Test-Path -LiteralPath $wt.Path)) { $d.Reason = 'missing on disk'; return [pscustomobject]$d }
+  $tracked = @(git --no-optional-locks -C $wt.Path status --porcelain --untracked-files=no 2>$null | Where-Object { $_ })
+  $untracked = @(git --no-optional-locks -C $wt.Path status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ -like '??*' })
+  if (-not $tracked.Count -and -not $untracked.Count) { $d.Reason = 'no unsaved work'; return [pscustomobject]$d }
+  $d.IdleHours = Get-WtIdleHours $wt.Path
+  if ($null -eq $d.IdleHours) { $d.Reason = 'idle unknown'; return [pscustomobject]$d }
+  if ($d.IdleHours -lt ($IdleDays * 24)) { $d.Reason = "idle $($d.IdleHours) h (< $([math]::Round($IdleDays * 24, 1)) h)"; return [pscustomobject]$d }
+  if (Test-InUseByProcess $wt.Path) { $d.Reason = 'a running process references this path'; return [pscustomobject]$d }
+  $d.Park = $true
+  $d.Reason = "$($tracked.Count) tracked / $($untracked.Count) untracked change(s), idle $($d.IdleHours) h"
+  return [pscustomobject]$d
+}
+
+# Back up the WHOLE slot state (tracked edits + untracked non-ignored files) into one commit via an
+# ISOLATED temp index - never the slot's own index or HEAD - and publish it as
+# refs/backup/wt/<repo>/<slot>/<ts>, then PROVE it: every changed/untracked path must hash to exactly
+# the worktree file's content. A thin local bundle (origin's objects excluded) is written under
+# ~/.codai/parked. Returns @{ Ok; Ref; Bundle; Why }. When the proof cannot be made the caller KEEPS the
+# slot - a lossy removal is never allowed.
+function Save-ParkedSlot([string]$wtPath, [string]$repoName, [string]$slot) {
+  $res = [ordered]@{ Ok = $false; Ref = ''; Bundle = ''; Why = '' }
+  $head = & git -C $wtPath rev-parse --verify -q HEAD 2>$null
+  if ($LASTEXITCODE -or -not $head) { $res.Why = 'no valid HEAD (broken worktree)'; return [pscustomobject]$res }
+  $head = "$head".Trim()
+  $tracked = @(git --no-optional-locks -C $wtPath diff --name-only HEAD 2>$null | Where-Object { $_ })
+  $untracked = @(git --no-optional-locks -C $wtPath ls-files --others --exclude-standard 2>$null | Where-Object { $_ })
+  $paths = @(@($tracked + $untracked) | Where-Object { $_ } | Select-Object -Unique)
+  $gitDir = ((& git -C $wtPath rev-parse --path-format=absolute --git-dir 2>$null) -replace '/', '\')
+  if (-not $gitDir) { $res.Why = 'cannot resolve git dir'; return [pscustomobject]$res }
+  $tmpIdx = Join-Path ([IO.Path]::GetTempPath()) ('wt-park-idx-' + [guid]::NewGuid().ToString('N'))
+  $realIdx = Join-Path $gitDir 'index'
+  if (Test-Path -LiteralPath $realIdx) { Copy-Item -LiteralPath $realIdx $tmpIdx -Force }
+  $prevIdx = $env:GIT_INDEX_FILE
+  $tree = ''
+  try {
+    $env:GIT_INDEX_FILE = $tmpIdx
+    if (-not (Test-Path -LiteralPath $tmpIdx)) { & git -C $wtPath read-tree HEAD 2>$null | Out-Null }
+    & git -C $wtPath add -A 2>$null | Out-Null
+    if ($LASTEXITCODE) { $res.Why = 'git add -A on a temp index failed'; return [pscustomobject]$res }
+    # GitHub refuses blobs > 100 MB: leave huge added files out of the commit. Their path then fails
+    # the verify below, so an incomplete backup is REFUSED rather than accepted.
+    $big = @(& git -C $wtPath diff --cached --name-only --diff-filter=A HEAD 2>$null | Where-Object { $_ } | Where-Object { $f = Join-Path $wtPath $_; (Test-Path -LiteralPath $f -PathType Leaf) -and (Get-Item -LiteralPath $f).Length -gt 50MB })
+    foreach ($b in $big) { & git -C $wtPath rm -q --cached -- $b 2>$null | Out-Null }
+    $tree = & git -C $wtPath write-tree 2>$null
+    $treeCode = $LASTEXITCODE
+    $tree = "$tree".Trim()
+    if ($treeCode -or -not $tree) { $res.Why = 'write-tree failed'; return [pscustomobject]$res }
+  } finally {
+    if ($prevIdx) { $env:GIT_INDEX_FILE = $prevIdx } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $tmpIdx -Force -ErrorAction SilentlyContinue
+  }
+  $ts = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+  $msgFile = [IO.Path]::GetTempFileName()
+  [IO.File]::WriteAllText($msgFile, "worktree prune park ${repoName}/${slot}: unleased standard slot with unsaved work backed up before removal`n`nhead: $head`n", [Text.UTF8Encoding]::new($false))
+  $commit = & git -C $wtPath -c user.name=agentq -c user.email=agentq@localhost commit-tree $tree -p $head -F $msgFile 2>$null
+  $commitCode = $LASTEXITCODE
+  $commit = "$commit".Trim()
+  Remove-Item $msgFile -Force -ErrorAction SilentlyContinue
+  if ($commitCode -or -not $commit) { $res.Why = 'commit-tree failed'; return [pscustomobject]$res }
+  $ref = "refs/backup/wt/$repoName/$slot/$ts"
+  & git -C $wtPath show-ref --verify -q $ref 2>$null
+  if ($LASTEXITCODE -eq 0) { $ref = "$ref-" + ([guid]::NewGuid().ToString('N').Substring(0, 4)) }
+  & git -C $wtPath update-ref $ref $commit 2>$null
+  if ($LASTEXITCODE) { $res.Why = "update-ref $ref failed"; return [pscustomobject]$res }
+  $res.Ref = $ref
+  # Prove the ref: every changed/untracked path must hold EXACTLY the worktree bytes (--path applies
+  # the same clean filters `git add` did, so a CRLF worktree file matches its stored LF blob).
+  foreach ($p in $paths) {
+    $f = Join-Path $wtPath $p
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+    $want = & git -C $wtPath hash-object "--path=$p" -- $f 2>$null
+    $want = "$want".Trim()
+    $got = & git -C $wtPath rev-parse --verify -q "${ref}:$p" 2>$null
+    $got = "$got".Trim()
+    if (-not $want -or $got -ne $want) { $res.Why = "verify failed for $p"; return [pscustomobject]$res }
+  }
+  $parkRoot = if ($env:AGENTQ_PARK_ROOT) { $env:AGENTQ_PARK_ROOT } else { Join-Path $HOME '.codai\parked' }
+  $bdir = Join-Path (Join-Path (Join-Path $parkRoot $repoName) $slot) 'bundles'
+  New-Item -ItemType Directory -Force -Path $bdir | Out-Null
+  $bundle = Join-Path $bdir "$ts.bundle"
+  $bargs = @('bundle', 'create', '-q', $bundle, $ref)
+  if (@(git -C $wtPath remote 2>$null) -contains 'origin') { $bargs += @('--not', '--remotes=origin') }
+  & git -C $wtPath @bargs 2>$null | Out-Null
+  if ($LASTEXITCODE -or -not (Test-Path -LiteralPath $bundle)) { $res.Why = 'bundle create failed'; return [pscustomobject]$res }
+  & git -C $wtPath bundle verify -q $bundle 2>$null | Out-Null
+  if ($LASTEXITCODE) { $res.Why = 'bundle verify failed'; return [pscustomobject]$res }
+  $res.Bundle = $bundle
+  $res.Ok = $true
+  return [pscustomobject]$res
 }
 
 function Remove-WorktreeSafe([string]$wtPath, [string]$main) {
@@ -279,6 +402,7 @@ switch ($Action) {
     if ($Slot -or $Name) { $a += @('-Slot', $(if ($Slot) { $Slot } else { $Name })) }
     if ($Branch) { $a += @('-Branch', $Branch) }
     if ($PSBoundParameters.ContainsKey('Ref')) { $a += @('-Ref', $Ref) }
+    if ($Wait) { $a += '-Wait'; if ($PSBoundParameters.ContainsKey('MaxMin')) { $a += @('-MaxMin', "$MaxMin") } }
     & pwsh @a
     exit $LASTEXITCODE
   }
@@ -379,16 +503,38 @@ switch ($Action) {
     }
   }
   'prune' {
-    $removed = 0; $kept = 0
+    $removed = 0; $kept = 0; $parked = 0
     foreach ($main in Get-TargetRepos) {
       git -C $main worktree prune 2>$null
       foreach ($wt in Get-Worktrees $main) {
         $a = Get-Assessment $wt $main
         if ($wt.Main) { continue }
-        if (-not $a.Removable) { $kept++; Write-Host ("keep    {0,-60} {1}" -f $a.Path, $a.Reason); continue }
-        if ($PSCmdlet.ShouldProcess($a.Path, 'remove worktree')) {
-          if (Remove-WorktreeSafe $a.Path $main) { $removed++; Write-Host ("removed {0,-60} {1}" -f $a.Path, $a.Reason); Remove-BranchIfIntegrated $wt.Branch $main } else { $kept++ }
+        if ($a.Removable) {
+          if ($PSCmdlet.ShouldProcess($a.Path, 'remove worktree')) {
+            if (Remove-WorktreeSafe $a.Path $main) { $removed++; Write-Host ("removed {0,-60} {1}" -f $a.Path, $a.Reason); Remove-BranchIfIntegrated $wt.Branch $main } else { $kept++ }
+          }
+          continue
         }
+        # An UNLEASED standard slot still holding unsaved work is not provably disposable, but leaving
+        # it forever lets the next lease reset it silently: back it up in full, then remove it once it
+        # has been idle >= -ParkedIdleDays and no process references it.
+        $p = Get-ParkDecision $wt $main $ParkedIdleDays
+        if ($p.Park) {
+          if ($PSCmdlet.ShouldProcess($a.Path, "park: $($p.Reason)")) {
+            $b = Save-ParkedSlot $a.Path (Split-Path -Leaf $main) (Split-Path -Leaf $a.Path)
+            if ($b.Ok -and (Remove-WorktreeSafe $a.Path $main)) {
+              $removed++; $parked++
+              Write-Host ("parked  {0,-60} backup={1} bundle={2}" -f $a.Path, $b.Ref, $b.Bundle)
+              Remove-BranchIfIntegrated $wt.Branch $main
+            } elseif ($b.Ok) {
+              $kept++; Write-Host ("keep    {0,-60} backed up {1} but remove failed" -f $a.Path, $b.Ref)
+            } else {
+              $kept++; Write-Host ("keep    {0,-60} backup not proven: {1}" -f $a.Path, $b.Why)
+            }
+          }
+          continue
+        }
+        $kept++; Write-Host ("keep    {0,-60} {1}" -f $a.Path, $a.Reason); continue
       }
       foreach ($o in Get-OrphanDirs $main) {
         if (-not $o.Removable) { $kept++; Write-Host ("keep    {0,-60} {1}" -f $o.Path, $o.Reason); continue }
@@ -397,7 +543,7 @@ switch ($Action) {
         }
       }
     }
-    Write-Host "worktree prune: removed=$removed kept=$kept"
+    Write-Host "worktree prune: removed=$removed kept=$kept$(if ($parked) { " parked=$parked" })"
   }
   'relocate' {
     $moved = 0; $waiting = 0

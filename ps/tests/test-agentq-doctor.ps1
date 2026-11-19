@@ -8,14 +8,14 @@ $Aq = (Resolve-Path $Aq).Path
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aqdr-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $coord = Join-Path $tmp 'coord'; $wt = Join-Path $tmp 'wt'; $inst = Join-Path $tmp 'inst'; $srcPs = Join-Path $tmp 'src\ps'
 $cfg = Join-Path $tmp 'cfg.json'
-$envSet = 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_SESSION', 'AGENTQ_INSTALL_DIR', 'AGENTQ_DOCTOR_NO_TASKS'
+$envSet = 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_SESSION', 'AGENTQ_INSTALL_DIR', 'AGENTQ_DOCTOR_NO_TASKS', 'AGENTQ_GIT_AUTOSYNC'
 $env:AGENTQ_HOME = $coord
 $env:CODAI_WT_ROOT = $wt
 $env:AGENTQ_CONFIG = $cfg
 $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'; $env:AGENTQ_SESSION = 'test-doctor'
 $env:AGENTQ_INSTALL_DIR = $inst
 $env:AGENTQ_DOCTOR_NO_TASKS = '1'
-foreach ($v in 'AGENTQ_SRC', 'AGENTQ_DOCTOR_FAULT', 'AGENTQ_DOCTOR_SERIAL', 'AGENTQ_SYSTEM_HOME') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+foreach ($v in 'AGENTQ_SRC', 'AGENTQ_DOCTOR_FAULT', 'AGENTQ_DOCTOR_SERIAL', 'AGENTQ_SYSTEM_HOME', 'AGENTQ_GIT_AUTOSYNC') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $cfgText = '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"minFreeCommitGB":0}'
 [IO.File]::WriteAllText($cfg, $cfgText)
@@ -54,6 +54,8 @@ function Reset-State {
   Put (Join-Path $srcPs 'bin\agentq-config.json') $cfgSrc; Put (Join-Path $inst 'bin\agentq-config.json') $cfgSrc
   Write-Manifest
   [IO.File]::WriteAllText($cfg, $cfgText)
+  # the doctor's git-autosync check runs this fake in every case (section 13 covers fail/warn/missing)
+  $env:AGENTQ_GIT_AUTOSYNC = $gaOk
 }
 # A worktree slot: <wt>\<repo>\<slot>\.git is a FILE naming the gitdir. Returns the gitdir.
 function New-FakeSlot([string]$repoName, [string]$slot) {
@@ -96,6 +98,20 @@ function Get-TreeState([string]$dir) {
       if ($_.PSIsContainer) { "D $rel" } else { "F $rel $((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash) $($_.LastWriteTimeUtc.Ticks)" }
     })
 }
+
+# The doctor shells out to `git-autosync -Doctor`; point it at a FAKE (never the real scheduled task).
+function New-FakeGitAutosync([string]$name, [string[]]$lines, [int]$exitCode) {
+  $p = Join-Path $tmp "fake-ga\$name.ps1"
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $p)) | Out-Null
+  # each line is a PowerShell single-quoted literal, so a line that is not valid syntax on its own
+  # (e.g. "OK   snapshot fresh (newest verdict 3m ago)") still prints verbatim to stdout
+  $body = @(foreach ($l in $lines) { "'" + ($l -replace "'", "''") + "'" })
+  [IO.File]::WriteAllText($p, ((@($body) -join "`n") + "`nexit $exitCode`n"))
+  $p
+}
+$gaOk = New-FakeGitAutosync 'ok' @('OK   snapshot fresh (newest verdict 3m ago)', 'OK   no ghost keys in the snapshot', 'DOCTOR: OK (0 warning(s))') 0
+$gaFail = New-FakeGitAutosync 'fail' @('FAIL snapshot stale (newest verdict 430m ago > 15m) - ticks are not landing; try: schtasks /run /tn git-autosync', 'DOCTOR: 1 problem(s), 0 warning(s)') 3
+$gaWarn = New-FakeGitAutosync 'warn' @('WARN ghost key(s): a (a full pass drops them)', 'DOCTOR: OK (1 warning(s))') 0
 
 $deadPid = Get-DeadPid
 $gitProc = $null
@@ -334,7 +350,38 @@ try {
   Remove-Item Env:AGENTQ_DOCTOR_FAULT
   $crash = Rows $r 'stale-index-lock' 'warn'
   Check '12 crashed check -> one warn row "check crashed"' ($crash.Count -eq 1 -and $crash[0].detail -match '^check crashed: ') $raw
-  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 8 -and $code -eq 0) $raw
+  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 9 -and $code -eq 0) $raw
+
+  # ---- 13 git-autosync health folded into the doctor ------------------------------------------------
+  # The doctor does NOT re-implement git-autosync's checks: it runs the tool with -Doctor and folds the
+  # verdict in. A fake stands in for the tool, so nothing here touches the real scheduled task.
+  Reset-State
+  $r = DJ -All
+  Check '13a tool OK: no fail/warn rows, exit 0, 0 problems/warnings' (@(Rows $r 'git-autosync' 'fail').Count -eq 0 -and @(Rows $r 'git-autosync' 'warn').Count -eq 0 -and $code -eq 0 -and $r.problems -eq 0 -and $r.warnings -eq 0) $raw
+  Check '13a the tool''s OK lines are printed as info rows' (@($r.rows | Where-Object { $_.check -eq 'git-autosync' -and $_.kind -eq 'info' }).Count -eq 2) $raw
+  $o = AQ doctor -All
+  Check '13a human: ok line + the tool summary' ($code -eq 0 -and $o -match '(?m)^ok\s+git-autosync\s+DOCTOR: OK' -and $o -match '(?m)^info\s+git-autosync\b') $o
+
+  # 13b a FAIL from the tool makes the doctor report the problem and exit non-zero
+  $env:AGENTQ_GIT_AUTOSYNC = $gaFail
+  $r = DJ -All
+  $rows = Rows $r 'git-autosync' 'fail'
+  Check '13b FAIL from the tool -> a fail row naming the problem' ($rows.Count -eq 1 -and $rows[0].detail -match 'snapshot stale' -and $rows[0].hint -match 'run it by hand') $raw
+  Check '13b FAIL -> exit non-zero, counts 1 problem' ($code -eq 1 -and $r.problems -eq 1 -and $r.warnings -eq 0) $raw
+  $o = AQ doctor -All
+  Check '13b human: FAIL line under git-autosync, exit 1' ($code -eq 1 -and $o -match '(?m)^FAIL\s+git-autosync\s+snapshot stale' -and $o -match 'doctor: 1 problem\(s\), 0 warning\(s\)') $o
+
+  # 13c a WARN is counted as a warning; the exit stays 0
+  $env:AGENTQ_GIT_AUTOSYNC = $gaWarn
+  $r = DJ -All
+  Check '13c WARN from the tool -> a warn row, warning counted, exit 0' (@(Rows $r 'git-autosync' 'warn').Count -eq 1 -and $r.problems -eq 0 -and $r.warnings -eq 1 -and $code -eq 0) $raw
+
+  # 13d a missing tool is a WARNING (never a FAIL, never a crash)
+  $env:AGENTQ_GIT_AUTOSYNC = (Join-Path $tmp 'nope\git-autosync.ps1')
+  $r = DJ -All
+  $rows = Rows $r 'git-autosync' 'warn'
+  Check '13d missing tool -> one warn "(git-autosync not installed)", exit 0' ($rows.Count -eq 1 -and $rows[0].detail -match 'git-autosync not installed' -and $r.problems -eq 0 -and $r.warnings -eq 1 -and $code -eq 0) $raw
+  $env:AGENTQ_GIT_AUTOSYNC = $gaOk
 } finally {
   if ($gitProc) { try { $gitProc.Kill($true) } catch {} }
   Pop-Location

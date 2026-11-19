@@ -45,6 +45,16 @@ What one pass does, per repo (only when it is provably safe):
   (knip failed on a file not in the commit; could also pass falsely) and retried a full pre-push every
   pass. Now: commits go to origin autosync/replay-<branch> (--no-verify, own namespace) and land via
   `agentq land` (clean slot, dedupe, hooks on the clean result). A failed land backs off -ReplayBackoffMin.
+
+  DAEMON (2026-11-19): the scheduled task runs ONE PASS PER TICK (a 2-minute repetition trigger), not a
+  long-lived -Loop. A -Loop process keeps the copy of this script it loaded at start, so an edit made
+  mid-life is silently ignored: the per-repo status snapshot landed 2026-11-18 07:37 while the loop
+  (started 05:16) was running, and for the next 20 h it kept syncing (log lines at 01:45Z) yet never
+  wrote a status - `-Status` showed all 24 repos "stale" and read as "the daemon is dead". One pass per
+  tick means every tick reads the current code and `-Status` can trust the snapshot's age. IgnoreNew skips
+  a tick whose predecessor still runs; ExecutionTimeLimit (30 min, ~5x a measured full pass) ends a wedged
+  pass so it cannot wedge every later tick. -Loop still works for a manual run; -InstallLoop restores the
+  old long-lived model. `-Doctor` is the one-command health check; `-Status` reports freshness + ghosts.
 Log: ~/.codai/git-autosync.log (one line per action). Exit 0 = in sync or moved, 3 = skipped/refused.
 #>
 param(
@@ -57,7 +67,10 @@ param(
   [string[]]$ReplayRepos = @('codai', 'brivio', 'money', 'metu', 'mmo'),
   # Repos whose agents commit locally and never push by policy (vitals ADR-0019): unpushed commits are expected.
   [string[]]$LocalCommitRepos = @('vitals'),
-  [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$Status,
+  [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$InstallLoop,
+  [switch]$Status, [switch]$Doctor,
+  # Read-only: what the next pass would decide for ONE repo, and why (never moves anything).
+  [string]$Explain,
   [switch]$ParkNow, [double]$ParkIdleHours = 1, [switch]$Report,
   # Opt-in (or fleet config `autosync.parkConflictingCommits`): a local commit whose patch CONFLICTS
   # with upstream is parked - backed up, dumped as a patch, dropped from the local branch - instead of
@@ -148,10 +161,16 @@ function Get-State { if (Test-Path $StateFile) { try { return (Get-Content $Stat
 function Set-State($s) { [IO.File]::WriteAllText($StateFile, ($s | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false)) }
 function Get-StatusMap { if (Test-Path $StatusFile) { try { return (Get-Content $StatusFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }; @{} }
 function Save-StatusMap($m) {
-  # Atomic: -Status (or a human) must never read a half-written table.
-  $tmp = "$StatusFile.new"
-  [IO.File]::WriteAllText($tmp, ($m | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
-  Move-Item -Force $tmp $StatusFile
+  # Atomic AND collision-safe: -Status (or a human) must never read a half-written table, and since
+  # 2026-11-19 the map is written PER REPO, so a scheduled tick and a manual run can write at the same
+  # moment (they are serialised only per repo, not for this write). A fixed ".new" name collided and the
+  # failed Move-Item threw - which, with $ErrorActionPreference='Stop', would kill the whole pass. A
+  # unique temp plus a swallowed failure is correct here: a lost write is rewritten by the next pass.
+  $tmp = "$StatusFile.$PID.$([guid]::NewGuid().ToString('N').Substring(0, 6)).new"
+  try {
+    [IO.File]::WriteAllText($tmp, ($m | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+    Move-Item -Force $tmp $StatusFile -ErrorAction Stop
+  } catch { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 }
 
 # 'private' | 'public' | 'unknown', cached 24 h. GIT_AUTOSYNC_VISIBILITY overrides (tests).
@@ -656,6 +675,15 @@ function Sync-Repo([string]$r) {
   return @{ code = 0; msg = "moved $($head.Substring(0,8)) -> $($target.Substring(0,8)): $what" }
 }
 
+if ($Explain) {
+  # WHY a repo is refused or would move - the classification, without moving anything. A plain -WhatIf
+  # already prints the reason; -Explain is the named, single-repo entry point (and the thing -Status
+  # points at), so nobody has to remember the flag combination or read this script at 3 a.m.
+  if (-not (Test-Path (Join-Path $Explain '.git'))) { "not a repo: $Explain"; exit 2 }
+  "explain $Explain (read-only; nothing is moved):"
+  & pwsh -NoProfile -File $PSCommandPath -Repo $Explain -WhatIf
+  exit $LASTEXITCODE
+}
 if ($Report) {
   # Daily drift report: every repo that is behind its upstream, with the last autosync reason.
   $rows = @()
@@ -680,20 +708,83 @@ if ($Report) {
   if ($rows.Count -and (Test-Path $aq)) { & pwsh -NoProfile -File $aq note -Message $msg *> $null }
   exit $(if ($rows.Count) { 3 } else { 0 })
 }
+if ($Doctor) {
+  # One command that answers "is the daemon doing its job RIGHT NOW". -Status's snapshot can be hours old
+  # while the log still looks alive, and checking 25 repos by hand takes minutes on the loaded machine.
+  $bad = 0; $warn = 0; $out = [Collections.Generic.List[string]]::new()
+  $t = Get-ScheduledTask -TaskName 'git-autosync' -ErrorAction SilentlyContinue
+  if (-not $t) { $out.Add('FAIL task git-autosync is not installed (run: git-autosync.ps1 -Install)'); $bad++ }
+  else {
+    $ti = Get-ScheduledTaskInfo -TaskName 'git-autosync' -ErrorAction SilentlyContinue
+    $rep = @($t.Triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval })
+    if ($rep.Count) { $out.Add("OK   task repeats every $($rep[0].Repetition.Interval) (state $($t.State))") }
+    elseif (-not @($t.Triggers | Where-Object { $_.Repetition }).Count) { $out.Add('FAIL task has no repeating trigger - it will not resume by itself after a pass ends'); $bad++ }
+    if ($ti -and [int]$ti.LastTaskResult -ne 0) { $out.Add("WARN last task result $($ti.LastTaskResult)"); $warn++ }
+  }
+  $sm = Get-StatusMap
+  if (-not $sm.Count) { $out.Add('FAIL no status snapshot yet - the daemon has not completed a pass'); $bad++ }
+  else {
+    $ages = @($sm.Values | ForEach-Object { try { [int](([DateTime]::UtcNow - [DateTime]$_.at).TotalMinutes) } catch { 99999 } })
+    $newest = ($ages | Measure-Object -Minimum).Minimum
+    if ($newest -le 15) { $out.Add("OK   snapshot fresh (newest verdict ${newest}m ago)") }
+    else { $out.Add("FAIL snapshot stale (newest verdict ${newest}m ago > 15m) - ticks are not landing; try: schtasks /run /tn git-autosync"); $bad++ }
+    $cfgLeaves = @{}; foreach ($rp in $Repo) { $cfgLeaves[(Split-Path $rp -Leaf)] = 1 }
+    $ghosts = @($sm.Keys | Where-Object { -not $cfgLeaves.ContainsKey($_) })
+    if ($ghosts.Count) { $out.Add("WARN ghost key(s): $($ghosts -join ', ') (a full pass drops them)"); $warn++ } else { $out.Add('OK   no ghost keys in the snapshot') }
+    $refused = @($sm.Values | Where-Object { [int]$_.code -eq 3 }).Count
+    if ($refused) { $out.Add("INFO $refused repo(s) refused on the last pass (see -Status)") }
+  }
+  $loopN = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' }).Count
+  if ($loopN -gt 1) { $out.Add("WARN $loopN long-lived loops are running"); $warn++ }
+  elseif ($loopN -eq 1) { $out.Add('INFO one long-lived loop is running (its code is frozen at start)') }
+  # The recovery surface is worth only what can be read back. A corrupted/GC'd object store is otherwise
+  # discovered on the day someone NEEDS the backup, so prove the newest backup ref of each configured repo
+  # still resolves to a readable commit. Bounded to 2 refs per repo (the repos carry thousands).
+  $nRefs = 0; $badRefs = @()
+  foreach ($rp in $Repo) {
+    if (-not (Test-Path (Join-Path $rp '.git'))) { continue }
+    foreach ($ref in @(G $rp for-each-ref --sort=-creatordate --count 2 --format='%(refname)' 'refs/backup/')) {
+      $nRefs++
+      if (-not (G $rp rev-parse --verify --quiet "$ref^{commit}" 2>$null)) { $badRefs += "$(Split-Path $rp -Leaf):$ref" }
+    }
+  }
+  if ($badRefs.Count) { $out.Add("FAIL unreadable backup ref(s): $($badRefs -join ', ')"); $bad++ }
+  elseif ($nRefs) { $out.Add("OK   $nRefs newest backup ref(s) resolve to readable commits") }
+  else { $out.Add('WARN no refs/backup/* refs found in any configured repo'); $warn++ }
+  $out | ForEach-Object { $_ }
+  ''
+  if ($bad) { "DOCTOR: $bad problem(s), $warn warning(s)"; exit 3 }
+  "DOCTOR: OK ($warn warning(s))"
+  exit 0
+}
 if ($Status) {
   $t = Get-ScheduledTask -TaskName 'git-autosync' -ErrorAction SilentlyContinue
-  if ($t) { "task: $($t.State)" } else { 'task: not installed' }
-  # The daemon has died twice unnoticed (2026-11-15, 2026-11-18): a task in "Ready" says nothing.
+  $ti = if ($t) { Get-ScheduledTaskInfo -TaskName 'git-autosync' -ErrorAction SilentlyContinue } else { $null }
+  if ($t) {
+    $rep = @($t.Triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval } | ForEach-Object { $_.Repetition.Interval }) -join ','
+    $head = "task: $($t.State)  trigger: $(if ($rep) { "repeats every $rep" } else { 'at-logon only' })"
+    if ($ti) { $head += "  last: $(if ($ti.LastRunTime -and $ti.LastRunTime.Year -gt 1900) { $ti.LastRunTime.ToString('HH:mm') } else { 'never' }) rc=$($ti.LastTaskResult)  next: $(if ($ti.NextRunTime -and $ti.NextRunTime.Year -gt 1900) { $ti.NextRunTime.ToString('HH:mm') } else { '-' })" }
+    $head
+  } else { 'task: not installed - run: git-autosync.ps1 -Install' }
+  # The old long-lived loop keeps the code it loaded at start (an edit mid-life is silently ignored): say
+  # which model is live. In one-pass mode there is no process between ticks, so snapshot AGE is the signal.
   $loopN = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync.*-Loop' }).Count
-  "loop: $(if ($loopN) { "running ($loopN)" } else { 'NOT RUNNING - start it: schtasks /run /tn git-autosync' })"
+      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' }).Count
+  "mode: $(if ($loopN) { "long-lived loop running ($loopN) - code frozen at start" } else { 'one pass per tick (self-updating)' })"
   $sm = Get-StatusMap
   if ($sm.Count) {
+    $ages = @($sm.Values | ForEach-Object { try { [int](([DateTime]::UtcNow - [DateTime]$_.at).TotalMinutes) } catch { 99999 } })
+    $newest = ($ages | Measure-Object -Minimum).Minimum
+    # A full pass is ~6 min; >15 min with a repeating trigger means ticks are not landing.
+    "snapshot: newest verdict ${newest}m ago -> $(if ($newest -le 15) { 'FRESH' } else { 'STALE - ticks are not landing; check the task (schtasks /run /tn git-autosync)' })"
+    $cfgLeaves = @{}; foreach ($rp in $Repo) { $cfgLeaves[(Split-Path $rp -Leaf)] = 1 }
     "repos ($($sm.Count)) - verdict of the last pass (the log deliberately omits the steady in-sync state):"
     foreach ($k in ($sm.Keys | Sort-Object)) {
       $e = $sm[$k]
       $age = try { [int](([DateTime]::UtcNow - [DateTime]$e.at).TotalMinutes) } catch { -1 }
-      $m = "$($e.msg)"; if ($m.Length -gt 104) { $m = $m.Substring(0, 104) + '...' }
+      $m = "$($e.msg)"; if (-not $cfgLeaves.ContainsKey($k)) { $m = '(not in the configured repo list) ' + $m }
+      if ($m.Length -gt 104) { $m = $m.Substring(0, 104) + '...' }
       "{0,-14} {1,5}m  {2}" -f $k, $age, $m
     }
     ''
@@ -796,13 +887,51 @@ if ($Install) {
   $vbs = 'E:\gh\vmui\scripts\hidden-run.vbs'
   if (-not (Test-Path $vbs)) { throw "missing $vbs (hidden launcher)" }
   $pwsh = (Get-Command pwsh).Source
-  $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Loop"
-  $trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-  Register-ScheduledTask -TaskName 'git-autosync' -Action $act -Trigger $trg -Settings $set -Description 'fast-forward shared clones to upstream when safe' -Force | Out-Null
+  # Replace whichever model is live, including a loop started OUTSIDE the task: an old -Loop keeps the
+  # script it loaded at start and would double-sync beside the new tick.
+  try { Stop-ScheduledTask -TaskName 'git-autosync' -ErrorAction Stop } catch { }
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' } |
+    ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; "stopped the old long-lived loop (pid $($_.ProcessId))" } catch { } }
+  $common = '-NoProfile -ExecutionPolicy Bypass -File ' + "`"$PSCommandPath`""
+  if ($InstallLoop) {
+    # Long-lived model (kept for anyone who wants warmth): the code is FROZEN at load time.
+    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common -Loop"
+    $trg = @(New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $desc = 'fast-forward shared clones to upstream when safe (long-lived -Loop, code frozen at start)'
+  } else {
+    # One pass per tick: the code is always current (see DAEMON in the header). IgnoreNew skips a tick
+    # whose predecessor is still running; the 30-minute cap ends a wedged pass instead of letting it
+    # block every later tick via IgnoreNew; StartWhenAvailable runs a tick missed to a reboot or sleep.
+    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common"
+    $trg = @(
+      (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2))
+    )
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    $desc = 'fast-forward shared clones to upstream when safe (one pass per 2 min tick)'
+  }
+  Register-ScheduledTask -TaskName 'git-autosync' -Action $act -Trigger $trg -Settings $set -Description $desc -Force | Out-Null
   Start-ScheduledTask -TaskName 'git-autosync'
-  'installed + started scheduled task git-autosync'
-  exit 0
+  # Self-check (2026-11-19): registering a task proves nothing (the daemon died unnoticed twice, and the
+  # stale-loop episode looked healthy from the task state). The status map is written PER REPO, so a fresh
+  # 'at' appears within seconds of the first pass starting - wait bounded for it and say so.
+  $fresh = $false; $deadline = (Get-Date).AddSeconds(150)
+  while (-not $fresh -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $StatusFile) {
+      try { $m = Get-Content $StatusFile -Raw | ConvertFrom-Json -AsHashtable } catch { $m = @{} }
+      foreach ($k in @($m.Keys)) {
+        $a = $m[$k].at
+        if ($a -and ([DateTime]::UtcNow - [DateTime]$a).TotalMinutes -lt 3) { $fresh = $true; break }
+      }
+    }
+  }
+  "installed + started scheduled task git-autosync ($desc)"
+  if ($fresh) { 'self-check OK: a fresh per-repo verdict landed (the new model is running)'; exit 0 }
+  'self-check FAILED: no fresh per-repo verdict within 150 s - run: schtasks /run /tn git-autosync, then git-autosync.ps1 -Doctor'
+  exit 3
 }
 
 if ($Loop) {
@@ -839,12 +968,26 @@ do {
     # broken. $StatusFile (written once below) is the per-repo answer; -Status renders it.
     $repeat = $Loop -and $LastMsg[$r] -eq $res.msg; $LastMsg[$r] = $res.msg
     if ($res.msg -ne 'in sync' -and -not $repeat -and -not ($Loop -and $res.msg -like 'skip:*')) { Write-Log $r $res.msg } elseif (-not $Loop) { "$((Split-Path $r -Leaf)) $($res.msg)" }
-    $pass[(Split-Path $r -Leaf)] = @{ at = [DateTime]::UtcNow.ToString('o'); code = [int]$res.code; msg = "$($res.msg)" }
+    $leaf = (Split-Path $r -Leaf)
+    $pass[$leaf] = @{ at = [DateTime]::UtcNow.ToString('o'); code = [int]$res.code; msg = "$($res.msg)" }
+    # Persist AT ONCE, not only at the end of the pass: a 25-repo pass takes ~6 min (measured 349 s on
+    # 2026-11-19), and -Status / -Doctor / the -Install self-check must see a fresh verdict within
+    # seconds of the pass starting. The end-of-pass block below still does the ONE prune of the table.
+    if (-not $WhatIf) { $one = Get-StatusMap; $one[$leaf] = $pass[$leaf]; Save-StatusMap $one }
     if ($res.code) { $rc = $res.code }
   }
   if ($pass.Count) {
     $sm = Get-StatusMap
     foreach ($k in $pass.Keys) { $sm[$k] = $pass[$k] }
+    # A FULL pass drops verdicts for repos no longer configured: the map otherwise only ever grows, so a
+    # key written when the list held something else (a stray path, a renamed repo) lingers forever and
+    # -Status renders it as a live verdict (2026-11-19: a phantom repo "a" sat in the table for weeks).
+    # A single-repo run ($Repo.Count -eq 1 - the manual and test path) keeps the merge so it never wipes
+    # the rest of the table.
+    if ($Repo.Count -gt 1) {
+      $leaves = @{}; foreach ($rp in $Repo) { $leaves[(Split-Path $rp -Leaf)] = 1 }
+      foreach ($k in @($sm.Keys)) { if (-not $leaves.ContainsKey($k)) { $sm.Remove($k) } }
+    }
     Save-StatusMap $sm
   }
   if ($Loop) { $rc = 0; Start-Sleep -Seconds $IntervalSec }

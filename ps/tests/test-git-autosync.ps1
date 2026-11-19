@@ -230,5 +230,38 @@ $r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; (Get-Item 
 Ok ((Run $r) -eq 3) '11d held (<1 h idle)'
 $env:GIT_AUTOSYNC_OWNER_CHECK = 'off'
 
+# 12 the status snapshot drops keys for repos no longer in the list on a FULL pass, but a single-repo run
+#    keeps the rest of the table (2026-11-19: a phantom repo "a" rendered as a live verdict for weeks, and
+#    the map only ever grew). The array MUST be passed via -Command: `pwsh -File s.ps1 -Repo a,b`
+#    stringifies it and binds the extra element positionally (see the git-autosync repo memory).
+$status = Join-Path $root 'git-autosync-status.json'
+Remove-Item $status -ErrorAction SilentlyContinue
+$g1 = Join-Path $root 'ghost1'; $g2 = Join-Path $root 'ghost2'
+foreach ($d in $g1, $g2) { & pwsh -NoProfile -Command "New-Item -ItemType Directory -Force '$d' | Out-Null; git init -q -b main '$d' | Out-Null" *> $null }
+& pwsh -NoProfile -Command "& '$tool' -Repo @('$g1','$g2')" *> $null
+$keys = @((Get-Content $status -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+Ok (($keys -contains 'ghost1') -and ($keys -contains 'ghost2')) '12 full pass wrote both keys'
+$j = Get-Content $status -Raw | ConvertFrom-Json
+$j | Add-Member -NotePropertyName 'ghostX' -NotePropertyValue @{ at = [DateTime]::UtcNow.ToString('o'); code = 0; msg = 'in sync' } -Force
+[IO.File]::WriteAllText($status, ($j | ConvertTo-Json -Depth 5))
+& pwsh -NoProfile -Command "& '$tool' -Repo @('$g1','$g2')" *> $null
+$keys = @((Get-Content $status -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+Ok (-not ($keys -contains 'ghostX')) '12 full pass dropped the ghost key'
+Ok (($keys -contains 'ghost1') -and ($keys -contains 'ghost2')) '12 real keys kept'
+& pwsh -NoProfile -Command "& '$tool' -Repo '$g1'" *> $null
+$keys = @((Get-Content $status -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+Ok ($keys -contains 'ghost2') '12 single-repo run kept the other keys'
+
+# 13 -Doctor must never crash and must print a verdict (exit 0 ok/warn, 3 problem - both accepted, the
+#    task may legitimately not be installed on the machine running the suite); -Explain is read-only.
+$r = Fresh; Push-B $r 'x.txt' "d`n"
+$doc = (& pwsh -NoProfile -Command "& '$tool' -Repo '$($r.a)' -Doctor" 2>&1 | Out-String); $docRc = $LASTEXITCODE
+Ok ($docRc -in @(0, 3)) '13 -Doctor exits 0 or 3'
+Ok ($doc -match 'DOCTOR:') '13 -Doctor prints a verdict line'
+$hBefore = (git -C $r.a rev-parse HEAD)
+$ex = (& pwsh -NoProfile -Command "& '$tool' -Explain '$($r.a)'" 2>&1 | Out-String)
+Ok ($ex -match 'explain .*(read-only)') '13 -Explain prints its banner'
+Ok ((git -C $r.a rev-parse HEAD) -eq $hBefore) '13 -Explain moved nothing'
+
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

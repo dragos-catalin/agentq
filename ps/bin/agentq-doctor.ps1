@@ -499,6 +499,78 @@ function Test-DoctorTasks {
   }
 }
 
+# ---- 8. git-autosync (the daemon health), via its own -Doctor -----------------------------------
+# One command covers everything: instead of re-implementing its checks (scheduled task, snapshot
+# freshness, ghost keys, long-lived loops), call `git-autosync -Doctor` and fold its verdict into this
+# report. A FAIL line makes this doctor exit non-zero; WARN lines are counted as warnings; OK/INFO
+# lines are printed as info rows. Bounded (120 s). A missing or unreadable tool is a WARNING, never a
+# FAIL and never a crash: a machine without git-autosync is a valid install.
+function Get-DoctorGitAutosyncPath {
+  # an explicit override wins (tests point this at a fake); missing at that path is reported, not ignored
+  if ($env:AGENTQ_GIT_AUTOSYNC) { return "$($env:AGENTQ_GIT_AUTOSYNC)" }
+  $ctx = Get-DoctorInstallContext
+  # the installed copy (what the scheduled task runs), else the source checkout, else next to this script
+  $cands = @((Join-DoctorRel $ctx.inst 'bin\git-autosync.ps1'))
+  if ($ctx.srcDir) { $cands += (Join-DoctorRel $ctx.srcDir 'bin\git-autosync.ps1') }
+  if ($PSScriptRoot) { $cands += (Join-Path $PSScriptRoot 'git-autosync.ps1') }
+  foreach ($c in $cands) { if ($c -and [IO.File]::Exists($c)) { return $c } }
+  $null
+}
+function Test-DoctorGitAutosync {
+  $tool = Get-DoctorGitAutosyncPath
+  if (-not $tool -or -not [IO.File]::Exists($tool)) {
+    $where = if ($tool) { $tool } else { 'no installed copy and none next to this script' }
+    Add-DoctorRow 'git-autosync' 'warn' '' "(git-autosync not installed): $where" 'install it (git-autosync.ps1 -Install) or point AGENTQ_GIT_AUTOSYNC at it'
+    Add-DoctorSummary 'git-autosync' 'not installed'
+    return
+  }
+  $timeoutSec = 120
+  $psi = [Diagnostics.ProcessStartInfo]::new('pwsh')
+  foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $tool, '-Doctor')) { $psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  try { $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8 } catch { }
+  $proc = $null; $outTask = $null; $errTask = $null
+  try {
+    $proc = [Diagnostics.Process]::Start($psi)
+    # read async so a full pipe can never deadlock a long run
+    $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+  } catch {
+    if ($proc) { try { $proc.Dispose() } catch { } }
+    Add-DoctorRow 'git-autosync' 'warn' '' "(git-autosync not installed - could not start $tool): $($_.Exception.Message)" 'run it by hand: pwsh -NoProfile -File "<git-autosync.ps1>" -Doctor'
+    Add-DoctorSummary 'git-autosync' 'could not run'
+    return
+  }
+  if (-not $proc.WaitForExit($timeoutSec * 1000)) {
+    try { $proc.Kill($true) } catch { }
+    try { $proc.WaitForExit(5000) | Out-Null } catch { }
+    $proc.Dispose()
+    Add-DoctorRow 'git-autosync' 'warn' '' "git-autosync -Doctor did not finish within $timeoutSec s (killed): it may be wedged" 'run it by hand: pwsh -NoProfile -File "<git-autosync.ps1>" -Doctor'
+    Add-DoctorSummary 'git-autosync' "timed out after $timeoutSec s"
+    return
+  }
+  try { $proc.WaitForExit() } catch { }   # let the async readers drain before reading the result
+  $stdout = ''; $stderr = ''
+  try { $stdout = "$($outTask.GetAwaiter().GetResult())" } catch { }
+  try { $stderr = "$($errTask.GetAwaiter().GetResult())" } catch { }
+  $exit = 0; try { $exit = $proc.ExitCode } catch { }
+  $proc.Dispose()
+  $fails = 0; $summary = ''
+  $outLines = @($stdout -split "`r?`n" | Where-Object { "$_".Trim() })
+  foreach ($ln in $outLines) {
+    $t = "$ln".Trim()
+    if ($t -match '^FAIL\b') { $fails++; Add-DoctorRow 'git-autosync' 'fail' '' ($t -replace '^FAIL[ \t:]+', '') "run it by hand: pwsh -NoProfile -File `"$tool`" -Doctor" }
+    elseif ($t -match '^WARN\b') { Add-DoctorRow 'git-autosync' 'warn' '' ($t -replace '^WARN[ \t:]+', '') }
+    elseif ($t -match '^DOCTOR:') { $summary = $t }
+    else { Add-DoctorRow 'git-autosync' 'ok' '' $t }
+  }
+  # its own exit code is authoritative: exit 3 is a problem even if no FAIL line was parsed
+  if ($exit -eq 3 -and $fails -eq 0) { $fails++; Add-DoctorRow 'git-autosync' 'fail' '' 'git-autosync -Doctor exited 3 but printed no FAIL line' "run it by hand: pwsh -NoProfile -File `"$tool`" -Doctor" }
+  if ($stderr.Trim()) { Add-DoctorRow 'git-autosync' 'ok' '' "stderr: $($stderr.Trim())" }
+  $sum = if ($summary) { $summary } else { "$($outLines.Count) line(s), exit $exit" }
+  Add-DoctorSummary 'git-autosync' "$sum  [$tool]"
+}
+
 # ---- report -----------------------------------------------------------------------------------
 function Format-DoctorText($row) { if ($row.subject) { "$($row.subject): $($row.detail)" } else { "$($row.detail)" } }
 function Write-DoctorReport([object[]]$rows, [string[]]$order, [string]$header, [int]$fails, [int]$warns) {
@@ -547,6 +619,7 @@ function Invoke-Doctor {
     'marks'               = { Test-DoctorMarks }
     'state-size'          = { Test-DoctorStateSize }
     'scheduled-tasks'     = { Test-DoctorTasks }
+    'git-autosync'        = { Test-DoctorGitAutosync }
   }
   $timings = [ordered]@{}
   foreach ($cn in @($checks.Keys)) {

@@ -10,10 +10,20 @@ $Bin = (Resolve-Path $Bin).Path; $Hooks = (Resolve-Path $Hooks).Path
 $Tool = Join-Path $Bin 'worktree.ps1'; $Aq = Join-Path $Bin 'agentq.ps1'; $Deploy = Join-Path $Hooks 'deploy-clean.ps1'
 $fx = Join-Path $env:TEMP ('wtv2-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $env:CODAI_WT_ROOT = "$fx\.wt"; $env:AGENTQ_HOME = "$fx\coord"; $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_SESSION = 'wt-test'; $env:AGENTQ_BIN = $Bin
-'{"minFreeCommitGB":0}' | Set-Content "$fx-cfg.json"; $env:AGENTQ_CONFIG = "$fx-cfg.json"
+'{"minFreeCommitGB":0,"taskSlotsPerRepo":8}' | Set-Content "$fx-cfg.json"; $env:AGENTQ_CONFIG = "$fx-cfg.json"
 $fails = 0
 function Check([string]$n, [bool]$ok, [string]$d = '') { if ($ok) { Write-Host "PASS $n" } else { Write-Host "FAIL $n $d" -ForegroundColor Red; $script:fails++ } }
 function Run { $o = @(& pwsh -NoProfile @args 2>&1 | ForEach-Object { "$_" }); $script:code = $LASTEXITCODE; $o -join "`n" }
+# Age a slot so the tool's own idle check (HEAD commit committer date + HEAD/copilot-meta mtimes) sees
+# it as >= $days old: an empty commit back-dates the committer date, the mtimes are then set.
+function Age-Slot([string]$wt, [int]$days) {
+  $old = (Get-Date).ToUniversalTime().AddDays(-$days)
+  $env:GIT_COMMITTER_DATE = $old.ToString('o'); $env:GIT_AUTHOR_DATE = $old.ToString('o')
+  git -C $wt commit -q --allow-empty -m 'age-slot' 2>$null
+  Remove-Item Env:GIT_COMMITTER_DATE, Env:GIT_AUTHOR_DATE -ErrorAction SilentlyContinue
+  $gd = (git -C $wt rev-parse --path-format=absolute --git-dir).Replace('/', '\')
+  foreach ($n in 'HEAD', 'copilot-meta.json') { $p = Join-Path $gd $n; if (Test-Path -LiteralPath $p) { (Get-Item -LiteralPath $p).LastWriteTime = $old.ToLocalTime() } }
+}
 try {
   New-Item -ItemType Directory -Force "$fx\remote.git", "$fx\repo" | Out-Null
   git -C "$fx\remote.git" init -q --bare -b main
@@ -63,6 +73,40 @@ try {
   Check 'migrate left leased task-2 and standard task-1 alone' ((Test-Path "$fx\.wt\repo\task-2\a.txt") -and (Test-Path "$fx\.wt\repo\task-1\a.txt")) $o
   Check 'migrate ignores _-prefixed dirs' (Test-Path "$fx\.wt\repo\_x-not-orphan")
 
+  # --- parked slots (prune -ParkedIdleDays): an UNLEASED standard slot that still holds unsaved work
+  # is backed up in full (ref verified path by path) and removed once idle; every other case is kept ---
+  $env:AGENTQ_PARK_ROOT = "$fx\parked"
+  foreach ($s in 'task-3', 'task-4', 'task-6', 'task-7') {
+    Run -File $Tool new -Repo "$fx\repo" -Name $s -Purpose 'park test' | Out-Null
+    $lid = (Get-Content "$fx\coord\leases\repo\$s.json" -Raw | ConvertFrom-Json).leaseId
+    Run -File $Aq unlease -Repo "$fx\.wt\repo\$s" -LeaseId $lid | Out-Null   # unleased, but with no work it stays put
+  }
+  Run -File $Aq lease -Repo "$fx\repo" -Slot task-5 -Purpose 'leased dirty' -Json | Out-Null
+  Add-Content "$fx\.wt\repo\task-3\a.txt" 'd3'; 'u3' | Set-Content "$fx\.wt\repo\task-3\untracked3.txt"
+  Add-Content "$fx\.wt\repo\task-4\a.txt" 'd4'
+  Add-Content "$fx\.wt\repo\task-5\a.txt" 'd5'
+  Add-Content "$fx\.wt\repo\task-6\a.txt" 'd6'
+  Add-Content "$fx\.wt\repo\task-7\a.txt" 'd7'
+  $fsw = [IO.File]::Open("$fx\.wt\repo\task-7\blob.bin", 'Create'); $fsw.SetLength(51MB); $fsw.Dispose()   # >50MB: excluded from the backup -> verify must fail
+  $expA3 = git -C "$fx\.wt\repo\task-3" hash-object --path=a.txt -- "$fx\.wt\repo\task-3\a.txt"; $expA3 = "$expA3".Trim()
+  $expU3 = git -C "$fx\.wt\repo\task-3" hash-object --path=untracked3.txt -- "$fx\.wt\repo\task-3\untracked3.txt"; $expU3 = "$expU3".Trim()
+  'Start-Sleep -Seconds 120' | Set-Content "$fx\sleeper.ps1"
+  $sleeper = Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$fx\sleeper.ps1", "$fx\.wt\repo\task-6" -PassThru -WindowStyle Hidden
+  $dl = (Get-Date).AddSeconds(15)
+  do { Start-Sleep -Milliseconds 300; $scmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($sleeper.Id)" -ErrorAction SilentlyContinue).CommandLine } while (-not ($scmd -and $scmd -match 'task-6') -and (Get-Date) -lt $dl)
+  foreach ($s in 'task-3', 'task-5', 'task-6', 'task-7') { Age-Slot "$fx\.wt\repo\$s" 5 }
+  $o = Run -File $Tool prune -Repo "$fx\repo" -OlderThanHours 0 -ParkedIdleDays 3
+  $ref3 = ([regex]::Match($o, 'refs/backup/wt/repo/task-3/\S+')).Value
+  $gotA3 = git -C "$fx\repo" rev-parse --verify -q "${ref3}:a.txt"; $gotA3 = "$gotA3".Trim()
+  $gotU3 = git -C "$fx\repo" rev-parse --verify -q "${ref3}:untracked3.txt"; $gotU3 = "$gotU3".Trim()
+  Check 'park: dirty unleased slot idle > bound backed up (ref verifies) then removed' ((-not (Test-Path "$fx\.wt\repo\task-3")) -and $ref3 -and $gotA3 -eq $expA3 -and $gotU3 -eq $expU3) $o
+  Check 'park: a thin bundle was written under ~/.codai/parked' ($o -match 'bundle=' -and (Get-ChildItem "$env:AGENTQ_PARK_ROOT\repo\task-3\bundles" -Filter '*.bundle' -ErrorAction SilentlyContinue)) $o
+  Check 'park: same slot idle < bound is kept' (Test-Path "$fx\.wt\repo\task-4\a.txt") $o
+  Check 'park: LEASED dirty slot is never removed' (Test-Path "$fx\.wt\repo\task-5\a.txt") $o
+  Check 'park: slot with a live process is never removed' (Test-Path "$fx\.wt\repo\task-6\a.txt") $o
+  Check 'park: backup-verify failure keeps the slot' ((Test-Path "$fx\.wt\repo\task-7\a.txt") -and $o -match 'backup not proven: verify failed for blob\.bin') $o
+  Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+
   # deploy-clean: release slot, release run, follow loop with supersede
   $out = Run -File $Deploy -Root "$fx\repo" -NoEnvCopy -NoInstall -Target web -Command 'Write-Host "DEPLOYING $env:DEPLOY_SHA in $env:DEPLOY_WORKTREE"'
   Check 'deploy-clean runs in <root>\<repo>\release' ($code -eq 0 -and $out -match [regex]::Escape("in $fx\.wt\repo\release")) $out
@@ -91,7 +135,8 @@ $out = Run -File $Deploy -Root "$fx\repo" -NoEnvCopy -NoInstall -Target web -Com
   Check 'journal: release-preempt + release-superseded + 2x release-begin' (($j -contains 'release-preempt') -and ($j -contains 'release-superseded') -and @($j | Where-Object { $_ -eq 'release-begin' }).Count -ge 3)
   Pop-Location
 } finally {
-  foreach ($v in 'CODAI_WT_ROOT', 'AGENTQ_HOME', 'AGENTQ_SESSION', 'AGENTQ_BIN', 'AGENTQ_CONFIG', 'WORKTREE_ALLOW_ADHOC') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  if ($sleeper) { Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue }
+  foreach ($v in 'CODAI_WT_ROOT', 'AGENTQ_HOME', 'AGENTQ_SESSION', 'AGENTQ_BIN', 'AGENTQ_CONFIG', 'WORKTREE_ALLOW_ADHOC', 'AGENTQ_PARK_ROOT') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$fx`"" 2>$null; Remove-Item "$fx-cfg.json" -ErrorAction SilentlyContinue
 }
 if ($fails) { Write-Host "$fails FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }
