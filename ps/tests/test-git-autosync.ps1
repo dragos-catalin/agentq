@@ -8,6 +8,9 @@ $env:GIT_AUTOSYNC_LOG = Join-Path $root 'autosync.log'
 $env:GIT_AUTOSYNC_PARK = Join-Path $root 'parked'
 $env:GIT_AUTOSYNC_NO_NOTE = '1'
 $env:GIT_AUTOSYNC_STATE = Join-Path $root 'state.json'
+# The coord root holds the daemon record + the journal -Doctor writes on a verdict change; isolate it so
+# no test line ever reaches the real ~/.codai/coord.
+$env:GIT_AUTOSYNC_COORD = Join-Path $root 'coord'
 $env:GIT_AUTOSYNC_BACKUP_URL = Join-Path $root 'backups.git'; git init -q --bare $env:GIT_AUTOSYNC_BACKUP_URL
 $env:GIT_AUTOSYNC_VISIBILITY = 'private'
 $env:GIT_AUTOSYNC_LAND = Join-Path $PSScriptRoot 'fake-land.ps1'
@@ -262,6 +265,61 @@ $hBefore = (git -C $r.a rev-parse HEAD)
 $ex = (& pwsh -NoProfile -Command "& '$tool' -Explain '$($r.a)'" 2>&1 | Out-String)
 Ok ($ex -match 'explain .*(read-only)') '13 -Explain prints its banner'
 Ok ((git -C $r.a rev-parse HEAD) -eq $hBefore) '13 -Explain moved nothing'
+
+# 14 -VerifyBackups: EVERY refs/backup/* ref must resolve to a readable commit; batched, exit 3 otherwise
+$r = Fresh
+$head = git -C $r.a rev-parse HEAD
+git -C $r.a update-ref refs/backup/ok $head
+$blob = ('hello' | git -C $r.a hash-object -w --stdin)          # a ref to a BLOB is not a readable commit
+git -C $r.a update-ref refs/backup/notacommit $blob
+$vb = (& pwsh -NoProfile -File $tool -Repo $r.a -VerifyBackups 2>&1 | Out-String); $vrc = $LASTEXITCODE
+Ok ($vrc -eq 3) '14 exits 3 when a backup ref is unreadable'
+Ok ($vb -match '1/2 refs readable') '14 reports readable/total'
+Ok ($vb -match 'UNREADABLE refs/backup/notacommit') '14 names the unreadable ref'
+git -C $r.a update-ref -d refs/backup/notacommit
+$vb2 = (& pwsh -NoProfile -File $tool -Repo $r.a -VerifyBackups 2>&1 | Out-String); $vrc2 = $LASTEXITCODE
+Ok ($vrc2 -eq 0) '14 exits 0 when every backup ref is readable'
+Ok ($vb2 -match '1/1 refs readable') '14 all readable'
+Ok ($vb2 -notmatch 'UNREADABLE') '14 no unreadable ref named'
+# -Json: one object { at, exit, unreadable, repos:[{repo,readable,total,unreadable}] }
+$vj = ((& pwsh -NoProfile -File $tool -Repo $r.a -VerifyBackups -Json 2>$null | Out-String).Trim()) | ConvertFrom-Json
+Ok ($vj.exit -eq 0 -and @($vj.repos).Count -eq 1 -and $vj.repos[0].total -eq 1 -and $vj.repos[0].readable -eq 1 -and $vj.unreadable -eq 0) '14 -Json: all readable, exit 0'
+git -C $r.a update-ref refs/backup/notacommit $blob
+$vjb = ((& pwsh -NoProfile -File $tool -Repo $r.a -VerifyBackups -Json 2>$null | Out-String).Trim()) | ConvertFrom-Json
+Ok ($vjb.exit -eq 3 -and $vjb.unreadable -eq 1 -and (@($vjb.repos[0].unreadable) -contains 'refs/backup/notacommit')) '14 -Json: names the unreadable ref, exit 3'
+git -C $r.a update-ref -d refs/backup/notacommit
+
+# 15 -Doctor -Json: ONE JSON line (the frozen daemon record) + a journal line on a verdict CHANGE only
+$jf = Join-Path $env:GIT_AUTOSYNC_COORD 'journal.jsonl'
+Remove-Item $env:GIT_AUTOSYNC_STATE -ErrorAction SilentlyContinue   # no stored verdict -> the next run is a change
+Remove-Item $jf -ErrorAction SilentlyContinue
+$r = Fresh; Push-B $r 'x.txt' "j`n"
+$jout = (& pwsh -NoProfile -File $tool -Repo $r.a -Doctor -Json 2>$null | Out-String); $jrc = $LASTEXITCODE
+$jout = $jout.Trim()
+$rec = $null; try { $rec = $jout | ConvertFrom-Json } catch { }
+Ok ($null -ne $rec) '15 -Json stdout parses as one JSON object'
+Ok ($jout -notmatch '(?m)^(OK|FAIL|WARN|INFO|DOCTOR)') '15 -Json stdout carries no human lines'
+Ok (($rec.PSObject.Properties.Name -join ',') -eq 'name,at,verdict,okCount,warnCount,failCount,lines,failStreak,history') '15 record has the frozen keys'
+Ok ($rec.name -eq 'git-autosync') '15 record name is git-autosync'
+Ok ($rec.verdict -in @('ok', 'warn', 'fail')) '15 verdict is one of ok|warn|fail'
+Ok ($rec.failCount -eq @($rec.lines | Where-Object { "$_" -match '^FAIL' }).Count) '15 failCount matches the FAIL lines'
+Ok ($jrc -eq $(if ($rec.failCount -gt 0) { 3 } else { 0 })) '15 exit code matches the verdict'
+Ok ($rec.failStreak -eq 0 -and @($rec.history).Count -eq 0) '15 no prior history on a first run'
+Ok (Test-Path $jf) '15 journal line written on the first change'
+$n1 = @(Get-Content $jf).Count
+Ok ($n1 -ge 1 -and (Get-Content $jf -Raw) -match 'daemon-doctor') '15 journal line is event daemon-doctor'
+$null = & pwsh -NoProfile -File $tool -Repo $r.a -Doctor -Json 2>$null
+$n2 = @(Get-Content $jf).Count
+Ok ($n1 -eq $n2) '15 no journal line while the verdict is unchanged'
+# 15b the change detector on RECOVERY: seed a fresh status snapshot so the 'no snapshot' FAIL clears; the
+#     journal must gain exactly one line iff the verdict actually changed (machine-independent).
+$statusFile = Join-Path (Split-Path $env:GIT_AUTOSYNC_STATE -Parent) 'git-autosync-status.json'
+[IO.File]::WriteAllText($statusFile, (@{ (Split-Path $r.a -Leaf) = @{ at = [DateTime]::UtcNow.ToString('o'); code = 0; msg = 'in sync' } } | ConvertTo-Json -Depth 4))
+$rec2 = ((& pwsh -NoProfile -File $tool -Repo $r.a -Doctor -Json 2>$null | Out-String).Trim()) | ConvertFrom-Json
+$n3 = @(Get-Content $jf).Count
+if ($rec2.verdict -ne $rec.verdict) { Ok ($n3 -eq $n2 + 1) "15b recovery ($($rec.verdict)->$($rec2.verdict)) writes exactly one line" }
+else { Ok ($n3 -eq $n2) '15b unchanged verdict writes no line' }
+Ok (((Get-Content $env:GIT_AUTOSYNC_STATE -Raw | ConvertFrom-Json).lastDoctorVerdict) -eq $rec2.verdict) '15b stored verdict tracks the latest'
 
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

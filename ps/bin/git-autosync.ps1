@@ -37,6 +37,7 @@ What one pass does, per repo (only when it is provably safe):
 
   git-autosync.ps1 [-Repo E:\gh\codai[,E:\gh\brivio]] [-WhatIf] [-ParkNow] [-ParkIdleHours 1]
                    [-Loop -IntervalSec 120] [-Install] [-Status] [-Report]
+                   [-Doctor [-Json]] [-VerifyBackups [-Json]]
 
   BACKUP TARGET (2026-10-17 audit): 15 of 25 repos are PUBLIC, so a backup branch on origin publishes
   WIP drafts. Private repos -> origin (objects already there, tiny push). Public or unknown visibility ->
@@ -68,7 +69,7 @@ param(
   # Repos whose agents commit locally and never push by policy (vitals ADR-0019): unpushed commits are expected.
   [string[]]$LocalCommitRepos = @('vitals'),
   [switch]$WhatIf, [switch]$Loop, [int]$IntervalSec = 120, [switch]$Install, [switch]$InstallLoop,
-  [switch]$Status, [switch]$Doctor,
+  [switch]$Status, [switch]$Doctor, [switch]$Json, [switch]$VerifyBackups,
   # Read-only: what the next pass would decide for ONE repo, and why (never moves anything).
   [string]$Explain,
   [switch]$ParkNow, [double]$ParkIdleHours = 1, [switch]$Report,
@@ -92,6 +93,13 @@ $StatusFile = if ($env:GIT_AUTOSYNC_STATUS) { $env:GIT_AUTOSYNC_STATUS } else {
   $sd = Split-Path $StateFile -Parent
   Join-Path $(if ($sd) { $sd } else { Join-Path $HOME '.codai' }) 'git-autosync-status.json'
 }
+# Daemon health + the journal live in the coord root, the same place agentq.ps1 / agentq-sync.ps1 use:
+# ~/.codai/coord, $env:AGENTQ_HOME when set, or GIT_AUTOSYNC_COORD for tests. `-Json` reads the daemon
+# record written there (by agentq-sync.ps1) to carry failStreak/history forward, and -Doctor journal
+# verdict changes there.
+$CoordRoot = if ($env:GIT_AUTOSYNC_COORD) { $env:GIT_AUTOSYNC_COORD }
+  elseif ($env:AGENTQ_HOME) { $env:AGENTQ_HOME }
+  else { Join-Path (Join-Path $HOME '.codai') 'coord' }
 if ($env:GIT_AUTOSYNC_BACKUP_URL) { $BackupUrl = $env:GIT_AUTOSYNC_BACKUP_URL }
 $script:NoFetch = $false
 $LastMsg = @{}
@@ -173,6 +181,109 @@ function Save-StatusMap($m) {
   } catch { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 }
 
+function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
+# Prior daemon record ({ name, at, verdict, okCount, warnCount, failCount, lines, failStreak, history })
+# if agentq-sync.ps1 has written one. -Json carries failStreak/history forward from it.
+function Get-DaemonRecord([string]$name) {
+  try {
+    $f = Join-Path (Join-Path $CoordRoot 'daemons') "$name.json"
+    if (Test-Path -LiteralPath $f) { return (Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable) }
+  } catch { }
+  $null
+}
+# One JSON line appended to the coord journal - the SAME shape agentq.ps1 Write-Journal / agentq-sync.ps1
+# Write-JournalLine use (ts, session, event, ...), mutex-guarded. NOTE: agentq.ps1's Write-Journal is not
+# reachable from this process, and its `note` verb stamps event=note, so we append the `daemon-doctor`
+# line directly rather than spawning it. Best effort: a failure here must never break a pass.
+function Write-DaemonJournal([hashtable]$e) {
+  if (-not $e.ContainsKey('ts')) { $e.ts = Iso ([DateTime]::UtcNow) }
+  if (-not $e.ContainsKey('session')) { $e.session = 'git-autosync' }
+  $jf = Join-Path $CoordRoot 'journal.jsonl'
+  $dir = Split-Path $jf -Parent
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+  $line = ($e | ConvertTo-Json -Compress -Depth 6)
+  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
+  try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText($jf, $line + "`n", [Text.UTF8Encoding]::new($false)) }
+  finally { try { $m.ReleaseMutex() } catch { }; $m.Dispose() }
+}
+# Journal the verdict ONCE per CHANGE (a -Doctor runs every minute; a line per run would drown the
+# journal). The last recorded verdict lives in the existing state file, under `lastDoctorVerdict`.
+function Record-DoctorVerdict([string]$verdict, [int]$ok, [int]$warn, [int]$fail) {
+  try {
+    $st = Get-State
+    $prev = if ($st.ContainsKey('lastDoctorVerdict')) { "$($st['lastDoctorVerdict'])" } else { '' }
+    if ($prev -eq $verdict) { return }
+    try { Write-DaemonJournal @{ event = 'daemon-doctor'; name = 'git-autosync'; verdict = $verdict; okCount = $ok; warnCount = $warn; failCount = $fail } } catch { }
+    $st = Get-State
+    $st['lastDoctorVerdict'] = $verdict
+    Set-State $st
+  } catch { }
+}
+# Count long-lived -Loop processes. The CIM query costs ~0.5 s and `agentq doctor` and `agentq-sync`
+# both run -Doctor within the same minute, so cache the answer for 45 s in the coord root (best effort:
+# a failed read/write just re-queries).
+function Get-AutosyncLoopCount {
+  $cache = Join-Path $CoordRoot '.loop-scan.json'
+  try {
+    if (Test-Path -LiteralPath $cache) {
+      $c = Get-Content -LiteralPath $cache -Raw | ConvertFrom-Json -AsHashtable
+      if ($c -and $c.ContainsKey('at') -and $c.ContainsKey('n') -and ([DateTime]::UtcNow - [DateTime]$c['at']).TotalSeconds -lt 45) { return [int]$c['n'] }
+    }
+  } catch { }
+  $n = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' }).Count
+  try {
+    $dir = Split-Path $cache -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    [IO.File]::WriteAllText($cache, (@{ at = [DateTime]::UtcNow.ToString('o'); n = $n } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+  } catch { }
+  $n
+}
+# The whole -Doctor computation, built ONCE so the human report and the -Json daemon record never diverge.
+# Returns @{ lines = <List[string]>; bad = <int>; warn = <int> }.
+function Invoke-AutosyncDoctor {
+  $bad = 0; $warn = 0; $out = [Collections.Generic.List[string]]::new()
+  $t = Get-ScheduledTask -TaskName 'git-autosync' -ErrorAction SilentlyContinue
+  if (-not $t) { $out.Add('FAIL task git-autosync is not installed (run: git-autosync.ps1 -Install)'); $bad++ }
+  else {
+    $ti = Get-ScheduledTaskInfo -TaskName 'git-autosync' -ErrorAction SilentlyContinue
+    $rep = @($t.Triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval })
+    if ($rep.Count) { $out.Add("OK   task repeats every $($rep[0].Repetition.Interval) (state $($t.State))") }
+    elseif (-not @($t.Triggers | Where-Object { $_.Repetition }).Count) { $out.Add('FAIL task has no repeating trigger - it will not resume by itself after a pass ends'); $bad++ }
+    if ($ti -and [int]$ti.LastTaskResult -ne 0) { $out.Add("WARN last task result $($ti.LastTaskResult)"); $warn++ }
+  }
+  $sm = Get-StatusMap
+  if (-not $sm.Count) { $out.Add('FAIL no status snapshot yet - the daemon has not completed a pass'); $bad++ }
+  else {
+    $ages = @($sm.Values | ForEach-Object { try { [int](([DateTime]::UtcNow - [DateTime]$_.at).TotalMinutes) } catch { 99999 } })
+    $newest = ($ages | Measure-Object -Minimum).Minimum
+    if ($newest -le 15) { $out.Add("OK   snapshot fresh (newest verdict ${newest}m ago)") }
+    else { $out.Add("FAIL snapshot stale (newest verdict ${newest}m ago > 15m) - ticks are not landing; try: schtasks /run /tn git-autosync"); $bad++ }
+    $cfgLeaves = @{}; foreach ($rp in $Repo) { $cfgLeaves[(Split-Path $rp -Leaf)] = 1 }
+    $ghosts = @($sm.Keys | Where-Object { -not $cfgLeaves.ContainsKey($_) })
+    if ($ghosts.Count) { $out.Add("WARN ghost key(s): $($ghosts -join ', ') (a full pass drops them)"); $warn++ } else { $out.Add('OK   no ghost keys in the snapshot') }
+    $refused = @($sm.Values | Where-Object { [int]$_.code -eq 3 }).Count
+    if ($refused) { $out.Add("INFO $refused repo(s) refused on the last pass (see -Status)") }
+  }
+  $loopN = Get-AutosyncLoopCount
+  if ($loopN -gt 1) { $out.Add("WARN $loopN long-lived loops are running"); $warn++ }
+  elseif ($loopN -eq 1) { $out.Add('INFO one long-lived loop is running (its code is frozen at start)') }
+  # The recovery surface is worth only what can be read back. A corrupted/GC'd object store is otherwise
+  # discovered on the day someone NEEDS the backup, so prove the newest backup ref of each configured repo
+  # still resolves to a readable commit. Bounded to 2 refs per repo (the repos carry thousands).
+  $nRefs = 0; $badRefs = @()
+  foreach ($rp in $Repo) {
+    if (-not (Test-Path (Join-Path $rp '.git'))) { continue }
+    foreach ($ref in @(G $rp for-each-ref --sort=-creatordate --count 2 --format='%(refname)' 'refs/backup/')) {
+      $nRefs++
+      if (-not (G $rp rev-parse --verify --quiet "$ref^{commit}" 2>$null)) { $badRefs += "$(Split-Path $rp -Leaf):$ref" }
+    }
+  }
+  if ($badRefs.Count) { $out.Add("FAIL unreadable backup ref(s): $($badRefs -join ', ')"); $bad++ }
+  elseif ($nRefs) { $out.Add("OK   $nRefs newest backup ref(s) resolve to readable commits") }
+  else { $out.Add('WARN no refs/backup/* refs found in any configured repo'); $warn++ }
+  @{ lines = $out; bad = $bad; warn = $warn }
+}
 # 'private' | 'public' | 'unknown', cached 24 h. GIT_AUTOSYNC_VISIBILITY overrides (tests).
 function Get-Visibility([string]$r, [string]$remote) {
   if ($env:GIT_AUTOSYNC_VISIBILITY) { return $env:GIT_AUTOSYNC_VISIBILITY }
@@ -189,7 +300,6 @@ function Get-Visibility([string]$r, [string]$remote) {
   $st['visibility'][$url] = @{ v = $v; at = [DateTime]::UtcNow.ToString('o') }; Set-State $st
   $v
 }
-
 # Byte-exact blob -> file (PowerShell pipes re-encode text; cmd redirection does not).
 function Save-Blob([string]$repo, [string]$id, [string]$file) {
   cmd /c "git -C `"$repo`" cat-file blob $id > `"$file`""
@@ -708,51 +818,69 @@ if ($Report) {
   if ($rows.Count -and (Test-Path $aq)) { & pwsh -NoProfile -File $aq note -Message $msg *> $null }
   exit $(if ($rows.Count) { 3 } else { 0 })
 }
+if ($VerifyBackups) {
+  # Read back EVERY backup ref of every configured repo: a backup is worth only what the object store
+  # still holds, so prove each ref resolves to a readable commit. Batched per repo (one for-each-ref +
+  # one cat-file --batch-check over stdin) because a per-ref `rev-parse` is far too slow on repos with
+  # 1500 refs. Exit 3 if any ref is unreadable, else 0. -Json prints ONE object instead of the lines.
+  $rcV = 0; $totBad = 0; $reposOut = [Collections.Generic.List[object]]::new()
+  foreach ($r in $Repo) {
+    $leaf = Split-Path $r -Leaf
+    if (-not (Test-Path (Join-Path $r '.git'))) { if (-not $Json) { "$($leaf): not a repo" }; continue }
+    $refs = @(G $r for-each-ref --format='%(objectname) %(refname)' 'refs/backup/')
+    $names = @($refs | ForEach-Object { ($_ -split ' ', 2)[1] })
+    $bad = @()
+    if ($refs.Count) {
+      # `<sha>^{commit}` peels tags to commits and reports `missing` for a pruned/blob object - exactly
+      # the semantic of `rev-parse --verify --quiet "<ref>^{commit}"`, in one process.
+      $inputs = @($refs | ForEach-Object { (($_ -split ' ', 2)[0]) + '^{commit}' })
+      $res = @($inputs | & git -C $r --no-optional-locks cat-file --batch-check 2>$null | ForEach-Object { "$_" })
+      for ($i = 0; $i -lt $refs.Count; $i++) {
+        $isCommit = $false
+        if ($i -lt $res.Count) { $parts = @($res[$i] -split ' '); $isCommit = ($parts.Count -ge 2 -and $parts[1] -eq 'commit') }
+        if (-not $isCommit) { $bad += $names[$i] }
+      }
+    }
+    $totBad += $bad.Count
+    if ($bad.Count) { $rcV = 3 }
+    if ($Json) { $reposOut.Add([ordered]@{ repo = $leaf; readable = ($refs.Count - $bad.Count); total = $refs.Count; unreadable = @($bad) }) }
+    else {
+      "$($leaf): $($refs.Count - $bad.Count)/$($refs.Count) refs readable"
+      foreach ($b in $bad) { "  UNREADABLE $b" }
+    }
+  }
+  if ($Json) { [ordered]@{ at = (Iso ([DateTime]::UtcNow)); exit = $rcV; unreadable = $totBad; repos = @($reposOut) } | ConvertTo-Json -Depth 6 -Compress }
+  exit $rcV
+}
 if ($Doctor) {
   # One command that answers "is the daemon doing its job RIGHT NOW". -Status's snapshot can be hours old
   # while the log still looks alive, and checking 25 repos by hand takes minutes on the loaded machine.
-  $bad = 0; $warn = 0; $out = [Collections.Generic.List[string]]::new()
-  $t = Get-ScheduledTask -TaskName 'git-autosync' -ErrorAction SilentlyContinue
-  if (-not $t) { $out.Add('FAIL task git-autosync is not installed (run: git-autosync.ps1 -Install)'); $bad++ }
-  else {
-    $ti = Get-ScheduledTaskInfo -TaskName 'git-autosync' -ErrorAction SilentlyContinue
-    $rep = @($t.Triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval })
-    if ($rep.Count) { $out.Add("OK   task repeats every $($rep[0].Repetition.Interval) (state $($t.State))") }
-    elseif (-not @($t.Triggers | Where-Object { $_.Repetition }).Count) { $out.Add('FAIL task has no repeating trigger - it will not resume by itself after a pass ends'); $bad++ }
-    if ($ti -and [int]$ti.LastTaskResult -ne 0) { $out.Add("WARN last task result $($ti.LastTaskResult)"); $warn++ }
-  }
-  $sm = Get-StatusMap
-  if (-not $sm.Count) { $out.Add('FAIL no status snapshot yet - the daemon has not completed a pass'); $bad++ }
-  else {
-    $ages = @($sm.Values | ForEach-Object { try { [int](([DateTime]::UtcNow - [DateTime]$_.at).TotalMinutes) } catch { 99999 } })
-    $newest = ($ages | Measure-Object -Minimum).Minimum
-    if ($newest -le 15) { $out.Add("OK   snapshot fresh (newest verdict ${newest}m ago)") }
-    else { $out.Add("FAIL snapshot stale (newest verdict ${newest}m ago > 15m) - ticks are not landing; try: schtasks /run /tn git-autosync"); $bad++ }
-    $cfgLeaves = @{}; foreach ($rp in $Repo) { $cfgLeaves[(Split-Path $rp -Leaf)] = 1 }
-    $ghosts = @($sm.Keys | Where-Object { -not $cfgLeaves.ContainsKey($_) })
-    if ($ghosts.Count) { $out.Add("WARN ghost key(s): $($ghosts -join ', ') (a full pass drops them)"); $warn++ } else { $out.Add('OK   no ghost keys in the snapshot') }
-    $refused = @($sm.Values | Where-Object { [int]$_.code -eq 3 }).Count
-    if ($refused) { $out.Add("INFO $refused repo(s) refused on the last pass (see -Status)") }
-  }
-  $loopN = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' }).Count
-  if ($loopN -gt 1) { $out.Add("WARN $loopN long-lived loops are running"); $warn++ }
-  elseif ($loopN -eq 1) { $out.Add('INFO one long-lived loop is running (its code is frozen at start)') }
-  # The recovery surface is worth only what can be read back. A corrupted/GC'd object store is otherwise
-  # discovered on the day someone NEEDS the backup, so prove the newest backup ref of each configured repo
-  # still resolves to a readable commit. Bounded to 2 refs per repo (the repos carry thousands).
-  $nRefs = 0; $badRefs = @()
-  foreach ($rp in $Repo) {
-    if (-not (Test-Path (Join-Path $rp '.git'))) { continue }
-    foreach ($ref in @(G $rp for-each-ref --sort=-creatordate --count 2 --format='%(refname)' 'refs/backup/')) {
-      $nRefs++
-      if (-not (G $rp rev-parse --verify --quiet "$ref^{commit}" 2>$null)) { $badRefs += "$(Split-Path $rp -Leaf):$ref" }
+  # The computation is factored into Invoke-AutosyncDoctor so the human report and the -Json daemon
+  # record are built once and never diverge.
+  $d = Invoke-AutosyncDoctor
+  $lines = @($d.lines); $bad = [int]$d.bad; $warn = [int]$d.warn
+  $verdict = if ($bad) { 'fail' } elseif ($warn) { 'warn' } else { 'ok' }
+  $ok = [math]::Max(0, $lines.Count - $bad - $warn)
+  Record-DoctorVerdict $verdict $ok $warn $bad
+  if ($Json) {
+    # ONE line of JSON on stdout: the frozen daemon record the gateway/hub consume. Human lines are
+    # omitted in -Json mode; failStreak/history carry forward from the record on disk. Exit 3 on a FAIL.
+    $prior = Get-DaemonRecord 'git-autosync'
+    $streak = if ($prior -and $prior.ContainsKey('failStreak') -and $null -ne $prior['failStreak']) { [int]$prior['failStreak'] } else { 0 }
+    # an empty array written through $(if ...) collapses to null; keep it in a variable so history is []
+    $hist = @()
+    if ($prior -and $prior.ContainsKey('history') -and $prior['history']) { $hist = @($prior['history']) }
+    $rec = [ordered]@{
+      name = 'git-autosync'; at = (Iso ([DateTime]::UtcNow)); verdict = $verdict
+      okCount = $ok; warnCount = $warn; failCount = $bad
+      lines = @($lines | Select-Object -First 60 | ForEach-Object { $s = "$_"; if ($s.Length -gt 400) { $s.Substring(0, 400) } else { $s } })
+      failStreak = $streak
+      history = $hist
     }
+    $rec | ConvertTo-Json -Depth 6 -Compress
+    exit $(if ($bad) { 3 } else { 0 })
   }
-  if ($badRefs.Count) { $out.Add("FAIL unreadable backup ref(s): $($badRefs -join ', ')"); $bad++ }
-  elseif ($nRefs) { $out.Add("OK   $nRefs newest backup ref(s) resolve to readable commits") }
-  else { $out.Add('WARN no refs/backup/* refs found in any configured repo'); $warn++ }
-  $out | ForEach-Object { $_ }
+  $lines | ForEach-Object { $_ }
   ''
   if ($bad) { "DOCTOR: $bad problem(s), $warn warning(s)"; exit 3 }
   "DOCTOR: OK ($warn warning(s))"

@@ -302,7 +302,9 @@ try {
   $jsonCode = $code
   $o = AQ doctor -All
   $after = Get-TreeState $tmp
-  Check '8 -Json parses: rows + generatedAt' ($null -ne $r -and @($r.rows).Count -gt 0 -and "$($r.generatedAt)" -ne '') $raw
+  Check '8 -Json parses: rows + at + scope + exit' ($null -ne $r -and @($r.rows).Count -gt 0 -and "$($r.at)" -ne '' -and $null -ne $r.scope -and $null -ne $r.exit) $raw
+  Check '8 -Json has the frozen top-level keys' (($r.PSObject.Properties.Name -join ',') -eq 'at,scope,rows,problems,warnings,exit') $raw
+  Check '8 -Json scope carries the scope summary' ($null -ne $r.scope.slots -and "$($r.scope.text)" -ne '') $raw
   Check '8 -Json counts = its rows' ($r.problems -eq @($r.rows | Where-Object status -eq 'fail').Count -and $r.warnings -eq @($r.rows | Where-Object status -eq 'warn').Count -and $r.problems -eq 3 -and $r.warnings -eq 3) $raw
   Check '8 human report has the same counts and exit code' ($o -match "doctor: $($r.problems) problem\(s\), $($r.warnings) warning\(s\)" -and $code -eq 1 -and $jsonCode -eq 1) $o
   Check '8 every row has the six fields' (@($r.rows | Where-Object { @($_.PSObject.Properties.Name) -join ',' -ne 'check,status,kind,subject,detail,hint' }).Count -eq 0) $raw
@@ -350,7 +352,7 @@ try {
   Remove-Item Env:AGENTQ_DOCTOR_FAULT
   $crash = Rows $r 'stale-index-lock' 'warn'
   Check '12 crashed check -> one warn row "check crashed"' ($crash.Count -eq 1 -and $crash[0].detail -match '^check crashed: ') $raw
-  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 9 -and $code -eq 0) $raw
+  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 10 -and $code -eq 0) $raw
 
   # ---- 13 git-autosync health folded into the doctor ------------------------------------------------
   # The doctor does NOT re-implement git-autosync's checks: it runs the tool with -Doctor and folds the
@@ -382,6 +384,20 @@ try {
   $rows = Rows $r 'git-autosync' 'warn'
   Check '13d missing tool -> one warn "(git-autosync not installed)", exit 0' ($rows.Count -eq 1 -and $rows[0].detail -match 'git-autosync not installed' -and $r.problems -eq 0 -and $r.warnings -eq 1 -and $code -eq 0) $raw
   $env:AGENTQ_GIT_AUTOSYNC = $gaOk
+
+  # ---- 14 daemons: the health records agentq-sync writes are folded into the doctor ------------------
+  Reset-State
+  Put (Join-Path $coord 'daemons\git-autosync.json') ([ordered]@{ name = 'git-autosync'; at = (Ago 5).ToString('o'); verdict = 'warn'; okCount = 2; warnCount = 1; failCount = 0; lines = @('WARN x'); failStreak = 0; history = @() } | ConvertTo-Json)
+  Put (Join-Path $coord 'daemons\other.json') ([ordered]@{ name = 'other'; at = (Ago 5).ToString('o'); verdict = 'fail'; okCount = 0; warnCount = 0; failCount = 1; lines = @('FAIL boom'); failStreak = 3; history = @() } | ConvertTo-Json)
+  $r = DJ -All
+  Check '14 daemon warn -> one warn row' (@(Rows $r 'daemons' 'warn' | Where-Object { $_.subject -eq 'git-autosync' -and $_.detail -match 'verdict warn' }).Count -eq 1) $raw
+  Check '14 daemon fail -> fail row with the FAIL line + streak' (@(Rows $r 'daemons' 'fail' | Where-Object { $_.subject -eq 'other' -and $_.detail -match 'boom' -and $_.detail -match '3 consecutive' }).Count -eq 1) $raw
+  Check '14 fail daemon -> exit 1, 1 problem, 1 warning' ($code -eq 1 -and $r.problems -eq 1 -and $r.warnings -eq 1) $raw
+  Check '14 summary counts the records' (@($r.rows | Where-Object { $_.check -eq 'daemons' -and $_.kind -eq 'summary' -and $_.detail -match '^2 daemon record' }).Count -eq 1) $raw
+  Reset-State
+  Put (Join-Path $coord 'daemons\git-autosync.json') ([ordered]@{ name = 'git-autosync'; at = (Ago 5).ToString('o'); verdict = 'ok'; okCount = 3; warnCount = 0; failCount = 0; lines = @('OK x'); failStreak = 0; history = @() } | ConvertTo-Json)
+  $r = DJ -All
+  Check '14 all-ok daemons -> no row, exit 0' (@(Rows $r 'daemons' 'fail').Count -eq 0 -and @(Rows $r 'daemons' 'warn').Count -eq 0 -and $code -eq 0) $raw
 } finally {
   if ($gitProc) { try { $gitProc.Kill($true) } catch {} }
   Pop-Location

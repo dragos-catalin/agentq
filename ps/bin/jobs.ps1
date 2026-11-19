@@ -6,6 +6,10 @@ jobs — inspect and manage background jobs registered by job-start.ps1.
   jobs.ps1 show <id> [-Tail 30]  registry json + computed state + log tail
   jobs.ps1 kill <id>             taskkill /T /F the job's process tree; state killed
   jobs.ps1 prune [-Days 7]       delete finished/dead/killed entries older than -Days
+  jobs.ps1 reap [-WhatIf] [-Json]  reconcile the registry: a job still `running`/`starting` whose pid is
+                                 dead or was recycled is marked `dead` (+ endedAt, reapedBy). A live job is
+                                 never touched. -WhatIf prints the changes without writing; -Json prints them
+                                 as JSON. Fixes the `agentq doctor` dead-keeper FAIL rows.
   jobs.ps1 orphans [-Kill]       report pwsh/node/cmd processes running .copilot-tmp scripts or
                                  run-build/agentq whose ancestry has no live VS Code / copilot
                                  process, plus DEAD registry jobs. Reports only; -Kill kills the trees.
@@ -17,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 . (Join-Path $PSScriptRoot 'agentq-jobs-lib.ps1')
 
-$Verb = 'list'; $Target = $null; $All = $false; $Json = $false; $Kill = $false; $Days = 7; $Tail = 30
+$Verb = 'list'; $Target = $null; $All = $false; $Json = $false; $Kill = $false; $WhatIf = $false; $Days = 7; $Tail = 30
 $argv = @($args); $i = 0
 if ($argv.Count -and "$($argv[0])" -notlike '-*') { $Verb = "$($argv[0])".ToLowerInvariant(); $i = 1 }
 while ($i -lt $argv.Count) {
@@ -26,6 +30,7 @@ while ($i -lt $argv.Count) {
     'all' { $All = $true }
     'json' { $Json = $true }
     'kill' { $Kill = $true }
+    'whatif' { $WhatIf = $true }
     'days' { $i++; $Days = [double]$argv[$i] }
     'tail' { $i++; $Tail = [int]$argv[$i] }
     'id' { $i++; $Target = "$($argv[$i])" }
@@ -146,11 +151,30 @@ function Invoke-Orphans {
   } else { 'report only; re-run with -Kill to kill the listed process trees (check each first)' }
 }
 
+function Invoke-Reap {
+  # Reconcile the registry with reality: a job still running/starting whose process is gone (or was
+  # recycled - pid alive but a different start time) is dead. A LIVE job is never touched. This is the
+  # repair for agentq doctor's dead-keeper FAIL rows.
+  $rows = @()
+  foreach ($j in Get-AllJobs) {
+    $st = "$($j['state'])"
+    if ($st -notin 'running', 'starting') { continue }
+    if (Test-JobPidAlive ([int]$j['pid']) $j['pidStart']) { continue }
+    $rows += [pscustomobject]@{ id = "$($j['id'])"; pid = [int]$j['pid']; state = $st; label = "$($j['label'])" }
+    if (-not $WhatIf) { Update-Job $j['id'] @{ state = 'dead'; endedAt = (Get-JobIso ([DateTime]::UtcNow)); reapedBy = 'jobs.ps1 reap' } }
+  }
+  if ($Json) { ConvertTo-Json -InputObject @($rows) -Depth 4; return }
+  if (-not $rows.Count) { 'no stale jobs to reap'; return }
+  foreach ($r in $rows) { "{0,-12} {1,-26} pid {2}  {3}" -f $(if ($WhatIf) { '(would reap)' } else { 'reaped' }), $r.id, $r.pid, $r.label }
+  "$(if ($WhatIf) { 'would mark' } else { 'marked' }) $($rows.Count) job(s) dead"
+}
+
 switch ($Verb) {
   'list' { Show-List }
   'show' { Show-Job }
   'kill' { Invoke-Kill }
   'prune' { Invoke-Prune }
   'orphans' { Invoke-Orphans }
-  default { [Console]::Error.WriteLine("jobs: unknown verb '$Verb' (list|show|kill|prune|orphans)"); exit 2 }
+  'reap' { Invoke-Reap }
+  default { [Console]::Error.WriteLine("jobs: unknown verb '$Verb' (list|show|kill|prune|reap|orphans)"); exit 2 }
 }

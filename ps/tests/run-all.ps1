@@ -61,6 +61,7 @@ $suites = [ordered]@{
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'prune'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-prune.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'doctor'          = @('-File', (Join-Path $PSScriptRoot 'test-agentq-doctor.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'agentq-sync'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-sync.ps1'), '-Bin', $bin)
   'hook pre'        = @('-File', (Join-Path $PSScriptRoot 'test-hook-pre.ps1'), '-Hooks', $hooks)
   'install'         = @('-File', (Join-Path $PSScriptRoot 'test-install.ps1'), '-Src', $root)
 }

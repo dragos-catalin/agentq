@@ -6,6 +6,8 @@ current marks, the journal lines appended since the last accepted push, and the 
 hub mark ops applied locally. The response lists hub ops not yet applied; each one is
 written into marks/ in agentq.ps1 Set-Mark's exact shape (+ a journal line), so
 `agentq run/acquire/commit` and the guard hook honour a freeze set in the hub.
+Each pass also collects daemon health (default git-autosync; agentq-config.json
+`autosync.daemons`) into <root>/daemons/<name>.json and a top-level `daemons` array.
 
 Auth: a codai API key whose owner is super_admin, stored DPAPI-encrypted (CurrentUser)
 in ~/.codai/agentq-sync.key. Never printed.
@@ -59,6 +61,95 @@ function Invoke-ProbeTick {
 function Get-Jobs {
   if (-not (Get-Command Get-JobsForSync -ErrorAction SilentlyContinue)) { return @() }
   try { @(Get-JobsForSync) } catch { [Console]::Error.WriteLine("agentq-sync: jobs skipped: $_"); @() }
+}
+
+# Daemon health (<root>/daemons/<name>.json + a top-level `daemons` array in the push). The list is
+# fleet policy: agentq-config.json `autosync.daemons` (default just git-autosync). Each daemon is run
+# with `-Doctor -Json`, which prints the frozen record { name, at, verdict, okCount, warnCount,
+# failCount, lines, failStreak, history }; agentq-sync keeps history (cap 48, newest last) and
+# failStreak current and writes the record back. A daemon that fails to run is SKIPPED, never a push
+# failure. The tool is resolved next to this script (the source copy), or via AGENTQ_GIT_AUTOSYNC (tests).
+$script:DaemonNamesComputed = $false; $script:DaemonNames = @()
+function Get-DaemonNames {
+  if ($script:DaemonNamesComputed) { return $script:DaemonNames }
+  $names = @('git-autosync')
+  $cfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $HOME '.copilot\bin\agentq-config.json' }
+  if (Test-Path -LiteralPath $cfgPath) {
+    try {
+      $c = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json -AsHashtable -DateKind String
+      if ($c -is [System.Collections.IDictionary] -and $c.ContainsKey('autosync') -and $c['autosync'] -is [System.Collections.IDictionary] -and $c['autosync'].ContainsKey('daemons')) {
+        $names = @($c['autosync']['daemons'] | ForEach-Object { "$_" })
+      }
+    } catch { }
+  }
+  $script:DaemonNames = @($names | Where-Object { $_ })
+  $script:DaemonNamesComputed = $true
+  $script:DaemonNames
+}
+function Get-DaemonTool([string]$name) {
+  if ($name -eq 'git-autosync') {
+    if ($env:AGENTQ_GIT_AUTOSYNC) { return $env:AGENTQ_GIT_AUTOSYNC }
+    $local = Join-Path $PSScriptRoot 'git-autosync.ps1'
+    if (Test-Path -LiteralPath $local) { return $local }
+  }
+  $null
+}
+# Run one daemon with `-Doctor -Json` and parse the ONE JSON line it prints. Bounded (60 s) and guarded:
+# any failure (missing tool, crash, timeout, unparseable output) returns $null and the caller skips it.
+function Get-DaemonRecord([string]$name) {
+  $tool = Get-DaemonTool $name
+  if (-not $tool -or -not (Test-Path -LiteralPath $tool)) { return $null }
+  $psi = [Diagnostics.ProcessStartInfo]::new('pwsh')
+  foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $tool, '-Doctor', '-Json')) { $psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  try { $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8 } catch { }
+  $p = $null
+  try {
+    $p = [Diagnostics.Process]::Start($psi)
+    $outT = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(60000)) { try { $p.Kill($true) } catch { }; $p.Dispose(); return $null }
+    try { $p.WaitForExit() } catch { }
+    $text = "$($outT.GetAwaiter().GetResult())"
+    $p.Dispose()
+  } catch { if ($p) { try { $p.Dispose() } catch { } }; return $null }
+  $line = @($text -split "`r?`n" | Where-Object { "$_".Trim() -like '{*' } | Select-Object -Last 1)
+  if (-not $line) { return $null }
+  try { return ($line.Trim() | ConvertFrom-Json -AsHashtable -DateKind String) } catch { return $null }
+}
+# Merge a fresh verdict into the persisted record: history grows by one (cap 48, newest last), failStreak
+# increments on `fail` and resets otherwise. lines capped at 60 x 400 chars (the frozen contract).
+function Update-DaemonRecord([string]$name, $rec) {
+  $dir = Join-Path $Root 'daemons'
+  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+  $f = Join-Path $dir "$name.json"
+  $prev = $null
+  if (Test-Path -LiteralPath $f) { try { $prev = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable -DateKind String } catch { $prev = $null } }
+  $history = @()
+  if ($prev -and $prev.ContainsKey('history') -and $prev['history']) { $history = @($prev['history']) }
+  $streak = if ($prev -and $prev.ContainsKey('failStreak') -and $null -ne $prev['failStreak']) { [int]$prev['failStreak'] } else { 0 }
+  $verdict = "$($rec['verdict'])"
+  $history += [ordered]@{ at = "$($rec['at'])"; verdict = $verdict }
+  if ($history.Count -gt 48) { $history = @($history[($history.Count - 48)..($history.Count - 1)]) }
+  $streak = if ($verdict -eq 'fail') { $streak + 1 } else { 0 }
+  $lines = @(if ($rec.ContainsKey('lines') -and $rec['lines']) { @($rec['lines']) | Select-Object -First 60 | ForEach-Object { $s = "$_"; if ($s.Length -gt 400) { $s.Substring(0, 400) } else { $s } } } else { @() })
+  $out = [ordered]@{
+    name = "$name"; at = "$($rec['at'])"; verdict = $verdict
+    okCount = [int]$rec['okCount']; warnCount = [int]$rec['warnCount']; failCount = [int]$rec['failCount']
+    lines = $lines; failStreak = $streak; history = $history
+  }
+  [IO.File]::WriteAllText($f, ($out | ConvertTo-Json -Depth 6), $Utf8)
+  $out
+}
+function Get-Daemons {
+  $out = [Collections.Generic.List[object]]::new()
+  foreach ($name in @(Get-DaemonNames)) {
+    try {
+      $rec = Get-DaemonRecord $name
+      if (-not $rec) { [Console]::Error.WriteLine("agentq-sync: daemon '$name' skipped (no record)"); continue }
+      $out.Add((Update-DaemonRecord $name $rec))
+    } catch { [Console]::Error.WriteLine("agentq-sync: daemon '$name' skipped: $_") }
+  }
+  $out
 }
 
 function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
@@ -228,10 +319,10 @@ function Invoke-Push {
   $j = Get-NewLines $state.offset
   $body = [ordered]@{
     host = $env:COMPUTERNAME; root = $Root; agentVersion = $Version
-    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); jobs = @(Get-Jobs); journal = @($j.lines); ackOps = @($state.ack)
+    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); jobs = @(Get-Jobs); daemons = @(Get-Daemons); journal = @($j.lines); ackOps = @($state.ack)
   }
   if ($DryRun) {
-    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) jobs=$($body.jobs.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
+    "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) jobs=$($body.jobs.Count) daemons=$($body.daemons.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
     if ($env:AGENTQ_SYNC_DUMP) { [IO.File]::WriteAllText($env:AGENTQ_SYNC_DUMP, ($body | ConvertTo-Json -Depth 6), $Utf8) }
     return
   }
@@ -270,6 +361,16 @@ if ($Status) {
   "state: offset=$($s.offset) lastOk=$($s.lastOk) lastError=$($s.lastError) pendingAck=$($s.ack.Count)"
   $t = Get-ScheduledTask -TaskName 'agentq-sync' -ErrorAction SilentlyContinue
   if ($t) { "task: $($t.State) -> $($t.Actions[0].Execute) $($t.Actions[0].Arguments)" } else { 'task: not installed' }
+  $dn = @(Get-DaemonNames)
+  "daemons: $($dn.Count) configured ($($dn -join ', '))"
+  $dd = Join-Path $Root 'daemons'
+  if (Test-Path -LiteralPath $dd) {
+    foreach ($f in Get-ChildItem -LiteralPath $dd -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+      try { $rec = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -AsHashtable -DateKind String } catch { "  $($f.BaseName): unreadable"; continue }
+      $age = try { [int](([DateTime]::UtcNow - [DateTime]$rec['at']).TotalMinutes) } catch { -1 }
+      "  {0,-16} {1,-5} failStreak {2}  {3}m ago  ({4} lines)" -f "$($rec['name'])", "$($rec['verdict'])", [int]$rec['failStreak'], $age, @($rec['lines']).Count
+    }
+  } else { '  (no daemon records yet)' }
   exit 0
 }
 if ($Install) {

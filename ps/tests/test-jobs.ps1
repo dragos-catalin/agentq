@@ -166,9 +166,39 @@ $oldId = 'old-0001'
 & pwsh -NoProfile -File $jobs prune | Out-Null
 Check 'jobs prune removes finished > 7 days, keeps recent' (-not (Test-Path (Join-Path $env:AGENTQ_HOME "jobs\$oldId.json")) -and (Test-Path $jf))
 
+# --- jobs reap: reconcile the registry with reality (dead/recycled pid -> dead; live untouched) --------
+$reapLog = Join-Path $cwd 'reap.log'; Set-Content -LiteralPath $reapLog -Value 'x'
+@{ id = 'reap-dead'; label = 'zombie'; command = 'x'; cwd = $cwd; pid = 999999; pidStart = 1; log = $reapLog; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-5).ToString('o'); state = 'running'; ownerPid = 999999; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-dead.json")
+$live = (& pwsh -NoProfile -File $start -Label 'reap live' -Command 'Start-Sleep 30' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
+Start-Sleep -Milliseconds 500
+$rj = (& pwsh -NoProfile -File $jobs reap -Json) | ConvertFrom-Json
+Check 'jobs reap reports the dead-pid running job' (@($rj | Where-Object { $_.id -eq 'reap-dead' }).Count -eq 1)
+Check 'jobs reap never lists the live job' (@($rj | Where-Object { $_.id -eq $live.id }).Count -eq 0)
+$rd = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-dead.json") -Raw | ConvertFrom-Json
+Check 'jobs reap marks dead + endedAt + reapedBy' ($rd.state -eq 'dead' -and $rd.endedAt -and $rd.reapedBy)
+$rl = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($live.id).json") -Raw | ConvertFrom-Json
+Check 'jobs reap leaves the live job running' ($rl.state -eq 'running')
+# -WhatIf prints the change but writes nothing
+@{ id = 'reap-wi'; label = 'zombie2'; command = 'x'; cwd = $cwd; pid = 999999; pidStart = 1; log = $reapLog; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-5).ToString('o'); state = 'running'; ownerPid = 999999; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-wi.json")
+$wiOut = (& pwsh -NoProfile -File $jobs reap -WhatIf) -join "`n"
+$rwi = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-wi.json") -Raw | ConvertFrom-Json
+Check 'jobs reap -WhatIf writes nothing' ($rwi.state -eq 'running' -and $wiOut -match 'would reap')
+# a recycled pid (alive, but a different start time) is dead too
+@{ id = 'reap-recycle'; label = 'recycled'; command = 'x'; cwd = $cwd; pid = $PID; pidStart = 1; log = $reapLog; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-5).ToString('o'); state = 'running'; ownerPid = $PID; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-recycle.json")
+& pwsh -NoProfile -File $jobs reap | Out-Null
+$rrc = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\reap-recycle.json") -Raw | ConvertFrom-Json
+Check 'jobs reap treats a recycled pid as dead' ($rrc.state -eq 'dead')
+& pwsh -NoProfile -File $jobs kill $live.id | Out-Null
+
 # --- agentq-sync payload carries jobs[] in the contract shape ---------------------------------------
 $env:AGENTQ_SYNC_STATE = Join-Path $tmp 'sync-state.json'
 $env:AGENTQ_SYNC_DUMP = Join-Path $tmp 'sync-body.json'
+# daemon health: the default daemon (git-autosync) is pointed at a fake so the dry-run never runs the
+# real tool (which would scan the configured repos and touch real state); the payload stays deterministic.
+$fakeDaemon = Join-Path $tmp 'fake-git-autosync.ps1'
+$fakeRec = '{"name":"git-autosync","at":"2026-01-01T00:00:00Z","verdict":"warn","okCount":2,"warnCount":1,"failCount":0,"lines":["WARN x"],"failStreak":0,"history":[]}'
+[IO.File]::WriteAllText($fakeDaemon, "'" + $fakeRec.Replace("'", "''") + "'`n")
+$env:AGENTQ_GIT_AUTOSYNC = $fakeDaemon
 $d = (& pwsh -NoProfile -File $sync -Once -DryRun) -join ' '
 $body = Get-Content $env:AGENTQ_SYNC_DUMP -Raw | ConvertFrom-Json
 $sj = @($body.jobs | Where-Object { $_.id -eq $o.id })
@@ -176,7 +206,10 @@ $keys = 'id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,startedAt
 Check 'agentq-sync -DryRun counts jobs' ($d -match 'jobs=\d+') $d
 Check 'sync jobs[] entry has exactly the contract fields' ($sj.Count -eq 1 -and -not (Compare-Object $keys @($sj[0].PSObject.Properties.Name))) (($sj | ConvertTo-Json -Compress))
 Check 'sync jobs[] carries computed state (dead/suspect)' (@($body.jobs | Where-Object { $_.id -eq $deadId -and $_.state -eq 'dead' }).Count -eq 1)
-Remove-Item Env:AGENTQ_SYNC_DUMP, Env:AGENTQ_SYNC_STATE
+Check 'agentq-sync -DryRun counts daemons' ($d -match 'daemons=1') $d
+Check 'sync payload carries daemons[] in the frozen shape' (@($body.daemons).Count -eq 1 -and $body.daemons[0].name -eq 'git-autosync' -and $body.daemons[0].verdict -eq 'warn' -and @($body.daemons[0].history).Count -eq 1) (($body.daemons | ConvertTo-Json -Compress))
+Check 'daemon record written under coord/daemons' (Test-Path (Join-Path $env:AGENTQ_HOME 'daemons\git-autosync.json'))
+Remove-Item Env:AGENTQ_SYNC_DUMP, Env:AGENTQ_SYNC_STATE, Env:AGENTQ_GIT_AUTOSYNC
 
 # --- run-build: defaults + isolated child -------------------------------------------------------------
 $pa = [System.Management.Automation.Language.Parser]::ParseFile($rb, [ref]$null, [ref]$null).ParamBlock.Parameters

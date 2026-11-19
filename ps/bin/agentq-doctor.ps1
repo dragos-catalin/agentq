@@ -571,6 +571,35 @@ function Test-DoctorGitAutosync {
   Add-DoctorSummary 'git-autosync' "$sum  [$tool]"
 }
 
+# ---- 9. daemons: the health records agentq-sync writes (git-autosync, ...) -----------------------
+# Each <root>/daemons/<name>.json is { name, at, verdict, okCount, warnCount, failCount, lines,
+# failStreak, history }. A `fail` verdict is a problem (a daemon is not doing its job); `warn` is a
+# warning. Written by agentq-sync, so an absent dir just means nothing has been collected yet.
+function Test-DoctorDaemons {
+  $dir = Join-Path $Root 'daemons'
+  if (-not [IO.Directory]::Exists($dir)) { Add-DoctorSummary 'daemons' 'no daemon records yet'; return }
+  $n = 0; $failed = 0
+  foreach ($f in @([IO.DirectoryInfo]::new($dir).EnumerateFiles('*.json'))) {
+    $rec = $null
+    try { $rec = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json -DateKind String } catch { }
+    if ($null -eq $rec) { Add-DoctorRow 'daemons' 'warn' $f.BaseName 'daemon record is not readable JSON' 'let the owning daemon rewrite it (agentq-sync collects it each pass)'; continue }
+    $n++
+    $name = "$(P $rec 'name' $f.BaseName)"; $verdict = "$(P $rec 'verdict' '?')"
+    $streak = 0; try { $streak = [int](P $rec 'failStreak' 0) } catch { }
+    $counts = "$(P $rec 'okCount' 0) ok, $(P $rec 'warnCount' 0) warn, $(P $rec 'failCount' 0) fail, $streak consecutive"
+    if ($verdict -eq 'fail') {
+      $failed++
+      $lines = @(P $rec 'lines' @())
+      $firstFail = @($lines | Where-Object { "$_" -match '^FAIL' } | Select-Object -First 1)
+      $why = if ($firstFail.Count) { " ($($firstFail[0]))" } else { '' }
+      Add-DoctorRow 'daemons' 'fail' $name "daemon verdict fail: $counts$why" 'run it by hand: pwsh -NoProfile -File <the daemon tool> -Doctor'
+    } elseif ($verdict -eq 'warn') {
+      Add-DoctorRow 'daemons' 'warn' $name "daemon verdict warn: $counts"
+    }
+  }
+  Add-DoctorSummary 'daemons' "$n daemon record(s), $failed failing"
+}
+
 # ---- report -----------------------------------------------------------------------------------
 function Format-DoctorText($row) { if ($row.subject) { "$($row.subject): $($row.detail)" } else { "$($row.detail)" } }
 function Write-DoctorReport([object[]]$rows, [string[]]$order, [string]$header, [int]$fails, [int]$warns) {
@@ -620,6 +649,7 @@ function Invoke-Doctor {
     'state-size'          = { Test-DoctorStateSize }
     'scheduled-tasks'     = { Test-DoctorTasks }
     'git-autosync'        = { Test-DoctorGitAutosync }
+    'daemons'             = { Test-DoctorDaemons }
   }
   $timings = [ordered]@{}
   foreach ($cn in @($checks.Keys)) {
@@ -635,11 +665,20 @@ function Invoke-Doctor {
   $fails = @($rows | Where-Object { $_.status -eq 'fail' }).Count
   $warns = @($rows | Where-Object { $_.status -eq 'warn' }).Count
   $script:DoctorExit = if ($fails) { 1 } else { 0 }
+  $scopeText = if ($scope.only) { "repo $($scope.only)" } else { "all repos ($($scope.repoCount))" }
   if ($Json) {
-    [ordered]@{ generatedAt = (Iso (Now)); problems = $fails; warnings = $warns; elapsedMs = [int]$sw.ElapsedMilliseconds; timings = $timings; rows = $rows } | ConvertTo-Json -Depth 5 -Compress
+    # ONE JSON object on stdout (the frozen shape `{ at, scope, rows, problems, warnings, exit }` callers
+    # consume) instead of the human table; the exit code is unchanged. `scope` mirrors the header.
+    [ordered]@{
+      at = (Iso (Now))
+      scope = [ordered]@{ only = "$($scope.only)"; repos = [int]$scope.repoCount; slots = @($scope.slots).Count; wtRoot = "$($scope.wtRoot)"; text = $scopeText }
+      rows = $rows
+      problems = $fails
+      warnings = $warns
+      exit = $script:DoctorExit
+    } | ConvertTo-Json -Depth 6 -Compress
     return
   }
-  $scopeText = if ($scope.only) { "repo $($scope.only)" } else { "all repos ($($scope.repoCount))" }
   $header = "agentq doctor  $(Iso (Now))  scope: $scopeText, $($scope.slots.Count) slot(s) under $($scope.wtRoot)  state: $Root  $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
   Write-DoctorReport $rows (@('scope') + @($checks.Keys)) $header $fails $warns
 }
