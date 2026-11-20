@@ -1,6 +1,11 @@
 <#
 agentq — cross-agent coordination for builds, deploys, installs and commits on this machine.
 
+NEW HERE? RUN `agentq help` FIRST. It prints every verb (one line each, grouped) and `agentq help
+<verb>` prints that verb's usage plus a copy-paste example (`agentq help land`). Unknown verbs and
+unknown flags print the same index and exit 2, so a guess costs one call, not a search. The list below
+is the long form of the same thing; it is not the only way in.
+
 WHY: many agents share one clone (and its worktrees). Before this, every lock was
 poll-and-race, per worktree, with no reason field and no shared history, so builds
 corrupted each other's .next/.turbo, deploys raced, a commit swept another agent's
@@ -126,10 +131,16 @@ $Verb = 'status'; $Resource = $null; $Purpose = $null; $Message = $null; $Paths 
 $Repo = $null; $ExpectRepo = $null; $State = $null; $Reason = $null; $Id = $null
 $Capacity = 1; $TimeoutMin = 60; $StaleMin = 10; $Last = 30; $Hours = 12; $MinFreeGB = 6
 $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGiven = $false
+$StaleOnly = $false; $IdleHours = [double]0; $Reclaim = $false; $Track = $false
 # bounded slot acquisition for `lease -Wait` (exit 7 on the bound; 0/3 otherwise).
 $Wait = $false; $MaxMin = $null; $MaxMinGiven = $false
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
+# -Hold [-HoldMin n] (ADR 0012): the holder is running a long job OUTSIDE the slot and asks agentq to keep
+# the lease until then (journalled, bounded). Without it a lease is reclaimed when its slot has seen no work
+# for leaseIdleMin (45 min) / leaseOwnerIdleMin (90 min, live owner shell) - work, not "the chat is busy".
+$Hold = $false; $HoldMin = $null
+$FbKind = $null; $EvalSample = $false
 $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
 $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $DoLand = $false; $Force = $false
 # v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
@@ -150,6 +161,15 @@ $argv = @($args)
 $dd = [array]::IndexOf($argv, '--')
 if ($dd -ge 0) { $Rest = @($argv | Select-Object -Skip ($dd + 1)); $argv = @($argv | Select-Object -First $dd) }
 $i = 0
+# `agentq help [<verb>]`, `agentq -h|--help|-?`: the discoverability entry point. An agent that does
+# not know a verb exists must be able to ask in ONE step. Before this there was no `help` verb at all,
+# so `agentq help` fell into `default` (dump the whole comment block, exit 2 = "failed" to an agent)
+# and an agent looking for `land` burned 7 turns guessing verb names (2026-11-20).
+if ($argv.Count -and "$($argv[0])".ToLowerInvariant() -in @('help', '-h', '--help', '-?', '/?')) {
+  $Verb = 'help'
+  if ($argv.Count -gt 1 -and "$($argv[1])" -notlike '-*') { $Sub = "$($argv[1])".ToLowerInvariant() }
+  $argv = @()
+}
 if ($argv.Count -and "$($argv[0])" -notlike '-*') { $Verb = "$($argv[0])"; $i = 1 }
 if ($Verb -eq 'workspace' -and $argv.Count -gt 1 -and "$($argv[1])" -notlike '-*') { $Sub = "$($argv[1])".ToLowerInvariant(); $i = 2 }
 while ($i -lt $argv.Count) {
@@ -186,8 +206,18 @@ while ($i -lt $argv.Count) {
     'wait' { $Wait = $true }
     'maxmin' { $MaxMin = [double](& $next); $MaxMinGiven = $true }
     'json' { $Json = $true }
+    'staleonly' { $StaleOnly = $true }
+    'idlehours' { $IdleHours = [double](& $next) }
+    'stale-only' { $StaleOnly = $true }
+    'idle-hours' { $IdleHours = [double](& $next) }
+    'reclaim' { $Reclaim = $true }
+    'track' { $Track = $true }
     'slot' { $Slot = & $next }
     'role' { $Role = & $next }
+    'hold' { $Hold = $true }
+    'holdmin' { $Hold = $true; $HoldMin = & $next }
+    'kind' { $FbKind = & $next }
+    'sample' { $EvalSample = $true }
     'path' { $WtPath = & $next }
     'branch' { $Branch = & $next }
     'onto' { $Onto = & $next }
@@ -217,9 +247,13 @@ while ($i -lt $argv.Count) {
     'days' { $Days = [double](& $next) }
     default {
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
-        throw "agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'."
+        [Console]::Error.WriteLine("agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'.")
+        exit 2
       }
-      throw "agentq: unknown argument '$a' (put the command after --)"
+      [Console]::Error.WriteLine("agentq: unknown argument '$a' (put the command after '--').")
+      [Console]::Error.WriteLine("  flags of 'agentq $Verb': agentq help $Verb")
+      [Console]::Error.WriteLine("  every verb:             agentq help")
+      exit 2
     }
   }
   $i++
@@ -230,7 +264,7 @@ Set-StrictMode -Version 3
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
 # consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
 # happens where work happens (run/commit/lease/land) and in `sweep`.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'metrics', 'doctor'
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'metrics', 'doctor', 'help'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -311,9 +345,26 @@ function Get-RepoInfo([string]$path) {
 # the clone. The PreToolUse guard covers editor writes; this covers the agentq verbs that create the
 # commits and the landings. Work belongs in a leased slot. Deliberate one-off (say why in the purpose):
 # AGENTQ_SHARED_CLONE_COMMIT_OK=1.
+#
+# The refusal must fire ONLY for the repo's MAIN working tree. A leased slot is a LINKED worktree, and a
+# slot is exactly where `agentq commit` / `agentq land` are supposed to run (2026-11-19: every commit in
+# a slot was refused as "E:\gh\codai is the SHARED clone" because the decision rested on path arithmetic
+# over `--git-common-dir`, whose parent is the main clone for EVERY worktree of the repo).
+# Production tells the two apart: a linked worktree has its own git dir (<common>/worktrees/<name>), so
+# only the main worktree has git-dir == git-common-dir. Test-IsMainWorktree asks git that question; the
+# path comparison stays as a second, independent witness and a refusal needs BOTH to say "main tree".
+function Test-IsMainWorktree([object]$repo) {
+  if (-not $repo -or -not $repo.Top) { return $false }
+  $gd = "$(& git -C $repo.Top rev-parse --path-format=absolute --git-dir 2>$null)".Trim()
+  $cd = "$($repo.Common)".Trim()
+  if (-not $gd -or -not $cd) { return $false }   # cannot prove it is the main tree -> do not refuse
+  $norm = { param($p) ([IO.Path]::GetFullPath("$p")).TrimEnd('\', '/').ToLowerInvariant() }
+  ((& $norm $gd) -eq (& $norm $cd))
+}
 function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
   if (-not $repo -or -not $repo.Top -or -not $repo.Common) { return }
   if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1') { return }
+  if (-not (Test-IsMainWorktree $repo)) { return }               # a linked worktree (leased slot): fine
   $norm = { param($p) ([IO.Path]::GetFullPath("$p")).TrimEnd('\', '/').ToLowerInvariant() }
   # Top is the worktree path, Common the shared .git: they are equal only in the shared clone itself.
   $commonRoot = Split-Path $repo.Common -Parent
@@ -954,6 +1005,113 @@ function Invoke-Propose {
 }
 
 # ---- metrics (DC-017): wait/hold distributions from the journal --------------------------
+# ---- can-preempt verdict (ADR 0013, 2026-11-19): ONE instant answer ----------------------
+# An agent blocked on a resource used to spend minutes discovering whether the holder can be stopped:
+# read status, find the pid, sample CPU, guess, maybe break the wrong ticket. This answers in one call
+# with a verdict AND the exact command. READ-ONLY: it never breaks, never renews, never writes state.
+function Invoke-Eval {
+  if (-not $Resource) { [Console]::Error.WriteLine('agentq eval -Resource <build:repo|install:repo|commit:repo|deploy:repo:target|slot:repo:slot> [-Sample]'); exit 2 }
+  $res = Resolve-Resource $Resource (Get-RepoInfo $Repo)
+  $sample = [bool]$EvalSample
+  $line = { param($k, $v) "{0,-9}: {1}" -f $k, $v }
+
+  # --- a slot: answer is about the lease, not a queue -----------------------------------------
+  if ("$res" -like 'slot:*') {
+    $p = "$res" -split ':'
+    $l = @(Read-Leases $p[1] | Where-Object { $_.slot -eq $p[2] } | Select-Object -First 1)
+    if (-not $l) { & $line 'verdict' 'FREE'; & $line 'why' "no lease on $($p[1])/$($p[2])"; return }
+    $idle = [math]::Round([double](P $l 'idleMin' 0))
+    $why = @("lease $($l.leaseId) held by $($l.session) since $((P $l 'created' '')): '$((P $l 'purpose' ''))'", "work clock: slot idle $idle min; owner pid alive=$($l.alive); chat idle=$(if ($null -ne (P $l 'chatIdleMin' $null)) { (P $l 'chatIdleMin') } else { '-' }) min")
+    if ($l.stale) {
+      & $line 'verdict' 'STALE-RECLAIM'
+      & $line 'why' ($why -join '; ')
+      & $line 'how' "agentq unlease -Repo `"$(P $l 'path')`" -LeaseId $($l.leaseId) -Reason 'stale, reclaiming'  (backs up unsaved state to refs/backup/wt/... first)"
+    } else {
+      & $line 'verdict' 'WAIT'
+      & $line 'why' ($why -join '; ')
+      & $line 'how' "not stale yet. If the work is real but runs OUTSIDE the slot, the holder must renew it (agentq renew -LeaseId $($l.leaseId)); do not break a live lease - coordinate with $($l.session)."
+    }
+    return
+  }
+
+  # --- a queue resource: answer is about the holder ticket -------------------------------------
+  $cap = Get-Capacity $res
+  $live = @(Get-Live $res)
+  $holders = @($live | Where-Object { Test-Held $_ $live $cap })
+  $waiting = @($live | Where-Object { -not (Test-Held $_ $live $cap) })
+  if (-not $holders.Count) {
+    & $line 'verdict' 'FREE'
+    & $line 'why' "$res has no holder ($($waiting.Count) waiter(s)); your ticket is next"
+    return
+  }
+  $rows = @()
+  $worst = 'FREE'
+  foreach ($h in $holders) {
+    $pid0 = [int](P $h 'pid' 0)
+    $alive = Test-Alive $h
+    $beat = [double](P $h 'beatAgeMin' 999)
+    $kids = 0; $cpu = $null
+    if ($alive -and $pid0 -gt 0) {
+      try { $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$pid0" -ErrorAction SilentlyContinue).Count } catch { }
+      try { $cpu = (Get-Process -Id $pid0 -ErrorAction SilentlyContinue).CPU } catch { }
+    }
+    if ($sample -and $alive -and $pid0 -gt 0) {
+      Start-Sleep -Milliseconds 900
+      try { $c2 = (Get-Process -Id $pid0 -ErrorAction SilentlyContinue).CPU; if ($null -ne $cpu -and $null -ne $c2) { $cpu = [math]::Round(($c2 - $cpu), 2) } } catch { $cpu = $null }
+    }
+    $cmd = "$(P $h 'cmd' '') `"$(P $h 'purpose' '')`""
+    $isDeploy = $cmd -match '(?i)deploy|release|land|pulumi|terraform apply|gcloud run (replace|update)|vercel'
+    $v = 'WAIT'; $whyH = @()
+    if (-not $alive) { $v = 'PREEMPT-OK'; $whyH += 'holder pid is GONE (crashed)' }
+    elseif ($isDeploy) { $v = 'NEVER'; $whyH += 'this is a deploy/release: stopping it mid-flight can leave a half-shipped service' }
+    elseif ($kids -eq 0 -and ($null -eq $cpu -or $cpu -lt 0.5) -and $beat -gt 5) { $v = 'PREEMPT-OK'; $whyH += "no child processes and ~no CPU (${cpu}s/0.9s) for $([math]::Round($beat)) min: the holder looks wedged" }
+    elseif ($beat -gt (2 * $StaleMin)) { $v = 'PREEMPT-OK'; $whyH += "heartbeat stale $([math]::Round($beat)) min (> 2x stale $StaleMin) even though the pid lives" }
+    else { $whyH += "holder is alive and working (children=$kids, cpu=${cpu}s): let it finish" }
+    $whyH += "holder $($h.id) on ${res}: pid $pid0, beat $([math]::Round($beat)) min, '$((P $h 'purpose' ''))'"
+    $rows += [pscustomobject]@{ verdict = $v; ticket = $h.id; pid = $pid0; kids = $kids; cpuSec = $cpu; beatMin = [math]::Round($beat); why = ($whyH -join '; ') }
+    if ($v -eq 'NEVER') { $worst = 'NEVER' } elseif ($v -eq 'PREEMPT-OK' -and $worst -ne 'NEVER') { $worst = 'PREEMPT-OK' }
+  }
+  if ($Json) { @{ resource = $res; verdict = $worst; holders = $rows; waiting = $waiting.Count } | ConvertTo-Json -Depth 4; return }
+  foreach ($r in $rows) {
+    & $line 'verdict' $r.verdict
+    & $line 'holder' "ticket $($r.ticket) pid $($r.pid) children $($r.kids) cpu $($r.cpuSec)s beat $($r.beatMin)m"
+    & $line 'why' $r.why
+    if ($r.verdict -eq 'PREEMPT-OK') { & $line 'how' "agentq break -Resource '$res' -Id $($r.ticket) -Reason 'wedged: no child/CPU for $($r.beatMin) min'   (then re-run your command; the queue slot is yours)" }
+    elseif ($r.verdict -eq 'NEVER') { & $line 'how' 'wait, or ask the owner; a release must not be broken mid-flight' }
+    else { & $line 'how' "wait. If it exceeds 2x its usual hold, agentq propose -Reason '...' breaks a STALE holder automatically." }
+  }
+  & $line 'queue' "$($holders.Count) holder(s), $($waiting.Count) waiter(s), capacity $cap"
+}
+
+# ---- feedback for future agents (ADR 0013) -------------------------------------------------
+# Anomalies, ideas and "next time do X" notes about agentq itself, from agents that had to work around
+# it. They belong to the TOOL, not to a task, so they live next to the coordinator and show up in
+# `agentq since`/the hub, not in a repo tracker. One JSON file per note; the journal gets the event.
+function Invoke-Feedback {
+  $dir = Join-Path $Root 'feedback'
+  if ($Message) {
+    $kind = if ($FbKind) { "$FbKind".ToLowerInvariant() } else { 'note' }
+    if ($kind -notin 'note', 'idea', 'bug', 'anomaly', 'praise') { [Console]::Error.WriteLine("agentq feedback: -Kind must be note|idea|bug|anomaly|praise (got '$kind')"); exit 2 }
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $ts = (Now).ToString('yyyyMMdd-HHmmss')
+    $id = "$ts-$((Get-Random -Minimum 1000 -Maximum 9999))"
+    $f = Join-Path $dir "$id.json"
+    $o = [ordered]@{ id = $id; ts = (Iso (Now)); kind = $kind; session = $Session; host = $env:COMPUTERNAME; repo = $(if ($RepoArg) { Split-Path $RepoArg -Leaf } else { '' }); resource = "$Resource"; message = $Message }
+    [IO.File]::WriteAllText($f, ($o | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    Write-Journal @{ event = 'feedback'; resource = 'agentq'; kind = $kind; message = $Message; id = $id; session = $Session }
+    Write-Output "recorded $kind feedback $id -> $dir"
+    Write-Output "the next agent working on agentq sees it with: agentq feedback"
+    return
+  }
+  if (-not (Test-Path $dir)) { Write-Output 'no feedback yet (agentq feedback -Kind idea|bug|anomaly|note -Message "...")'; return }
+  $items = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First $Last | ForEach-Object { try { Get-Content $_.FullName -Raw | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+  if (-not $items.Count) { Write-Output 'no feedback yet'; return }
+  if ($Json) { @{ feedback = @($items) } | ConvertTo-Json -Depth 4; return }
+  foreach ($i in $items) { "{0}  {1,-7}  {2,-12}  {3}" -f $i.ts, $i.kind, $i.session, $i.message | Write-Output }
+  Write-Output ""
+  Write-Output "$(@($items).Count) note(s), newest first. Add yours: agentq feedback -Kind bug|idea|anomaly -Message '...'"
+}
+
 function Show-Metrics {
   $from = (Now).AddHours(-$Hours)
   $items = @(Read-Journal 0 $from $null | Where-Object { (JProp $_ 'event') -in 'done', 'fail', 'cloud-done', 'cloud-fail' -and $_.PSObject.Properties['holdSec'] })
@@ -1098,6 +1256,8 @@ function Invoke-Run {
         $h = @(Get-Live $busy[0].resource)[0]
         foreach ($t in $tickets) { Remove-Ticket $t 'busy (-NoWait)' 'giveup' }
         [Console]::Error.WriteLine("agentq: $($busy[0].resource) is busy: $($h.session) '$($h.purpose)' since $($h.created)")
+        [Console]::Error.WriteLine("  next: agentq eval -Resource '$($busy[0].resource)' -Purpose '<what you want to do>' says whether the holder can be preempted, and the exact command; agentq status lists every holder.")
+        [Console]::Error.WriteLine("        Or drop -NoWait: the run queues and starts the moment the holder releases (agentq help run).")
         exit 3
       }
       foreach ($t in $tickets) { Update-Ticket $t @{ held = $true; acquired = (Iso (Now)) } }
@@ -1385,6 +1545,9 @@ function Show-Status {
     $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
+  # Discoverability (2026-11-20): an agent that only ever reads `status` must still learn where the rest
+  # of the tool is. One line, always last, never in -Json (that path returned above, parsers).
+  Write-Output '== HELP every verb + group: agentq help | usage + example for one: agentq help <verb> (e.g. agentq help land)'
 }
 
 # Journal lines come from several writers (agentq, guard hook: tool/paths/repo, no resource); StrictMode 3
@@ -1534,7 +1697,12 @@ function Invoke-Acquire {
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $Purpose }
   if ($NoWait) {
     $live = @(Get-Live $res)
-    if ([array]::IndexOf(@($live | ForEach-Object id), $t.id) -ge (Get-Capacity $res)) { Remove-Ticket $t 'busy (-NoWait)' 'giveup'; exit 3 }
+    if ([array]::IndexOf(@($live | ForEach-Object id), $t.id) -ge (Get-Capacity $res)) {
+      Remove-Ticket $t 'busy (-NoWait)' 'giveup'
+      [Console]::Error.WriteLine("agentq: $res is busy (-NoWait gave up at once).")
+      [Console]::Error.WriteLine("  next: drop -NoWait to queue, or agentq eval -Resource '$res' -Purpose '<what you want to do>' for a verdict + the exact command.")
+      exit 3
+    }
   } else { Wait-Turn $t $TimeoutMin $null }
   Write-Journal @{ event = 'start'; resource = $res; tickets = @($t.id); purpose = $Purpose }
   Write-Output $t.id
@@ -1549,7 +1717,7 @@ function Invoke-Release {
 }
 
 . (Join-Path $PSScriptRoot 'agentq-v2.ps1')
-if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'renew', 'lease-check', 'prune', 'probe', 'slo') { Renew-ForCwd }
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'renew', 'lease-check', 'prune', 'probe', 'slo', 'eval', 'feedback', 'who') { Renew-ForCwd }
 # Session renewal only for verbs that mean "this agent is working"; maintenance verbs (sweep, break,
 # unlease, metrics, rotate) from the same session must not keep a lease alive they are judging.
 if ($Verb.ToLowerInvariant() -in 'run', 'commit', 'publish', 'land', 'note', 'acquire', 'release', 'bump', 'propose', 'lease', 'backup', 'since') { Renew-ForSession }
@@ -1604,9 +1772,83 @@ function Register-Agent {
     [IO.File]::WriteAllText($tmp, ($rec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)); Move-Item -Force -LiteralPath $tmp -Destination $f
   } catch {}
 }
-if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'since', 'help', 'prune', 'probe', 'slo', 'sweep') { Register-Agent }
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'since', 'help', 'prune', 'probe', 'slo', 'sweep', 'eval', 'feedback', 'who') { Register-Agent }
+
+# ---- help: ONE source of truth for discovery ------------------------------------------------
+# Every verb in the switch below MUST have an entry here (tests/test-agentq-help.ps1 asserts it by
+# parsing both from this file). `agentq help` is the index an agent reads in one step; `agentq help
+# <verb>` is the usage. This is why `run` is the only verb an agent needs to remember.
+$script:AqHelp = [ordered]@{
+  'run' = @{ g = 'Queue & run'; u = 'run -Resource <build|install|commit|deploy:<target>|slot:<repo>:<slot>|any name> -Purpose "why" [-- <cmd>] [-Lane interactive|quick|gate|heavy|batch] [-Priority -50..50] [-MinFreeGB 6] [-TimeoutMin n] [-Where local|cloud|auto] [-Ws <ws>] [-NoWait]'; d = 'queue for a resource, hold it, run the command, release'; e = 'agentq run -Resource build -Purpose "typecheck" -- pnpm typecheck' }
+  'acquire' = @{ g = 'Queue & run'; u = 'acquire -Resource R [-Purpose p] [-Capacity n] [-NoWait]'; d = 'low-level: take one ticket and print its id (scripting; `run` does this for you)' }
+  'release' = @{ g = 'Queue & run'; u = 'release -Resource R -Id <ticket> [-Reason "..."]'; d = 'low-level: give back a ticket taken with `acquire`' }
+  'status' = @{ g = 'Queue & run'; u = 'status [<repo>] [-All] [-Json]'; d = 'who holds what, waiters, stale, marks, leases, releases, load'; e = 'agentq status --json | ConvertFrom-Json' }
+  'log' = @{ g = 'Queue & run'; u = 'log [-Last 30] [-All] [-Json]'; d = 'recent journal: queued/start/done/fail/break/mark/note/commit' }
+  'since' = @{ g = 'Queue & run'; u = 'since [-Hours 12] [-Json]'; d = 'what changed in this repo: journal + git log' }
+  'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
+  'bump' = @{ g = 'Fairness & overrides (v3)'; u = 'bump [-Id <ticket>] -By 20 -Reason "..."'; d = 'raise my waiting ticket in the scheduler order (cap bumpMax)' }
+  'burst' = @{ g = 'Fairness & overrides (v3)'; u = 'burst [-Resource build:machine] [-By 1] [-Minutes 30] -Reason "..."'; d = 'temporary extra slot, refused when RAM/commit headroom is under 2x the gate' }
+  'propose' = @{ g = 'Fairness & overrides (v3)'; u = 'propose [-Reason "..."]'; d = 'diagnose my wait and APPLY safe remedies (break dead/STALE >2x, bump long waits, short burst)' }
+  'metrics' = @{ g = 'Fairness & overrides (v3)'; u = 'metrics [-Hours 24] [-Json]'; d = 'wait/hold p50/p90 per resource x lane x kind' }
+  'probe' = @{ g = 'Fairness & overrides (v3)'; u = 'probe [-Force] [-Json]'; d = 'take a load sample now (start latency + seconds since input) -> == LOAD / == AGENTS'; e = 'agentq probe -Force' }
+  'rotate' = @{ g = 'Fairness & overrides (v3)'; u = 'rotate'; d = 'archive the journal now (sweep does it above journalRotateMB)' }
+  'commit' = @{ g = 'Commit'; u = 'commit -Purpose "why" -Message "type(scope): msg" -Paths a,b [-NoPush]'; d = 'add+commit ONLY those paths under commit:<repo>, trailers, fetch+merge+push with retry' }
+  'mark' = @{ g = 'Marks'; u = 'mark -Resource R -State frozen|blocked|clear -Reason "..."'; d = 'freeze/block a resource: run and acquire refuse it and print the reason'; e = 'agentq mark -Resource deploy:codai:gateway -State frozen -Reason "incident: 500s since 08:12Z"' }
+  'break' = @{ g = 'Marks'; u = 'break -Resource R [-Id <ticket>] -Reason "..."'; d = 'remove a stale/stuck/dead ticket (never a live, healthy holder)' }
+  'lease' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'lease -Purpose "why" [-Slot task-2|scratch-1|release] [-Branch b] [-Ref r] [-Wait [-MaxMin n]] [-Hold [-HoldMin n]]'; d = 'take a worktree slot; prints the path (exit 0). -Wait polls, exit 7 = bound expired, 3 = frozen'; e = 'agentq lease -Purpose "long task" -Wait -MaxMin 5' }
+  'claim' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'claim -LeaseId <id> -Claims "apps/x/**,packages/y/**"'; d = 'declare the paths my lease owns (advisory; replaces the list)' }
+  'unlease' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'unlease -Repo <slot dir> [-Slot <slot>] -LeaseId <id> [-Reason "..."] [-Force -Reason "..."]'; d = 'give the slot back (backs up anything unpushed first); a foreign break while the holder chat is live needs -Force' }
+  'renew' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'renew [-LeaseId <id>] [-Repo <r>]'; d = 'refresh my lease heartbeat (a long job OUTSIDE the slot needs -Hold)' }
+  'sweep' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'sweep [-WhatIf] [-Json]'; d = 'reap dead/stale tickets and leases, rotate the journal, prune state' }
+  'who' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'who [<repo>] [-Json]'; d = 'one line per lease: is this slot really in use, by whom, is the holder alive' }
+  'eval' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'eval -Resource <build:repo|install:repo|commit:repo|deploy:repo:target|slot:repo:slot> [-Sample] [-Json]'; d = 'instant verdict on preemption: PREEMPT-OK | WAIT | NEVER + the exact command to run'; e = 'agentq eval -Resource build:codai' }
+  'feedback' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'feedback -Kind note|idea|bug|anomaly|praise -Message "..."'; d = 'tell the owner what worked or broke (journaled, shown on the hub)' }
+  'lease-check' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'lease-check [-Json]'; d = 'diagnose my own lease binding (chat/session -> slot, liveness clock, work clock)' }
+  'backup' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'backup -Path <worktree> [-Slot <name>] -Reason "..."'; d = 'proof-of-work snapshot of a slot -> refs/backup/... plus a bundle' }
+  'land' = @{ g = 'Land & release (ADR 0001)'; u = 'land -Branch <topic> -Onto <dev|main> -Purpose "why" [-Gate "<cmd>"] [-Also a,b] [-Force]'; d = 'land my branch: pre-gate the rebased result in my slot, then serialized merge+push (exit 5 conflict, 6 pre-gate)'; e = 'agentq land -Branch feat/x -Onto main -Purpose "ship" -Gate "pnpm typecheck"' }
+  'publish' = @{ g = 'Land & release (ADR 0001)'; u = 'publish -Paths a,b -Message "type(scope): msg" -Purpose "why" [-Onto main] [-Base <ref>] [-Land] [-NoPush]'; d = 'commit my paths and, with -Land, land them in one step' }
+  'release-begin' = @{ g = 'Land & release (ADR 0001)'; u = 'release-begin -Repo <r> -Target <t> -Sha <sha> [-Ref r] [-Follow branch] [-OwnerPid n]'; d = 'deploy-clean opens a release run (supersede-aware; see ADR 0001)' }
+  'release-phase' = @{ g = 'Land & release (ADR 0001)'; u = 'release-phase -Phase <name> [-Unsafe]'; d = 'checkpoint of a release; a landing during a SAFE phase makes the next one exit 4 superseded' }
+  'release-end' = @{ g = 'Land & release (ADR 0001)'; u = 'release-end -State done|failed|superseded'; d = 'close the release run' }
+  'release-cancel' = @{ g = 'Land & release (ADR 0001)'; u = 'release-cancel -Target <t> -Reason "..."'; d = 'abandon a release record, with a reason' }
+  'notify-landing' = @{ g = 'Land & release (ADR 0001)'; u = 'notify-landing -Repo <r> -Branch <b> [-Sha <sha>] [-Target <t>]'; d = 'tell running releases that a commit landed (called by commit/land)' }
+  'workspace' = @{ g = 'Cloud workspaces (devcloud F2)'; u = 'workspace take|release|list -Name <ws>'; d = 'register or look up a warm cloud workspace used by run -Where cloud' }
+  'prune' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'prune [-WhatIf] [-Days n] [-All] [-Json]'; d = 'remove state nobody needs any more (sweep runs it too)' }
+  'doctor' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'doctor [-All] [-Src <checkout>/ps] [-Json]'; d = 'health report of the whole install; exit 1 when a check fails' }
+  'slo' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'slo [-Hours 168] [-Json] [-Track]'; d = 'queue time, waits over 10 min, hook cost per day, slots lost with a live chat' }
+  'flakes' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'flakes [-Id <test key or substring> -Reason "why"]'; d = 'quarantine report; -Id lifts a quarantine' }
+  'store' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]'; d = 'SQLite index of the journal + job registry (the JSONL stays the source of truth)' }
+  'help' = @{ g = 'Help'; u = 'help [<verb>]'; d = 'this index, or one verb''s usage and an example'; e = 'agentq help land' }
+}
+function Show-AgentqHelp([string]$For) {
+  if ($For) {
+    if ($script:AqHelp.Contains($For)) {
+      $h = $script:AqHelp[$For]
+      Write-Output "agentq $For - $($h.d)"
+      Write-Output ''
+      Write-Output "  usage:   agentq $($h.u)"
+      if ($h.ContainsKey('e')) { Write-Output "  example: $($h.e)" }
+      return
+    }
+    [Console]::Error.WriteLine("agentq: no verb '$For'")
+  }
+  Write-Output 'agentq - cross-agent coordination: builds, installs, commits, deploys, worktree slots.'
+  Write-Output "  One verb to remember: run. Everything else: agentq help <verb>   (config: agentq-config.json)"
+  $last = ''
+  foreach ($k in $script:AqHelp.Keys) {
+    $h = $script:AqHelp[$k]
+    if ($h.g -ne $last) { Write-Output ''; Write-Output "== $($h.g)"; $last = $h.g }
+    Write-Output ("  {0,-15} {1}" -f $k, $h.d)
+  }
+  Write-Output ''
+  Write-Output 'READ-ONLY (never queue, never reap): status log since who metrics slo flakes doctor probe eval'
+  Write-Output 'EXIT: 0 ok | 2 usage | 3 frozen/blocked/timeout | 4 release superseded | 5 land conflict | 6 land pre-gate | 7 lease -Wait bound expired'
+  Write-Output 'DESIGN: 4 ADRs in docs/adr (0001 slots/leases/land, 0002 v3 scheduler, 0007 system store, 0009 orchestrator)'
+}
 
 switch ($Verb.ToLowerInvariant()) {
+  # Agent-facing discovery mirror of $AqHelp. Keep the two in step (test-agentq-help.ps1 asserts it).
+  'help' { Show-AgentqHelp $Sub; if ($Sub -and -not $script:AqHelp.Contains($Sub)) { exit 2 }; exit 0 }
   'run' { Invoke-Run }
   'commit' { Invoke-Commit }
   'status' { Show-Status }
@@ -1642,6 +1884,9 @@ switch ($Verb.ToLowerInvariant()) {
   'unlease' { Invoke-Unlease }
   'renew' { Invoke-Renew }
   'sweep' { Invoke-Sweep }
+  'who' { Invoke-Who }
+  'eval' { Invoke-Eval }
+  'feedback' { Invoke-Feedback }
   'lease-check' { Invoke-LeaseCheck }
   'backup' { Invoke-Backup }
   'release-begin' { Invoke-ReleaseBegin }
@@ -1656,9 +1901,40 @@ switch ($Verb.ToLowerInvariant()) {
   'doctor' { . (Join-Path $PSScriptRoot 'agentq-doctor.ps1'); Invoke-Doctor; exit $script:DoctorExit }
   # ADR 0003 W4-4: SLO report from the journal (ready->landed p90, flake rate, lost work, queue waits, bypass).
   'flakes' { Invoke-FlakesVerb }
-  'slo' { $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))"); if ($Json) { $sa += '--json' }; if (-not $env:AGENTQ_NO_STORE) { $sa += @('--store', $Root) }; & node @sa; exit $LASTEXITCODE }
+  'slo' {
+    $sa = @((Join-Path $PSScriptRoot 'agentq-slo.mjs'), '--journal', $Journal, '--days', "$([math]::Max(1, [math]::Round($Hours / 24)))")
+    if (-not $env:AGENTQ_NO_STORE) { $sa += @('--store', $Root) }
+    # default path is unchanged (pass-through, --json only when asked)
+    if (-not $Track) { if ($Json) { $sa += '--json' }; & node @sa; exit $LASTEXITCODE }
+    # --track (idea 6): compute the metric, journal `slo-alert` when slotsLostLiveChat moved, and remember it.
+    # The alert SINK (hub tile / mail) lives outside this repo; this is the in-repo signal.
+    $sa += '--json'
+    $slOut = @(& node @sa 2>&1 | ForEach-Object { "$_" }); $slCode = $LASTEXITCODE
+    try {
+      $now = [int]((($slOut -join "`n") | ConvertFrom-Json).slo.slotsLostLiveChat.value)
+      $sf = Join-Path $Root 'slo-state.json'
+      $prev = $null
+      if (Test-Path -LiteralPath $sf) { try { $prev = [int]((Get-Content -LiteralPath $sf -Raw | ConvertFrom-Json).slotsLostLiveChat) } catch {} }
+      if ($null -ne $prev -and $now -gt $prev) {
+        Write-Journal @{ event = 'slo-alert'; resource = 'slo'; metric = 'slotsLostLiveChat'; prev = $prev; now = $now; reason = "slots lost with a live chat increased ($prev -> $now), target = 0" }
+        [Console]::Error.WriteLine("agentq: SLO ALERT slotsLostLiveChat $prev -> $now (target 0) - a slot was taken from a live chat")
+      }
+      if ($null -eq $prev -or $now -ne $prev) { [IO.File]::WriteAllText($sf, (@{ slotsLostLiveChat = $now; at = (Iso (Now)) } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false)) }
+    } catch { [Console]::Error.WriteLine("agentq: slo --track could not read the metric: $($_.Exception.Message)") }
+    $slOut | ForEach-Object { Write-Output $_ }
+    exit $slCode
+  }
   # ADR 0006: SQLite index of the journal + job registry (rebuildable; JSONL stays the source of truth).
     # agentq store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]
     'store' { $sub = if ($State) { "$State" } else { 'status' }; $sa = @((Join-Path $PSScriptRoot 'agentq-store.mjs'), $sub, '--home', $Root); if ($Id) { $sa += @('--event', $Id) }; if ($Repo) { $sa += @('--repo', (Split-Path -Leaf $Repo)) }; if ($sub -eq 'query') { $sa += @('--hours', "$Hours") }; & node @sa; exit $LASTEXITCODE }
-  default { Get-Help $PSCommandPath; exit 2 }
+    # An unknown verb is an agent guessing. Teach it instead of dumping the 148-line header and exiting
+    # 2 with no hint (the `land` 7-turn waste, 2026-11-20). Same content, one screen, exit 2 = usage.
+    default {
+      [Console]::Error.WriteLine("agentq: unknown verb '$Verb'")
+      [Console]::Error.WriteLine("  next: agentq help            (every verb, one line each)")
+      [Console]::Error.WriteLine("        agentq help <verb>     (usage + example for one verb; e.g. agentq help land)")
+      Write-Output ''
+      Show-AgentqHelp
+      exit 2
+    }
 }

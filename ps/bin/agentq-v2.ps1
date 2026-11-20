@@ -18,7 +18,10 @@ function Get-Config {
   if ($script:Cfg) { return $script:Cfg }
   $c = @{
     taskSlotsPerRepo = 3; taskSlotsMachine = 10; releaseSlots = @{}; pinned = @{}
-    leaseDeadIdleMin = 120; leaseMaxIdleMin = 1440; unleasedRemoveIdleHours = 168; minFreeCommitGB = 12
+    # leaseMaxIdleMin: the hard cap on a slot nobody works in. 24 h let a chat that merely POLLED keep a
+    # slot for a day (2026-11-19: 17 leases, several idle 5-7 h, none stale because a bound chat was
+    # fresh); 6 h reclaims an idle slot within a workday. A genuine long job outside the slot uses -Hold.
+    leaseDeadIdleMin = 120; leaseMaxIdleMin = 360; unleasedRemoveIdleHours = 168; minFreeCommitGB = 12
     # v3 scheduler (devcloud F1): machine cap, soft slots, aging, idle-yield watchdog, override limits.
     machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10
     bumpMax = 50; burstMax = 2; burstMaxMin = 60; overridesPerHour = 6; runBuildTimeoutMin = 240
@@ -43,10 +46,17 @@ function Get-Config {
 }
 function Get-WtRoot { if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' } }
 function Get-ReleaseSlotCount([string]$repoName) { $r = (Get-Config).releaseSlots; if ($r -and $r.ContainsKey($repoName)) { [int]$r[$repoName] } else { 1 } }
-function Get-PinnedSlots([string]$repoName) { $p = (Get-Config).pinned; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
+# Index access, not property access: under StrictMode 3 `(Get-Config).scratchSlots` THROWS when the key is
+# absent (the default map has no scratchSlots), so a scratch lease failed before the default 3 could apply.
+function Get-ScratchSlotCount { $c = Get-Config; if ($c -and $c.ContainsKey('scratchSlots') -and $c['scratchSlots']) { [int]$c['scratchSlots'] } else { 3 } }
+function Get-PinnedSlots([string]$repoName) { $p = (Get-Config)['pinned']; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
 # The ONLY slot names that exist. Anything else is legacy and gets migrated away.
 function Get-SlotRole([string]$repoName, [string]$slot) {
   if ($slot -match '^task-(\d+)$') { if ([int]$Matches[1] -ge 1 -and [int]$Matches[1] -le (Get-Config).taskSlotsPerRepo) { return 'task' }; return $null }
+  # scratch-N (ADR 0012): a SHORT-LIVED slot for work that must not consume a task slot - a subagent's
+  # one-off task, a scratch edit. Not counted in taskSlotsPerRepo / taskSlotsMachine, reclaimed after
+  # leaseScratchIdleMin (15 min) with no work. Unsaved state is still backed up before reclaiming.
+  if ($slot -match '^scratch-(\d+)$') { if ([int]$Matches[1] -ge 1 -and [int]$Matches[1] -le (Get-ScratchSlotCount)) { return 'scratch' }; return $null }
   if ($slot -eq 'release') { return 'release' }
   if ($slot -match '^release-(\d+)$') { if ([int]$Matches[1] -ge 2 -and [int]$Matches[1] -le (Get-ReleaseSlotCount $repoName)) { return 'release' }; return $null }
   if ($slot -eq 'land') { return 'land' }
@@ -55,7 +65,14 @@ function Get-SlotRole([string]$repoName, [string]$slot) {
 }
 
 # ---- helpers ------------------------------------------------------------------------------
-function P($o, [string]$n, $d = '') { if ($null -ne $o -and $o.PSObject.Properties.Name -contains $n -and $null -ne $o.$n) { $o.$n } else { $d } }
+# Get-Config returns a HASHTABLE, and PSObject.Properties does NOT list a hashtable's keys, so the old
+# property-name check always missed and every config value read through P silently fell back to its default
+# (leaseIdleMin, leaseOwnerIdleMin, leaseScratchIdleMin, leaseChatGraceMin, holdDefaultMin were never honoured).
+function P($o, [string]$n, $d = '') {
+  if ($null -eq $o) { return $d }
+  if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n) -and $null -ne $o[$n]) { return $o[$n] } ; return $d }
+  if ($o.PSObject.Properties.Name -contains $n -and $null -ne $o.$n) { $o.$n } else { $d }
+}
 function Write-JsonAtomic([string]$file, $obj) {
   $dir = Split-Path -Parent $file
   if (-not (Test-Path -LiteralPath $dir)) {
@@ -134,14 +151,22 @@ function Get-LeaseExtraBeat($l) {
   }
   $best
 }
-# Any agentq call from the lease's own session, or naming it with -LeaseId, renews it.
+# Any agentq call FOR THE LEASE'S OWN REPO from its session, or naming it with -LeaseId, renews it.
+# ADR 0012: this used to renew EVERY lease of the session, so one `agentq run` for repo A kept a lease in
+# repo B alive - measured 2026-11-19: session term-32600 held 5 leases across 3 repos and all 5 showed a
+# 17-minute heartbeat while nobody had touched those slots for hours.
 function Renew-ForSession {
   try {
+    $ri = Get-RepoInfo $(if ($RepoArg) { $RepoArg } else { (Get-Location).Path })
+    $rn = if ($ri) { $ri.Name } else { $null }
     foreach ($f in @(Get-ChildItem -LiteralPath $LDir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
       $raw = [IO.File]::ReadAllText($f.FullName)
       if (-not ($raw.Contains("`"$Session`"") -or ($LeaseId -and $raw.Contains("`"$LeaseId`"")))) { continue }
       $l = $raw | ConvertFrom-Json
-      if (($LeaseId -and (P $l 'leaseId') -eq $LeaseId) -or ((P $l 'session') -eq $Session)) { Touch-Lease ([pscustomobject]@{ file = $f.FullName }) }
+      if ($LeaseId -and (P $l 'leaseId') -eq $LeaseId) { Touch-Lease ([pscustomobject]@{ file = $f.FullName }); continue }
+      if ((P $l 'session') -ne $Session) { continue }
+      if (-not $rn -or (P $l 'repo') -ne $rn) { continue }
+      Touch-Lease ([pscustomobject]@{ file = $f.FullName })
     }
   } catch {}
 }
@@ -217,6 +242,21 @@ function Read-LeaseChat([string]$leaseFile) {
   } catch {}
   $r
 }
+# OQ-001 / ADR 0009 stage 0: the chat side of a lease, computed in ONE place so `unlease` and the journal
+# cannot drift apart (they did: the reaper's 20-min chat grace sat INSIDE the SLO's 30-min live window, so
+# a slot could be expired while the SLO still called its chat live).
+#   idle   = minutes since the bound chat's last call (null = no chat ever bound to this lease)
+#   byChat = the release was initiated by a chat bound to this lease (the hook records it in <lease>.release):
+#            the holder gave its own slot back from another shell - not a loss.
+#   live   = the state the SLO counts as a loss when a lease ends, and that `unlease` refuses to break.
+# 30 must match TARGETS.liveChatIdleMin in agentq-slo.mjs (the number the daily report judges against).
+function Get-LeaseChatFacts($l) {
+  $ch = Read-LeaseChat $l.file
+  $idle = if ($ch.at) { [math]::Round(((Now) - $ch.at).TotalMinutes, 1) } else { $null }
+  $byChat = [bool]($ch.releaseBy -and $ch.releaseAt -and ((Now) - $ch.releaseAt).TotalMinutes -le 15 -and (@($ch.chats) -contains $ch.releaseBy))
+  $live = ($null -ne $idle) -and ($idle -le 30) -and (-not $byChat) -and (-not (@($ch.chats) -contains $Session))
+  [pscustomobject]@{ chats = @($ch.chats); idle = $idle; byChat = $byChat; live = $live }
+}
 function Read-Leases([string]$repoName) {
   $dirs = if ($repoName) { @(Join-Path $LDir $repoName) } else { @(Get-ChildItem $LDir -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
   $cfg = Get-Config
@@ -232,29 +272,49 @@ function Read-Leases([string]$repoName) {
         $rn = Split-Path $d -Leaf
         $l = [pscustomobject]@{ leaseId = 'unreadable'; repo = $rn; slot = $f.BaseName; role = '?'; path = (Get-SlotPath $rn $f.BaseName); branch = ''; purpose = 'unreadable lease file'; session = '?'; pid = $PID; procStart = $null; created = (Iso (Now)) }
       }
-      $hb = "$($f.FullName).hb"
-      $beat = if (Test-Path -LiteralPath $hb) { (Get-Item -LiteralPath $hb).LastWriteTimeUtc } else { ParseUtc (P $l 'created' (Iso (Now))) }
-      # DC-021: work in a slot from ANOTHER shell (owner shell died) or from a script outside agentq
-      # still touches the slot's git index (status/add/commit/checkout). Count it as activity: 24
-      # leases of live work were expired in 15 days because only the owner pid + .hb counted.
+      $createdAt = ParseUtc (P $l 'created' (Iso (Now)))
+      # LIVENESS = WORK IN THE SLOT (ADR 0012, 2026-11-19). Three beats, in order of authority:
+      #   .work - a tool call that NAMES the slot (an edit inside it, a command whose cwd is in it), written
+      #           only by hooks/guard-tooluse.ps1. Primary proof somebody works IN the slot.
+      #   .hb   - an agentq call from this lease's repo/session (Renew-ForCwd / Renew-ForSession) or renew.
+      #   slot git activity (index/HEAD/logs) - work from outside agentq (DC-021).
+      # The retired model treated "the chat made ANY tool call" as liveness, so a chat that moved on held
+      # its slots for hours: measured 2026-11-19, 14 leases, 6 with no slot activity for 5-23 h, none stale.
+      $hbFile = "$($f.FullName).hb"
+      $beats = @($(if (Test-Path -LiteralPath $hbFile) { (Get-Item -LiteralPath $hbFile).LastWriteTimeUtc } else { $createdAt }))
+      $workFile = "$($f.FullName).work"
+      if (Test-Path -LiteralPath $workFile) { $beats += (Get-Item -LiteralPath $workFile).LastWriteTimeUtc }
       $act = Get-SlotGitActivity (P $l 'path' '')
       # Ignore the index writes of the lease's own checkout (first 2 min after creation).
-      $createdAt = ParseUtc (P $l 'created' (Iso (Now)))
-      if ($act -and $act -gt $beat -and $act -gt $createdAt.AddMinutes(2)) { $beat = $act }
+      if ($act -and $act -gt $createdAt.AddMinutes(2)) { $beats += $act }
+      $beat = @($beats | Sort-Object -Descending)[0]
       $alive = Test-Alive ([pscustomobject]@{ pid = [int](P $l 'pid' 0); procStart = (P $l 'procStart' $null) })
       $idle = ((Now) - $beat).TotalMinutes
-      # The land lease owner is the agentq land process itself (20 s heartbeat): dead owner = land over.
-      $deadIdle = if ((P $l 'role' '') -eq 'land') { 3 } else { $cfg.leaseDeadIdleMin }
-      # OQ-001: a chat bound to this lease that made a tool call within leaseDeadIdleMin = a live owner.
+      $lrole = "$(P $l 'role' '')"
+      # A live owner pid is a reason to be more patient, never a licence to hold a slot forever: the old
+      # rule let an open shell keep a slot for 24 h with nobody in it.
+      if ($lrole -eq 'land') { $deadIdle = 3 }                       # the land process heartbeats every 20 s
+      elseif ($lrole -eq 'scratch') { $deadIdle = [double](P $cfg 'leaseScratchIdleMin' 15) }
+      elseif ($alive) { $deadIdle = [double](P $cfg 'leaseOwnerIdleMin' 90) }
+      else { $deadIdle = [double](P $cfg 'leaseIdleMin' 45) }
+      # A bound chat's call that NAMES the slot buys a SHORT grace (a burst of calls, a build that touches
+      # no git). It is no longer a licence to hold the slot while the chat works somewhere else.
       $chatAt = $null
-      if ((P $l 'role' '') -in 'task', 'pinned') { try { $chatF = "$($f.FullName).chat"; if ([IO.File]::Exists($chatF)) { $chatAt = [IO.File]::GetLastWriteTimeUtc($chatF) } } catch {} }
-      $chatLive = [bool]($chatAt -and ((Now) - $chatAt).TotalMinutes -le $deadIdle)
-      $stale = ((-not ($alive -or $chatLive)) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin)
+      if ($lrole -in 'task', 'pinned', 'scratch') { try { $chatF = "$($f.FullName).chat"; if ([IO.File]::Exists($chatF)) { $chatAt = [IO.File]::GetLastWriteTimeUtc($chatF) } } catch {} }
+      # 30 = the live-chat window the SLO judges against (TARGETS.liveChatIdleMin). At 20 the reaper expired
+      # slots whose chat the same report still called live - the avoidable half of `slotsLostLiveChat`.
+      $graceMin = if ($lrole -eq 'scratch') { 0 } else { [double](P $cfg 'leaseChatGraceMin' 30) }
+      $chatOld = (-not $chatAt) -or (((Now) - $chatAt).TotalMinutes -gt $graceMin)
+      # -Hold: an explicit, journalled "I am running a long job OUTSIDE the slot, keep it" with its own expiry.
+      $held = $false
+      $hu = P $l 'holdUntil' $null
+      if ($hu) { $huT = ParseUtc $hu; $held = [bool]($huT -and $huT -gt (Now)) }
+      $stale = (-not $held) -and ((($idle -gt $deadIdle) -and $chatOld) -or ($idle -gt $cfg.leaseMaxIdleMin))
       # W1-3: the ticket/job scan costs seconds on a big registry, so only a lease that would be
       # stale pays for it (most calls see no stale lease and never scan).
       if ($stale) {
         $xa = Get-LeaseExtraBeat $l
-        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = ((-not ($alive -or $chatLive)) -and $idle -gt $deadIdle) -or ($idle -gt $cfg.leaseMaxIdleMin) }
+        if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = (-not $held) -and ((($idle -gt $deadIdle) -and $chatOld) -or ($idle -gt $cfg.leaseMaxIdleMin)) }
       }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
       $l | Add-Member -NotePropertyName beat -NotePropertyValue $beat -Force
@@ -262,6 +322,13 @@ function Read-Leases([string]$repoName) {
       $l | Add-Member -NotePropertyName idleMin -NotePropertyValue ([math]::Round($idle, 1)) -Force
       $l | Add-Member -NotePropertyName stale -NotePropertyValue $stale -Force
       $l | Add-Member -NotePropertyName chatIdleMin -NotePropertyValue $(if ($chatAt) { [math]::Round(((Now) - $chatAt).TotalMinutes, 1) } else { $null }) -Force
+      # why this lease is (or is not) taken by the next sweep: the threshold that applied, the chat grace,
+      # -Hold, and a short reason. Used by `who` and by the lease-kept journal line Invoke-Sweep writes.
+      $why = if ($stale) { 'stale' } elseif ($held) { 'held' } elseif ($idle -le $deadIdle) { 'recent work' } elseif (-not $chatOld) { 'chat grace' } else { 'ok' }
+      $l | Add-Member -NotePropertyName thresholdMin -NotePropertyValue ([math]::Round($deadIdle, 1)) -Force
+      $l | Add-Member -NotePropertyName graceMin -NotePropertyValue ([math]::Round($graceMin, 1)) -Force
+      $l | Add-Member -NotePropertyName held -NotePropertyValue $held -Force
+      $l | Add-Member -NotePropertyName why -NotePropertyValue $why -Force
       $out += $l
     }
   }
@@ -506,13 +573,13 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   # OQ-001: what the chat side looked like when the lease ended. `byChat` = the release was run by a
   # chat bound to this lease (the hook records who ran `unlease`), i.e. the worker gave its own slot back
   # from another shell; that is not a loss. chatIdleMin <= 30 on anything else is the metric to drive to 0.
-  $ch = Read-LeaseChat $l.file
-  $chatIdle = if ($ch.at) { [math]::Round(((Now) - $ch.at).TotalMinutes, 1) } else { $null }
-  $byChat = [bool]($ch.releaseBy -and $ch.releaseAt -and ((Now) - $ch.releaseAt).TotalMinutes -le 15 -and (@($ch.chats) -contains $ch.releaseBy))
+  $f = Get-LeaseChatFacts $l
+  $chatIdle = $f.idle
+  $byChat = $f.byChat
   if ($event -eq 'lease-expire-failed') { Remove-Item -LiteralPath "$($l.file).release" -Force -ErrorAction SilentlyContinue }
-  else { Remove-Item -LiteralPath $l.file, "$($l.file).hb", "$($l.file).chat", "$($l.file).release" -Force -ErrorAction SilentlyContinue }
+  else { Remove-Item -LiteralPath $l.file, "$($l.file).hb", "$($l.file).chat", "$($l.file).work", "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   if ($event -in 'lease-expire', 'lease-break' -and (P $l 'session') -ne $Session) { Add-LeaseNotice $l $event $why $backupRef }
-  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($ch.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
+  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
 # Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed).
 function Expire-Lease($l, [string]$why) {
@@ -530,6 +597,15 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   # `-Wait` (2026-11-18): the bound is -MaxMin (default 5 min) and expiry exits 7 with one stdout line.
   # Without it the legacy -TimeoutMin (default 60) applies and expiry exits 3, exactly as before.
   $boundMin = if ($wait) { if ($maxMinGiven) { [double]$maxMin } else { 5 } } else { $timeoutMin }
+  # ADR 0013: a SUBAGENT must never queue. Its parent owns the work slot; the subagent works INSIDE that
+  # slot (or takes a scratch slot), and if it cannot get one quickly it RETURNS to the parent with a note
+  # instead of burning its session on a wait - the measured cost of the old behaviour was slots held by
+  # dead chats and ~52.9 h/week of queue time, much of it subagents waiting for a pool their lead already
+  # had. CODAI_SUBAGENT=1 (the harness sets it for subagents) turns every unnamed lease into a 60 s probe.
+  if (($env:CODAI_SUBAGENT -eq '1' -or $env:AGENTQ_FAIL_FAST -eq '1') -and -not $slot -and -not $wait) {
+    $wait = $true
+    if (-not $maxMinGiven) { $maxMin = 1; $maxMinGiven = $true }
+  }
   # $slotValid: ADR 0001 says only standard slots exist. An unknown -Slot is NEVER leased; it is either a
   # hard error (no -Wait) or a slot that never frees (with -Wait), so -Wait cannot invent a bogus slot.
   $slotValid = $true
@@ -545,6 +621,11 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   $announced = $false
   $loadSaid = $false
   $limitSaid = $false
+  # Auto-escalation (ADR 0012): an agent blocked on a slot must not have to ask the owner what to do.
+  # After 10 minutes of waiting we run the sanctioned remedies once: propose (break a hung/STALE queue
+  # holder, bump my waiting tickets) and sweep (expire stale leases and dead tickets). Journaled by both.
+  $waitStart = Now
+  $escalated = $false
   # One exit for both expiry sites: -Wait prints ONE line to stdout and exits 7; otherwise the legacy
   # stderr message + exit 3 (byte-identical to what callers parsed before).
   $expire = {
@@ -552,10 +633,15 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
     $held = (@(Read-Leases $repoName) | ForEach-Object { "$($_.slot)=$($_.session) '$($_.purpose)' idle $($_.idleMin)m" }) -join '; '
     if ($wait) {
       Write-Output ("agentq: no free {0} in {1} within {2} min - {3}{4}" -f $(if ($slot) { "slot $slot" } else { "$role slot" }), $repoName, $boundMin, $whyWait, $(if ($held) { "; held: $held" } else { '' }))
+      Write-Output "  next: agentq eval -Resource '$($role):$repoName' tells you whether a holder can be preempted (and the exact command), or agentq propose -Reason '...' breaks a hung one automatically."
+      if ($env:CODAI_SUBAGENT -eq '1' -or $env:AGENTQ_FAIL_FAST -eq '1') { Write-Output "  SUBAGENT: do not wait. Hand the work back to the parent session (agentq note -Message 'blocked on <resource>: <what is left>') and end the turn." }
       Write-Journal @{ event = 'lease-timeout'; resource = "slot:${repoName}:$(if ($slot) { $slot } else { $role })"; purpose = $purpose; reason = $whyWait; repo = $repoName; waitedMin = $boundMin }
       exit 7
     }
     [Console]::Error.WriteLine("agentq: $whyLegacy. Held: $held")
+    # Same event as the -Wait path so the SLO sees BOTH kinds of give-up (the legacy one was invisible:
+    # the 40 lease-timeouts of 2026-11-12..19 counted only -Wait bounds, not -TimeoutMin abandons).
+    Write-Journal @{ event = 'lease-timeout'; resource = "slot:${repoName}:$(if ($slot) { $slot } else { $role })"; purpose = $purpose; reason = $whyLegacy; repo = $repoName; waitedMin = $timeoutMin }
     exit 3
   }
   # A frozen/blocked slot is a hard stop (exit 3). Only -Wait checks it, so the plain lease is unchanged.
@@ -590,12 +676,22 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       $cands = if (-not $slotValid) { @() }
       elseif ($slot) { @($slot) }
       elseif ($role -eq 'task') { @(1..$cfg.taskSlotsPerRepo | ForEach-Object { "task-$_" }) }
+      elseif ($role -eq 'scratch') { @(1..(Get-ScratchSlotCount) | ForEach-Object { "scratch-$_" }) }
       elseif ($role -eq 'release') { @('release') + @(2..([math]::Max(2, (Get-ReleaseSlotCount $repoName))) | Where-Object { $_ -le (Get-ReleaseSlotCount $repoName) } | ForEach-Object { "release-$_" }) }
       else { @($role) }
       $capHit = $false
       foreach ($s in $cands) {
         $cur = $leases | Where-Object { $_.slot -eq $s } | Select-Object -First 1
         if ($cur -and $cur.stale) { if (-not (Expire-Lease $cur "stale (idle $($cur.idleMin) min, owner alive=$($cur.alive)) - reclaimed by $Session")) { continue }; $cur = $null }
+        # -Reclaim (idea 8): a live lease whose ONLY protection is a chat grace (idle past its threshold,
+        # not held) is taken for a blocked agent instead of a foreign `unlease` break. Requires -Reason.
+        if ($cur -and $Reclaim -and -not (P $cur 'held' $false) -and $cur.idleMin -gt (P $cur 'thresholdMin' 0)) {
+          $rcWhy = "reclaimed by $Session for '$purpose' ($Reason): idle $($cur.idleMin) min > threshold $((P $cur 'thresholdMin' 0)) min, why='$(P $cur 'why' '')'"
+          if (Expire-Lease $cur $rcWhy) {
+            Write-Journal @{ event = 'lease-reclaim'; resource = "slot:${repoName}:$s"; ticket = (P $cur 'leaseId'); by = $Session; purpose = $purpose; reason = $Reason; idleMin = $cur.idleMin; repo = $repoName }
+            $cur = $null
+          }
+        }
         if ($cur) { continue }
         if ($role -eq 'task' -and (Get-TaskLeaseCount) -ge $agl.limit) { $capHit = $true; break }
         $p = Get-SlotPath $repoName $s
@@ -606,8 +702,8 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
           claims = @($(if ($role -in 'task', 'pinned') { $Claims } else { @() }))
         }
         $f = Get-LeaseFile $repoName $s
-        # a chat binding left by a previous lease of this slot must not keep the new one alive
-        Remove-Item -LiteralPath "$f.chat", "$f.release" -Force -ErrorAction SilentlyContinue
+        # a chat binding / work clock left by a previous lease of this slot must not keep the new one alive
+        Remove-Item -LiteralPath "$f.chat", "$f.work", "$f.release" -Force -ErrorAction SilentlyContinue
         Write-JsonAtomic $f $l
         [IO.File]::WriteAllText("$f.hb", '')
         Write-Journal @{ event = 'lease'; resource = "slot:${repoName}:$s"; ticket = $l.leaseId; purpose = $purpose; branch = "$branch"; repo = $repoName; loadWaitSec = (Get-LoadWaitSec) }
@@ -626,6 +722,12 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       & $expire $whyWait $why
     }
     if (-not $announced) { [Console]::Error.WriteLine("agentq: waiting for a free $role slot in $repoName ..."); $announced = $true }
+    if (-not $escalated -and ((Now) - $waitStart).TotalMinutes -ge 10) {
+      $escalated = $true
+      [Console]::Error.WriteLine('agentq: waited 10 min - trying the sanctioned remedies once (propose + sweep)')
+      try { $prevR = $Reason; $script:Reason = "auto-escalation: waited 10 min for a $role slot in $repoName"; $null = Invoke-Propose } catch { } finally { $script:Reason = $prevR }
+      try { $null = Invoke-Sweep } catch { }
+    }
     Start-Sleep -Seconds 3
   }
 }
@@ -701,12 +803,36 @@ function Invoke-Lease {
   Assert-ExpectedRepo $repo
   if (-not $repo) { throw 'agentq lease: not in a git repo (pass -Repo)' }
   if (-not $Purpose -and -not $Wait) { throw 'agentq lease: -Purpose is required (other agents read it)' }
+  # -Reclaim (idea 8) takes another session's grace-held slot, so it needs a journalled reason like `break`.
+  if ($Reclaim -and -not $Reason) { throw "agentq lease: -Reclaim needs -Reason '...' (it expires another session's slot that only a chat grace was holding)" }
   # -Wait is also a bounded "is a slot free?" probe (usually with -MaxMin 0), so a missing -Purpose is
   # not an error there: record an explicit placeholder rather than refuse. Plain lease: still required.
   if (-not $Purpose) { $script:Purpose = '(no -Purpose: agentq lease -Wait probe)' }
+  # ADR 0012 (2026-11-19): ONE task slot per session per repo. 4 of the 14 live leases that day were
+  # subagent slots - a subagent shares its lead's session, and "lease another task slot" is what made
+  # ~160 leases/day against a pool of 11 per repo. A second task lease from the same session is refused
+  # with the two sanctioned alternatives; -Slot task-N is the deliberate override.
+  if ((-not $Slot) -and "$Role" -in '', 'task' -and -not $Wait) {
+    $mine = @(Read-Leases $repo.Name | Where-Object { (P $_ 'role') -eq 'task' -and (P $_ 'session') -eq $Session -and -not $_.stale })
+    if ($mine.Count) {
+      $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+      [Console]::Error.WriteLine("agentq: this session already holds a task slot in $($repo.Name): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path instead of leasing. For isolated one-off work use a scratch slot: agentq lease -Role scratch -Purpose '<why>' (not counted against the caps, reclaimed after 15 min without work). To take a second task slot on purpose, name it: -Slot task-N.")
+      exit 3
+    }
+  }
   $main = Get-MainTop $repo
   $owner = Get-DefaultOwner
   $l = New-Lease $repo $Slot $Role $Purpose $Branch $owner $TimeoutMin $NoWait $Wait $MaxMin $MaxMinGiven
+  # -Hold: an explicit, bounded, journalled claim that the holder runs a long job OUTSIDE the slot.
+  if ($Hold -and $l) {
+    $hm = if ($HoldMin) { [double]$HoldMin } else { [double](P (Get-Config) 'holdDefaultMin' 180) }
+    try {
+      $raw = Get-Content -LiteralPath $l.file -Raw | ConvertFrom-Json -AsHashtable
+      $raw['holdUntil'] = Iso ((Now).AddMinutes($hm))
+      Write-JsonAtomic $l.file $raw
+      Write-Journal @{ event = 'lease-hold'; resource = "slot:$($l.repo):$($l.slot)"; ticket = $l.leaseId; holdMin = $hm; purpose = $Purpose; repo = $l.repo }
+    } catch { [Console]::Error.WriteLine("agentq: -Hold could not be recorded: $($_.Exception.Message)") }
+  }
   try {
     & git -C $main fetch -q origin 2>$null
     $refToUse = if ($Ref) { $Ref } else { $up = (& git -C $main rev-parse --abbrev-ref '@{u}' 2>$null); if ($up) { $up } else { 'HEAD' } }
@@ -714,7 +840,7 @@ function Invoke-Lease {
     # tree) is backed up before the reset. A failed backup aborts the lease: nothing is discarded.
     if (Test-Path -LiteralPath $l.path) { [void](Backup-Slot $l.path $repo.Name $l.slot "pre-reset for new lease $($l.leaseId)" -CommitsOnly:($l.role -eq 'release')) }
     Initialize-Slot $main $l.path $refToUse $Branch (-not $env:AGENTQ_NO_ENV_COPY)
-    if ($l.role -in 'task', 'pinned') { [void](Prepare-Slot $main $l.path $repo.Name) }
+    if ($l.role -in 'task', 'pinned', 'scratch') { [void](Prepare-Slot $main $l.path $repo.Name) }
     if (@($Claims).Count) { Show-ClaimOverlaps $repo.Name $l @($Claims) }
   } catch {
     Remove-LeaseRecord $l 'lease-failed' "$($_.Exception.Message)" ''
@@ -742,6 +868,18 @@ function Invoke-Unlease {
   }
   $foreign = ($l.session -ne $Session)
   if ($foreign -and -not $Reason) { [Console]::Error.WriteLine("agentq: lease belongs to $($l.session); breaking it needs -Reason"); exit 2 }
+  # OQ-001 / ADR 0009 stage 0: the one loss the SLO drives to 0 is a lease ended while its holder's chat was
+  # still live (`slotsLostLiveChat` - 3 lease-break + 1 lease-expire in the 24 h to 2026-11-20, reasons like
+  # "the research-reference gate is on main"). The breaker is rarely wrong about the WORK, but the holder's
+  # chat still holds plan and context and the slot is reset under it. Refuse exactly what the SLO would
+  # count: a break initiated by the holder's own chat (from another shell), or any break once the chat is
+  # older than the window, still goes through. The override is explicit and journalled: -Force -Reason.
+  $f = Get-LeaseChatFacts $l
+  if ($foreign -and -not $Force -and $f.live) {
+    $who = if ($f.chats.Count) { @($f.chats) -join ', ' } else { '(unknown)' }
+    [Console]::Error.WriteLine("agentq: NOT released - $repoName/$Slot is held by $($l.session) ('$($l.purpose)') and its chat was active $($f.idle) min ago (chat $who). That is the loss the SLO counts as slotsLostLiveChat: the holder's context is still alive while the slot is reset under it. Coordinate with it (agentq status -All, hub /ops/agentq) or wait; if the holder is genuinely gone and only the chat file is stale-fresh, re-run with -Force -Reason '<why>' (journalled, and the holder is notified).")
+    exit 3
+  }
   $why = if ($Reason) { $Reason } else { 'released by holder' }
   try { $ref = Backup-Slot (P $l 'path') $repoName $Slot $why -CommitsOnly:((P $l 'role') -eq 'release') }
   catch { [Console]::Error.WriteLine("agentq: NOT released - backup failed: $($_.Exception.Message)"); exit 3 }
@@ -758,7 +896,15 @@ function Invoke-Renew {
 function Invoke-Sweep {
   $n = 0; $kept = 0
   foreach ($l in Read-Leases $null) {
-    if (-not $l.stale) { continue }
+    if (-not $l.stale) {
+      # AUDITABLE "why not stale" (idea 3): a lease past its threshold that a chat grace or -Hold keeps is
+      # exactly the case that made `sweep: expired=0` opaque (2026-11-19: 17 leases, 0 stale, several idle
+      # 5-7 h because a bound chat was fresh). One journal line per such lease, keyed to the sweep.
+      if ($l.idleMin -gt (P $l 'thresholdMin' 0)) {
+        Write-Journal @{ event = 'lease-kept'; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); idleMin = $l.idleMin; thresholdMin = (P $l 'thresholdMin' 0); chatIdleMin = (P $l 'chatIdleMin' $null); graceMin = (P $l 'graceMin' 0); held = [bool](P $l 'held' $false); why = "$(P $l 'why' '')"; repo = $l.repo }
+      }
+      continue
+    }
     if (Expire-Lease $l "stale (idle $($l.idleMin) min, owner alive=$($l.alive))") { $n++; Write-Output "expired $($l.repo)/$($l.slot) ($($l.session) '$($l.purpose)')" }
     else { $kept++; Write-Output "KEPT $($l.repo)/$($l.slot): backup failed (journal: lease-expire-failed)" }
   }
@@ -782,6 +928,37 @@ function Invoke-Sweep {
     try { . (Join-Path $PSScriptRoot 'agentq-prune.ps1'); $pr = Invoke-Prune -Quiet; if ($pr -and $pr.ContainsKey('total')) { $pruned = [int]$pr.total } } catch { Write-Output "prune skipped: $_" }
   }
   Write-Output "sweep: expired=$n kept=$kept reaped=$reaped pruned=$pruned"
+}
+
+# `agentq who [<repo>]` (ADR 0012): one line per lease answering "is this slot really in use?" - who holds
+# it, for what, how long the SLOT has been idle (the work clock) and whether the next sweep takes it.
+# Read-only: it never expires or renews anything, so it is safe to run from any session.
+function Invoke-Who {
+  $only = $null
+  if ($RepoArg) { $r = Get-RepoInfo $RepoArg; if ($r) { $only = $r.Name } }
+  $rows = @(Read-Leases $only | Sort-Object -Property idleMin -Descending)
+  if (-not $rows.Count) { Write-Output $(if ($only) { "no leases in $only" } else { 'no leases' }); return }
+  # filters (idea 5): --stale-only for triage, --idle-hours N for "what has been idle at least N hours".
+  if ($StaleOnly) { $rows = @($rows | Where-Object { $_.stale }) }
+  if ($IdleHours -gt 0) { $rows = @($rows | Where-Object { $_.idleMin -ge ([double]$IdleHours * 60) }) }
+  if (-not $rows.Count) { if ($Json) { @{ leases = @() } | ConvertTo-Json -Depth 4 } else { Write-Output "no leases match the filter$(if ($only) { " in $only" })" }; return }
+  # NOT $json: PowerShell variable names are case-insensitive, so a local $json would shadow the -Json
+  # flag ($Json) and `who -Json` would silently print the table (found by test-agentq-lease-liveness.ps1).
+  $jsonRows = @()
+  foreach ($l in $rows) {
+    $purp = "$(P $l 'purpose' '')"; if ($purp.Length -gt 46) { $purp = $purp.Substring(0, 46) }
+    # why the next sweep takes it or not (idea 4): held | recent work | chat grace | stale.
+    $row = [ordered]@{ repo = $l.repo; slot = $l.slot; role = (P $l 'role' ''); session = (P $l 'session' ''); idleMin = $l.idleMin; chatIdleMin = (P $l 'chatIdleMin' $null); alive = [bool]$l.alive; stale = [bool]$l.stale; why = "$(P $l 'why' '')"; purpose = "$(P $l 'purpose' '')"; path = (P $l 'path' '') }
+    if ($Json) { $jsonRows += $row; continue }
+    Write-Output ("{0,-10} {1,-10} {2,-8} {3,-13} idle {4,7}m  chat {5,7}  alive {6,-5} {7,-5} why={8,-12} {9}" -f `
+        $l.repo, $l.slot, (P $l 'role' ''), (P $l 'session' ''), $l.idleMin, $(if ($null -ne (P $l 'chatIdleMin' $null)) { (P $l 'chatIdleMin') } else { '-' }), [bool]$l.alive, $(if ($l.stale) { 'STALE' } else { '' }), "$(P $l 'why' '')", $purp)
+  }
+  if ($Json) { @{ leases = $jsonRows } | ConvertTo-Json -Depth 4 }
+  else {
+    $stale = @($rows | Where-Object stale).Count
+    Write-Output ""
+    Write-Output "total $($rows.Count) lease(s), $stale stale (the next sweep backs them up and takes them). idle = work clock: minutes since anyone touched that SLOT (a tool call naming it, an agentq call for its repo, or git activity in it)."
+  }
 }
 
 # For scripts and guards: exit 3 + holder when -Path is (inside, or a parent of) a leased slot.

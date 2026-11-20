@@ -1,8 +1,12 @@
-# ADR 0009 stage 0 (OQ-001): a slot lease is kept alive by the tool calls of the CHAT that works in it.
-# The per-tool-call hook (hooks/guard-tooluse.ps1) binds a chat to a lease when it works in the slot and
-# touches <lease>.json.chat on every later call of that chat; agentq counts a recent touch like a live
-# owner process. Guard calls run under Windows PowerShell 5.1 where available (that is what the editor
-# starts) and under PowerShell 7 otherwise. Isolated in %TEMP%.
+# ADR 0009 stage 0 (OQ-001) + ADR 0012 (2026-11-19): a slot lease is kept alive by WORK IN THE SLOT, not
+# by a chat being busy. The per-tool-call hook (hooks/guard-tooluse.ps1) binds a chat to a lease when it
+# WORKS in the slot (an edit inside it, or a working command that names it) and:
+#   - touches <lease>.json.work on a call that NAMES the slot (the primary work clock), and
+#   - touches <lease>.json.chat on every later call of that chat (a short keep-alive grace).
+# An unrelated call of a bound chat therefore no longer keeps the slot: it refreshes only the chat, and the
+# lease goes stale once the slot has been idle past its threshold and the chat is older than the grace.
+# Guard calls run under Windows PowerShell 5.1 where available (that is what the editor starts) and under
+# PowerShell 7 otherwise. Isolated in %TEMP%.
 param(
   [string]$Aq = (Join-Path $PSScriptRoot '..\bin\agentq.ps1'),
   [string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1')
@@ -18,7 +22,7 @@ $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NA
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $cfg = Join-Path $tmp 'cfg.json'
 # dead owner: stale after 60 min idle; any lease: stale after 600 min idle
-'{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseDeadIdleMin":60,"leaseMaxIdleMin":600,"minFreeCommitGB":0}' | Set-Content $cfg
+'{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseChatGraceMin":20,"leaseMaxIdleMin":600,"minFreeCommitGB":0}' | Set-Content $cfg
 $env:AGENTQ_CONFIG = $cfg
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
@@ -35,9 +39,12 @@ function Hook([string]$chat, [string]$tool, $ti, [switch]$Seven) {
 }
 function Edit([string]$chat, [string]$path) { Hook $chat 'replace_string_in_file' @{ filePath = $path; oldString = 'x'; newString = 'y' } }
 function Cmd([string]$chat, [string]$command) { Hook $chat 'run_in_terminal' @{ command = $command } }
-# Make the SLOT look idle for $min minutes with a dead owner (heartbeat, git index, lease record).
+# Make the SLOT look idle for $min minutes with a dead owner: the WORK clock (.work) and the agentq
+# heartbeat (.hb) alike, plus the slot's git activity and the lease record. ADR 0012 added .work as a
+# primary beat, so a test that only ages .hb/git would leave the slot looking freshly worked in.
 function Age($leaseJson, [int]$min) {
   [IO.File]::SetLastWriteTimeUtc("$leaseJson.hb", [DateTime]::UtcNow.AddMinutes(-$min))
+  if ([IO.File]::Exists("$leaseJson.work")) { [IO.File]::SetLastWriteTimeUtc("$leaseJson.work", [DateTime]::UtcNow.AddMinutes(-$min)) }
   $l = Get-Content $leaseJson -Raw | ConvertFrom-Json; $l.created = [DateTime]::UtcNow.AddMinutes(-$min - 5).ToString('o'); $l.pid = 999999; $l.procStart = $null
   [IO.File]::WriteAllText($leaseJson, ($l | ConvertTo-Json -Compress))
   $gd = ((Get-Content (Join-Path $l.path '.git') -Raw) -replace '^gitdir:\s*', '').Trim()
@@ -72,29 +79,38 @@ try {
   Check '1 chat bound: <lease>.json.chat names it' ((Chats $lf) -contains 'chat-1') ((Chats $lf) -join ',')
   Check '1 chat bound: chats/<chat>.json names the lease' ((Test-Path "$chatDir\chat-1.json") -and (Get-Content "$chatDir\chat-1.json" -Raw) -match $la.leaseId)
 
-  # 2 a tool call of that chat that has NOTHING to do with the slot keeps the lease alive
+  # 2 the WORK clock, not "the chat is busy", is what keeps the lease (ADR 0012; ideas 1+7: an unrelated
+  #   call of a bound chat refreshes NOTHING - not .hb, not .work, not even the chat grace)
   Age $lf 90; ChatAge $lf 90
   $l = Lease $la.leaseId
   Check '2 control: chat silent for 90 min -> stale again' ($l.stale -and $l.chatIdleMin -ge 89) ($l | ConvertTo-Json -Compress)
   $hbBefore = (Get-Item "$lf.hb").LastWriteTimeUtc
+  $workBefore = (Get-Item "$lf.work").LastWriteTimeUtc
+  $chatBefore = (Get-Item "$lf.chat").LastWriteTimeUtc
   $r = Cmd 'chat-1' 'git status'
   $l = Lease $la.leaseId
-  Check '2 unrelated tool call of the bound chat -> NOT stale' ($l -and -not $l.stale) ($l | ConvertTo-Json -Compress)
-  Check '2 idleMin still reports the idle slot, chatIdleMin the chat' ($l.idleMin -ge 89 -and $l.chatIdleMin -lt 3) "idle=$($l.idleMin) chat=$($l.chatIdleMin)"
-  Check '2 the slot heartbeat was not faked' ((Get-Item "$lf.hb").LastWriteTimeUtc -eq $hbBefore)
+  Check '2 an unrelated call of the bound chat touches NOTHING (.hb/.work/.chat) and stays stale' ((Get-Item "$lf.hb").LastWriteTimeUtc -eq $hbBefore -and (Get-Item "$lf.work").LastWriteTimeUtc -eq $workBefore -and (Get-Item "$lf.chat").LastWriteTimeUtc -eq $chatBefore -and $l.stale) "idle=$($l.idleMin) chat=$($l.chatIdleMin)"
+  # a call whose command NAMES the slot refreshes the WORK clock (.work), the heartbeat and the chat grace
+  Age $lf 90; ChatAge $lf 90
+  $null = Cmd 'chat-1' "git -C `"$($la.path)`" status --short"
+  $l = Lease $la.leaseId
+  Check '2 a call naming the slot refreshes .work and .hb (idle drops)' (-not $l.stale -and $l.idleMin -lt 2) "idle=$($l.idleMin)"
+  Check '2 .work was touched by the naming call' (((Get-Item "$lf.work").LastWriteTimeUtc) -gt [DateTime]::UtcNow.AddMinutes(-1))
+  Check '2 the naming call also refreshes the chat grace' ($l.chatIdleMin -lt 3) "chat=$($l.chatIdleMin)"
+  # a slot the chat is working in is not expired by a sweep, and status shows it kept by a chat
   $env:AGENTQ_SESSION = 'sweeper'
   $o = AQ sweep
-  Check '2 sweep does not expire a slot whose chat is active' ($o -match 'expired=0' -and (Test-Path $lf)) $o
+  Check '2 sweep does not expire a slot its chat is working in' ($o -match 'expired=0' -and (Test-Path $lf)) $o
   $o = AQ status -All
   Check '2 status shows the lease as kept by a chat' ($o -match "repo/$($la.slot)\s+task\s+chat\s") $o
-  # the same through a read tool, and under PowerShell 7
-  ChatAge $lf 90
-  $r = Hook 'chat-1' 'read_file' @{ filePath = (Join-Path $repo 'a.txt'); startLine = 1; endLine = 2 } -Seven
+  # a read that NAMES the slot refreshes the heartbeat, and under PowerShell 7 too
+  Age $lf 90; ChatAge $lf 90
+  $r = Hook 'chat-1' 'read_file' @{ filePath = (Join-Path $la.path 'a.txt'); startLine = 1; endLine = 2 } -Seven
   $l = Lease $la.leaseId
-  Check '2 a read by the bound chat keeps it alive too (PowerShell 7 run)' (-not $l.stale -and $l.chatIdleMin -lt 3)
+  Check '2 a read that names the slot keeps it alive (PowerShell 7 run)' (-not $l.stale -and $l.idleMin -lt 2) "idle=$($l.idleMin)"
 
   # 3 another chat does not keep it alive, and reading or inspecting a slot does not bind
-  ChatAge $lf 90
+  Age $lf 90; ChatAge $lf 90
   $null = Cmd 'chat-2' 'git status'
   Check '3 a tool call of an UNBOUND chat does nothing' ((Lease $la.leaseId).stale)
   $null = Hook 'chat-2' 'read_file' @{ filePath = (Join-Path $la.path 'a.txt'); startLine = 1; endLine = 2 }
@@ -159,9 +175,15 @@ try {
   $o = AQ lease -Slot $la.slot -Purpose 'work C' -Json; $lc = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   $null = Edit 'chat-6' (Join-Path $lc.path 'a.txt')
   $env:AGENTQ_SESSION = 'intruder'
+  $before = @(Journal 'lease-break').Count
   $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Reason 'i need a slot'
+  Check '8 a foreign break while its chat is LIVE is REFUSED (exit 3), the lease survives, nothing journalled' ($code -eq 3 -and $o -match 'slotsLostLiveChat' -and (Test-Path $lf) -and @(Journal 'lease-break').Count -eq $before) "$code | $o"
+  $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Reason 'holder is dead, the chat file is stale-fresh'
+  Check '8 a long -Reason alone does not override it' ($code -eq 3 -and (Test-Path $lf)) "$code | $o"
+  $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Slot $la.slot -Force -Reason 'holder is dead, the chat file is stale-fresh'
   $br = Journal 'lease-break' | Select-Object -Last 1
-  Check '8 broken by someone else while its chat is live -> byChat=false, chatIdleMin small (the SLO counts it)' ($br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1) ($br | ConvertTo-Json -Compress)
+  Check '8 -Force -Reason breaks it and the SLO still counts it (byChat=false, chatIdleMin small)' ($code -eq 0 -and $br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1) "$code | $o | $($br | ConvertTo-Json -Compress)"
+  Check '8 the slot is free after the forced break' (-not (Test-Path $lf))
 
   # 9 the release runs from a SCRIPT FILE: the command names only the script. The hook reads the script for a
   # chat that is bound to a lease (seen live: a cleanup script released the slot and the journal said byChat=false)
