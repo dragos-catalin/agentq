@@ -282,7 +282,34 @@ function Invoke-AutosyncDoctor {
   if ($badRefs.Count) { $out.Add("FAIL unreadable backup ref(s): $($badRefs -join ', ')"); $bad++ }
   elseif ($nRefs) { $out.Add("OK   $nRefs newest backup ref(s) resolve to readable commits") }
   else { $out.Add('WARN no refs/backup/* refs found in any configured repo'); $warn++ }
+  $staleN = 0
+  foreach ($rp in $Repo) {
+    $sd = Get-StaleDirty $rp
+    if ($sd.n) { $out.Add("WARN $(Split-Path $rp -Leaf): $($sd.n) dirty path(s) idle > $($sd.hours)h (oldest $($sd.oldestH)h: $($sd.sample)) - autosync never commits them; commit (agentq commit -Paths) or archive"); $warn++; $staleN++ }
+  }
+  if (-not $staleN) { $out.Add("OK   no dirty path idle > $(Get-StaleDirtyHours)h in any configured repo") }
   @{ lines = $out; bad = $bad; warn = $warn }
+}
+# DRIFT (2026-11-20): 15 shared clones carried work nobody committed for up to a month (agents finished
+# without `agentq commit`, the owner never noticed). Autosync must never commit someone else's edit, so it
+# makes the backlog VISIBLE instead: -Doctor WARNs (the hub /ops/agentq record) and -Status lists it.
+# Each dirty path ages on its own file mtime (deleted paths are skipped); GIT_AUTOSYNC_STALE_DIRTY_HOURS
+# overrides the 24 h threshold.
+function Get-StaleDirtyHours { if ($env:GIT_AUTOSYNC_STALE_DIRTY_HOURS) { [double]$env:GIT_AUTOSYNC_STALE_DIRTY_HOURS } else { 24 } }
+function Get-StaleDirty([string]$r) {
+  $hours = Get-StaleDirtyHours; $res = @{ n = 0; oldestH = 0; sample = ''; hours = $hours }
+  if (-not (Test-Path (Join-Path $r '.git'))) { return $res }
+  $cut = [DateTime]::Now.AddHours(-$hours); $oldest = $null
+  foreach ($ln in @(G $r -c core.quotepath=off status --porcelain --untracked-files=all 2>$null | Select-Object -First 5000)) {
+    if ("$ln".Length -lt 4) { continue }
+    $p = "$ln".Substring(3); if ($p -match ' -> (.+)$') { $p = $Matches[1] }; $p = $p.Trim('"')
+    $f = Join-Path $r $p
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+    $t = (Get-Item -LiteralPath $f -Force).LastWriteTime
+    if ($t -lt $cut) { $res.n++; if (-not $oldest -or $t -lt $oldest) { $oldest = $t; $res.sample = $p } }
+  }
+  if ($oldest) { $res.oldestH = [int]([DateTime]::Now - $oldest).TotalHours }
+  $res
 }
 # 'private' | 'public' | 'unknown', cached 24 h. GIT_AUTOSYNC_VISIBILITY overrides (tests).
 function Get-Visibility([string]$r, [string]$remote) {
@@ -947,8 +974,10 @@ if ($Status) {
       "{0,-14} {1,5}m  {2}" -f $k, $age, $m
     }
     ''
-    'journal (actions and refusals only):'
   } else { '(no status snapshot yet - run a pass: git-autosync.ps1 -Repo <repo>)'; '' }
+  $stale = @(foreach ($rp in $Repo) { $sd = Get-StaleDirty $rp; if ($sd.n) { "  {0,-14} {1} path(s), oldest {2}h: {3}" -f (Split-Path $rp -Leaf), $sd.n, $sd.oldestH, $sd.sample } })
+  if ($stale.Count) { "uncommitted work idle > $(Get-StaleDirtyHours)h (autosync never commits it - commit via agentq or archive):"; $stale; '' }
+  'journal (actions and refusals only):'
   if (Test-Path $Log) { Get-Content $Log -Tail 10 }
   exit 0
 }

@@ -267,6 +267,19 @@ $hBefore = (git -C $r.a rev-parse HEAD)
 $ex = (& pwsh -NoProfile -Command "& '$tool' -Explain '$($r.a)'" 2>&1 | Out-String)
 Ok ($ex -match 'explain .*(read-only)') '13 -Explain prints its banner'
 Ok ((git -C $r.a rev-parse HEAD) -eq $hBefore) '13 -Explain moved nothing'
+# 13b stale dirty work: a dirty file idle > threshold is WARNed by -Doctor (drift 2026-11-20), a fresh one is not
+$r = Fresh; W "$($r.a)\y.txt" "fresh`n"
+$doc = (& pwsh -NoProfile -Command "& '$tool' -Repo '$($r.a)' -Doctor" 2>&1 | Out-String)
+Ok ($doc -match 'OK   no dirty path idle') '13b fresh dirty edit is not stale'
+W "$($r.a)\old.txt" "old`n"; Age "$($r.a)\old.txt"   # 10 h old
+$env:GIT_AUTOSYNC_STALE_DIRTY_HOURS = '6'
+$doc = (& pwsh -NoProfile -Command "& '$tool' -Repo '$($r.a)' -Doctor" 2>&1 | Out-String)
+$st = (& pwsh -NoProfile -Command "& '$tool' -Repo '$($r.a)' -Status" 2>&1 | Out-String)
+Remove-Item Env:GIT_AUTOSYNC_STALE_DIRTY_HOURS
+Ok ($doc -match 'WARN .*1 dirty path\(s\) idle > 6h .*old\.txt') '13b idle untracked file is WARNed by name'
+Ok ($doc -notmatch 'y\.txt\)') '13b the fresh edit is not named'
+Ok ($st -match 'uncommitted work idle > 6h' -and $st -match '1 path\(s\), oldest \d+h: old\.txt') '13b -Status lists the idle work'
+Ok ((Get-Content "$($r.a)\old.txt" -Raw) -eq "old`n") '13b stale check touched nothing'
 
 # 14 -VerifyBackups: EVERY refs/backup/* ref must resolve to a readable commit; batched, exit 3 otherwise
 $r = Fresh
