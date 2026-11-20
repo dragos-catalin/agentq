@@ -38,10 +38,15 @@ function Cfg([string]$extra = '') { "{`"taskSlotsPerRepo`":12,`"taskSlotsMachine
 Cfg
 $env:AGENTQ_CONFIG = $cfg
 # A leased task slot on a fresh topic branch; returns the lease.
+# 2026-11-20: one SESSION holds one task slot per repo (the rule that stops a chat from hoarding slots),
+# and this fixture is a single session that deliberately holds up to 11 -> it names each slot explicitly.
+$script:slotN = 0
 function Slot([string]$branch) {
+  $script:slotN++
   Push-Location $repo
-  try { $o = AQ lease -Purpose "work $branch" -Branch $branch -Ref origin/dev -Json } finally { Pop-Location }
+  try { $o = AQ lease -Purpose "work $branch" -Branch $branch -Ref origin/dev -Slot "task-$($script:slotN)" -Json } finally { Pop-Location }
   $l = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  if (-not $l -or -not $l.path) { throw "Slot '$branch' got no lease (exit $code): $o" }
   git -C $l.path config core.autocrlf false
   $l
 }

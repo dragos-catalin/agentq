@@ -34,6 +34,16 @@ try {
   $lf = Get-Content (Join-Path $env:AGENTQ_HOME "leases\$repoName\$($l1.slot).json") -Raw | ConvertFrom-Json
   Check '1 claims stored on the lease' ((@($lf.claims) -join ',') -eq 'apps/hub/**,packages/ui/**') ($lf | ConvertTo-Json -Compress)
 
+  # 1b. ADR 0012: a claim-carrying lease is still a task lease - a second one from the same session is
+  #     refused (exit 3) unless -Slot names it. Claims that do not overlap S1's, so no claim-overlap event.
+  $o = AQ lease -Purpose 'second hub work' -Claims 'docs/**' -NoWait
+  Check '1b a second task lease from the same session is refused (exit 3), even with claims' ($code -eq 3 -and $o -match 'already holds a task slot' -and $o -match 'scratch') $o
+  $o = AQ lease -Purpose 'deliberate second slot' -Claims 'docs/**' -Slot task-2 -NoWait -Json -OwnerPid (Owner)
+  $l2b = $o | Select-String '^\{' | ForEach-Object { $_.Line | ConvertFrom-Json } | Select-Object -First 1
+  Check '1b ... unless -Slot task-2 is named (deliberate second slot)' ($code -eq 0 -and $l2b.slot -eq 'task-2') $o
+  $o = AQ unlease -Repo $l2b.path -LeaseId $l2b.leaseId
+  Check '1b ... and it is released again (frees task-2 for case 2)' ($code -eq 0) $o
+
   $env:AGENTQ_SESSION = 'S2'
   $o = AQ lease -Purpose 'hubx work' -Claims 'apps/hubx/**' -Json -OwnerPid (Owner)
   $l2 = $o | Select-String '^\{' | ForEach-Object { $_.Line | ConvertFrom-Json } | Select-Object -First 1

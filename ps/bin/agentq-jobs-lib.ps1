@@ -49,9 +49,30 @@ function Update-Job([string]$id, [hashtable]$set) {
     Write-JobRaw $j
   }
 }
+# Parsed jobs are cached per file (mtime ticks + length) for the life of the dot-sourcing process: the
+# resident agentq-sync loop re-read and re-parsed all ~600 registry files twice per 15 s tick (reap +
+# mirror), ~8 s CPU per tick = 0.6 of a core forever (2026-11-20). Writes are atomic renames, so a changed
+# job always changes the stamp. Callers get a shallow clone, so mutating a returned job never poisons the cache.
+$script:JobParseCache = @{}
+$script:JobRowCache = @{}
 function Get-AllJobs {
-  @(Get-ChildItem -LiteralPath (Get-JobDir) -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
-      Read-Job $_.BaseName } | Where-Object { $_ })
+  $files = @([IO.DirectoryInfo]::new((Get-JobDir)).GetFiles('*.json') | Sort-Object Name)
+  $seen = [Collections.Generic.HashSet[string]]::new()
+  $out = [Collections.Generic.List[object]]::new()
+  foreach ($f in $files) {
+    $k = $f.FullName; [void]$seen.Add($k)
+    $stamp = "$($f.LastWriteTimeUtc.Ticks):$($f.Length)"
+    $c = $script:JobParseCache[$k]
+    if (-not $c -or $c.stamp -ne $stamp) {
+      $j = Read-Job $f.BaseName
+      if (-not $j) { $script:JobParseCache.Remove($k); continue }
+      $c = @{ stamp = $stamp; job = $j }
+      $script:JobParseCache[$k] = $c
+    }
+    $out.Add($c.job.Clone())
+  }
+  foreach ($k in @($script:JobParseCache.Keys)) { if (-not $seen.Contains($k)) { $script:JobParseCache.Remove($k) } }
+  @($out)
 }
 
 # Same process as recorded? pidStart = StartTime UTC ticks; PIDs are recycled.
@@ -187,21 +208,29 @@ function Format-JobTree([int]$root) {
 function Get-JobsForSync([int]$days = 7, [int]$max = 500) {
   $cut = [DateTime]::UtcNow.AddDays(-$days)
   $rows = [Collections.Generic.List[object]]::new()
+  $keep = @{}
   foreach ($j in Get-AllJobs) {
     $st = ConvertTo-JobUtc $j['startedAt']
     if ($st -and $st -lt $cut) { continue }
+    # A terminal job's view is fixed (no pid probe, log no longer written), so reuse it.
+    $terminal = "$($j['state'])" -notin 'running', 'starting'
+    $ck = "$($j['id'])|$($j['state'])|$($j['endedAt'])|$($j['exitCode'])|$($j['log'])"
+    if ($terminal -and $script:JobRowCache.ContainsKey($ck)) { $rows.Add($script:JobRowCache[$ck]); $keep[$ck] = $script:JobRowCache[$ck]; continue }
     $v = Get-JobView $j
     $cmd = "$($j['command'])"; if ($cmd.Length -gt 500) { $cmd = $cmd.Substring(0, 500) }
-    $rows.Add([pscustomobject]@{
-        active  = ($v.state -in 'running', 'suspect', 'starting')
-        started = $(if ($st) { $st } else { [DateTime]::MinValue })
-        row     = [ordered]@{
-          id = "$($j['id'])"; label = "$($j['label'])"; command = $cmd; cwd = "$($j['cwd'])"; repo = "$($j['repo'])"; host = "$($j['host'])"
-          pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
-          startedAt = $j['startedAt']; endedAt = $j['endedAt']; lastOutputAt = $v.lastOutputAt; log = "$($j['log'])"
-        }
-      })
+    $entry = [pscustomobject]@{
+      active  = ($v.state -in 'running', 'suspect', 'starting')
+      started = $(if ($st) { $st } else { [DateTime]::MinValue })
+      row     = [ordered]@{
+        id = "$($j['id'])"; label = "$($j['label'])"; command = $cmd; cwd = "$($j['cwd'])"; repo = "$($j['repo'])"; host = "$($j['host'])"
+        pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
+        startedAt = $j['startedAt']; endedAt = $j['endedAt']; lastOutputAt = $v.lastOutputAt; log = "$($j['log'])"
+      }
+    }
+    $rows.Add($entry)
+    if ($terminal) { $keep[$ck] = $entry }
   }
+  $script:JobRowCache = $keep
   $ordered = @($rows | Sort-Object -Property @{ Expression = 'active'; Descending = $true }, @{ Expression = 'started'; Descending = $true })
   if ($max -gt 0 -and $ordered.Count -gt $max) { $ordered = @($ordered[0..($max - 1)]) }
   @($ordered | ForEach-Object { $_.row })

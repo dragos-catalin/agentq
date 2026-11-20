@@ -17,7 +17,10 @@ $env:AGENTQ_INSTALL_DIR = $inst
 $env:AGENTQ_DOCTOR_NO_TASKS = '1'
 foreach ($v in 'AGENTQ_SRC', 'AGENTQ_DOCTOR_FAULT', 'AGENTQ_DOCTOR_SERIAL', 'AGENTQ_SYSTEM_HOME', 'AGENTQ_GIT_AUTOSYNC') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force $tmp | Out-Null
-$cfgText = '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"minFreeCommitGB":0}'
+# leaseIdleMin 120: the dead-owner fixture is idle 45 min; ADR 0012 made a dead owner stale at
+# leaseIdleMin (45), which put the fixture exactly ON the threshold and turned a warning into a
+# problem. 120 keeps the fixture "aged but not stale" (the behaviour these checks assert).
+$cfgText = '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseIdleMin":120,"minFreeCommitGB":0}'
 [IO.File]::WriteAllText($cfg, $cfgText)
 $fail = 0
 $script:code = 0; $script:raw = ''
@@ -352,7 +355,9 @@ try {
   Remove-Item Env:AGENTQ_DOCTOR_FAULT
   $crash = Rows $r 'stale-index-lock' 'warn'
   Check '12 crashed check -> one warn row "check crashed"' ($crash.Count -eq 1 -and $crash[0].detail -match '^check crashed: ') $raw
-  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 10 -and $code -eq 0) $raw
+  # 11 summaries (not 10): ADR 0012 added the `lease-hygiene` check, one more summary row; the crashed
+  # stale-index-lock emits a warn finding instead of its summary, so 11 summaries remain.
+  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 11 -and $code -eq 0) $raw
 
   # ---- 13 git-autosync health folded into the doctor ------------------------------------------------
   # The doctor does NOT re-implement git-autosync's checks: it runs the tool with -Doctor and folds the

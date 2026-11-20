@@ -6,6 +6,14 @@
   -Suites a,b   run only these suites (names from tests/run-all.ps1 -List) instead of all of them:
                 the full set takes hours on a busy workstation, so a small fix is gated by the suites
                 that cover it. -SkipTests installs without any gate (say why in the commit / tracker).
+  -Parallel n   suites to run at once (default 4; 1 = the old one-after-another order). Measured on the
+                2026-11-20 set: 8 suites 416 s serial -> 185 s at -Parallel 8. Suites that must own the
+                machine (install, term interrupt, reap terminals, git-autosync, guard cloud) still run
+                alone; everything else is safe to overlap because each suite uses its own temp home.
+  -Full         run the whole suite even when the green record says this exact ps/ tree already passed.
+  The gate is skipped ONLY when a full green run recorded the SAME content hash (run-all.ps1 -LastGreen)
+  and that run is under 24 h old: the suites run a function of ps/, so an unchanged tree needs no repeat.
+  The decision and both hashes are printed - nothing is skipped silently.
   agentq-config.json is MERGED, never replaced: keys the installed copy already has keep their local
   value (slot counts, workspaces), new keys are added from the checkout (2026-10-19, twice: an install
   silently shrank the live slot caps).
@@ -13,7 +21,7 @@
   `agentq doctor` compares the live files against it.
   AGENTQ_INSTALL_DIR overrides the destination (tests).
 #>
-param([switch]$Check, [switch]$SkipTests, [string[]]$Suites)
+param([switch]$Check, [switch]$SkipTests, [switch]$Full, [string[]]$Suites, [int]$Parallel = 4)
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
 $cfgKey = 'bin\agentq-config.json'
@@ -38,6 +46,8 @@ $map = [ordered]@{
   'bin\vscode-chat-terminals.mjs' = 'bin\vscode-chat-terminals.mjs'; 'tests\test-reap-terminals.ps1' = 'bin\test-reap-terminals.ps1'
   # ADR 0003 wave 1: publish, lease activity + notices + slot prep, PowerShell entry hardening
   'tests\test-agentq-publish.ps1' = 'bin\test-agentq-publish.ps1'; 'tests\test-agentq-lease3.ps1' = 'bin\test-agentq-lease3.ps1'; 'tests\test-agentq-args.ps1' = 'bin\test-agentq-args.ps1'
+  # 2026-11-20: `agentq help` + the unknown-verb/flag teaching (the suite is drift-locked against the script)
+  'tests\test-agentq-help.ps1' = 'bin\test-agentq-help.ps1'
   # ADR 0003 W2-4 job objects + W4-4 SLO report
   'bin\agentq-jobobject-lib.ps1' = 'bin\agentq-jobobject-lib.ps1'; 'bin\agentq-jobobject.ps1' = 'bin\agentq-jobobject.ps1'; 'bin\agentq-slo.mjs' = 'bin\agentq-slo.mjs'; 'bin\agentq-store.mjs' = 'bin\agentq-store.mjs'; 'tests\test-store.mjs' = 'bin\test-store.mjs'; 'bin\agentq-flakes.mjs' = 'bin\agentq-flakes.mjs'; 'tests\test-flakes.mjs' = 'bin\test-flakes.mjs'; 'tests\test-land-flakes.ps1' = 'bin\test-land-flakes.ps1'; 'tests\test-agentq-claims.ps1' = 'bin\test-agentq-claims.ps1'; 'tests\test-land-batch.ps1' = 'bin\test-land-batch.ps1'; 'tests\fake-gate.ps1' = 'bin\fake-gate.ps1'
   'tests\test-jobobject.ps1' = 'bin\test-jobobject.ps1'; 'tests\test-land-finalize.ps1' = 'bin\test-land-finalize.ps1'; 'tests\test-land-reclaim.ps1' = 'bin\test-land-reclaim.ps1'; 'tests\test-land-precheck.ps1' = 'bin\test-land-precheck.ps1'
@@ -86,8 +96,23 @@ if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; 
 if (-not $SkipTests) {
   $ra = @('-NoProfile', '-File', (Join-Path $src 'tests\run-all.ps1'))
   if ($Suites) { $ra += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
-  & pwsh @ra
-  if ($LASTEXITCODE) { throw 'install: tests are red - not installing' }
+  if ($Parallel -gt 1) { $ra += @('-Parallel', "$Parallel") }
+  # Instant repeat: a full green run of THIS content is already the gate (run-all.ps1 writes the hash).
+  $alreadyGreen = $false
+  if (-not $Suites -and -not $Full) {
+    $gf = Join-Path (Split-Path -Parent $src) '.copilot-tmp\last-green.json'
+    $fresh = $false
+    if (Test-Path -LiteralPath $gf) { try { $g = Get-Content -LiteralPath $gf -Raw | ConvertFrom-Json -AsHashtable; $fresh = ((Get-Date) - (Get-Date "$($g.at)")).TotalHours -lt 24 } catch { $fresh = $false } }
+    if ($fresh) {
+      & pwsh -NoProfile -File (Join-Path $src 'tests\run-all.ps1') -LastGreen
+      if ($LASTEXITCODE -eq 0) { $alreadyGreen = $true }
+    }
+  }
+  if ($alreadyGreen) { Write-Host 'install: tests SKIPPED - ps/ is byte-identical to the tree that passed (use -Full to force)' }
+  else {
+    & pwsh @ra
+    if ($LASTEXITCODE) { throw 'install: tests are red - not installing' }
+  }
 }
 $bk = Join-Path $dst ".backup\$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
 # Files the destination does not have yet go first: agentq.ps1 dot-sources its companions at start, so a

@@ -154,12 +154,27 @@ Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
 Set-Content $cfgPath $cfgText
 
 # 7. break removes a live ticket with a reason and journals it.
-$holder = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'deploy:api', '-Purpose', 'stuck', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 8') -WorkingDirectory $repo -PassThru -WindowStyle Hidden
-Start-Sleep -Seconds 2
-& pwsh -NoProfile -File $aq break -Resource 'deploy:api' -Reason 'unit break' | Out-Null
+$holder = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'deploy:api', '-Purpose', 'stuck', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 60') -WorkingDirectory $repo -PassThru -WindowStyle Hidden
+# Wait for the TICKET on disk, not a fixed 2 s: a fresh pwsh needs several seconds to parse agentq.ps1
+# (135 KB + 144 KB of agentq-v2.ps1) on a busy machine, and `break` with no ticket prints
+# "nothing to break" and journals nothing - which is how this check went red (2026-11-20). The queue
+# folder is `deploy_<repo>_<target>` ('deploy_repo_api' here), NOT 'deploy_api': a filter of
+# '*deploy_api*' never matches (measured 2026-11-20), so the wait silently ran to its bound.
+$w = 0; $tk = $null
+while ($w -lt 240 -and -not $tk) {
+  $tk = @(Get-ChildItem (Join-Path $env:AGENTQ_HOME 'queues') -Recurse -Filter '*.json' -ErrorAction SilentlyContinue |
+    Where-Object { $_.DirectoryName -like '*deploy_repo_api*' } |
+    ForEach-Object { try { Get-Content $_.FullName -Raw | ConvertFrom-Json } catch { } } |
+    Where-Object { $_ -and $_.purpose -eq 'stuck' })[0]
+  if (-not $tk) { Start-Sleep -Milliseconds 250; $w++ }
+}
+# `break` resolves the resource against the CWD's repo, so run it where the holder ran: from anywhere
+# else it targets deploy:<thatRepo>:api and prints "nothing to break" (found while debugging).
+Push-Location $repo
+try { & pwsh -NoProfile -File $aq break -Resource 'deploy:api' -Reason 'unit break' | Out-Null } finally { Pop-Location }
 $j = Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json }
-Check 'break journaled with reason' (@($j | Where-Object { $_.event -eq 'break' -and $_.reason -like 'unit break*' }).Count -eq 1)
-$holder.WaitForExit(30000) | Out-Null
+Check 'break journaled with reason' (@($j | Where-Object { $_.event -eq 'break' -and $_.reason -like 'unit break*' }).Count -eq 1) "ticket found=$([bool]$tk) after $([int]($w * 0.25)) s"
+Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
 
 # 8. a run waiting for build:<repo> must not already occupy build:machine (phantom hold).
 $repoHold = Start-Process pwsh -ArgumentList @('-NoProfile', '-File', $aq, 'run', '-Resource', 'build', '-Purpose', 'repo-holder', '-MinFreeGB', '0', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 12') -WorkingDirectory $repo -PassThru -WindowStyle Hidden

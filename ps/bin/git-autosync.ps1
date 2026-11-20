@@ -33,7 +33,7 @@ What one pass does, per repo (only when it is provably safe):
     - real conflict / binary / delete-vs-modify / untracked unique -> copied to
       ~/.codai/parked/<repo>/<ts>/ (+ MANIFEST.tsv), blob written to the object store, upstream taken,
       journaled with `agentq note`. Only when the file is idle >= -ParkIdleHours (default 1, owner 2026-10-18) AND no live agent session touched it
-      in the last 30 min (who-owns-file.ps1; a failing check counts as active), or -ParkNow.
+      in the last 6 h (who-owns-file.ps1 -Repo -TouchedWithinHours 6; a failing check counts as active), or -ParkNow.
 
   git-autosync.ps1 [-Repo E:\gh\codai[,E:\gh\brivio]] [-WhatIf] [-ParkNow] [-ParkIdleHours 1]
                    [-Loop -IntervalSec 120] [-Install] [-Status] [-Report]
@@ -400,9 +400,12 @@ function Start-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [strin
   $id = "$name-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))"
   $logf = Join-Path $dir "$id.log"; $rcf = Join-Path $dir "$id.rc"; $wrap = Join-Path $dir "$id.ps1"
   $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+  # The land runs from the shared clone but works in its own lease slot; without the override agentq's
+  # shared-clone guard refused every replay (journal 'shared-clone-refused' verb land, codai drift 2026-11).
   $body = @(
     "Set-Location -LiteralPath $(& $q $r)",
-    "& pwsh -NoProfile -File $(& $q $land) land -Branch $(& $q $topic) -Onto $(& $q $upBranch) -Purpose $(& $q "git-autosync replay of deferred commits on $branch") *> $(& $q $logf)",
+    "`$env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'",
+    "& pwsh -NoProfile -ExecutionPolicy Bypass -File $(& $q $land) land -Branch $(& $q $topic) -Onto $(& $q $upBranch) -Purpose $(& $q "git-autosync replay of deferred commits on $branch") *> $(& $q $logf)",
     "[IO.File]::WriteAllText($(& $q $rcf), [string]`$LASTEXITCODE)"
   ) -join "`n"
   [IO.File]::WriteAllText($wrap, $body, [Text.UTF8Encoding]::new($false))
@@ -410,7 +413,7 @@ function Start-ReplayLand([string]$r, [string]$remote, [string]$upBranch, [strin
   @{ pid = $p.Id; started = [DateTime]::UtcNow.ToString('o'); rc = $rcf; log = $logf; topic = $topic; head = ''; target = '' }
 }
 
-# A file a live agent session touched in the last 30 min is never parked, however old its mtime (a hot
+# A file a live agent session (active <30 min) touched in the last 6 h is never parked, however old its mtime (a hot
 # tracker kept codai 33 commits behind for hours, 2026-10-17). who-owns-file.ps1 exit 3 = ACTIVE-OWNER,
 # 0 = nobody; anything else (missing, crash) counts as active. GIT_AUTOSYNC_OWNER_CHECK=off for tests.
 function Test-ActiveOwner([string]$r, [string]$p) {
@@ -418,7 +421,10 @@ function Test-ActiveOwner([string]$r, [string]$p) {
   if ($chk -eq 'off') { return $false }
   if (-not (Test-Path $chk)) { return $true }
   Push-Location $r
-  try { & pwsh -NoProfile -File $chk -Path $p *> $null; $rc = $LASTEXITCODE } finally { Pop-Location }
+  # -Repo: exact path in THIS repo (a bare '%parent%leaf' matched other repos). -TouchedWithinHours: a
+  # session that merely read the file days ago is not an owner (session_files keeps only the first touch);
+  # files being edited right now are already protected by the -ParkIdleHours mtime check.
+  try { & pwsh -NoProfile -ExecutionPolicy Bypass -File $chk -Path $p -Repo $r -TouchedWithinHours 6 *> $null; $rc = $LASTEXITCODE } finally { Pop-Location }
   return ($rc -ne 0)
 }
 
@@ -649,12 +655,26 @@ function Sync-Repo([string]$r) {
   }  # Paths the move changes vs paths with local changes (staged or not).
   $moving = @(G $r -c core.quotepath=off diff --no-renames --name-only HEAD $target)
   $dirty = @(G $r status --porcelain --untracked-files=no | ForEach-Object { $_.Substring(3).Trim('"') })
-  $overlap = @($dirty | Where-Object { $moving -contains $_ })
+  $movingSet = [Collections.Generic.HashSet[string]]::new([string[]]$moving)
+  $overlap = @($dirty | Where-Object { $movingSet.Contains($_) })
+  $headPaths = [Collections.Generic.HashSet[string]]::new([string[]]@(G $r -c core.quotepath=off diff --no-renames --name-only --diff-filter=A HEAD $target))
+  # Target blob ids and worktree hashes in TWO git calls instead of 2 per path: on a loaded box each
+  # spawn took seconds and codai's 9-path refusal recomputed for ~28 min per pass (2026-11-20).
+  $tBlob = @{}
+  foreach ($ln in @(G $r -c core.quotepath=off ls-tree -r --full-tree $target)) {
+    $tab = $ln.IndexOf("`t"); if ($tab -gt 0) { $tBlob[$ln.Substring($tab + 1)] = ($ln.Substring(0, $tab) -split ' ')[2] }
+  }
+  $wHash = @{}
+  $hashPaths = @(@($overlap) + @($headPaths | Where-Object { $dirty -notcontains $_ }) | Where-Object { Test-Path -LiteralPath (Join-Path $r $_) -PathType Leaf })
+  if ($hashPaths.Count) {
+    $hs = @($hashPaths | & git -C $r --no-optional-locks hash-object --stdin-paths 2>$null)
+    if ($hs.Count -eq $hashPaths.Count) { for ($i = 0; $i -lt $hs.Count; $i++) { $wHash[$hashPaths[$i]] = "$($hs[$i])".Trim() } }
+  }
   $stage = @(); $conflict = @(); $superseded = @()
   foreach ($p in $overlap) {
     $full = Join-Path $r $p
-    $w = if (Test-Path -LiteralPath $full) { (G $r hash-object -- $p).Trim() } else { 'deleted' }
-    $t = (G $r rev-parse --verify --quiet "$($target):$p" 2>$null)
+    $w = if (-not (Test-Path -LiteralPath $full)) { 'deleted' } elseif ($wHash.ContainsKey($p)) { $wHash[$p] } else { (G $r hash-object -- $p).Trim() }
+    $t = $tBlob[$p]
     if ($w -eq $t -or ($w -eq 'deleted' -and -not $t)) { $stage += $p; continue }
     if ($w -ne 'deleted' -and $t) {
       # Blobs written to this path by commits between HEAD and the target (raw diff, new-side id).
@@ -676,27 +696,38 @@ function Sync-Repo([string]$r) {
   # upstream version (pushed from a worktree) holds no unique work -> blob kept, file removed, the
   # read-tree writes upstream. Anything else is someone's real new file -> refuse.
   $untrackedHit = @()
-  $headPaths = [Collections.Generic.HashSet[string]]::new([string[]]@(G $r -c core.quotepath=off diff --no-renames --name-only --diff-filter=A HEAD $target))
   foreach ($p in $headPaths) {
     if ($dirty -contains $p) { continue }
     $full = Join-Path $r $p
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
-    $w = (G $r hash-object -- $p) | Select-Object -First 1
+    $w = if ($wHash.ContainsKey($p)) { $wHash[$p] } else { (G $r hash-object -- $p) | Select-Object -First 1 }
     if (-not $w) { continue }
-    $w = $w.Trim(); $t = ((G $r rev-parse --verify --quiet "$($target):$p" 2>$null) | Select-Object -First 1)
+    $w = $w.Trim(); $t = $tBlob[$p]
     $written = if ($w -eq $t) { @($w) } else { @(Get-Written $p) }
     if ($written -contains $w) { $untrackedHit += [pscustomobject]@{ p = $p; w = $w } } else { $conflict += "$p (untracked)" }
   }
+  # The per-path 3-way classification costs several git spawns per path and a held repo recomputed it
+  # every 2 min (~28 min per codai pass, 2026-11-20). Reuse it for 10 min while HEAD, target and the
+  # path's content are unchanged; the idle and live-owner gates below always run fresh.
+  $st0 = Get-State; $rcAll = if ($st0['resolveCache']) { $st0['resolveCache'] } else { @{} }
+  $rcOld = if ($rcAll[$name]) { $rcAll[$name] } else { @{} }; $rcNew = @{}; $nowU = [DateTime]::UtcNow
   $resolved = @(); $hold = @()
   foreach ($c in $conflict) {
     $isU = $c.EndsWith(' (untracked)'); $p = $c -replace ' \(untracked\)$', ''
-    $res = Resolve-Path3 $r $p $target $isU
+    $ck = if ($wHash.ContainsKey($p)) { "$head|$target|$c|$($wHash[$p])" } else { $null }
+    $hit = if ($ck) { $rcOld[$ck] } else { $null }
+    if ($hit -and ($nowU - [DateTime]$hit.at).TotalMinutes -lt 10) { $res = @{ kind = $hit.kind; why = $hit.why; bytes = $hit.bytes }; $rcNew[$ck] = $hit }
+    else { $res = Resolve-Path3 $r $p $target $isU; if ($ck) { $rcNew[$ck] = @{ kind = $res.kind; why = $res.why; bytes = $res.bytes; at = $nowU.ToString('o') } } }
     if ($res.kind -eq 'park' -and -not $ParkNow) {
       $full = Join-Path $r $p
       if ((Test-Path -LiteralPath $full) -and ((Get-Date) - (Get-Item -LiteralPath $full).LastWriteTime).TotalHours -lt $ParkIdleHours) { $hold += "$c [$($res.why), edited <$($ParkIdleHours)h ago]"; continue }
-      if (Test-ActiveOwner $r $p) { $hold += "$c [$($res.why), a live agent session touched it <30 min ago]"; continue }
+      if (Test-ActiveOwner $r $p) { $hold += "$c [$($res.why), a live agent session touched it <6 h ago]"; continue }
     }
     $resolved += [pscustomobject]@{ p = $p; untracked = $isU; kind = $res.kind; why = $res.why; bytes = $res.bytes }
+  }
+  if ($conflict.Count -and ($rcNew.Count -or $rcOld.Count)) {
+    $st = Get-State; if (-not $st.ContainsKey('resolveCache')) { $st['resolveCache'] = @{} }
+    $st['resolveCache'][$name] = $rcNew; Set-State $st
   }
   if ($hold.Count) { return @{ code = 3; msg = "refuse: $($hold.Count) local edit(s) collide with incoming and are still being edited: $($hold -join ', ')" } }
   $what = "$($published)behind $behind, ahead $ahead (all on $up), staging $($stage.Count) already-upstream file(s)"
@@ -779,7 +810,7 @@ function Sync-Repo([string]$r) {
     $aq = Join-Path $HOME '.copilot\bin\agentq.ps1'
     if ((Test-Path $aq) -and -not $env:GIT_AUTOSYNC_NO_NOTE) {
       $note = "git-autosync: $name moved to $up; dirty state backed up as $($snap.where):$($snap.ref)" + $(if ($parkDir) { "; $(@($resolved | Where-Object kind -eq 'park').Count) colliding file(s) parked in $parkDir (MANIFEST.tsv) - re-apply by hand if still wanted" } else { '' })
-      Push-Location $r; try { & pwsh -NoProfile -File $aq note -Message $note *> $null } finally { Pop-Location }
+      Push-Location $r; try { & pwsh -NoProfile -ExecutionPolicy Bypass -File $aq note -Message $note *> $null } finally { Pop-Location }
     }
   }
   return @{ code = 0; msg = "moved $($head.Substring(0,8)) -> $($target.Substring(0,8)): $what" }
@@ -791,7 +822,7 @@ if ($Explain) {
   # points at), so nobody has to remember the flag combination or read this script at 3 a.m.
   if (-not (Test-Path (Join-Path $Explain '.git'))) { "not a repo: $Explain"; exit 2 }
   "explain $Explain (read-only; nothing is moved):"
-  & pwsh -NoProfile -File $PSCommandPath -Repo $Explain -WhatIf
+  & pwsh -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Repo $Explain -WhatIf
   exit $LASTEXITCODE
 }
 if ($Report) {
@@ -815,7 +846,7 @@ if ($Report) {
   $msg = if ($rows.Count) { "git-autosync drift report: $($rows.Count) repo(s) behind upstream - " + ($rows -join ' | ') } else { 'git-autosync drift report: every repo is at its upstream' }
   $msg
   $aq = Join-Path $HOME '.copilot\bin\agentq.ps1'
-  if ($rows.Count -and (Test-Path $aq)) { & pwsh -NoProfile -File $aq note -Message $msg *> $null }
+  if ($rows.Count -and (Test-Path $aq)) { & pwsh -NoProfile -ExecutionPolicy Bypass -File $aq note -Message $msg *> $null }
   exit $(if ($rows.Count) { 3 } else { 0 })
 }
 if ($VerifyBackups) {
@@ -1065,6 +1096,13 @@ if ($Install) {
 if ($Loop) {
   $script:mx = [Threading.Mutex]::new($false, 'Global\git-autosync-loop')
   if (-not $script:mx.WaitOne(0)) { 'git-autosync: loop already running'; exit 0 }
+} elseif ($Repo.Count -gt 1) {
+  # The task launches via hidden-run.vbs (Run ..., False): wscript exits at once, so IgnoreNew never sees
+  # the pass still running. A full pass is ~6 min against a 2-min tick; without this every tick stacked
+  # another pwsh (12 live on 2026-11-20, each re-fetching and WMI-scanning). One full pass at a time.
+  $script:tx = [Threading.Mutex]::new($false, $(if ($env:GIT_AUTOSYNC_MUTEX) { "$env:GIT_AUTOSYNC_MUTEX-tick" } else { 'Global\git-autosync-tick' }))
+  try { $own = $script:tx.WaitOne(0) } catch [Threading.AbandonedMutexException] { $own = $true }
+  if (-not $own) { 'git-autosync: a full pass is already running'; exit 0 }
 }
 $rc = 0
 do {

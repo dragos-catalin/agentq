@@ -5,3 +5,4 @@ coverage/
 *.log
 .env*
 __pycache__/
+.axiom/

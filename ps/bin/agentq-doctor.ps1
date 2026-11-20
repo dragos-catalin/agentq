@@ -342,6 +342,34 @@ function Test-DoctorConfig {
 }
 
 # ---- 4a. dead-owner: leases whose owner process is gone ------------------------------------------
+# lease hygiene (ADR 0012): a slot nobody touched for a while is a slot another agent waits for, and the
+# loss counters are the SLO that must stay at zero. Reported per repo, so the owner sees WHICH pool is
+# clogged instead of discovering it from an agent that gave up waiting.
+function Test-DoctorLeaseHygiene($scope) {
+  $leases = @(Get-DoctorLeases)
+  if ($scope.only) { $leases = @($leases | Where-Object { "$(P $_ 'repo' '')" -eq $scope.only }) }
+  if (-not $leases.Count) { Add-DoctorSummary 'lease-hygiene' 'no leases'; return }
+  $stale = @($leases | Where-Object { $_.PSObject.Properties['stale'] -and $_.stale })
+  $warm = @($leases | Where-Object { -not ($_.PSObject.Properties['stale'] -and $_.stale) -and [double]$_.idleMin -ge 30 })
+  $byRepo = @($leases | Group-Object { "$(P $_ 'repo' '')" } | Sort-Object Count -Descending | ForEach-Object { "$($_.Name):$($_.Count)" }) -join ' '
+  Add-DoctorSummary 'lease-hygiene' "$($leases.Count) lease(s) [$byRepo]; $($stale.Count) stale (the sweep backs them up and takes them); $($warm.Count) idle >= 30 min"
+  foreach ($l in ($stale | Select-Object -First 20)) {
+    Add-DoctorRow 'lease-hygiene' 'warn' "$(P $l 'repo' '')/$(P $l 'slot' '')" "STALE: slot idle $([math]::Round([double]$l.idleMin)) min, session $(P $l 'session' '?') '$(P $l 'purpose' '')'" 'the sweep (task copilot-worktree-prune, every 30 min) reclaims it; `agentq who` lists every lease with its work clock'
+  }
+  foreach ($l in ($warm | Select-Object -First 5)) {
+    Add-DoctorRow 'lease-hygiene' 'info' "$(P $l 'repo' '')/$(P $l 'slot' '')" "idle $([math]::Round([double]$l.idleMin)) min (reclaimed at leaseIdleMin 45 / leaseOwnerIdleMin 90), session $(P $l 'session' '?')" 'if the work is real but outside the slot, renew it: agentq renew -LeaseId <id> (or lease -Hold -HoldMin <n>)'
+  }
+  # Loss counters (24 h): the SLO numbers that must stay at zero. Cheap: one journal tail.
+  try {
+    $losses = @(Get-RecentLeaseLosses 24)
+    $exp = @($losses | Where-Object { (JProp $_ 'event') -eq 'lease-expire' }).Count
+    $brk = @($losses | Where-Object { (JProp $_ 'event') -eq 'lease-break' }).Count
+    $lvl = @($exp + $brk)
+    if ($lvl -gt 5) { Add-DoctorRow 'lease-hygiene' 'warn' 'losses-24h' "$exp expired + $brk broken in 24 h" 'agentq who -> find the holder and coordinate; every expiry is backed up to refs/backup/wt/<repo>/<slot>/<ts>' }
+    else { Add-DoctorRow 'lease-hygiene' 'ok' 'losses-24h' "$exp expired + $brk broken in 24 h" }
+  } catch { }
+}
+
 function Test-DoctorLeaseOwners($scope) {
   $looked = 0; $dead = 0; $kept = 0
   foreach ($l in @(Get-DoctorLeases)) {
@@ -644,6 +672,7 @@ function Invoke-Doctor {
     'install-drift'       = { Test-DoctorInstall }
     'config-drift'        = { Test-DoctorConfig }
     'dead-owner'          = { Test-DoctorLeaseOwners $scope }
+    'lease-hygiene'       = { Test-DoctorLeaseHygiene $scope }
     'dead-keeper'         = { Test-DoctorJobs $scope }
     'marks'               = { Test-DoctorMarks }
     'state-size'          = { Test-DoctorStateSize }

@@ -49,7 +49,13 @@ $env:AGENTQ_CONFIG = $cfg
 
 function Slot([string]$branch) {
   Push-Location $repo
-  try { $o = AQ lease -Purpose "work $branch" -Branch $branch -Ref origin/dev -Json } finally { Pop-Location }
+  # One session per slot: the suite models DIFFERENT agents leasing (ADR 0012 refuses a second plain
+  # task lease from the same session in one repo), so each lease gets its own session id.
+  $prev = $env:AGENTQ_SESSION
+  try {
+    $env:AGENTQ_SESSION = "li-$branch"
+    $o = AQ lease -Purpose "work $branch" -Branch $branch -Ref origin/dev -Json
+  } finally { $env:AGENTQ_SESSION = $prev; Pop-Location }
   $l = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   git -C $l.path config core.autocrlf false
   $l

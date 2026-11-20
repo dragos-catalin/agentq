@@ -11,7 +11,10 @@ $env:AGENTQ_NO_SIGNAL = '1'
 $env:AGENTQ_SESSION = 'test-A'
 $cfg = Join-Path $tmp 'cfg.json'
 New-Item -ItemType Directory -Force $tmp | Out-Null
-'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseDeadIdleMin":1,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
+# leaseIdleMin 1: ADR 0012 makes a lease with a DEAD owner stale at leaseIdleMin (it no longer reads
+# leaseDeadIdleMin), so the "dead owner + idle > 1 min -> STALE" check below needs this knob set; without
+# it the dead-owner threshold is the default 45 and idle 3 would not be stale.
+'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseIdleMin":1,"leaseDeadIdleMin":1,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
 $env:AGENTQ_CONFIG = $cfg
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
@@ -30,7 +33,9 @@ try {
   $l1 = $o | Select-Object -Last 1 | ConvertFrom-Json
   Check 'lease task -> task-1 under wt root' ($code -eq 0 -and $l1.slot -eq 'task-1' -and (Test-Path (Join-Path $l1.path 'a.txt'))) $o
   Check 'lease checks out the branch' ((git -C $l1.path rev-parse --abbrev-ref HEAD) -eq 'feat/x')
-  $o = AQ lease -Purpose 'feature y' -Json; $l2 = $o | Select-Object -Last 1 | ConvertFrom-Json
+  # ADR 0012 refuses a second task lease in one session unless the slot is named -> name it (the
+  # deliberate override); a plain second lease would exit 3 and break the JSON parse below.
+  $o = AQ lease -Slot task-2 -Purpose 'feature y' -Json; $l2 = $o | Select-Object -Last 1 | ConvertFrom-Json
   Check 'second lease -> task-2' ($l2.slot -eq 'task-2') $o
   $o = AQ lease -Purpose 'too many' -NoWait
   Check 'per-repo task cap refuses (exit 3)' ($code -eq 3) $o

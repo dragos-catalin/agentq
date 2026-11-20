@@ -9,6 +9,14 @@ $installer = Join-Path $Src 'install.ps1'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aqin-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $dst = Join-Path $tmp 'dst'
 New-Item -ItemType Directory -Force $dst | Out-Null
+# Snapshot the checkout and install FROM THE SNAPSHOT: every check here compares the installed bytes to
+# the source it copied from, so an external writer touching ps/ mid-suite (another agent, an autosync, a
+# hook) made the suite fail with a drift that does not exist (2026-11-20: 3 FAILs in a parallel run,
+# green alone). The copy is what the installer reads, so the semantics are unchanged.
+$liveSrc = $Src
+$Src = Join-Path $tmp 'src'
+Copy-Item -LiteralPath $liveSrc -Destination $Src -Recurse -Force
+$installer = Join-Path $Src 'install.ps1'
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
 function Install([string]$from, [string[]]$more) {

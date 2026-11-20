@@ -8,6 +8,8 @@ written into marks/ in agentq.ps1 Set-Mark's exact shape (+ a journal line), so
 `agentq run/acquire/commit` and the guard hook honour a freeze set in the hub.
 Each pass also collects daemon health (default git-autosync; agentq-config.json
 `autosync.daemons`) into <root>/daemons/<name>.json and a top-level `daemons` array.
+Each pass also reaps the background-job registry (`jobs.ps1 reap`: a job still running/starting whose
+pid is dead or recycled becomes `dead`), so agentq doctor's dead-keeper row cannot accumulate again.
 
 Auth: a codai API key whose owner is super_admin, stored DPAPI-encrypted (CurrentUser)
 in ~/.codai/agentq-sync.key. Never printed.
@@ -57,6 +59,30 @@ function Invoke-ProbeTick {
   if (([DateTime]::UtcNow - $script:ProbeAt).TotalSeconds -lt 55) { return }
   $script:ProbeAt = [DateTime]::UtcNow
   try { $null = Invoke-LoadProbe $Root 50 12 'sync' } catch { }
+}
+# Background-job registry hygiene: `jobs.ps1 reap` marks a job still running/starting whose pid is dead
+# or was recycled as `dead` - the repair for agentq doctor's dead-keeper rows. Doing it HERE makes it
+# continuous instead of a manual chore (2026-11-19: 23 dead `running` jobs had accumulated and doctor
+# kept reporting them). A live job is never touched. Best effort: any failure is swallowed so a broken
+# registry can never break the mirror.
+function Invoke-ReapJobs {
+  if (-not (Get-Command Get-AllJobs -ErrorAction SilentlyContinue)) { return 0 }
+  $n = 0
+  try {
+    foreach ($j in @(Get-AllJobs)) {
+      if ("$($j['state'])" -notin 'running', 'starting') { continue }
+      if (Test-JobPidAlive ([int]$j['pid']) $j['pidStart']) { continue }
+      Update-Job $j['id'] @{ state = 'dead'; endedAt = (Get-JobIso ([DateTime]::UtcNow)); reapedBy = 'agentq-sync' }
+      $n++
+    }
+  } catch { [Console]::Error.WriteLine("agentq-sync: reap skipped: $_") }
+  $n
+}
+# Everything a pass does locally before it mirrors. Reap only - the load probe stays on the resident
+# loop's own cadence (a one-shot scheduled tick must not add a 12 s probe sample every minute).
+function Invoke-Housekeeping {
+  $reaped = Invoke-ReapJobs
+  if ($reaped -gt 0) { [Console]::Error.WriteLine("agentq-sync: reaped $reaped dead job(s)") }
 }
 function Get-Jobs {
   if (-not (Get-Command Get-JobsForSync -ErrorAction SilentlyContinue)) { return @() }
@@ -140,7 +166,18 @@ function Update-DaemonRecord([string]$name, $rec) {
   [IO.File]::WriteAllText($f, ($out | ConvertTo-Json -Depth 6), $Utf8)
   $out
 }
+# The resident loop spawns one pwsh per daemon per run (~1.4 s wall, ~0.8 s CPU each), so it refreshes
+# the verdicts every $DaemonEverySec and republishes the last records in between (history then spans
+# 48 x 5 min = 4 h instead of 12 min). A one-shot pass (-Once / the scheduled tick) always refreshes.
+$DaemonEverySec = 300
+$script:DaemonsAt = [DateTime]::MinValue; $script:DaemonsLast = $null
 function Get-Daemons {
+  if ($Loop -and $null -ne $script:DaemonsLast -and ([DateTime]::UtcNow - $script:DaemonsAt).TotalSeconds -lt $DaemonEverySec) { return $script:DaemonsLast }
+  $script:DaemonsAt = [DateTime]::UtcNow
+  $script:DaemonsLast = Get-DaemonsFresh
+  $script:DaemonsLast
+}
+function Get-DaemonsFresh {
   $out = [Collections.Generic.List[object]]::new()
   foreach ($name in @(Get-DaemonNames)) {
     try {
@@ -416,8 +453,12 @@ if ($Loop) {
   if (-not $mx.WaitOne(0)) { 'agentq-sync: loop already running'; exit 0 }
   while ($true) {
     Invoke-ProbeTick
+    Invoke-Housekeeping
     try { Invoke-Push | Out-Null } catch { [Console]::Error.WriteLine("$_") }
     Start-Sleep -Seconds $IntervalSec
   }
 }
+# One push per tick (the installed scheduled task) shares the housekeeping with the loop, so a dead job
+# is reaped within a minute whether the daemon runs warm (-Loop) or one-shot.
+Invoke-Housekeeping
 Invoke-Push

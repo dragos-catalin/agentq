@@ -55,6 +55,8 @@ Ok ((git -C $r.a log origin/main --format=%s) -contains 'mine') '3 commit on ori
 Ok (((git -C $r.a show origin/main:x.txt) -join '') -eq '3') '3 upstream change kept'
 Ok ((git -C $r.a diff --cached --name-only) -eq 'z.txt') '3 staged wip kept'
 Ok (@(Get-Content $env:FAKE_LAND_CALLS -ErrorAction SilentlyContinue).Count -eq 1) '3 land called once'
+# agentq's shared-clone guard refuses a land started from the clone without the override (codai drift 2026-11)
+Ok ((Get-Content $env:FAKE_LAND_CALLS -Raw) -match 'shared_ok=1') '3 land runs with AGENTQ_SHARED_CLONE_COMMIT_OK'
 Ok (-not (git -C $r.o for-each-ref refs/heads/autosync)) '3 replay topic cleaned up'
 
 # 3b unpushed commit that conflicts with upstream -> refuse, nothing moves

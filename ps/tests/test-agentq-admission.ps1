@@ -22,6 +22,7 @@ foreach ($v in 'AGENTQ_IDLE_FAKE', 'AGENTQ_FAKE_LOCALTIME', 'AGENTQ_NO_AGENT_LIM
 $cfg = Join-Path $tmp 'cfg.json'; $env:AGENTQ_CONFIG = $cfg
 function Cfg([double]$maxHoldMin, [bool]$enabled = $true, $agentLimit = $null) {
   $h = @{ taskSlotsPerRepo = 3; taskSlotsMachine = 5; minFreeCommitGB = 0; machineCap = 2; quickBurst = 0; agingMin = 0; idleYieldMin = 0
+    scratchSlots = 3; holdDefaultMin = 180
     admission = @{ enabled = $enabled; probeMs = 400; window = 3; everySec = 0; staleSec = 300; maxHoldMin = $maxHoldMin }
   }
   if ($agentLimit) { $h.agentLimit = $agentLimit }
@@ -83,11 +84,30 @@ try {
   $l1 = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   Check '3 recovered: lease granted' ($code -eq 0 -and $l1.slot -eq 'task-1') $o
 
+  # 3b. ADR 0012: at most ONE task slot per session per repo. test-adm already holds task-1 (case 3).
+  $o = AQ lease -Purpose 'second agent, same session' -NoWait
+  Check '3b a second plain task lease from the same session is refused (exit 3) and names the scratch alternative' ($code -eq 3 -and $o -match 'already holds a task slot' -and $o -match 'scratch' -and -not (Test-Path (Join-Path $env:AGENTQ_HOME 'leases\repo\task-2.json'))) $o
+  $o = AQ lease -Purpose 'deliberate second slot' -Slot task-2 -NoWait -Json
+  $l2b = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  Check '3b ... but naming -Slot task-2 is allowed (deliberate second slot for the same session)' ($code -eq 0 -and $l2b.slot -eq 'task-2') $o
+  $null = AQ unlease -Repo $l2b.path -LeaseId $l2b.leaseId
+  Check '3b ... and that second slot is released again (frees task-2 for case 4)' ($code -eq 0)
+  # scratch is the sanctioned escape hatch: granted even when the task cap is reached (agent limit 1 of 1 -
+  # test-adm holds task-1, so a plain task lease is refused while role scratch is not counted at all).
+  Cfg 60 $true @{ enabled = $true; awayAfterMin = 10; present = 1; away = 1; night = @{ from = '23:00'; to = '07:00'; limit = 1 } }
+  Load 50
+  $o = AQ lease -Role scratch -Purpose 'one-off isolation' -NoWait -Json
+  $lsc = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  Check '3b -Role scratch is granted even when the task cap is reached; the slot is scratch-N' ($code -eq 0 -and $lsc.role -eq 'scratch' -and $lsc.slot -match '^scratch-\d+$') $o
+  Cfg 60
+
   # 4. progress guarantee: held only by load for maxHoldMin -> admitted anyway, journaled
   Cfg 0.05   # 3 s
   Load 2000
   $sw = [Diagnostics.Stopwatch]::StartNew()
+  $env:AGENTQ_SESSION = 'agent-2'   # ADR 0012: a SECOND agent - test-adm already holds task-1
   $o = AQ lease -Purpose 'held then admitted' -TimeoutMin 2 -Json
+  $env:AGENTQ_SESSION = 'test-adm'
   $l2 = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   Check '4 saturated + waiting: granted after maxHoldMin' ($code -eq 0 -and $l2.slot -eq 'task-2' -and $sw.Elapsed.TotalSeconds -ge 3) "$([int]$sw.Elapsed.TotalSeconds) s | $o"
   Check '4 journal: admission-override' (@(Journal 'admission-override').Count -eq 1)
@@ -191,7 +211,9 @@ try {
   Check '8 owner present (input 5 s ago) -> the present limit' ($a.state -eq 'present' -and $a.limit -eq 1 -and $a.base -eq 5 -and $a.inputIdleSec -eq 5 -and $a.leased -eq 2) ($a | ConvertTo-Json -Compress)
   $o = AQ status
   Check '8 status prints the limit, the reason and the schedule' ($o -match '== AGENTS limit 1 of 5 task slots \(owner present \(last input 5 s ago\); night 23:00-07:00: not now\); 2 leased') $o
+  $env:AGENTQ_SESSION = 'agent-3'   # ADR 0012: a THIRD agent, its own session (test-adm holds task-1)
   $o = AQ lease -Purpose 'third agent while the owner works' -NoWait
+  $env:AGENTQ_SESSION = 'test-adm'
   Check '8 present: a new task lease over the limit is refused (exit 3) and says why' ($code -eq 3 -and $o -match 'task slot cap \(1\) reached - agent limit: owner present' -and -not (Test-Path (Join-Path $env:AGENTQ_HOME 'leases\repo\task-3.json'))) $o
   $hold = Journal 'agent-limit-hold' | Select-Object -Last 1
   Check '8 journal: agent-limit-hold with the limit and the reason' ($hold -and $hold.limit -eq 1 -and $hold.base -eq 5 -and $hold.reason -match 'owner present') ($hold | ConvertTo-Json -Compress)
@@ -202,7 +224,9 @@ try {
   Idle 3600
   $a = Agents
   Check '8 owner away at noon (no input for 60 min) -> the away limit' ($a.state -eq 'away' -and $a.limit -eq 3 -and $a.night -eq $false) ($a | ConvertTo-Json -Compress)
+  $env:AGENTQ_SESSION = 'agent-3'   # the same third agent now gets in (away limit 3)
   $o = AQ lease -Purpose 'third agent, owner away' -NoWait -Json
+  $env:AGENTQ_SESSION = 'test-adm'
   $l3 = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   Check '8 away: the same lease is now granted' ($code -eq 0 -and $l3.slot -eq 'task-3') $o
   $env:AGENTQ_FAKE_LOCALTIME = '02:00'

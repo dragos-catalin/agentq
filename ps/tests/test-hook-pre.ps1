@@ -162,10 +162,17 @@ try {
   Ok ((Test-Path "$leaseFile.chat") -and (Get-Content "$leaseFile.chat" -Raw) -match 'chat-x') 'chat keep-alive: the chat is bound to the lease'
   [IO.File]::SetLastWriteTimeUtc("$leaseFile.chat", [DateTime]::UtcNow.AddHours(-2))
   Case 'chat keep-alive: a later unrelated call of that chat is allowed as before' (@{ hook_event_name = 'PreToolUse'; session_id = 'chat-x'; cwd = $plain; tool_name = 'run_in_terminal'; tool_input = @{ command = 'git status' } }) 'allow'
-  Ok (([DateTime]::UtcNow - (Get-Item "$leaseFile.chat").LastWriteTimeUtc).TotalMinutes -lt 2) 'chat keep-alive: ... and it refreshed the lease'
+  # 2026-11-19 (ideas 1+7): <lease>.json.chat ages with the WORK clock - "the chat is busy" is not
+  # "someone works in this slot". Only a call that NAMES the slot refreshes it, so the grace expires
+  # once the chat stops working there (17 leases sat idle 5-7 h, none stale, while a bound chat was
+  # fresh). These cases lock the contract in BOTH directions.
+  Ok (([DateTime]::UtcNow - (Get-Item "$leaseFile.chat").LastWriteTimeUtc).TotalMinutes -ge 90) 'chat keep-alive: an unrelated call does NOT refresh the lease (the chat is busy elsewhere)'
   [IO.File]::SetLastWriteTimeUtc("$leaseFile.chat", [DateTime]::UtcNow.AddHours(-2))
   Case 'chat keep-alive: a DENIED call of that chat is still denied' (@{ hook_event_name = 'PreToolUse'; session_id = 'chat-x'; cwd = $plain; tool_name = 'run_in_terminal'; tool_input = @{ command = $forcePush } }) 'deny-json' 'Force-push'
-  Ok (([DateTime]::UtcNow - (Get-Item "$leaseFile.chat").LastWriteTimeUtc).TotalMinutes -lt 2) 'chat keep-alive: ... and it still counts as activity of the chat'
+  Ok (([DateTime]::UtcNow - (Get-Item "$leaseFile.chat").LastWriteTimeUtc).TotalMinutes -ge 90) 'chat keep-alive: a denied unrelated call does not refresh it either'
+  [IO.File]::SetLastWriteTimeUtc("$leaseFile.chat", [DateTime]::UtcNow.AddHours(-2))
+  Case 'chat keep-alive: a call that NAMES the slot is allowed as before' (@{ hook_event_name = 'PreToolUse'; session_id = 'chat-x'; cwd = $plain; tool_name = 'replace_string_in_file'; tool_input = @{ filePath = "$slot\a.txt"; oldString = 'a'; newString = 'b' } }) 'allow'
+  Ok (([DateTime]::UtcNow - (Get-Item "$leaseFile.chat").LastWriteTimeUtc).TotalMinutes -lt 2) 'chat keep-alive: a call that names the slot DOES refresh it (the work clock)'
 }
 finally {
   Remove-Item $fxRoot -Recurse -Force -ErrorAction SilentlyContinue

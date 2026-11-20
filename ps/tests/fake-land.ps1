@@ -2,7 +2,7 @@
 # on origin/<onto> in a throwaway clone and pushes. FAKE_LAND_FAIL=1 -> exit 7 without pushing.
 param([Parameter(Position = 0)][string]$Cmd, [string]$Branch, [string]$Onto, [string]$Purpose)
 if ($env:FAKE_LAND_FAIL) { Add-Content $env:FAKE_LAND_CALLS 'fail'; exit 7 }
-Add-Content $env:FAKE_LAND_CALLS 'land'
+Add-Content $env:FAKE_LAND_CALLS "land shared_ok=$($env:AGENTQ_SHARED_CLONE_COMMIT_OK)"
 $origin = (git remote get-url origin).Trim()
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('fl-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 git clone -q $origin $tmp 2>$null

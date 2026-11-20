@@ -82,6 +82,36 @@ $st = (& pwsh -NoProfile -File $sync -Status 2>&1 | ForEach-Object { "$_" }) -jo
 Check '6 -Status lists the configured daemons' ($st -match 'daemons: 1 configured \(git-autosync\)') $st
 Check '6 -Status shows the last daemon verdict' ($st -match 'git-autosync\s+ok\s+failStreak 0') $st
 
+# 7 per-pass job-registry reap: ONE sync pass marks a job still `running` whose pid is dead (or was
+#   recycled) as `dead` (+ reapedBy), and leaves a live job alone. This is `jobs.ps1 reap` made
+#   continuous, so agentq doctor's dead-keeper row cannot accumulate again (2026-11-19: 23 of them).
+#   Daemon collection off here: the default list would run the REAL git-autosync -Doctor.
+[IO.File]::WriteAllText($env:AGENTQ_CONFIG, '{"autosync":{"daemons":[]}}')
+$jobsDir = Join-Path $env:AGENTQ_HOME 'jobs'
+New-Item -ItemType Directory -Force $jobsDir | Out-Null
+$utf8 = [Text.UTF8Encoding]::new($false)
+$mkJob = {
+  param($id, $state, $procId, $startTicks)
+  [ordered]@{
+    id = $id; label = $id; command = 'x'; cwd = $tmp; repo = 'repo'; host = $env:COMPUTERNAME
+    pid = $procId; pidStart = $startTicks; log = (Join-Path $tmp "$id.log"); expectedMin = 1
+    startedAt = (Get-Date).ToUniversalTime().ToString('o'); state = $state; ownerPid = $PID
+  } | ConvertTo-Json
+}
+[IO.File]::WriteAllText((Join-Path $jobsDir 'dead-0001.json'), (& $mkJob 'dead-0001' 'running' 999999 $null), $utf8)
+[IO.File]::WriteAllText((Join-Path $jobsDir 'live-0001.json'), (& $mkJob 'live-0001' 'running' $PID (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks), $utf8)
+[IO.File]::WriteAllText((Join-Path $jobsDir 'done-0001.json'), (& $mkJob 'done-0001' 'done' 999999 $null), $utf8)
+$r = RunSync
+Check '7 a pass with a dead job still exits 0' ($r.code -eq 0) $r.out
+$dj = Get-Content (Join-Path $jobsDir 'dead-0001.json') -Raw | ConvertFrom-Json
+Check '7 one pass reaps the dead-pid running job' ($dj.state -eq 'dead' -and $dj.reapedBy -eq 'agentq-sync') "state=$($dj.state) by=$($dj.reapedBy)"
+$rawDead = Get-Content (Join-Path $jobsDir 'dead-0001.json') -Raw
+Check '7 reaped job got an ISO endedAt in the record' ($rawDead -match '"endedAt"\s*:\s*"\d{4}-\d{2}-\d{2}T') "$($dj.endedAt)"
+$lj = Get-Content (Join-Path $jobsDir 'live-0001.json') -Raw | ConvertFrom-Json
+Check '7 a live job is not touched' ($lj.state -eq 'running') "state=$($lj.state)"
+$dj2 = Get-Content (Join-Path $jobsDir 'done-0001.json') -Raw | ConvertFrom-Json
+Check '7 a job that is not running/starting is not touched' ($dj2.state -eq 'done' -and -not $dj2.PSObject.Properties['reapedBy']) "state=$($dj2.state)"
+
 Remove-Item Env:AGENTQ_GIT_AUTOSYNC -ErrorAction SilentlyContinue
 cmd /c rmdir /s /q "`"$tmp`"" 2>$null
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

@@ -170,10 +170,13 @@ $touchesWt = (($touchNorm -match '(?i)\\\.wt\\') -or ($touchNorm.IndexOf($wtRoot
 
 # The chat (not a shell) is what works in a slot. A chat that WORKS in a leased slot - an edit inside
 # it, or a command that names it - is bound to that lease: <coord>/chats/<chat>.json lists the leases,
-# and <lease>.json.chat lists the chats. From then on EVERY tool call of that chat, whatever it is
-# about (a deploy, a queue wait, a subagent's read), touches <lease>.json.chat, and agentq counts a
-# recent touch like a live owner process (agentq-v2.ps1 Read-Leases). 185 lease-break + 40 lease-expire
-# in 7 days came from leases whose owner shell had ended while the chat was still working elsewhere.
+# and <lease>.json.chat lists the chats. Binding happens from any call of that chat, but the KEEP-ALIVE
+# is only refreshed by a call that NAMES the slot (the binding loop in (1) adds the chat once; the loop
+# in (2) is what touches the clock): agentq counts a recent touch like a live owner process
+# (agentq-v2.ps1 Read-Leases), and <lease>.json.chat ages with the work clock since 2026-11-19.
+# 185 lease-break + 40 lease-expire in 7 days came from leases whose owner shell had ended while the
+# chat was still working elsewhere - and the older rule (EVERY call refreshed it) kept a chat that had
+# moved on holding its slot for hours.
 # Reads never bind (looking at another agent's slot is not working in it), nor do agentq's own
 # inspection and maintenance verbs. AGENTQ_NO_CHAT_KEEPALIVE=1 turns it off.
 $chatId = ''
@@ -188,10 +191,15 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
     if ([IO.File]::Exists($chatFile)) {
       try { foreach ($b in @((([IO.File]::ReadAllText($chatFile)) | ConvertFrom-Json).leases)) { if ($b -and $b.file -and $b.id) { $bound["$($b.file)"] = "$($b.id)" } } } catch { }
     }
+    # Cost: Get-GuardLeases walks every lease file. It is skipped when this call names no slot AND the
+    # chat is bound to none - the common case by far (the hook runs on every tool call). NEVER an early
+    # exit here: the destructive-command checks below must still run (a guard that fails open is worse
+    # than no guard).
+    $noLeaseWork = (-not $touchesWt) -and (-not $bound.Count)
     $dirty = $false
     # (1) bind: this call works in a leased slot
     $works = $isEditTool -or ($cmd -and $cmd -notmatch '(?i)agentq(-v2)?(\.ps1)?[''"]?\s+(status|log|since|lease-check|doctor|unlease|sweep|break|metrics|slo|prune|probe)\b')
-    if ($touchesWt -and $works) {
+    if ($touchesWt -and $works -and -not $noLeaseWork) {
       foreach ($l in @(Get-GuardLeases)) {
         if (-not $l.id -or -not (Test-NamesDir $touchNorm $l.path)) { continue }
         if ($bound[$l.file] -ne $l.id) { $bound[$l.file] = $l.id; $dirty = $true }
@@ -202,13 +210,28 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
           $chats = @(@($chats) + $chatId | Select-Object -Last 8)
           [IO.File]::WriteAllText($cf, (@{ leaseId = $l.id; chats = @($chats) } | ConvertTo-Json -Compress), $utf8G)
         }
+        # WORK clock (2026-11-19): "the chat is busy" is not "someone works in this slot". <lease>.json.work
+        # is touched ONLY by a call that names the slot, and agentq treats it as the primary liveness beat:
+        # a lease whose slot nobody touches is reclaimed after leaseIdleMin, however busy the chat is.
+        $wf = "$($l.file).work"
+        if ([IO.File]::Exists($wf)) { [IO.File]::SetLastWriteTimeUtc($wf, $nowG) } else { [IO.File]::WriteAllText($wf, $chatId, $utf8G) }
       }
     }
-    # (2) keep alive: every lease this chat is bound to, as long as it is still the same lease
-    foreach ($lf in @($bound.Keys)) {
+    # (2) keep alive ONLY while the chat WORKS in the slot (ideas 1+7). The old code refreshed
+    # <lease>.json.chat on EVERY tool call of a bound chat, so a chat that moved on elsewhere kept the
+    # lease almost forever - it only fell to leaseMaxIdleMin (measured 2026-11-19: 17 leases, several idle
+    # 5-7 h, none stale because a bound chat was fresh). <lease>.json.chat now ages like the work clock:
+    # only a call that NAMES the slot refreshes it, so the grace expires once the chat stops working there -
+    # which is what lets agentq (or `lease -Reclaim`) take the slot back.
+    $namedFiles = @{}
+    if ($touchesWt -and -not $noLeaseWork) {
+      foreach ($l in @(Get-GuardLeases)) { if ($l.id -and (Test-NamesDir $touchNorm $l.path)) { $namedFiles[$l.file] = $true } }
+    }
+    foreach ($lf in $(if ($noLeaseWork) { @() } else { @($bound.Keys) })) {
       $same = $false
       if ([IO.File]::Exists($lf)) { try { $same = ([IO.File]::ReadAllText($lf)) -match ('"leaseId"\s*:\s*"' + [regex]::Escape($bound[$lf]) + '"') } catch { $same = $true } }
       if (-not $same) { $bound.Remove($lf); $dirty = $true; continue }
+      if (-not $namedFiles[$lf]) { continue }   # an unrelated call: no keep-alive
       $cf = "$lf.chat"
       if ([IO.File]::Exists($cf)) { [IO.File]::SetLastWriteTimeUtc($cf, $nowG) }
       else { [IO.File]::WriteAllText($cf, (@{ leaseId = $bound[$lf]; chats = @($chatId) } | ConvertTo-Json -Compress), $utf8G) }
