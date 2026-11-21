@@ -77,6 +77,12 @@ $map = [ordered]@{
   # copy never carried it - the install gate could not run what it never installed.
   'tests\test-agentq-recover.ps1' = 'bin\test-agentq-recover.ps1'; 'tests\test-agentq-commit-fast.ps1' = 'bin\test-agentq-commit-fast.ps1'
   'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
+  # 2026-11-21: `agentq run` runs its child at the resolved repo root when the caller is OUTSIDE the
+  # repo, and keeps the caller's nested directory when INSIDE (commit 37fdf67, "a brand-new slot
+  # starts hollow").
+  'tests\test-agentq-cwd.ps1' = 'bin\test-agentq-cwd.ps1'
+  # 2026-11-21: `run-build.ps1 -Class web|scripts` (the second build resource for script-only builds).
+  'tests\test-build-class.ps1' = 'bin\test-build-class.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.

@@ -85,6 +85,13 @@ $suites = [ordered]@{
   'recover'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-recover.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'commit fast'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-commit-fast.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'fair share'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-fairshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-21: Invoke-Run runs the child at the resolved repo root when the caller is OUTSIDE it (the
+  # "a brand-new slot starts hollow" install trap, commit 37fdf67) and keeps the caller's nested cwd
+  # when INSIDE. Without this line the suite existed and never ran.
+  'cwd'             = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cwd.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-21: `run-build.ps1 -Class web|scripts` - the second build RESOURCE for script-only builds.
+  # Drives the REAL hooks/run-build.ps1 through -Plan and a fake agentq, so it takes no build:* ticket.
+  'build class'     = @('-File', (Join-Path $PSScriptRoot 'test-build-class.ps1'), '-RunBuild', (Join-Path $hooks 'run-build.ps1'))
 }
 $names = @($suites.Keys)
 if ($List) { $names | ForEach-Object { Write-Host $_ }; exit 0 }

@@ -18,6 +18,8 @@
   Usage:
     run-build.ps1 -Command 'pnpm typecheck'
     run-build.ps1 -Command 'pnpm build' -TimeoutMin 30
+    run-build.ps1 -Class scripts -Command 'node scripts/check-x.mjs'  # own resource, quick lane
+    run-build.ps1 -Plan -Class scripts -Command 'pnpm exec eslint .'   # print the class plan, run nothing
     run-build.ps1 -Status          # who holds the lock, where is the log
     run-build.ps1 -Wait            # block until free, then run
 
@@ -41,11 +43,24 @@ param(
   # agentq v3 lane: interactive|quick|gate|heavy|batch (default gate). batch runs at Idle CPU
   # priority, so higher lanes may run beside it (soft preemption).
   [Parameter(ParameterSetName = 'Run')][ValidateSet('interactive', 'quick', 'gate', 'heavy', 'batch')][string]$Lane = 'gate',
+  # Second build RESOURCE (2026-11-21). `web` (default) = exactly today's behaviour: resource `build`,
+  # the given -Lane. `scripts` = its own per-repo resource `build:<repo>:scripts` in the `quick` lane,
+  # so a script-only change (lint / format / a check-*.mjs) does not sit behind a multi-minute web
+  # build. A LANE cannot achieve that: a lane is priority only, and two tickets on `build:<repo>`
+  # still serialise at capacity 1.
+  # Concurrency safety rests ENTIRELY on the command allow-list checked below: the two classes may be
+  # in one worktree at the same time, so a scripts build must never touch the outputs a web build owns.
+  # Deliberately NOT in a parameter set, so `-Status -Class scripts` also works.
+  [ValidateSet('web', 'scripts')][string]$Class = 'web',
   [Parameter(ParameterSetName = 'Run')][int]$Priority = 0,
   # Build log silent this long -> WEDGED marker on the agentq ticket (shown by `agentq status`) and
   # a console warning. Cleared when output resumes. 0 disables.
   [Parameter(ParameterSetName = 'Run')][double]$WedgeMin = 10,
   [Parameter(ParameterSetName = 'Status')][switch]$Status,
+  # Print the class plan (resource / lane / lock / mutex) and exit 0 WITHOUT taking a ticket, locking
+  # or running anything. Read-only: the suite asserts the class mapping through this rather than
+  # queueing a real build:* ticket (which would block other agents).
+  [switch]$Plan,
   [string]$Root
 )
 
@@ -71,13 +86,47 @@ function Get-RepoRoot {
   return (Get-Location).Path
 }
 
+# The repo leaf agentq itself would use, so `build:<name>:scripts` names the same repo in every
+# worktree of it (agentq's Get-RepoInfo derives the name the same way: the leaf of the parent of the
+# git COMMON dir). A plain `Split-Path -Leaf $root` would name a leased slot `task-1` instead of
+# `brivio`, giving each worktree a private queue and a journal entry outside the repo's group file.
+function Get-RepoLeafName {
+  param([string]$Root)
+  $common = & git -C $Root rev-parse --path-format=absolute --git-common-dir 2>$null
+  $common = "$common".Trim()
+  if ($LASTEXITCODE -eq 0 -and $common -and (Test-Path -LiteralPath $common)) {
+    $n = Split-Path (Split-Path ($common -replace '/', '\') -Parent) -Leaf
+    if ($n) { return $n.ToLowerInvariant() }
+  }
+  # Not a git repo, an old git without --path-format, or a relative answer: the directory leaf.
+  (Split-Path -Leaf $Root).ToLowerInvariant()
+}
+
 $root = Get-RepoRoot -Explicit $Root
 $dir = Join-Path $root '.copilot-tmp'
 $null = New-Item -ItemType Directory -Force -Path $dir -EA SilentlyContinue
-$lockPath = Join-Path $dir 'build.lock'
+
+# --- build class -> resource / lane / lock / mutex (2026-11-21) --------------------------------
+# `web` (the default) keeps TODAY'S behaviour name for name: resource `build`, lock `build.lock` and
+# the very same mutex -- so nothing about an in-flight or habitual web build changes.
+# `scripts` runs on its OWN per-repo resource `build:<repo>:scripts` in the `quick` lane, with its own
+# lock file and its own mutex, so a script-only change no longer queues behind a multi-minute web
+# build and the two classes cannot block each other inside one worktree.
+# No agentq change is needed for the resource name: Resolve-Resource returns a 2+-colon string
+# literally and Get-Capacity falls back to 1 for an unknown resource. Honest limit: agentq's
+# Expand-Resources still adds `build:machine` to every `build:*` ticket, so a scripts build does count
+# against the machine-wide cap -- the win is at the REPO level, where `build:<repo>` (cap 1) no longer
+# serialises it against a web build.
+$repoName = Get-RepoLeafName $root
+$isScripts = ($Class -eq 'scripts')
+$resource = if ($isScripts) { "build:$($repoName):scripts" } else { 'build' }
+$laneEff = if ($isScripts) { 'quick' } else { $Lane }
+$lockPath = Join-Path $dir $(if ($isScripts) { 'build-scripts.lock' } else { 'build.lock' })
 # Per-repo, Global\ so it spans sessions, terminals and users -- not just this
 # desktop. Name must be filesystem-independent, hence the character scrub.
 $mutexName = "Global\brivio-build-$(($root -replace '[^A-Za-z0-9]', '_'))"
+# Web keeps the mutex name it has always had; scripts gets its own so the two classes never serialise.
+if ($isScripts) { $mutexName += '-scripts' }
 $script:mutex = $null
 $logDir = Join-Path $dir 'build-logs'
 $null = New-Item -ItemType Directory -Force -Path $logDir -EA SilentlyContinue
@@ -125,10 +174,11 @@ function Test-LockAlive {
 }
 
 function Show-Status {
+  $sfx = if ($isScripts) { ' [scripts]' } else { '' }
   $l = Read-Lock
   if (-not (Test-LockAlive $l)) {
     if ($l) { Write-Host "STALE-LOCK    previous build (pid $($l.pid)) died; lock will be reclaimed" }
-    else { Write-Host "FREE          no build running in $root" }
+    else { Write-Host "FREE          no build running in $root$sfx" }
     $last = Get-ChildItem $logDir -Filter '*.log' -EA SilentlyContinue |
       Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($last) {
@@ -139,7 +189,7 @@ function Show-Status {
   }
   $started = ConvertTo-Utc $l.startedUtc
   $age = if ($started) { [math]::Round(((Get-Date).ToUniversalTime() - $started).TotalMinutes, 1) } else { '?' }
-  Write-Host "BUSY          a build is running in $root"
+  Write-Host "BUSY          a build is running in $root$sfx"
   Write-Host "  command     $($l.command)"
   Write-Host "  session     $($l.session)"
   Write-Host "  pid         $($l.pid)   started $age min ago"
@@ -149,6 +199,29 @@ function Show-Status {
 }
 
 if ($Status) { exit (Show-Status) }
+
+# --- class plan and the scripts allow-list (2026-11-21) --------------------------------------------
+# `-Class scripts` may run CONCURRENTLY with a web build in the SAME worktree -- that is the whole
+# point of a second resource -- and the ONLY thing that makes that safe is this allow-list: a scripts
+# build must never write `.next`, `.turbo` or `*.tsbuildinfo`, the build outputs a web build owns and
+# mutates. So it takes a command that starts with `node` (a check script such as scripts/check-*.mjs)
+# or a formatter/linter through pnpm (`pnpm exec prettier|eslint|oxlint`). Anything else is refused
+# HERE, before a ticket is taken: a queued build that must not run is worse than a refusal.
+if ($isScripts -and -not ($Command -match '^\s*node(\s|$)' -or $Command -match '^\s*pnpm\s+exec\s+(prettier|eslint|oxlint)(\s|$)')) {
+  [Console]::Error.WriteLine("run-build.ps1 -Class scripts REFUSES this command: $Command")
+  [Console]::Error.WriteLine('  A scripts-class build runs BESIDE a web build in the same repo, so it must not touch the')
+  [Console]::Error.WriteLine('  outputs a web build owns (.next, .turbo, *.tsbuildinfo). Allowed: a command starting with')
+  [Console]::Error.WriteLine("  'node', or 'pnpm exec prettier|eslint|oxlint'. Use -Class web (the default) for anything else.")
+  exit 2
+}
+# -Plan: print the class mapping and exit 0 -- no ticket, no lock, no build. The suite asserts the
+# mapping through this instead of queueing a real build:* ticket behind other agents.
+if ($Plan) {
+  Write-Host "plan: class=$Class resource=$resource lane=$laneEff"
+  Write-Host "      lock=$lockPath"
+  Write-Host "      mutex=$mutexName"
+  exit 0
+}
 
 # ADR 0001: a build in a leased slot is activity for that lease (a queued 2 h build must not let
 # the slot go stale). Cheap: one lease-dir scan, no agentq process.
@@ -160,14 +233,15 @@ foreach ($lf in Get-ChildItem $leaseDir -Recurse -Filter '*.json' -File -EA Sile
 $sessionId = if ($env:AGENTQ_SESSION) { $env:AGENTQ_SESSION } elseif ($env:COPILOT_SESSION_ID) { $env:COPILOT_SESSION_ID.Substring(0, [Math]::Min(8, $env:COPILOT_SESSION_ID.Length)) } else { 'unknown' }
 
 # --- agentq queue (2026-09-27) ------------------------------------------------
-# Re-enter this script under `agentq run -Resource build`, unless we already hold it
-# (AGENTQ_HELD) or agentq is missing (then fall back to the legacy lock only).
+# Re-enter this script under `agentq run -Resource <class resource>` (`build` for web, or
+# `build:<repo>:scripts` for scripts), unless we already hold it or agentq is missing (then fall back
+# to the legacy lock only). AGENTQ_HELD is matched on the `build:` prefix, which covers both resources.
 $agentq = Join-Path $env:USERPROFILE '.copilot\bin\agentq.ps1'
 if ((Test-Path $agentq) -and ("$env:AGENTQ_HELD" -notmatch '(^|,)build:') -and -not $env:RUN_BUILD_NO_AGENTQ) {
   $why = if ($Purpose) { $Purpose } else { "build: $Command" }
-  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-Lane', $Lane, '-WedgeMin', "$WedgeMin")
+  $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-Lane', $laneEff, '-WedgeMin', "$WedgeMin", '-Class', $Class)
   if ($Root) { $self += @('-Root', $Root) }
-  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', 'build', '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root, '-Lane', $Lane, '-Priority', "$Priority")
+  $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', $resource, '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root, '-Lane', $laneEff, '-Priority', "$Priority")
   if (-not $Wait) { $aqArgs += '-NoWait' }
   & pwsh @aqArgs -- pwsh @self
   exit $LASTEXITCODE
