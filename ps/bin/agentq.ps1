@@ -1484,7 +1484,20 @@ function Invoke-Run {
     try { (Get-Process -Id $PID).PriorityClass = [Diagnostics.ProcessPriorityClass]$pc; if ($jobInfo) { $jobInfo.priority = $pc } } catch {}
     try {
       $exe = $cmdArgs[0]; $argv = @($cmdArgs | Select-Object -Skip 1)
-      & $exe @argv
+      # Run at the repo root, like Invoke-Commit does. Prepare-Slot launches the slot-prep install as
+      # `agentq run -Repo <slot> -- pnpm install` from the CALLER's directory, so without this the
+      # install filled the caller's tree, returned 0, and the prep recorded ready=true for a slot that
+      # still had no node_modules (2026-11-21, reported as "the next brand-new slot starts hollow").
+      # Only when the current directory is OUTSIDE the repo, so an ordinary in-repo invocation keeps
+      # its own (possibly nested) cwd exactly as before.
+      $pushed = $false
+      if ($repo -and $repo.Top) {
+        $here = (Get-Location).ProviderPath
+        $top = "$($repo.Top)".TrimEnd('\')
+        $inside = $here.Equals($top, [StringComparison]::OrdinalIgnoreCase) -or $here.StartsWith($top + '\', [StringComparison]::OrdinalIgnoreCase)
+        if (-not $inside) { Push-Location $repo.Top; $pushed = $true }
+      }
+      try { & $exe @argv } finally { if ($pushed) { Pop-Location } }
       $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }
     } finally { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }
     $jstat = if ($jobInfo -and $jobInfo.job -ne [IntPtr]::Zero) { Get-AgentqJobStats $jobInfo.job } else { $null }
