@@ -8,13 +8,15 @@ $Aq = (Resolve-Path $Aq).Path
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aqdr-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
 $coord = Join-Path $tmp 'coord'; $wt = Join-Path $tmp 'wt'; $inst = Join-Path $tmp 'inst'; $srcPs = Join-Path $tmp 'src\ps'
 $cfg = Join-Path $tmp 'cfg.json'
-$envSet = 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_SESSION', 'AGENTQ_INSTALL_DIR', 'AGENTQ_DOCTOR_NO_TASKS', 'AGENTQ_GIT_AUTOSYNC'
+$envSet = 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_SESSION', 'AGENTQ_INSTALL_DIR', 'AGENTQ_DOCTOR_NO_TASKS', 'AGENTQ_DOCTOR_NO_MEMORY', 'AGENTQ_GIT_AUTOSYNC'
 $env:AGENTQ_HOME = $coord
 $env:CODAI_WT_ROOT = $wt
 $env:AGENTQ_CONFIG = $cfg
 $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'; $env:AGENTQ_SESSION = 'test-doctor'
 $env:AGENTQ_INSTALL_DIR = $inst
 $env:AGENTQ_DOCTOR_NO_TASKS = '1'
+$env:AGENTQ_DOCTOR_NO_MEMORY = '1'
+$env:AGENTQ_DOCTOR_NO_STALE = '1'
 foreach ($v in 'AGENTQ_SRC', 'AGENTQ_DOCTOR_FAULT', 'AGENTQ_DOCTOR_SERIAL', 'AGENTQ_SYSTEM_HOME', 'AGENTQ_GIT_AUTOSYNC') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force $tmp | Out-Null
 # leaseIdleMin 120: the dead-owner fixture is idle 45 min; ADR 0012 made a dead owner stale at
@@ -355,9 +357,11 @@ try {
   Remove-Item Env:AGENTQ_DOCTOR_FAULT
   $crash = Rows $r 'stale-index-lock' 'warn'
   Check '12 crashed check -> one warn row "check crashed"' ($crash.Count -eq 1 -and $crash[0].detail -match '^check crashed: ') $raw
-  # 11 summaries (not 10): ADR 0012 added the `lease-hygiene` check, one more summary row; the crashed
-  # stale-index-lock emits a warn finding instead of its summary, so 11 summaries remain.
-  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' }).Count -eq 11 -and $code -eq 0) $raw
+  # The crashed stale-index-lock emits a warn finding INSTEAD of its summary, so one summary is missing.
+  # 10 summaries prove every other check ran. Counting them as a constant is what broke this check twice
+  # (ADR 0012 added lease-hygiene; 2026-11-21 added the machine-memory skip), so rows that only say
+  # "skipped (...)" are excluded: the number of checks that ACTUALLY ran is what this asserts.
+  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' -and $_.detail -notmatch '^skipped \(' }).Count -eq 10 -and $code -eq 0) $raw
 
   # ---- 13 git-autosync health folded into the doctor ------------------------------------------------
   # The doctor does NOT re-implement git-autosync's checks: it runs the tool with -Doctor and folds the
@@ -403,10 +407,97 @@ try {
   Put (Join-Path $coord 'daemons\git-autosync.json') ([ordered]@{ name = 'git-autosync'; at = (Ago 5).ToString('o'); verdict = 'ok'; okCount = 3; warnCount = 0; failCount = 0; lines = @('OK x'); failStreak = 0; history = @() } | ConvertTo-Json)
   $r = DJ -All
   Check '14 all-ok daemons -> no row, exit 0' (@(Rows $r 'daemons' 'fail').Count -eq 0 -and @(Rows $r 'daemons' 'warn').Count -eq 0 -and $code -eq 0) $raw
+
+  # ---- 15 machine-memory: the check must never SILENTLY vanish --------------------------------------
+  # It did: Get-MachineMemory threw under StrictMode (an undeclared $script:MmFloors that the doctor
+  # swallowed) so no row was emitted and no check noticed, while `agentq run` died with the same
+  # exception. The free-RAM/commit floors are a property of the MACHINE, not of this fixture, so the
+  # suite switches the check off (AGENTQ_DOCTOR_NO_MEMORY) and then proves that with the switch off a
+  # row is produced again - pass or warn, never absent. That absence was the bug.
+  Reset-State
+  $env:AGENTQ_DOCTOR_NO_MEMORY = '1'
+  $r = DJ -All
+  Check '15 NO_MEMORY=1 -> one skipped summary, no finding row' (@(Rows $r 'machine-memory' 'warn').Count -eq 0 -and @(Rows $r 'machine-memory' 'fail').Count -eq 0 -and @($r.rows | Where-Object { $_.check -eq 'machine-memory' -and $_.kind -eq 'summary' -and $_.detail -match 'AGENTQ_DOCTOR_NO_MEMORY=1' }).Count -eq 1) $raw
+  $env:AGENTQ_DOCTOR_NO_MEMORY = '0'
+  $r = DJ -All
+  Check '15 switch off -> the machine-memory row comes back (pass or warn, never absent)' (@($r.rows | Where-Object { $_.check -eq 'machine-memory' -and $_.kind -eq 'finding' }).Count -eq 1) $raw
+  $env:AGENTQ_DOCTOR_NO_MEMORY = '1'
+
+  # ---- 16 install-proof + stale-install: is the installed agentq really the repo's? -----------------
+  # Every earlier case ran with AGENTQ_DOCTOR_NO_STALE=1 (the fixture manifest records no commit and has
+  # no origin/main to compare), so this is the one place both checks run for real. Everything happens in
+  # a temp install dir and a temp git repo - NEVER the live ~/.copilot and NEVER this checkout.
+  Reset-State
+  $env:AGENTQ_DOCTOR_NO_STALE = '0'
+  $env:AGENTQ_INSTALL_DIR = $inst
+  # 16a: no manifest at all -> a warning ("cannot prove"), never an "ok"
+  Remove-Item (Join-Path $inst 'bin\agentq-install.json')
+  $r = DJ -All
+  $w = Rows $r 'install-proof' 'warn'
+  Check '16a no manifest -> warn "cannot prove", exit 0' ($w.Count -eq 1 -and $w[0].detail -match 'cannot prove' -and $w[0].detail -match 'no manifest' -and $code -eq 0) $raw
+  # 16b: a recorded hash that no longer matches, and a recorded file that is gone
+  Reset-State
+  $mf = Join-Path $inst 'bin\agentq-install.json'
+  $m = Get-Content $mf -Raw | ConvertFrom-Json
+  $m.files.'bin\agentq.ps1' = ('0' * 64)
+  [IO.File]::WriteAllText($mf, ($m | ConvertTo-Json -Depth 4))
+  Remove-Item (Join-Path $inst 'hooks\run-build.ps1')
+  $r = DJ -All
+  $f = Rows $r 'install-proof' 'fail'
+  Check '16b drifted hash -> fail naming the file' (@($f | Where-Object { $_.subject -eq 'bin\agentq.ps1' -and $_.detail -match 'differs from the recorded hash' }).Count -eq 1) $raw
+  Check '16b recorded file missing -> fail naming the file' (@($f | Where-Object { $_.subject -eq 'hooks\run-build.ps1' -and $_.detail -match 'NOT installed' }).Count -eq 1) $raw
+  Check '16b two findings -> exit 1' ($f.Count -eq 2 -and $code -eq 1) $raw
+  # 16c: a consistent manifest -> the proof row is ok and nothing else is emitted
+  Reset-State
+  $r = DJ -All
+  Check '16c consistent manifest -> no install-proof finding' (@(Rows $r 'install-proof' 'fail').Count -eq 0 -and @(Rows $r 'install-proof' 'warn').Count -eq 0) $raw
+  Check '16c proof summary counts the recorded files' (@($r.rows | Where-Object { $_.check -eq 'install-proof' -and $_.kind -eq 'summary' -and $_.detail -match 'recorded file\(s\) verified' }).Count -eq 1) $raw
+  # 16d: a real checkout with origin/main AHEAD of the commit the manifest records -> a real count
+  $gitRepo = Join-Path $tmp 'agqco'
+  if (-not (Test-Path (Join-Path $gitRepo '.git'))) {
+    git init -q -b main $gitRepo > $null 2>&1
+    git -C $gitRepo config user.email 'doctor@test' > $null 2>&1; git -C $gitRepo config user.name 'doctor' > $null 2>&1
+  }
+  $gitPs = Join-Path $gitRepo 'ps'; [IO.Directory]::CreateDirectory($gitPs) | Out-Null
+  foreach ($v in 'one', 'two', 'three') { Put (Join-Path $gitPs 'f.txt') $v; git -C $gitRepo add -A > $null 2>&1; git -C $gitRepo commit -q -m $v > $null 2>&1; if ($v -eq 'one') { $sha1 = (git -C $gitRepo rev-parse HEAD).Trim() }; if ($v -eq 'three') { $sha3 = (git -C $gitRepo rev-parse HEAD).Trim() } }
+  git -C $gitRepo update-ref refs/remotes/origin/main $sha3 > $null 2>&1
+  $inst2 = Join-Path $tmp 'inst2'
+  [IO.Directory]::CreateDirectory((Join-Path $inst2 'bin')) | Out-Null
+  [IO.File]::WriteAllText((Join-Path $inst2 'bin\agentq.ps1'), "# live A`n")
+  $h2 = Sha (Join-Path $inst2 'bin\agentq.ps1')
+  $mkManifest = { param($sha) Put (Join-Path $inst2 'bin\agentq-install.json') ([ordered]@{ src = $gitPs; sha = $sha; dirty = $false; at = [DateTime]::UtcNow.ToString('o'); files = [ordered]@{ 'bin\agentq.ps1' = $h2 } } | ConvertTo-Json) }
+  & $mkManifest $sha1
+  $env:AGENTQ_INSTALL_DIR = $inst2
+  $r = DJ -All -Src $gitPs
+  Check '16d installed 2 commits behind origin/main -> warn with the number' (@(Rows $r 'stale-install' 'warn' | Where-Object { $_.subject -eq 'installed' -and $_.detail -match ' 2 commit\(s\) behind origin/main' }).Count -eq 1 -and $code -eq 0) $raw
+  Check '16d the consistent temp manifest still proves ok' (@(Rows $r 'install-proof' 'fail').Count -eq 0 -and @(Rows $r 'install-proof' 'warn').Count -eq 0) $raw
+  Check '16d the source checkout at origin/main -> no source warn' (@(Rows $r 'stale-install' 'warn' | Where-Object { $_.subject -eq 'source' }).Count -eq 0) $raw
+  # 16e: the SOURCE checkout itself sits behind origin/main (the case that hides a fix)
+  git -C $gitRepo checkout -q $sha1 > $null 2>&1
+  $r = DJ -All -Src $gitPs
+  Check '16e source checkout behind origin/main -> warn on source' (@(Rows $r 'stale-install' 'warn' | Where-Object { $_.subject -eq 'source' -and $_.detail -match ' 2 commit\(s\) behind' -and $_.detail -match 'stale code' }).Count -eq 1) $raw
+  # 16f: the manifest records a commit the repo does not know (rebased away / never fetched) -> warn, no crash
+  git -C $gitRepo checkout -q main > $null 2>&1
+  & $mkManifest ('0' * 40)
+  $r = DJ -All -Src $gitPs
+  Check '16f recorded sha unknown locally -> warn, not a crash' (@(Rows $r 'stale-install' 'warn' | Where-Object { $_.subject -eq 'installed' -and $_.detail -match 'not present in' }).Count -eq 1 -and $code -eq 0) $raw
+  # 16g: no origin/main known locally -> said plainly, never treated as up to date
+  $gitRepo2 = Join-Path $tmp 'agqco2'
+  if (-not (Test-Path (Join-Path $gitRepo2 '.git'))) {
+    git init -q -b main $gitRepo2 > $null 2>&1
+    git -C $gitRepo2 config user.email 't@t' > $null 2>&1; git -C $gitRepo2 config user.name 't' > $null 2>&1
+    [IO.Directory]::CreateDirectory((Join-Path $gitRepo2 'ps')) | Out-Null
+    Put (Join-Path $gitRepo2 'ps\f.txt') 'x'; git -C $gitRepo2 add -A > $null 2>&1; git -C $gitRepo2 commit -q -m x > $null 2>&1
+  }
+  $r = DJ -All -Src (Join-Path $gitRepo2 'ps')
+  Check '16g origin/main absent -> an ok row saying so, no warn' (@($r.rows | Where-Object { $_.check -eq 'stale-install' -and $_.detail -match 'no origin/main known locally' }).Count -eq 1 -and @(Rows $r 'stale-install' 'warn').Count -eq 0 -and $code -eq 0) $raw
+  # restore the global switches and the shared install dir for the cleanup path
+  $env:AGENTQ_INSTALL_DIR = $inst
+  $env:AGENTQ_DOCTOR_NO_STALE = '1'
 } finally {
   if ($gitProc) { try { $gitProc.Kill($true) } catch {} }
   Pop-Location
-  foreach ($v in $envSet + 'AGENTQ_DOCTOR_FAULT' + 'AGENTQ_DOCTOR_SERIAL') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in $envSet + 'AGENTQ_DOCTOR_FAULT' + 'AGENTQ_DOCTOR_SERIAL' + 'AGENTQ_DOCTOR_NO_STALE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$tmp`"" 2>$null
 }
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

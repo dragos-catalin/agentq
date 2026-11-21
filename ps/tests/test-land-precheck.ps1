@@ -54,6 +54,30 @@ try {
   git -C $repo commit -qam 'dev cl'; git -C $repo push -q origin dev 2>$null
   $o = AQ land -Branch cl -Onto dev -Purpose 'changelog only'
   Check 'CHANGELOG-only conflict is not refused, lands' ($code -eq 0 -and $o -match 'landed cl') $o
+  # 4. The PUSHED tip conflicts with origin/dev, but the LOCAL (rebased) tip is a CLEAN descendant of it -
+  #    what a rebase in the slot produces. The precheck MUST judge the ref land merges (the local tip) and
+  #    land, not read origin/<branch> and refuse. Old behaviour: exit 5 "does not merge onto" on a branch
+  #    the user had already rebased (brivio 2026-11-21). The pre-gate and the merge already use
+  #    Resolve-LandRef (local-first); the precheck must agree with them.
+  git -C $repo pull -q --no-rebase origin dev 2>$null
+  git -C $tw fetch -q origin
+  git -C $tw checkout -q -B reb origin/dev
+  Set-Content (Join-Path $tw 'a.txt') 'reb clash'; git -C $tw commit -qam 'reb clash'; git -C $tw push -q origin reb 2>$null
+  Set-Content (Join-Path $repo 'a.txt') 'dev after reb'; git -C $repo commit -qam 'dev reb'; git -C $repo push -q origin dev 2>$null
+  git -C $repo fetch -q origin reb
+  git -C $tw fetch -q origin dev
+  git -C $tw checkout -q -B reb origin/dev
+  Set-Content (Join-Path $tw 'c.txt') 'c'; git -C $tw add c.txt; git -C $tw commit -qm 'reb rebased (local only)'
+  $devTop = (git -C $repo rev-parse origin/dev).Trim()
+  git -C $repo merge-tree --write-tree --name-only --no-messages origin/dev refs/remotes/origin/reb > $null 2>&1
+  Check 'rebased: pushed tip conflicts' ($LASTEXITCODE -eq 1)
+  $mb = (git -C $repo merge-base (git -C $repo rev-parse refs/heads/reb).Trim() origin/dev).Trim()
+  Check 'rebased: local tip is a clean descendant' ($mb -eq $devTop)
+  $o = AQ land -Branch reb -Onto dev -Purpose 'rebased local tip'
+  Check 'rebased local tip: not refused, lands' ($code -eq 0 -and $o -match 'landed reb') $o
+  git -C $repo fetch -q origin dev
+  git -C $repo cat-file -e origin/dev:c.txt 2>$null
+  Check 'reb content is on origin/dev' ($LASTEXITCODE -eq 0)
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_LAND_NO_PRECHECK') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }

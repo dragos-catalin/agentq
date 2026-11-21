@@ -11,6 +11,14 @@
                 machine (install, term interrupt, reap terminals, git-autosync, guard cloud) still run
                 alone; everything else is safe to overlap because each suite uses its own temp home.
   -Full         run the whole suite even when the green record says this exact ps/ tree already passed.
+  -Foreground   run the gate in THIS console instead of as a background job (see below).
+                The GATE RUNS AS A REGISTERED BACKGROUND JOB (bin/run-tests-job.ps1): the idle-terminal
+                reaper closed the calling terminal mid-gate on 2026-11-21 - 24 of 45 suites green, then
+                silence, a free shell, and nothing installed. "The shell is free again" is not evidence
+                the gate finished. A job gets its own hidden console (job-start.ps1), so nothing can reap
+                it; the caller still sees a live log and the REAL exit code. A STALL or a wait-cap timeout
+                is refused with its own message, never dressed up as "tests are red".
+                -Foreground (or AGENTQ_INSTALL_FOREGROUND=1) restores the old in-console stream.
   The gate is skipped ONLY when a full green run recorded the SAME content hash (run-all.ps1 -LastGreen)
   and that run is under 24 h old: the suites run a function of ps/, so an unchanged tree needs no repeat.
   The decision and both hashes are printed - nothing is skipped silently.
@@ -21,7 +29,7 @@
   `agentq doctor` compares the live files against it.
   AGENTQ_INSTALL_DIR overrides the destination (tests).
 #>
-param([switch]$Check, [switch]$SkipTests, [switch]$Full, [string[]]$Suites, [int]$Parallel = 4)
+param([switch]$Check, [switch]$SkipTests, [switch]$Full, [string[]]$Suites, [int]$Parallel = 4, [switch]$Foreground)
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
 $cfgKey = 'bin\agentq-config.json'
@@ -83,6 +91,14 @@ $map = [ordered]@{
   'tests\test-agentq-cwd.ps1' = 'bin\test-agentq-cwd.ps1'
   # 2026-11-21: `run-build.ps1 -Class web|scripts` (the second build resource for script-only builds).
   'tests\test-build-class.ps1' = 'bin\test-build-class.ps1'
+  # 2026-11-21: the gate itself runs as a registered background job (bin\run-tests-job.ps1), so a quiet
+  # 30-minute suite can never be killed by the terminal reaper - which is exactly what happened to this
+  # gate on 2026-11-21: 24 of 45 suites green, then silence, a free shell, and NOTHING installed.
+  'bin\run-tests-job.ps1' = 'bin\run-tests-job.ps1'; 'tests\test-run-tests-job.ps1' = 'bin\test-run-tests-job.ps1'
+  # 2026-11-22: the fleet-wide build-artefact cleaner - its liveness gate now cross-checks the
+  # `agentq status -All -Json` lease list AND the per-slot lease files, and fails safe (skip, loud)
+  # when neither is usable. Was live-only in ~/.copilot/bin and never carried by the repo before this.
+  'bin\clean-build-artifacts.ps1' = 'bin\clean-build-artifacts.ps1'; 'tests\test-clean-build-artifacts.ps1' = 'bin\test-clean-build-artifacts.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.
@@ -145,9 +161,9 @@ foreach ($k in $map.Keys) {
 }
 if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; exit 0 }
 if (-not $SkipTests) {
-  $ra = @('-NoProfile', '-File', (Join-Path $src 'tests\run-all.ps1'))
-  if ($Suites) { $ra += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
-  if ($Parallel -gt 1) { $ra += @('-Parallel', "$Parallel") }
+  $raArgs = @()
+  if ($Suites) { $raArgs += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
+  if ($Parallel -gt 1) { $raArgs += @('-Parallel', "$Parallel") }
   # Instant repeat: a full green run of THIS content is already the gate (run-all.ps1 writes the hash).
   $alreadyGreen = $false
   if (-not $Suites -and -not $Full) {
@@ -161,8 +177,17 @@ if (-not $SkipTests) {
   }
   if ($alreadyGreen) { Write-Host 'install: tests SKIPPED - ps/ is byte-identical to the tree that passed (use -Full to force)' }
   else {
-    & pwsh @ra
-    if ($LASTEXITCODE) { throw 'install: tests are red - not installing' }
+    # The gate runs as a REGISTERED BACKGROUND JOB by default: it gets its own hidden console, so the
+    # idle-terminal reaper cannot kill a suite that prints nothing for 20 min (2026-11-21: it did, and
+    # the install quietly did not happen). -Foreground (or AGENTQ_INSTALL_FOREGROUND=1) keeps the old
+    # behaviour for a shell that is already safe/attended.
+    $useJob = -not $Foreground -and -not $env:AGENTQ_INSTALL_FOREGROUND
+    if ($useJob) { & pwsh -NoProfile -File (Join-Path $src 'bin\run-tests-job.ps1') -RunAll (Join-Path $src 'tests\run-all.ps1') -Cwd (Split-Path -Parent $src) @raArgs }
+    else { & pwsh -NoProfile -File (Join-Path $src 'tests\run-all.ps1') @raArgs }
+    $code = $LASTEXITCODE
+    if ($code -eq 2) { throw 'install: the gate STALLED (its job log went quiet while the process was alive) - not installing; read the job log, then re-run' }
+    if ($code -eq 3) { throw 'install: the gate was still running when the wait cap expired - not installing; re-check the job id printed above, then re-run' }
+    if ($code) { throw 'install: tests are red - not installing' }
   }
 }
 $bk = Join-Path $dst ".backup\$((Get-Date).ToString('yyyyMMdd-HHmmss'))"

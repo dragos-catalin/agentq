@@ -92,6 +92,14 @@ $suites = [ordered]@{
   # 2026-11-21: `run-build.ps1 -Class web|scripts` - the second build RESOURCE for script-only builds.
   # Drives the REAL hooks/run-build.ps1 through -Plan and a fake agentq, so it takes no build:* ticket.
   'build class'     = @('-File', (Join-Path $PSScriptRoot 'test-build-class.ps1'), '-RunBuild', (Join-Path $hooks 'run-build.ps1'))
+  # 2026-11-21: the gate itself runs as a registered BACKGROUND JOB (bin\run-tests-job.ps1). The reaper
+  # closed this gate's terminal mid-run - 24 of 45 suites green, a free shell, nothing installed. The
+  # suite drives the real wrapper + job-start + wait-job and pins exit 0/1/2/3/4 and the foreground path.
+  'tests job'       = @('-File', (Join-Path $PSScriptRoot 'test-run-tests-job.ps1'), '-Bin', $bin)
+  # 2026-11-22: the fleet-wide build-artefact cleaner. Its liveness gate must cross-check the
+  # `agentq status -All -Json` lease list AND the per-slot lease files, skip a slot either marks in
+  # use, and fail SAFE (say `live NOT DETERMINED` + skip slot output) when the coord dir is unreadable.
+  'clean artifacts' = @('-File', (Join-Path $PSScriptRoot 'test-clean-build-artifacts.ps1'), '-Tool', (Join-Path $bin 'clean-build-artifacts.ps1'))
 }
 $names = @($suites.Keys)
 if ($List) { $names | ForEach-Object { Write-Host $_ }; exit 0 }

@@ -341,6 +341,107 @@ function Test-DoctorConfig {
   Add-DoctorSummary 'config-drift' "$(@($srcMap.Keys).Count) source key(s) compared with $instCfg ($missing not installed)"
 }
 
+# ---- 3b. install-proof + stale-install: is the installed agentq really the repo's? --------------
+# install.ps1 writes <installed>\bin\agentq-install.json = { src, sha, dirty, at, files:{rel:sha256} }.
+# The install gate can finish "green" and copy NOTHING (2026-11-21: it printed 24 of 45 suites green,
+# stopped with no footer and no `installed ...` line, the shell free - while the live files kept their
+# old sha and mtime and three new files were absent; only a hand hash comparison caught it). These two
+# checks make that ONE command. install-proof PROVES that every file the manifest records is installed
+# and unchanged; stale-install says how far the installed copy (and the source checkout itself) is
+# BEHIND refs/remotes/origin/main. Both are READ-ONLY and NEVER touch the network (no fetch, ever).
+# A suite that asserts exact row counts can switch both off with AGENTQ_DOCTOR_NO_STALE=1, the way
+# AGENTQ_DOCTOR_NO_TASKS / AGENTQ_DOCTOR_NO_MEMORY already work.
+function Invoke-DoctorGit([string]$path, [string[]]$gitArgs) {
+  # Native git that never throws: @{ code; out }. A missing git or a path that is not a repo is a code,
+  # not an exception. --no-optional-locks keeps a read-only probe from refreshing the index.
+  try { $out = @(& git --no-optional-locks -C $path @gitArgs 2>$null | ForEach-Object { "$_" }) }
+  catch { return [pscustomobject]@{ code = -1; out = @() } }
+  [pscustomobject]@{ code = [int]$LASTEXITCODE; out = $out }
+}
+function Format-DoctorSha([string]$sha) { if (-not $sha) { return '' }; $sha.Substring(0, [math]::Min(9, $sha.Length)) }
+function Test-DoctorInstallProof {
+  if ($env:AGENTQ_DOCTOR_NO_STALE -eq '1') { Add-DoctorSummary 'install-proof' 'skipped (AGENTQ_DOCTOR_NO_STALE=1)'; return }
+  $ctx = Get-DoctorInstallContext
+  $rerun = 're-run the installer from the source checkout (agentq install / ps\install.ps1)'
+  if ($ctx.manifestBad) {
+    Add-DoctorRow 'install-proof' 'warn' 'bin\agentq-install.json' 'the install manifest is not readable JSON: the install cannot be proven' $rerun
+    Add-DoctorSummary 'install-proof' "installed $($ctx.inst); manifest unreadable"; return
+  }
+  $man = $ctx.manifest
+  if ($null -eq $man) {
+    # no manifest is NOT an ok: without it nothing records what was copied, so a silent no-op install is
+    # invisible (exactly today's failure). Say "cannot prove", never "ok".
+    Add-DoctorRow 'install-proof' 'warn' "$($ctx.manifestFile)" 'no manifest - cannot prove this installed copy is the repo''s (nothing records what was copied)' $rerun
+    Add-DoctorSummary 'install-proof' "installed $($ctx.inst); no install manifest - cannot prove the install"; return
+  }
+  $manSha = if ($man.ContainsKey('sha') -and $man['sha']) { "$($man['sha'])".Trim() } else { '' }
+  $dirty = [bool]($man.ContainsKey('dirty') -and ("$($man['dirty'])".ToLowerInvariant() -in @('true', '1')))
+  $prov = "install $($ctx.inst); recorded commit $(if ($manSha) { Format-DoctorSha $manSha } else { '(none)' })$(if ($dirty) { ' (dirty tree)' })"
+  $files = if ($man.ContainsKey('files') -and $man['files'] -is [System.Collections.IDictionary]) { $man['files'] } else { $null }
+  if ($null -eq $files -or @($files.Keys).Count -eq 0) {
+    Add-DoctorRow 'install-proof' 'warn' 'files' "$prov; the manifest records no files - cannot prove the install" $rerun
+    Add-DoctorSummary 'install-proof' "$prov; 0 file(s) recorded"; return
+  }
+  $n = @($files.Keys).Count; $ok = 0; $drift = 0; $gone = 0
+  foreach ($rel in @($files.Keys)) {
+    $fp = Join-DoctorRel $ctx.inst "$rel"
+    if (-not [IO.File]::Exists($fp)) { $gone++; Add-DoctorRow 'install-proof' 'fail' "$rel" "$prov; recorded in the manifest but NOT installed (the copy step did not run for it)" $rerun; continue }
+    if ((Get-DoctorSha256 $fp) -ne "$($files[$rel])") { $drift++; Add-DoctorRow 'install-proof' 'fail' "$rel" "$prov; content differs from the recorded hash (the installed file changed after install, or the copy silently failed)" $rerun; continue }
+    $ok++
+  }
+  Add-DoctorSummary 'install-proof' "$prov; $ok of $n recorded file(s) verified$(if ($drift -or $gone) { " ($drift drifted, $gone missing)" } else { '' })"
+}
+function Test-DoctorStale {
+  if ($env:AGENTQ_DOCTOR_NO_STALE -eq '1') { Add-DoctorSummary 'stale-install' 'skipped (AGENTQ_DOCTOR_NO_STALE=1)'; return }
+  $ctx = Get-DoctorInstallContext
+  if (-not $ctx.srcDir -or -not [IO.Directory]::Exists($ctx.srcDir)) { Add-DoctorSummary 'stale-install' 'skipped: source checkout unknown (no -Src / AGENTQ_SRC / manifest src)'; return }
+  $co = "$($ctx.srcDir)"
+  $top = Invoke-DoctorGit $co @('rev-parse', '--show-toplevel')
+  $repoRoot = if ($top.code -eq 0 -and $top.out.Count) { "$($top.out[-1])".Trim() } else { '' }
+  if (-not $repoRoot) { Add-DoctorSummary 'stale-install' "source $co is not a git checkout: nothing to compare with origin/main"; return }
+  # origin/main = whatever the LAST fetch left. This doctor never fetches (no network), so an absent ref
+  # is SAID, never silently treated as up to date.
+  $om = Invoke-DoctorGit $repoRoot @('rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main')
+  $omSha = if ($om.code -eq 0 -and $om.out.Count) { "$($om.out[-1])".Trim() } else { '' }
+  if (-not $omSha) {
+    Add-DoctorRow 'stale-install' 'ok' '' "source $repoRoot has no origin/main known locally (this doctor never fetches): how far behind the installed copy is cannot be told here" 'git fetch (or agentq install, which fetches) to refresh origin/main'
+    Add-DoctorSummary 'stale-install' 'origin/main not known locally (no fetch)'; return
+  }
+  $omS = Format-DoctorSha $omSha
+  $manSha = if ($null -ne $ctx.manifest -and $ctx.manifest.ContainsKey('sha') -and $ctx.manifest['sha']) { "$($ctx.manifest['sha'])".Trim() } else { '' }
+  if (-not $manSha) {
+    Add-DoctorRow 'stale-install' 'ok' 'installed' "the install manifest records no commit: cannot compare the installed copy with origin/main ($omS)"
+  } else {
+    # a doctor never fetches, so a recorded sha the repo does not know is common after a rebase: prove it
+    # exists locally BEFORE counting (rev-list would otherwise fail on an unknown object).
+    $have = Invoke-DoctorGit $repoRoot @('cat-file', '-e', "$manSha^{commit}")
+    if ($have.code -ne 0) {
+      Add-DoctorRow 'stale-install' 'warn' 'installed' "the install manifest records commit $(Format-DoctorSha $manSha), not present in $repoRoot (never fetched, or rewritten): cannot count how far behind" 'agentq install (re-installs the checkout HEAD)'
+    } else {
+      $cnt = Invoke-DoctorGit $repoRoot @('rev-list', '--count', "$manSha..origin/main")
+      $nb = 0; if ($cnt.code -eq 0 -and $cnt.out.Count) { [void][int]::TryParse("$($cnt.out[-1])".Trim(), [ref]$nb) }
+      if ($nb -gt 0) { Add-DoctorRow 'stale-install' 'warn' 'installed' "the installed copy is $nb commit(s) behind origin/main ($(Format-DoctorSha $manSha) -> $omS): a landed fix may not be live" 'agentq install  (re-installs the checkout HEAD, which fetches)' }
+      else { Add-DoctorRow 'stale-install' 'ok' 'installed' "the installed copy matches origin/main ($omS)" }
+    }
+  }
+  # the source checkout's own ps/ behind origin/main - the case that hides a fix from every future install
+  $head = Invoke-DoctorGit $repoRoot @('rev-parse', 'HEAD')
+  $headSha = if ($head.code -eq 0 -and $head.out.Count) { "$($head.out[-1])".Trim() } else { '' }
+  if ($headSha -and $headSha -ine $omSha) {
+    $anc = Invoke-DoctorGit $repoRoot @('merge-base', '--is-ancestor', 'HEAD', 'origin/main')
+    if ($anc.code -eq 0) {
+      $cnt2 = Invoke-DoctorGit $repoRoot @('rev-list', '--count', 'HEAD..origin/main')
+      $ns = 0; if ($cnt2.code -eq 0 -and $cnt2.out.Count) { [void][int]::TryParse("$($cnt2.out[-1])".Trim(), [ref]$ns) }
+      Add-DoctorRow 'stale-install' 'warn' 'source' "the source checkout of ps/ is $ns commit(s) behind origin/main ($(Format-DoctorSha $headSha) -> $omS): re-installing from it would install stale code" 'git -C <checkout> pull --ff-only, then agentq install'
+    } else {
+      Add-DoctorRow 'stale-install' 'ok' 'source' "the source checkout is not behind origin/main ($(Format-DoctorSha $headSha))"
+    }
+  } elseif ($headSha) {
+    Add-DoctorRow 'stale-install' 'ok' 'source' "the source checkout is at origin/main ($omS)"
+  }
+  Add-DoctorSummary 'stale-install' "origin/main $omS; installed $(if ($manSha) { Format-DoctorSha $manSha } else { '(none)' }), source $(if ($headSha) { Format-DoctorSha $headSha } else { '(unknown)' }) - no fetch"
+}
+
 # ---- 4a. dead-owner: leases whose owner process is gone ------------------------------------------
 # lease hygiene (ADR 0012): a slot nobody touched for a while is a slot another agent waits for, and the
 # loss counters are the SLO that must stay at zero. Reported per repo, so the owner sees WHICH pool is
@@ -470,6 +571,16 @@ function Test-DoctorMarks {
 }
 
 # ---- 6. state-size ----------------------------------------------------------------------------
+function Test-DoctorMachineMemory {
+  # The free-RAM/commit floors are a property of the MACHINE, not of the fixture state, so a suite that
+  # asserts exact warning counts must be able to switch the check off (same idea as AGENTQ_DOCTOR_NO_TASKS).
+  if ($env:AGENTQ_DOCTOR_NO_MEMORY -eq '1') { Add-DoctorSummary 'machine-memory' 'skipped (AGENTQ_DOCTOR_NO_MEMORY=1)'; return }
+  $mm = Get-MachineMemory ([double]$MinFreeGB)
+  $nums = ($mm.floors -join ' / ')
+  $detail = "ram $($mm.ramGB) GB, commit $($mm.commitGB) GB free; floors: queue $($mm.queueFloorGB) GB, burst $($mm.burstFloorGB) GB, commit guard $($mm.commitGuardGB) GB, adaptive ram $($mm.ramFloorGB) GB / commit $($mm.commitFloorGB) GB"
+  if ($mm.unified) { Add-DoctorRow 'machine-memory' 'pass' '' "$detail (one number everywhere)" }
+  else { Add-DoctorRow 'machine-memory' 'warn' '' "$detail - $($mm.floors.Count) different floors ($nums); nothing is broken, each is a real gate, see ADR 0014 D3" 'set machineCapAdaptive.minFreeRamGB/minFreeCommitGB (adaptive) and -MinFreeGB (queue) to ONE number when you decide which' }
+}
 function Test-DoctorStateSize {
   $hint = 'agentq prune (-WhatIf shows what it would remove)'
   $agents = Get-DoctorFileCount (Join-Path $Root 'agents')
@@ -671,10 +782,13 @@ function Invoke-Doctor {
     'empty-package-store' = { Test-DoctorPackageStore $scope }
     'install-drift'       = { Test-DoctorInstall }
     'config-drift'        = { Test-DoctorConfig }
+    'install-proof'       = { Test-DoctorInstallProof }
+    'stale-install'       = { Test-DoctorStale }
     'dead-owner'          = { Test-DoctorLeaseOwners $scope }
     'lease-hygiene'       = { Test-DoctorLeaseHygiene $scope }
     'dead-keeper'         = { Test-DoctorJobs $scope }
     'marks'               = { Test-DoctorMarks }
+    'machine-memory'      = { Test-DoctorMachineMemory }
     'state-size'          = { Test-DoctorStateSize }
     'scheduled-tasks'     = { Test-DoctorTasks }
     'git-autosync'        = { Test-DoctorGitAutosync }

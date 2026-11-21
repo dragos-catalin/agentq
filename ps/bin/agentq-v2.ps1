@@ -1924,15 +1924,22 @@ function Invoke-Land {
   }
   # W2-6: refuse BEFORE queueing when the topic cannot merge onto the current tip (outside the files the
   # land resolver/finalizer handle). Saves the whole queue wait + slot setup of a land that ends in exit 5.
+  # The precheck MUST judge the SAME ref land will merge: Resolve-LandRef (below, used by the pre-gate and
+  # the merge) prefers the LOCAL tip refs/heads/<branch>, which after a rebase in the slot is a clean
+  # descendant while the PUSHED tip is still the pre-rebase, conflicting commit. Reading the remote ref
+  # here refused exactly the correctly-rebased branch (brivio 2026-11-21, docs/DEV_PERFORMANCE.md) and
+  # told the user to rebase what they had already rebased. Judging a ref land does not merge is worse than
+  # no precheck: it either false-refuses (this bug) or false-passes and still ends in exit 5 in the slot.
   & git -C $main fetch -q origin $Onto 2>$null
-  $preRef = if ((& git -C $main rev-parse --verify -q "refs/remotes/origin/$Branch" 2>$null)) { "refs/remotes/origin/$Branch" } elseif ((& git -C $main rev-parse --verify -q "refs/heads/$Branch" 2>$null)) { "refs/heads/$Branch" } else { $null }
+  $preRef = Resolve-LandRef $main $Branch
   if ($preRef -and -not $env:AGENTQ_LAND_NO_PRECHECK) {
+    $preWhere = if ($preRef -like 'refs/heads/*') { 'local tip' } else { 'pushed tip' }
     $mt = @(& git -C $main merge-tree --write-tree --name-only --no-messages "origin/$Onto" $preRef 2>$null | ForEach-Object { "$_" })
     if ($LASTEXITCODE -eq 1) {
       $hard = @($mt | Select-Object -Skip 1 | Where-Object { $_ -and $_ -notmatch '(^|/)(CHANGELOG\.md|package\.json)$' -and $_ -notmatch '^changes/' })
       if ($hard.Count) {
-        Write-Journal @{ event = 'land-precheck-conflict'; resource = $res; branch = $Onto; paths = $hard; reason = "$Branch conflicts with origin/$Onto before queueing"; repo = $repo.Name }
-        [Console]::Error.WriteLine("land: $Branch does not merge onto origin/$Onto (conflicts: $($hard -join ', ')). Nothing queued. Rebase it in your slot, push, and land again.")
+        Write-Journal @{ event = 'land-precheck-conflict'; resource = $res; branch = $Onto; ref = $preRef; paths = $hard; reason = "$Branch ($preWhere) conflicts with origin/$Onto before queueing"; repo = $repo.Name }
+        [Console]::Error.WriteLine("land: $Branch ($preWhere $preRef) does not merge onto origin/$Onto (conflicts: $($hard -join ', ')). Nothing queued. Resolve those files on $Branch (rebase it onto origin/$Onto if origin/$Onto moved) and land again.")
         $script:LandExit = 5; return
       }
     }
