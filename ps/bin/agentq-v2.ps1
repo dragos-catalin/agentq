@@ -579,6 +579,9 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   if ($event -eq 'lease-expire-failed') { Remove-Item -LiteralPath "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   else { Remove-Item -LiteralPath $l.file, "$($l.file).hb", "$($l.file).chat", "$($l.file).work", "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   if ($event -in 'lease-expire', 'lease-break' -and (P $l 'session') -ne $Session) { Add-LeaseNotice $l $event $why $backupRef }
+  # Slot history (2026-11-21): the holder + the backup ref survive the lease record, so a later takeover
+  # can still name whose work it just found and point at the exact ref to restore from.
+  Add-SlotHistory $l.repo $l.slot $event (P $l 'session') $backupRef '' $why
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
 # Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed).
@@ -799,6 +802,7 @@ function Invoke-Claim {
 }
 
 function Invoke-Lease {
+  $script:TakeoverNote = ''
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
   if (-not $repo) { throw 'agentq lease: not in a git repo (pass -Repo)' }
@@ -838,17 +842,35 @@ function Invoke-Lease {
     $refToUse = if ($Ref) { $Ref } else { $up = (& git -C $main rev-parse --abbrev-ref '@{u}' 2>$null); if ($up) { $up } else { 'HEAD' } }
     # Anything still unique in the dir (previous holder crashed between backup and release, a legacy
     # tree) is backed up before the reset. A failed backup aborts the lease: nothing is discarded.
-    if (Test-Path -LiteralPath $l.path) { [void](Backup-Slot $l.path $repo.Name $l.slot "pre-reset for new lease $($l.leaseId)" -CommitsOnly:($l.role -eq 'release')) }
+    # The backup used to be INVISIBLE (the ref was discarded with [void]): 2026-11-20 21:59 another session
+    # leased codai/task-3 while a previous holder's unsaved work was still in it - the work WAS saved
+    # (refs/backup/wt/codai/task-3/20261120-215948-8a2e) but nobody was told, so the holder concluded it was
+    # lost and rebuilt it. Now the takeover is printed, journalled, notified, and `agentq recover` can list
+    # and restore it. The backup still aborts the lease when it cannot be proven (fail closed).
+    if (Test-Path -LiteralPath $l.path) {
+      $prevRef = Backup-Slot $l.path $repo.Name $l.slot "pre-reset for new lease $($l.leaseId)" -CommitsOnly:($l.role -eq 'release')
+      # Nothing unique left in the dir (the reclaim/expire that preceded us already saved it) is NOT
+      # "nothing to report": the slot history holds the ref that path recorded, so the take-over is still
+      # announced and points at the exact backup. Without this the common case - a stale reclaim - stayed silent.
+      if (-not $prevRef) {
+        $h = @(Get-SlotHistory $repo.Name $l.slot 20 | Where-Object { (P $_ 'holder') -and (P $_ 'holder') -ne "$Session" })
+        if ($h.Count -and (P $h[-1] 'ref')) { $prevRef = "$(P $h[-1] 'ref')" }
+      }
+      if ($prevRef) { Publish-SlotTakeover $repo.Name $l.slot $prevRef $l.leaseId $l.path }
+    }
     Initialize-Slot $main $l.path $refToUse $Branch (-not $env:AGENTQ_NO_ENV_COPY)
     if ($l.role -in 'task', 'pinned', 'scratch') { [void](Prepare-Slot $main $l.path $repo.Name) }
     if (@($Claims).Count) { Show-ClaimOverlaps $repo.Name $l @($Claims) }
+    Add-SlotHistory $repo.Name $l.slot 'lease' $Session '' '' $Purpose
   } catch {
+    if ($script:TakeoverNote) { Write-Output $script:TakeoverNote }
     Remove-LeaseRecord $l 'lease-failed' "$($_.Exception.Message)" ''
     throw
   }
   $res = [pscustomobject]@{ leaseId = $l.leaseId; repo = $l.repo; slot = $l.slot; role = $l.role; path = $l.path; branch = "$Branch"; head = "$(& git -C $l.path rev-parse --short HEAD)".Trim() }
   if ($Json) { $res | ConvertTo-Json -Compress } else {
     Write-Output "leased $($l.repo)/$($l.slot) ($($l.leaseId)) -> $($l.path) @ $($res.head)$(if ($Branch) { " on $Branch" })"
+    if ($script:TakeoverNote) { Write-Output $script:TakeoverNote }
     # $PSCommandPath here is agentq-v2.ps1 (dot-sourced), which cannot be run on its own.
     Write-Output "release when done: pwsh -NoProfile -File `"$(Join-Path $PSScriptRoot 'agentq.ps1')`" unlease -Repo `"$($l.path)`" -LeaseId $($l.leaseId)"
   }
@@ -891,6 +913,153 @@ function Invoke-Renew {
   $p = if ($WtPath) { $WtPath } else { (Get-Location).Path }
   $l = if ($LeaseId) { Read-Leases $null | Where-Object { (P $_ 'leaseId') -eq $LeaseId } | Select-Object -First 1 } else { Find-LeaseForPath $p }
   if ($l) { Touch-Lease $l; Write-Output "renewed $($l.repo)/$($l.slot)" } else { Write-Output "no lease covers $p" }
+}
+
+# ---- slot history & recovery (2026-11-21) ---------------------------------------------------
+# Every take-over resets the worktree (`reset --hard` + `clean -fd`), and every reset is preceded by
+# Backup-Slot (which fails closed), so work is never actually discarded. It was invisible: 2026-11-20
+# 21:59 a new lease on codai/task-3 found the previous holder's unsaved work, backed it up to
+# refs/backup/wt/codai/task-3/20261120-215948-8a2e and told NOBODY - the holder concluded the work was
+# lost and rebuilt it. Three additions close that: a slot HISTORY that outlives the lease record, a loud
+# take-over notice (new holder + previous holder), and `agentq recover` to list and restore any backup.
+function Get-SlotHistoryFile([string]$repoName, [string]$slot) {
+  $d = Join-Path $Root 'slots'; if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force $d | Out-Null }
+  Join-Path $d ((Safe "$repoName--$slot") + '.jsonl')
+}
+function Add-SlotHistory([string]$repoName, [string]$slot, [string]$event, [string]$holder, [string]$ref, [string]$sha, [string]$why) {
+  try {
+    $r = [ordered]@{ ts = (Iso (Now)); event = $event; repo = $repoName; slot = $slot; holder = "$holder"; by = "$Session"; ref = "$ref"; sha = "$sha"; why = "$why" }
+    [IO.File]::AppendAllText((Get-SlotHistoryFile $repoName $slot), (($r | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
+  } catch { }
+}
+function Get-SlotHistory([string]$repoName, [string]$slot, [int]$last = 40) {
+  $f = Get-SlotHistoryFile $repoName $slot
+  if (-not (Test-Path -LiteralPath $f)) { return @() }
+  $rows = @()
+  foreach ($line in @(Get-Content -LiteralPath $f -ErrorAction SilentlyContinue)) {
+    if (-not "$line".Trim()) { continue }
+    try { $rows += ($line | ConvertFrom-Json) } catch { }
+  }
+  @($rows | Select-Object -Last $last)
+}
+# The repo's MAIN clone, resolved from a repo NAME: a slot may not exist yet, the shared clone always does.
+function Get-RepoMainFor([string]$repoName) {
+  $gh = Split-Path -Parent (Get-WtRoot)
+  $p = Join-Path $gh $repoName
+  if (Test-Path -LiteralPath (Join-Path $p '.git')) { return $p }
+  foreach ($s in @(@(1..4 | ForEach-Object { "task-$_" }) + @('land', 'release'))) {
+    $c = Get-SlotPath $repoName $s
+    if (Test-Path -LiteralPath (Join-Path $c '.git')) { return $c }
+  }
+  $null
+}
+function Get-SlotBackups([string]$repoName, [string]$slot, [int]$last = 8, [switch]$Fetch) {
+  $main = Get-RepoMainFor $repoName
+  if (-not $main) { return @() }
+  if ($Fetch) { & git -C $main fetch -q origin 'refs/backup/wt/*:refs/backup/wt/*' 2>$null | Out-Null }
+  # `for-each-ref` matches with FNM_PATHNAME, so a single `*` never crosses a `/`: `refs/backup/wt/<repo>/*`
+  # matches 0 refs (measured 2026-11-21 - 1607 refs under codai, 0 hits) while `<repo>/<slot>/*` works by
+  # accident. `/**` crosses the slash; the slot is then selected in PowerShell.
+  $pat = "refs/backup/wt/$repoName/**"
+  $rows = @()
+  foreach ($line in @(& git -C $main for-each-ref --sort=-creatordate --sort=-refname '--format=%(refname)|%(objectname)|%(creatordate:iso-strict)|%(subject)' $pat 2>$null)) {
+    if (-not "$line") { continue }
+    $f = "$line" -split '\|', 4
+    if (@($f).Count -lt 4) { continue }
+    $nm = @($f[0] -split '/')
+    $slotName = if ($nm.Count -ge 6) { $nm[4] } else { '' }
+    if ($slot -and $slotName -ne $slot) { continue }
+    $rows += [pscustomobject]@{
+      Ref = $f[0]; Sha = $f[1]; At = $f[2]; Subject = $f[3]
+      Slot = $slotName
+      Kind = $(if ($f[3] -like 'agentq backup *') { 'files' } else { 'commits' })
+    }
+  }
+  @($rows | Select-Object -First $last)
+}
+# A backup is accepted as a full ref, a sha, or a '<slot>/<stamp>' suffix.
+function Resolve-BackupRef([string]$repoName, [string]$what) {
+  if (-not $what) { return $null }
+  $main = Get-RepoMainFor $repoName; if (-not $main) { return $null }
+  $full = if ($what -like 'refs/*') { $what } else { "refs/backup/wt/$repoName/$what" }
+  foreach ($cand in @($what, $full)) {
+    $obj = "$(& git -C $main rev-parse --verify -q $cand 2>$null)".Trim()
+    if ($obj) { return [pscustomobject]@{ Ref = $cand; Sha = $obj } }
+  }
+  $null
+}
+# A take-over is loud now: journal + slot history + a notice to the previous holder + the note the new
+# holder reads on stdout. The note is also printed when the lease FAILS after the backup, so it cannot be lost.
+function Publish-SlotTakeover([string]$repoName, [string]$slot, [string]$ref, [string]$leaseId, [string]$path) {
+  $sha = ''
+  try { $sha = "$(& git -C $path rev-parse --short $ref 2>$null)".Trim() } catch { }
+  $prev = @(Get-SlotHistory $repoName $slot 20 | Where-Object { (P $_ 'event') -eq 'lease' -and (P $_ 'holder') -and (P $_ 'holder') -ne "$Session" })
+  $holder = if ($prev.Count) { "$(P $prev[-1] 'holder')" } else { '' }
+  Add-SlotHistory $repoName $slot 'takeover-backup' $holder $ref $sha "taken by $Session for lease $leaseId"
+  Write-Journal @{ event = 'lease-takeover'; resource = "slot:${repoName}:$slot"; ticket = $leaseId; holderSession = $holder; by = $Session; ref = $ref; sha = $sha; repo = $repoName }
+  if ($holder -and $holder -ne "$Session") {
+    # The same notice channel a holder already reads (any agentq call prints its notices).
+    Add-LeaseNotice ([ordered]@{ repo = $repoName; slot = $slot; leaseId = $leaseId; purpose = "slot taken over by $Session"; branch = ''; session = $holder }) 'lease-takeover' "another session leased $repoName/$slot while your unsaved work was still in it; it was backed up BEFORE the reset" $ref
+  }
+  $who = if ($holder) { " (last holder: $holder)" } else { '' }
+  $script:TakeoverNote = "agentq: this slot still held another session's unsaved work$who - it was backed up BEFORE the reset, nothing was discarded.`n  ref      $ref  ($sha)`n  see it   agentq recover -Repo $repoName -Slot $slot`n  restore  agentq recover -Repo $repoName -Ref $ref -To `"<path of YOUR slot>`" -Apply"
+}
+function Invoke-Recover {
+  $repoName = $null
+  if ($RepoArg) { $r = Get-RepoInfo $RepoArg; $repoName = if ($r) { $r.Name } else { (Split-Path -Leaf $RepoArg).ToLowerInvariant() } }
+  elseif ($To) { $r = Get-RepoInfo $To; if ($r) { $repoName = $r.Name } }
+  else { $r = Get-RepoInfo $null; if ($r) { $repoName = $r.Name } }
+  if (-not $repoName) { throw 'agentq recover: pass -Repo <name|path> (or run it inside the repo)' }
+  $main = Get-RepoMainFor $repoName
+  if (-not $main) { throw "agentq recover: no clone found for '$repoName' under $(Split-Path -Parent (Get-WtRoot))" }
+  $what = if ($Sha) { $Sha } elseif ($Ref) { $Ref } else { $null }
+  if (-not $what) {
+    $rows = @(Get-SlotBackups $repoName $Slot -Fetch)
+    if ($Json) { @{ repo = $repoName; slot = $Slot; backups = $rows } | ConvertTo-Json -Depth 4; return }
+    if (-not $rows.Count) { Write-Output "no backups for $repoName$(if ($Slot) { "/$Slot" }) - a reset is always preceded by one, so there is nothing to recover"; return }
+    Write-Output "backups for $repoName$(if ($Slot) { "/$Slot" })$(if (-not $Slot) { ' (every slot)' }), newest first. A reset is always preceded by one of these - nothing here was discarded."
+    foreach ($b in $rows) { Write-Output ("  {0,-58} {1,-9} {2,-25} {3,-8} {4}" -f $b.Ref, $b.Sha.Substring(0, 8), $b.At, $b.Kind, $b.Subject) }
+    $h = @(Get-SlotHistory $repoName $Slot 12)
+    if ($h.Count) {
+      Write-Output "who was there (slot history - outlives the lease record):"
+      foreach ($x in $h) {
+        $rf = "$(P $x 'ref')"; if ($rf.Length -gt 44) { $rf = $rf.Substring(0, 44) }
+        Write-Output ("  {0}  {1,-16} holder={2,-13} by={3,-13} {4}  {5}" -f (P $x 'ts'), (P $x 'event'), (P $x 'holder'), (P $x 'by'), $rf, (P $x 'why'))
+      }
+    }
+    Write-Output "restore: agentq recover -Repo $repoName -Ref <ref|sha|slot/stamp> [-To <path of your own slot> -Apply]"
+    return
+  }
+  $res = Resolve-BackupRef $repoName $what
+  if (-not $res) { throw "agentq recover: '$what' is not a ref/sha in $repoName (agentq recover -Repo $repoName lists them)" }
+  $subj = "$(& git -C $main log -1 --format=%s $($res.Sha) 2>$null)".Trim()
+  $kind = if ($subj -like 'agentq backup *') { 'files' } else { 'commits' }
+  $stat = @(& git -C $main show --stat --format='%h %s' $res.Sha 2>$null | ForEach-Object { "$_" })
+  Write-Output "backup $($res.Sha.Substring(0, 8))  kind=$kind  $subj"
+  $stat | Select-Object -First 25 | ForEach-Object { Write-Output "  $_" }
+  if (-not $To) {
+    Write-Output "nothing written. To restore into a slot YOU hold:"
+    Write-Output "  agentq recover -Repo $repoName -Ref $($res.Sha) -To `"<path of your slot>`" -Apply"
+    Write-Output "  (or by hand: git -C `"<slot>`" checkout $($res.Sha.Substring(0, 8)) -- .   # files |  git -C `"<slot>`" cherry-pick $($res.Sha.Substring(0, 8))   # commits)"
+    return
+  }
+  $rt = Get-RepoInfo $To
+  if (-not $rt) { throw "agentq recover: -To '$To' is not a git worktree" }
+  if ((Norm-Dir $rt.Top) -eq (Norm-Dir (Get-MainTop $rt)) -and -not $Force) {
+    throw "agentq recover: -To '$To' is the SHARED clone - restoring there mixes another session's draft into shared state. Restore into a leased slot (agentq lease -Purpose recover), or pass -Force."
+  }
+  $lease = Find-LeaseForPath $rt.Top
+  if ($lease -and (P $lease 'session') -ne $Session -and -not $Force) {
+    throw "agentq recover: '$To' is leased by $($lease.session) ('$($lease.purpose)') - do not write into another session's slot. Lease your own: agentq lease -Purpose recover"
+  }
+  if (-not $Apply) { Write-Output "dry run - nothing written. Re-run with -Apply to restore $($res.Sha.Substring(0, 8)) into $($rt.Top)"; return }
+  if ($kind -eq 'commits') { Write-Output "the ref is a real commit (not a file snapshot): apply it with the strategy you want, e.g. git -C `"$($rt.Top)`" cherry-pick $($res.Sha)"; return }
+  $before = @(& git -C $rt.Top status --porcelain 2>$null | Where-Object { $_ }).Count
+  $cio = @(& git -C $rt.Top checkout $res.Sha -- . 2>&1 | ForEach-Object { "$_" })
+  if ($LASTEXITCODE) { throw "agentq recover: checkout $($res.Sha.Substring(0, 8)) into $($rt.Top) failed: $($cio -join ' | ')" }
+  $after = @(& git -C $rt.Top status --porcelain 2>$null | Where-Object { $_ })
+  Write-Output "recovered $($res.Sha.Substring(0, 8)) into $($rt.Top): $($after.Count) changed path(s) (was $before). Review: git -C `"$($rt.Top)`" status"
+  Write-Journal @{ event = 'recover'; resource = "slot:${repoName}:$(Split-Path $rt.Top -Leaf)"; ref = $res.Ref; sha = $res.Sha; repo = $repoName; by = $Session }
 }
 
 function Invoke-Sweep {
@@ -1073,6 +1242,14 @@ function Invoke-ReleaseEnd {
     $x = Read-JsonFile $r.file | Add-Member -NotePropertyName file -NotePropertyValue $r.file -Force -PassThru
     if ($x.state -ne 'superseded') { $x.state = $(if ($State -eq 'superseded' -and $x.committed) { 'failed' } else { $State }) }
     $x.phaseAt = (Iso (Now))
+    # The run's exit code, recorded SEPARATELY from `phase`. `phase` is the last checkpoint the run
+    # ENTERED (release-phase); it is never an attribution of which step failed, and an exit code cannot
+    # honestly be mapped onto a phase: the failure happens somewhere in the wrapped command, which may
+    # be inside, after, or entirely outside any named checkpoint. 2026-11-21: a release exited 1 (its
+    # post-deploy gate returned `incomplete`) while `phase` still read `github`, and `phase=github` was
+    # read as "the GitHub step failed". Additive field; old readers ignore it, the display shows it as
+    # `exit=<n>` next to `last-phase=<p>`.
+    if ($null -ne $Code) { $x | Add-Member -NotePropertyName exitCode -NotePropertyValue ([int]$Code) -Force }
     $next = switch ($x.state) { 'superseded' { $x.supersedeSha } 'done' { $x.pendingSha } default { '' } }
     if ($next -eq 'cancel') { $next = '' }
     Save-Release $x
@@ -1421,7 +1598,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     }
     if ($script:GateExit) {
       Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = $Gate; repo = $repo.Name }
-      [Console]::Error.WriteLine("land: gate failed ($($script:GateExit)) for $Branch rebased onto origin/$Onto, BEFORE the queue - nothing queued, nothing pushed. Fix it in the slot and land again. (AGENTQ_LAND_NO_PREGATE=1 runs the gate in the queue instead.)")
+      [Console]::Error.WriteLine("land: gate failed ($($script:GateExit)) for $Branch rebased onto origin/$Onto running '$Gate', BEFORE the queue - nothing queued, nothing pushed. Fix it in the slot and land again. (AGENTQ_LAND_NO_PREGATE=1 runs the gate in the queue instead.)")
       $script:PregateResult = 'failed'; return
     }
     Set-GreenTree $repo.Name $tree $Gate $script:GateSec 'pre-gate'
@@ -1617,7 +1794,7 @@ function Invoke-LandSet([object[]]$set) {
         $gx = $script:GateExit
         if ($gx) {
           Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
-          [Console]::Error.WriteLine("land: gate failed ($gx) for $names - nothing pushed")
+          [Console]::Error.WriteLine("land: gate failed ($gx) for $names - '$Gate' exited non-zero; nothing pushed")
           $o.failExit = 6; return
         }
         Set-GreenTree $repo.Name $gateTree $Gate $script:GateSec 'land'
@@ -1736,6 +1913,14 @@ function Invoke-Land {
   } elseif ($Gate -eq 'none') {
     Write-Journal @{ event = 'land-gate-skipped'; resource = $res; branch = $Branch; reason = $why; repo = $repo.Name }
     $Gate = $null
+  }
+  # Visibility for the ungated majority: the 2026-11-21 readiness pass found 94 of 95 repos declare no
+  # `landGate` and 80 of them have no pre-push hook either, so their lands merge and push with NO check
+  # at all. Nothing is refused (an ungated land still beats a land that never happens) - but it is said
+  # out loud and journaled, because a silent ungated land is how a broken tree reaches other agents.
+  if (-not $Gate) {
+    Write-Journal @{ event = 'land-ungated'; resource = $res; branch = $Branch; onto = $Onto; reason = $why; repo = $repo.Name }
+    [Console]::Error.WriteLine("land: NO GATE for $($repo.Name) - $Branch -> $Onto will be merged and pushed unchecked. Close it once: add  `"landGate`": { `"$($repo.Name)`": `"<cmd>`" }  to bin/agentq-config.json (or pass -Gate `"<cmd>`").")
   }
   # W2-6: refuse BEFORE queueing when the topic cannot merge onto the current tip (outside the files the
   # land resolver/finalizer handle). Saves the whole queue wait + slot setup of a land that ends in exit 5.
@@ -1995,10 +2180,20 @@ function Get-V2Status([string]$repoName) {
 }
 function Format-V2Status($v) {
   if ($v.releases) {
-    Write-Output '== RELEASES'
+    # `phase` in the record is the LAST checkpoint the run entered (release-phase), and `state` is the
+    # run's own outcome. The two are independent: a FAILED run is NOT a failed phase, and nothing in the
+    # record attributes a failing exit code to a phase (the failure happens somewhere in the wrapped
+    # command, which is not tied to a checkpoint). So the column is labelled `last-phase` = the last
+    # checkpoint recorded, NOT the step that failed, and the run's exit code (only when recorded) is
+    # printed NEXT TO it, never as though it belonged to the phase. 2026-11-21: a release exited 1 (its
+    # post-deploy gate returned `incomplete`) while last-phase still read `github`, and `phase=github`
+    # was read by a human as "the GitHub step failed".
+    Write-Output "== RELEASES   (state = the run outcome; last-phase = the last checkpoint recorded, NOT the step that failed; exit = the run's own exit code when recorded)"
     foreach ($r in $v.releases) {
       $extra = @(); if ($r.supersedeSha) { $extra += "supersede->$(Short $r.supersedeSha)" }; if ($r.pendingSha) { $extra += "pending->$(Short $r.pendingSha)" }
-      Write-Output ("{0,-28} {1,-11} {2,-10} phase={3}{4} follow={5} {6} {7}" -f "$($r.repo)/$($r.target)", "$($r.state)".ToUpper(), (Short $r.sha), $r.phase, $(if ($r.committed) { ' (committed)' } else { ' (preemptible)' }), $r.follow, $r.session, ($extra -join ' '))
+      $exitCode = (P $r 'exitCode' $null)
+      $exitTxt = if ($null -ne $exitCode) { "exit=$exitCode" } else { 'exit=?' }
+      Write-Output ("{0,-28} {1,-11} {2,-10} {3} last-phase={4}{5} follow={6} {7} {8}" -f "$($r.repo)/$($r.target)", "$($r.state)".ToUpper(), (Short $r.sha), $exitTxt, $r.phase, $(if ($r.committed) { ' (committed)' } else { ' (preemptible)' }), $r.follow, $r.session, ($extra -join ' '))
     }
   }
   $lost = @(Get-RecentLeaseLosses 24)

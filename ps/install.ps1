@@ -68,23 +68,68 @@ $map = [ordered]@{
   'hooks\hook-pre.ps1' = 'hooks\hook-pre.ps1'; 'tests\test-hook-pre.ps1' = 'hooks\test-hook-pre.ps1'
   'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'
   'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
+  # 2026-11-21: the release `phase` is the last checkpoint, not the failed step - display + schema pinned
+  'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'
   'tests\test-agentq-prune.ps1' = 'bin\test-agentq-prune.ps1'; 'tests\test-agentq-doctor.ps1' = 'bin\test-agentq-doctor.ps1'
   'tests\test-slo.mjs' = 'bin\test-slo.mjs'
+  # 2026-11-21 (ADR 0014): slot take-over + `recover`, the commit/push split (D1), the per-session
+  # fair share (D4). `test-land-default-gate.ps1` was in run-all but not in this map, so the installed
+  # copy never carried it - the install gate could not run what it never installed.
+  'tests\test-agentq-recover.ps1' = 'bin\test-agentq-recover.ps1'; 'tests\test-agentq-commit-fast.ps1' = 'bin\test-agentq-commit-fast.ps1'
+  'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
-# Config merge: the installed file keeps every key it has; keys only the checkout has are appended.
+# Config merge: the installed file keeps every value it has; values only the checkout has are appended.
+# Nested maps merge one level deep (a `landGate` per-repo entry, a `pinned` list): an installed entry
+# wins, a new one from the checkout is added. A top-level-only merge could never deliver a new per-repo
+# default - 2026-11-21: `landGate.codai` was added to the checkout and silently dropped because the
+# installed copy already had a `landGate` key, so the live config never carried the gate.
 # Returns the merged text, or $null when nothing is missing (file left untouched).
+function Merge-ConfigMap([string]$prefix, $to, $from) {
+  $o = [ordered]@{}
+  foreach ($k in $to.Keys) {
+    $path = if ($prefix) { "$prefix.$k" } else { "$k" }
+    if ($from.ContainsKey($k) -and ($to[$k] -is [Collections.IDictionary]) -and ($from[$k] -is [Collections.IDictionary])) {
+      $o[$k] = Merge-ConfigMap $path $to[$k] $from[$k]
+    } else { $o[$k] = $to[$k] }
+  }
+  foreach ($k in $from.Keys) {
+    if (-not $to.ContainsKey($k)) {
+      $o[$k] = $from[$k]
+      $script:CfgAdded = @($script:CfgAdded) + @($(if ($prefix) { "$prefix.$k" } else { "$k" }))
+    }
+  }
+  $o
+}
 function Get-MergedConfig([string]$from, [string]$to) {
   $s = Get-Content -LiteralPath $from -Raw | ConvertFrom-Json -AsHashtable
   $d = Get-Content -LiteralPath $to -Raw | ConvertFrom-Json -AsHashtable
-  $add = @($s.Keys | Where-Object { -not $d.ContainsKey($_) })
-  if (-not $add.Count) { return $null }
-  $o = [ordered]@{}
-  foreach ($k in $d.Keys) { $o[$k] = $d[$k] }
-  foreach ($k in $add) { $o[$k] = $s[$k] }
-  $script:CfgAdded = $add
+  $script:CfgAdded = @()
+  $o = Merge-ConfigMap '' $d $s
+  if (-not @($script:CfgAdded).Count) { return $null }
   ($o | ConvertTo-Json -Depth 8) + "`n"
 }
+# --- green record freshness (begin) ---------------------------------------------------------------
+# Is <Path> a full-green record written less than MaxHours ago? ps/tests/run-all.ps1 writes it and the
+# install below reads it to skip a repeat of the exact content. `at` comes back from ConvertFrom-Json
+# as a [datetime] (PS 7 converts ISO-8601 strings), and `"$($g.at)"` then stringifies it in the
+# MACHINE's culture - Get-Date cannot re-parse that outside en-US, so $fresh stayed false and install
+# ran all 45 suites (~36 min) for a tree that had just passed them (2026-11-21, this machine: the
+# record held "2026-11-21T01:36:38" and Get-Date was handed "11/21/2026 01:36:38"). Take the value as
+# it is; parse a string with the invariant culture. Anything unreadable is NOT fresh (fail closed).
+function Test-GreenRecordFresh([string]$Path, [double]$MaxHours = 24) {
+  if (-not (Test-Path -LiteralPath $Path)) { return $false }
+  try {
+    $g = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
+    if (-not $g -or -not $g.ContainsKey('at') -or -not $g['at']) { return $false }
+    $v = $g['at']
+    if ($v -is [datetime]) { $at = $v }
+    elseif ($v -is [datetimeoffset]) { $at = $v.DateTime }
+    else { $at = [datetime]::Parse("$v", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+    (((Get-Date).ToUniversalTime() - $at.ToUniversalTime()).TotalHours -lt $MaxHours)
+  } catch { $false }
+}
+# --- green record freshness (end) -----------------------------------------------------------------
 $drift = @()
 foreach ($k in $map.Keys) {
   $a = Join-Path $src $k; $b = Join-Path $dst $map[$k]
@@ -102,7 +147,7 @@ if (-not $SkipTests) {
   if (-not $Suites -and -not $Full) {
     $gf = Join-Path (Split-Path -Parent $src) '.copilot-tmp\last-green.json'
     $fresh = $false
-    if (Test-Path -LiteralPath $gf) { try { $g = Get-Content -LiteralPath $gf -Raw | ConvertFrom-Json -AsHashtable; $fresh = ((Get-Date) - (Get-Date "$($g.at)")).TotalHours -lt 24 } catch { $fresh = $false } }
+    $fresh = Test-GreenRecordFresh $gf
     if ($fresh) {
       & pwsh -NoProfile -File (Join-Path $src 'tests\run-all.ps1') -LastGreen
       if ($LASTEXITCODE -eq 0) { $alreadyGreen = $true }
@@ -132,6 +177,12 @@ foreach ($k in $drift) {
   }
   # atomic replace: a hook firing mid-copy must never see half a file
   Copy-Item $a "$b.new" -Force; Move-Item "$b.new" $b -Force
+  # Copy-Item preserves alternate data streams, so a Zone.Identifier ("downloaded from the Internet")
+  # on the SOURCE travels to the installed copy and RemoteSigned then refuses to run it: the 2026-11-20
+  # "File C:\Users\vladu\.copilot\bin\git-autosync.ps1 cannot be loaded. The file ... is not digitally
+  # signed." — a live daemon that silently cannot start, with a clean-looking install. Unblock-File
+  # afterwards: the source is our own repo, never untrusted.
+  Unblock-File -LiteralPath $b -ErrorAction SilentlyContinue
   "installed $($map[$k])"
 }
 # What was installed, for `agentq doctor` (a hand edit of an installed file shows up as a hash mismatch).

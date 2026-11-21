@@ -34,11 +34,16 @@
   "idleYieldMin": 5,
   "idleCpuSec": 10,
   "bumpMax": 50,
+  "fairShare": {
+    "enabled": true,
+    "maxPerSession": 0
+  },
   "burstMax": 2,
   "burstMaxMin": 60,
   "overridesPerHour": 6,
   "landGate": {
-    "brivio": "pnpm land:gate"
+    "brivio": "pnpm land:gate",
+    "codai": "pnpm gate:store-copy"
   },
   "sharedCloneMode": "warn",
   "sharedCloneModeRepos": {

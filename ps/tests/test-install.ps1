@@ -76,6 +76,17 @@ try {
   $o = Install $Src @('-Check')
   Check '3 a config that only differs in local values is in sync' ($code -eq 0 -and $o -match 'in sync') $o
 
+  # 3b. a NESTED key inside a map the installed config already has - the landGate case (2026-11-21):
+  # a top-level-only merge kept the installed `landGate` value and silently dropped a new per-repo entry
+  # from the checkout, so the live config never carried codai's gate. Mutation: make Merge-ConfigMap
+  # non-recursive and this Check goes red.
+  $cg = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  $cg['landGate'] = @{ keepme = 'local' }
+  [IO.File]::WriteAllText($cfgDst, ($cg | ConvertTo-Json -Depth 8))
+  $o = Install $Src @('-SkipTests')
+  $cg2 = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  Check '3b a nested key the installed map lacks is added from the checkout' ($code -eq 0 -and $cg2['landGate']['keepme'] -eq 'local' -and $cg2['landGate'].Count -eq ($srcCfg['landGate'].Count + 1) -and $o -match 'added landGate\.') $o
+
   # 4. a hand-edited installed file: reported, restored, the edit kept in the backup
   Start-Sleep -Milliseconds 1100   # backup folders are named to the second
   $victim = Join-Path $dst 'hooks\hook-pre.ps1'
@@ -87,6 +98,20 @@ try {
   $bk = @(Get-ChildItem -LiteralPath (Join-Path $dst '.backup') -Directory | Sort-Object Name)[-1]
   Check '4 the edited copy is in the backup folder' ((Test-Path -LiteralPath (Join-Path $bk.FullName 'hooks\hook-pre.ps1')) -and (Get-Content -LiteralPath (Join-Path $bk.FullName 'hooks\hook-pre.ps1') -Raw) -match 'edited by hand')
   Check '4 no half-written file is left behind' (@(Get-ChildItem -LiteralPath $dst -Recurse -File -Filter '*.new').Count -eq 0)
+
+  # 4a. a SOURCE file that carries a Zone.Identifier ("downloaded from the Internet") must not leave the
+  # installed copy un-runnable: Copy-Item preserves alternate data streams, so without an Unblock-File the
+  # live copy fails with "cannot be loaded ... is not digitally signed" under RemoteSigned and the daemon
+  # silently never starts (2026-11-20, live git-autosync.ps1). Mutation: drop the Unblock-File in
+  # install.ps1 and the second Check below goes red.
+  Start-Sleep -Milliseconds 1100
+  $motwSrc = Join-Path $Src 'hooks\hook-pre.ps1'
+  [IO.File]::WriteAllText("$motwSrc`:Zone.Identifier", "[ZoneTransfer]`r`nZoneId=3`r`n")
+  Add-Content -LiteralPath $victim -Value '# edited again'
+  $o = Install $Src @('-SkipTests')
+  Check '4a the MOTW source is installed (drift seen)' ($code -eq 0 -and $o -match 'installed hooks\\hook-pre\.ps1') $o
+  $unblocked = -not (Get-Item -LiteralPath $victim -Stream Zone.Identifier -ErrorAction SilentlyContinue)
+  Check '4a the installed copy has NO Zone.Identifier (it must be runnable)' $unblocked
 
   # 4b. upgrade order: a file the destination lacks is copied before any existing file is replaced
   Start-Sleep -Milliseconds 1100
@@ -106,6 +131,29 @@ try {
   $dst = $keep
   Check '5 a mapped file missing from the checkout stops the install' ($code -ne 0 -and $o -match 'is in the map but not in this checkout') $o
   Check '5 ... and nothing was copied' (@(Get-ChildItem -LiteralPath $dst2 -Recurse -File).Count -eq 0)
+
+  # 7. the green-record freshness read (the "install: tests SKIPPED" path). A full green run of the
+  # same ps/ content must not be paid for twice: 45 suites are ~36 min, the skip is ~2 s. `at` is an
+  # ISO-8601 string in the file and a [datetime] after ConvertFrom-Json, and stringifying a [datetime]
+  # uses the MACHINE's culture: with `Get-Date "$($g.at)"` the skip silently never fired outside
+  # en-US (2026-11-21: 36 min for a byte-identical tree). The helper is read from the installer text,
+  # like the map above, so this fails if it is removed or made culture-dependent again.
+  $gblock = [regex]::Match($text, '(?s)# --- green record freshness \(begin\).*?# --- green record freshness \(end\) ---').Value
+  Check '7 the freshness helper is in the installer' ($gblock -match 'function Test-GreenRecordFresh')
+  if ($gblock) { Invoke-Expression $gblock }
+  $gf = Join-Path $tmp 'last-green.json'
+  $keepCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+  try {
+    [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('ro-RO')
+    [IO.File]::WriteAllText($gf, ('{"hash":"sha256:x","at":"' + (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss') + '","suites":45,"sec":10}'))
+    Check '7a a record from seconds ago is fresh under a non-US culture (ro-RO)' ((Test-GreenRecordFresh $gf 24) -eq $true)
+    [IO.File]::WriteAllText($gf, ('{"hash":"sha256:x","at":"' + (Get-Date).AddHours(-30).ToString('yyyy-MM-ddTHH:mm:ss') + '"}'))
+    Check '7b a record older than MaxHours is stale' ((Test-GreenRecordFresh $gf 24) -eq $false)
+    [IO.File]::WriteAllText($gf, '{"hash":"sha256:x","at":"not-a-date"}')
+    Check '7c an unreadable time is not fresh (fail closed)' ((Test-GreenRecordFresh $gf 24) -eq $false)
+  } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $keepCulture }
+  Check '7d a missing record is not fresh' ((Test-GreenRecordFresh (Join-Path $tmp 'nope.json') 24) -eq $false)
+  Check '7e the installer calls the helper instead of parsing $g.at inline' ($text -match 'Test-GreenRecordFresh \$gf')
 
   # 6. the live folder was never the destination
   $now = if (Test-Path -LiteralPath $live) { (Get-Item -LiteralPath $live).LastWriteTimeUtc.Ticks } else { 0 }

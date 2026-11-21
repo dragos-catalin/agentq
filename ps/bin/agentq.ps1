@@ -63,7 +63,9 @@ JSON OUTPUT (-Json / --json; `status --json` is the machine form of the == table
                  (ok|chat|owner-gone|STALE), idleMin, chatIdleMin, branch, session (holder
                  terminal), purpose, path, pid, created, beat, alive, stale }
       releases = the == RELEASES rows: the release record (repo, target, state, sha, phase,
-                 committed, follow, session, purpose, supersedeSha, pendingSha, ...)
+                 committed, follow, session, purpose, supersedeSha, pendingSha, exitCode, ...);
+                 `phase` is the LAST checkpoint entered, not the step that failed - `exitCode` (when
+                 recorded) is the run's own exit code and does not belong to any phase
       marks    = the == MARKS rows: { resource, state, at, session, reason }
       tickets  = the == QUEUES rows: { resource, role, lane, prio, state, ageMin, session,
                  purpose, id }
@@ -88,7 +90,10 @@ v3 SCHEDULER (devcloud F1, 2026-10-11)
   agentq metrics [-Hours 24] [-Json]   wait/hold p50/p90 per resource x lane x kind
   agentq rotate                        archive journal now (sweep does it above journalRotateMB)
   Knobs: bin/agentq-config.json (machineCap quickBurst agingMin idleYieldMin idleCpuSec bumpMax
-  burstMax burstMaxMin overridesPerHour journalRotateMB). Plan: E:\gh\vmui\docs\devcloud\PLAN.md
+  fairShare burstMax burstMaxMin overridesPerHour journalRotateMB). Plan: E:\gh\vmui\docs\devcloud\PLAN.md
+  fairShare: true|false | { enabled, maxPerSession } - when >= 2 sessions compete on a resource with
+  cap >= 2, waiters are interleaved by round over sessions and a session may hold ceil(cap/sessions)
+  slots (ADR 0014 D4). AGENTQ_NO_FAIRSHARE=1 opts out for one call.
 
 CLOUD PLACEMENT (devcloud F2, DC-037)
   agentq run -Resource build -Where local|cloud|auto [-Ws <name>] -Purpose x -- <cmd>
@@ -141,8 +146,12 @@ $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $
 # for leaseIdleMin (45 min) / leaseOwnerIdleMin (90 min, live owner shell) - work, not "the chat is busy".
 $Hold = $false; $HoldMin = $null
 $FbKind = $null; $EvalSample = $false
-$Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
+# -Code <n> (release-end): the wrapped command's exit code, recorded SEPARATELY from `phase` (see
+# Invoke-ReleaseEnd). `phase` is not an attribution of failure, so the code can never be stored on it.
+$Code = $null; $Phase = $null; $Unsafe = $false; $Target = $null; $Sha = $null; $Ref = $null; $Follow = $null
 $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $DoLand = $false; $Force = $false
+# recover (2026-11-21): -To = target worktree for a restore (dry run unless -Apply is also given).
+$To = $null; $Apply = $false
 # v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
 # devcloud F2: placement.
@@ -156,6 +165,14 @@ $WhatIf = $false; $Src = $null; $Days = 0
 # ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
 $script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
+# D4: ticket id whose fair-share refusal was already journaled (the wait loop polls every few seconds;
+# without this the journal would grow one `fair-share` line per poll).
+$script:FsNoted = ''
+# D3: cache of the memory floors Get-MachineMemory reads out of the config. It MUST exist: the function
+# starts with `if ($null -eq $script:MmFloors)`, and under Set-StrictMode that READ throws
+# ("The variable '$script:MmFloors' cannot be retrieved because it has not been set"), which took down
+# every `agentq run` (2026-11-21, caught by this repository's own fair-share suite).
+$script:MmFloors = $null
 $Rest = @()
 $argv = @($args)
 $dd = [array]::IndexOf($argv, '--')
@@ -224,6 +241,7 @@ while ($i -lt $argv.Count) {
     'gate' { $Gate = & $next }
     'phase' { $Phase = & $next }
     'unsafe' { $Unsafe = $true }
+    'code' { $Code = [int](& $next) }
     'target' { $Target = & $next }
     'sha' { $Sha = & $next }
     'ref' { $Ref = & $next }
@@ -240,6 +258,8 @@ while ($i -lt $argv.Count) {
     'base' { $Base = & $next }
     'land' { $DoLand = $true }
     'force' { $Force = $true }
+    'to' { $To = & $next }
+    'apply' { $Apply = $true }
     'ws' { $Ws = & $next }
     'name' { $WsName = & $next }
     'whatif' { $WhatIf = $true }
@@ -310,7 +330,9 @@ function Get-JournalFiles {
 }
 
 # Machine-wide capacities for named resources (override with -Capacity on first use).
-$DefaultCapacity = @{ 'build:machine' = 2 }
+# 'push:*' (ADR 0014 D1): pushing only contends on the remote ref, so two pushes may overlap; the
+# pre-push gates are the slow part and they must not hold the commit:<repo> index lock (see Invoke-Commit).
+$DefaultCapacity = @{ 'build:machine' = 2; 'push:*' = 2 }
 
 function Now { [DateTime]::UtcNow }
 function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
@@ -495,7 +517,7 @@ function Get-Capacity([string]$res) {
     return $cap
   }
   $f = Join-Path (QPath $res) 'capacity'
-  $base = if (Test-Path $f) { [int](Get-Content $f -Raw) } elseif ($DefaultCapacity.ContainsKey($res)) { $DefaultCapacity[$res] } else { 1 }
+  $base = if (Test-Path $f) { [int](Get-Content $f -Raw) } elseif ($DefaultCapacity.ContainsKey($res)) { $DefaultCapacity[$res] } elseif ($DefaultCapacity.ContainsKey(($res -split ':')[0] + ':*')) { $DefaultCapacity[($res -split ':')[0] + ':*'] } else { 1 }
   $base + (Get-BurstExtra $res)
 }
 
@@ -566,11 +588,11 @@ function Get-AdaptiveMachineCap {
       $dt = [double]([long]$t.total - [long]$prev.total); $di = [double]([long]$t.idle - [long]$prev.idle)
       $cpu = [math]::Round(100 * (1 - $di / $dt), 1)
     }
-    $os = Get-MemInfo
-    $ram = [math]::Round($os.FreePhysicalMemory / 1MB, 1); $commit = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
+    $mm = Get-MachineMemory ([double]$MinFreeGB)
+    $ram = $mm.ramGB; $commit = $mm.commitGB
     $cap = if ($prev -and $prev.cap) { [int]$prev.cap } else { $min }
     $why = 'hold'
-    $memLow = ($ram -lt [double](P $a 'minFreeRamGB' 24)) -or ($commit -lt [double](P $a 'minFreeCommitGB' 24))
+    $memLow = ($ram -lt $mm.ramFloorGB) -or ($commit -lt $mm.commitFloorGB)
     if ($memLow) { $cap--; $why = "memory low (ram ${ram} GB, commit ${commit} GB)" }
     elseif ($null -ne $cpu -and $cpu -ge [double](P $a 'cpuHigh' 85)) { $cap--; $why = "cpu ${cpu}% >= high" }
     elseif ($null -ne $cpu -and $cpu -le [double](P $a 'cpuLow' 55)) { $cap++; $why = "cpu ${cpu}% <= low" }
@@ -616,6 +638,45 @@ function Get-EffPrio($t) {
   $waited = ((Now) - (ParseUtc $t.created)).TotalMinutes
   $age = if ($aging -gt 0) { 5 * [math]::Floor($waited / $aging) } else { 0 }
   $base + [int](P $t 'prio' 0) + [int](P $t 'bump' 0) + $age
+}
+# D4 (ADR 0014): per-session fair share. The order above is priority-only, so one agent that fans out
+# N parallel jobs could take EVERY slot of a resource (build:machine cap 2-4) and every other session
+# waited behind the whole block. Two changes, both active only while at least two sessions compete:
+# the rank order is round-robin over sessions (priority order INSIDE a session), and a session may
+# hold at most ceil(cap / sessions) slots. With one session this is exactly the old behaviour.
+# Config `fairShare`: true|false | { enabled, maxPerSession } (default enabled, maxPerSession 0 =
+# derived). AGENTQ_NO_FAIRSHARE=1 turns it off for one call.
+function Get-FairShare {
+  $d = @{ enabled = $true; maxPerSession = 0 }
+  $c = Get-Config
+  if ($c.ContainsKey('fairShare')) {
+    $v = $c['fairShare']
+    if ($v -is [Collections.IDictionary]) {
+      if ($v.ContainsKey('enabled')) { $d.enabled = [bool]$v['enabled'] }
+      if ($v.ContainsKey('maxPerSession') -and $null -ne $v['maxPerSession']) { $d.maxPerSession = [int]$v['maxPerSession'] }
+    } elseif ($null -ne $v -and "$v" -ne '') { $d.enabled = [bool]$v }
+  }
+  if ($env:AGENTQ_NO_FAIRSHARE -eq '1') { $d.enabled = $false }
+  $d
+}
+# Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one
+# session's block of five waiters cannot sit in front of another session's single waiter. Grouping
+# them (round-robin by session, not by round) would NOT fix the starvation it was written for
+# (caught by this repository's own suite, 2026-11-21). Order inside a session is preserved.
+function Sort-BySession($waiting, [string[]]$sessions) {
+  $rest = [Collections.ArrayList]::new()
+  foreach ($x in @($waiting)) { [void]$rest.Add($x) }
+  $out = @()
+  while ($rest.Count -gt 0) {
+    $took = $false
+    foreach ($s in $sessions) {
+      $i = -1
+      for ($k = 0; $k -lt $rest.Count; $k++) { if ("$(P $rest[$k] 'session' '?')" -eq $s) { $i = $k; break } }
+      if ($i -ge 0) { $out += $rest[$i]; $rest.RemoveAt($i); $took = $true }
+    }
+    if (-not $took) { foreach ($x in $rest) { $out += $x }; break }
+  }
+  $out
 }
 # Legacy tickets (no `v`, written by agentq <= 0.2 during an install transition) hold by position.
 function Test-Held($t, [object[]]$live, [int]$cap) {
@@ -731,6 +792,33 @@ function Test-Admissible($t, [scriptblock]$gate) {
       Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
   if ($t.resource -like 'land:*' -and $waiting.Count -gt 1) { $waiting = @(Sort-ByClaims $waiting) }
   $lane = "$(P $t 'lane' 'gate')"
+  # D4 (ADR 0014): round-robin the rank order over sessions while >= 2 sessions compete, so one
+  # agent's fan-out does not sit as a block in front of another session's single waiter.
+  $fs = Get-FairShare
+  $fsRefused = $false
+  if ($fs.enabled -and $cap -ge 2 -and $waiting.Count -gt 1) {
+    $sess = @()
+    foreach ($x in @($held + $waiting)) { $s = "$(P $x 'session' '?')"; if ($sess -notcontains $s) { $sess += $s } }
+    if ($sess.Count -ge 2) {
+      if ($fs.maxPerSession -le 0) { $fs.maxPerSession = [int][math]::Ceiling($cap / $sess.Count) }
+      $bySess = @{}
+      foreach ($h in $held) { $hs = "$(P $h 'session' '?')"; $bySess[$hs] = [int]$bySess[$hs] + 1 }
+      # A session already at its share is NOT ranked at all: the slot a holder just freed goes to the
+      # other session instead of idling under a ticket that would be refused anyway. The filter is the
+      # same for every caller, so two tickets never disagree about who is in front.
+      $mineShared = ([int]$bySess["$(P $t 'session' '?')"]) -ge $fs.maxPerSession
+      if ($mineShared) {
+        $fsRefused = $true
+        if ($script:FsNoted -ne $t.id) {
+          $script:FsNoted = $t.id
+          Write-Journal @{ event = 'fair-share'; resource = $t.resource; ticket = $t.id; session = "$(P $t 'session' '?')"; held = [int]$bySess["$(P $t 'session' '?')"]; cap = $cap; maxPerSession = $fs.maxPerSession; reason = 'another session is waiting: my session is at its share' }
+        }
+        $script:PreemptNote = "fair share: my session holds $([int]$bySess["$(P $t 'session' '?')"]) of $cap (share $($fs.maxPerSession))"
+      }
+      $waiting = @($waiting | Where-Object { ([int]$bySess["$(P $_ 'session' '?')"]) -lt $fs.maxPerSession })
+      $waiting = @(Sort-BySession $waiting $sess)
+    }
+  }
   $rank = [array]::IndexOf(@($waiting | ForEach-Object id), $t.id)
   $ok = ($rank -ge 0 -and $rank -lt ($cap - $held.Count))
   if (-not $ok -and $t.resource -eq 'build:machine') {
@@ -763,7 +851,7 @@ function Test-Admissible($t, [scriptblock]$gate) {
       return @{ ok = $false; why = 'load'; load = $ld; live = $live; held = $held; cap = $cap; rank = $rank }
     }
   }
-  if (-not $ok) { return @{ ok = $false; why = 'queue'; live = $live; held = $held; cap = $cap; rank = $rank } }
+  if (-not $ok) { return @{ ok = $false; why = 'queue'; live = $live; held = $held; cap = $cap; rank = $rank; fairShare = $fsRefused } }
   if ($gate -and -not (& $gate)) { return @{ ok = $false; why = 'ram'; live = $live; held = $held; cap = $cap; rank = $rank } }
   @{ ok = $true; why = ''; live = $live; held = $held; cap = $cap; rank = $rank }
 }
@@ -824,6 +912,14 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
   } finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
 
+# Give a ticket back early (idempotent with the `finally` that removes it). Used by Invoke-Commit to end
+# the index lock BEFORE the pre-push gates run, so the next agent's `git add` starts immediately.
+function Drop-Ticket($t) {
+  if (-not $t) { return }
+  $f = (P $t 'file'); if (-not $f) { return }
+  Remove-Item -LiteralPath $f, "$f.hb" -Force -ErrorAction SilentlyContinue
+}
+
 # Acquire ALL tickets of one run atomically (DC-013): nothing is held while any part waits, so a
 # run waiting for build:machine no longer blocks build:<repo> (96.5 h measured in 15 days).
 # Check+grant happens under one machine-wide mutex so two runs never both take the last slot.
@@ -866,7 +962,7 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
       $msgs = foreach ($t in $tickets) {
         $r = $res[$t.id]; if ($r.ok) { continue }
         $who = ($r.held | ForEach-Object { "$($_.session) '$($_.purpose)' [$(P $_ 'lane' '?')] $([math]::Round(((Now) - (ParseUtc $_.created)).TotalMinutes,1))m$(if ($_.stale) { ' STALE' })" }) -join '; '
-        $why = if ($r.why -eq 'ram') { 'waiting for free RAM/commit' } elseif ($r.why -eq 'load') { "machine saturated (start probe median $($r.load.median) ms > $($r.load.thresholdMs) ms): no second build until it recovers or $([double](Get-AdmissionConfig).maxHoldMin) min pass" } else { "rank $($r.rank + 1) by priority, cap $($r.cap)" }
+        $why = if ($r.why -eq 'ram') { 'waiting for free RAM/commit' } elseif ($r.why -eq 'load') { "machine saturated (start probe median $($r.load.median) ms > $($r.load.thresholdMs) ms): no second build until it recovers or $([double](Get-AdmissionConfig).maxHoldMin) min pass" } elseif ($r.fairShare) { "session fair share: my session already holds its slots of cap $($r.cap) and another session is waiting (ADR 0014 D4)" } else { "rank $($r.rank + 1) by priority, cap $($r.cap)" }
         "$($t.resource) [$($t.lane)] $why; held by: $who"
       }
       [Console]::Error.WriteLine("agentq: waiting — $($msgs -join ' | ')")
@@ -887,12 +983,48 @@ function Wait-Turn($ticket, [int]$timeoutMin, [scriptblock]$extraGate, [object[]
   Wait-All @($ticket) @{ $ticket.id = $extraGate } $timeoutMin
 }
 
-function Test-FreeRam([double]$gb) {
+# ---- one machine-memory authority (D3, ADR 0014) -------------------------------------------------
+# "How much memory must be free before work starts" was answered in three places with three numbers:
+#   * the queue gate     -MinFreeGB, default 6, handed to Test-FreeRam;
+#   * the burst gate     -MinFreeGB * 2 = 12, an inline x2 that named no config key;
+#   * the adaptive cap   machineCapAdaptive.minFreeRamGB / minFreeCommitGB = 24 / 24.
+# Get-MachineMemory is the ONE place that reads them, next to the live numbers, so they can be shown
+# side by side (`agentq doctor` row `machine-memory`) and `unified` says whether they still agree.
+# The config-derived part is cached per process: Test-FreeRam runs inside every poll's gate scriptblock.
+# The VALUES are unchanged on purpose - collapsing them to one number decides which builds start, and
+# that is a scheduling policy (pick one, then set the config), not a refactor.
+function Get-MachineMemory([double]$queueGB) {
+  if ($null -eq $script:MmFloors) {
+    $cfg = Get-Config
+    $a = if ($cfg.ContainsKey('machineCapAdaptive')) { $cfg['machineCapAdaptive'] } else { $null }
+    $ramA = if ($a -and $a.ContainsKey('minFreeRamGB') -and $null -ne $a['minFreeRamGB']) { [double]$a['minFreeRamGB'] } else { 24.0 }
+    $comA = if ($a -and $a.ContainsKey('minFreeCommitGB') -and $null -ne $a['minFreeCommitGB']) { [double]$a['minFreeCommitGB'] } else { 24.0 }
+    $comG = if ($cfg.ContainsKey('minFreeCommitGB') -and $null -ne $cfg['minFreeCommitGB']) { [double]$cfg['minFreeCommitGB'] } else { 12.0 }
+    $script:MmFloors = @{ ram = $ramA; commitAdaptive = $comA; commitGuard = $comG }
+  }
+  $f = $script:MmFloors
   $os = Get-MemInfo
+  $ram = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+  $commit = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
+  # The multiplication MUST be parenthesised: inside @(...) the comma binds TIGHTER than *, so
+  # `@($q, $q * 2, ...)` is `($q, $q, ...) * 2` - the whole list repeated twice, every value doubled
+  # in significance and `unified` never true (2026-11-21: the doctor row printed "N different floors"
+  # for a machine whose three numbers were identical).
+  # Only REAL floors count: a 0 means that gate is not configured, and listing it would report a
+  # disagreement between a number and an absence of one (doctor noise, not a finding).
+  $floors = @(@($queueGB, ($queueGB * 2), $f.commitGuard, $f.ram, $f.commitAdaptive) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+  [pscustomobject]@{
+    ramGB = $ram; commitGB = $commit
+    queueFloorGB = $queueGB; burstFloorGB = $queueGB * 2
+    commitGuardGB = $f.commitGuard; ramFloorGB = $f.ram; commitFloorGB = $f.commitAdaptive
+    floors = $floors; unified = ($floors.Count -eq 1)
+  }
+}
+function Test-FreeRam([double]$gb) {
   # Commit charge too: 2026-09-30 "memory allocation failed" with 50 GB RAM free because the commit
   # limit was exhausted (vmmemWSL). FreeVirtualMemory = commit limit - committed (KB).
-  $commitGb = [double](Get-Config).minFreeCommitGB
-  (($os.FreePhysicalMemory / 1MB) -ge $gb) -and ($gb -le 0 -or $commitGb -le 0 -or ($os.FreeVirtualMemory / 1MB) -ge $commitGb)
+  $mm = Get-MachineMemory ([double]$MinFreeGB)
+  ($mm.ramGB -ge $gb) -and ($gb -le 0 -or $mm.commitGuardGB -le 0 -or ($mm.commitGB -ge $mm.commitGuardGB))
 }
 
 function Expand-Resources([string]$kind, $repo) {
@@ -958,8 +1090,9 @@ function Invoke-Burst {
   $c = Get-Config
   $by = [math]::Max(1, [math]::Min([int]$c.burstMax, $(if ($By) { $By } else { 1 })))
   $min = [math]::Max(1, [math]::Min([int]$c.burstMaxMin, $Minutes))
-  if ($res -eq 'build:machine' -and -not (Test-FreeRam ([double]$MinFreeGB * 2))) {
-    [Console]::Error.WriteLine("agentq burst: refused - less than $([double]$MinFreeGB * 2) GB RAM (or commit headroom) free; a burst would OOM the machine. Use -Where cloud when available."); exit 3
+  $mm = Get-MachineMemory ([double]$MinFreeGB)
+  if ($res -eq 'build:machine' -and -not (Test-FreeRam $mm.burstFloorGB)) {
+    [Console]::Error.WriteLine("agentq burst: refused - less than $($mm.burstFloorGB) GB RAM (or commit headroom) free; a burst would OOM the machine. Use -Where cloud when available."); exit 3
   }
   New-Item -ItemType Directory -Force (QPath $res) | Out-Null
   $b = [ordered]@{ resource = $res; by = $by; until = (Iso ((Now).AddMinutes($min))); reason = $Reason; session = $Session; at = (Iso (Now)) }
@@ -992,7 +1125,8 @@ function Invoke-Propose {
         $actions += "bumped own ticket $($w.id) on $res (+20, waited $([math]::Round($waitedMin)) min)"
       }
     }
-    if ($res -eq 'build:machine' -and $mine -and -not (Test-Path (BurstFile $res)) -and (Test-FreeRam ([double]$MinFreeGB * 2))) {
+    $mm = Get-MachineMemory ([double]$MinFreeGB)
+    if ($res -eq 'build:machine' -and $mine -and -not (Test-Path (BurstFile $res)) -and (Test-FreeRam $mm.burstFloorGB)) {
       $b = [ordered]@{ resource = $res; by = 1; until = (Iso ((Now).AddMinutes(20))); reason = "propose: $Reason"; session = $Session; at = (Iso (Now)) }
       [IO.File]::WriteAllText((BurstFile $res), ($b | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
       $actions += 'opened burst build:machine +1 for 20 min (RAM headroom >= 2x gate)'
@@ -1383,6 +1517,7 @@ function Invoke-Commit {
   $t = New-Ticket $res $Purpose "commit $($plist -join ' ')" $repo.Top
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $Purpose; paths = $plist; repo = $repo.Name }
   $script:CommitDone = $false
+  $tPush = $null
   try {
     Wait-Turn $t $TimeoutMin $null
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
@@ -1430,7 +1565,23 @@ function Invoke-Commit {
       Write-Journal @{ event = 'commit'; resource = $res; sha = $sha; purpose = $Purpose; message = $Message; paths = $files; foreign = $foreign; repo = $repo.Name }
       if ($foreign) { [Console]::Error.WriteLine("agentq: WARNING commit $sha also contains files outside -Paths: $($foreign -join ', ')") }
       Write-Output "committed $sha ($($files.Count) files)"
-      if (-not $NoPush) {
+    } finally { Pop-Location }
+    # ---- push phase (ADR 0014 D1) ----------------------------------------------------------------
+    # The index lock ENDS here. Holding `commit:<repo>` across the pre-push gates (husky lint/typecheck,
+    # minutes) queued every other agent's `git add` behind it - commit:codai was held 9.2 h over 7 days,
+    # and an agent that only wants to commit waited for the length of someone else's gates. A push has its
+    # own ticket (push:<repo>, capacity 2) because it contends on the remote ref only, and the retry loop
+    # below already DEFERS when an incoming change overlaps another agent's uncommitted edits.
+    Drop-Ticket $t
+    if (-not $NoPush) {
+      $resPush = "push:$($repo.Name)"
+      Assert-NotMarked $resPush
+      $tPush = New-Ticket $resPush $Purpose "push $($repo.Name)" $repo.Top
+      Write-Journal @{ event = 'queued'; resource = $resPush; ticket = $tPush.id; purpose = $Purpose; repo = $repo.Name }
+      Wait-Turn $tPush $TimeoutMin $null
+      $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $resPush) | Where-Object { $_ }) -join ','
+      Push-Location $repo.Top
+      try {
         $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
         $pushed = $false
         for ($i = 1; $i -le 4 -and -not $pushed; $i++) {
@@ -1438,7 +1589,12 @@ function Invoke-Commit {
           if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
           # Only a lost race (remote moved) is worth fetch+merge+retry. A pre-push hook
           # rejection (failing gates) would re-run the gates 4x in silence and look frozen.
-          if (-not ($pushOut -match 'non-fast-forward|fetch first|rejected .*\(stale|Updates were rejected')) {
+          # A LOST RACE, not a refusal. Two pushes to the same branch may now overlap (push:<repo>, cap 2),
+          # and a bare/remote repo answers the loser with `! [remote rejected] HEAD -> main (failed to
+          # update ref)` - which the old pattern (non-fast-forward|fetch first|rejected .*(stale|Updates
+          # were rejected) did NOT match, so the loser threw and its commit stayed local (caught by
+          # test-agentq-commit-fast, 2026-11-21). "cannot lock ref" is the same race seen by a second pusher.
+          if (-not ($pushOut -match 'non-fast-forward|fetch first|rejected .*\(stale|Updates were rejected|failed to update ref|cannot lock ref')) {
             $pushOut | Select-Object -Last 25 | ForEach-Object { [Console]::Error.WriteLine($_) }
             Write-Journal @{ event = 'push-failed'; resource = $res; sha = $sha; branch = $branch; repo = $repo.Name }
             throw "push failed (not a race: pre-push hook or remote refused; output above). Commit $sha is local - fix and push again."
@@ -1469,14 +1625,14 @@ function Invoke-Commit {
         Write-Output "pushed $head -> origin/$branch"
         $acts = @(Notify-Landing $repo.Name $branch "$(& git rev-parse HEAD)".Trim() '')
         if ($acts) { Write-Output "releases following origin/${branch}: $($acts -join ', ')" }
-      }
-    } finally { Pop-Location }
+      } finally { Pop-Location }
+    }
   } catch {
     # DC-015: ~30 % of commit tickets ended with no commit and no journaled reason. Record it.
     $msg = "$($_.Exception.Message)"
     Write-Journal @{ event = $(if ($script:CommitDone) { 'push-failed' } else { 'commit-failed' }); resource = $res; purpose = $Purpose; reason = $msg.Substring(0, [math]::Min(400, $msg.Length)); paths = $plist; repo = $repo.Name }
     throw
-  } finally { Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue }
+  } finally { Drop-Ticket $t; Drop-Ticket $tPush }
 }
 
 function Show-Status {
@@ -1799,6 +1955,7 @@ $script:AqHelp = [ordered]@{
   'claim' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'claim -LeaseId <id> -Claims "apps/x/**,packages/y/**"'; d = 'declare the paths my lease owns (advisory; replaces the list)' }
   'unlease' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'unlease -Repo <slot dir> [-Slot <slot>] -LeaseId <id> [-Reason "..."] [-Force -Reason "..."]'; d = 'give the slot back (backs up anything unpushed first); a foreign break while the holder chat is live needs -Force' }
   'renew' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'renew [-LeaseId <id>] [-Repo <r>]'; d = 'refresh my lease heartbeat (a long job OUTSIDE the slot needs -Hold)' }
+  'recover' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'recover [-Repo r] [-Slot s] [-Ref <ref|sha|slot/stamp>] [-To <my slot path>] [-Apply]'; d = 'list the backups taken before a slot was reset / restore one; a take-over also notifies the previous holder'; e = 'agentq recover -Repo codai -Slot task-3' }
   'sweep' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'sweep [-WhatIf] [-Json]'; d = 'reap dead/stale tickets and leases, rotate the journal, prune state' }
   'who' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'who [<repo>] [-Json]'; d = 'one line per lease: is this slot really in use, by whom, is the holder alive' }
   'eval' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'eval -Resource <build:repo|install:repo|commit:repo|deploy:repo:target|slot:repo:slot> [-Sample] [-Json]'; d = 'instant verdict on preemption: PREEMPT-OK | WAIT | NEVER + the exact command to run'; e = 'agentq eval -Resource build:codai' }
@@ -1883,6 +2040,7 @@ switch ($Verb.ToLowerInvariant()) {
   'claim' { Invoke-Claim }
   'unlease' { Invoke-Unlease }
   'renew' { Invoke-Renew }
+  'recover' { Invoke-Recover }
   'sweep' { Invoke-Sweep }
   'who' { Invoke-Who }
   'eval' { Invoke-Eval }

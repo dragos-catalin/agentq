@@ -67,7 +67,16 @@ $l4 = Join-Path $tmp 'grow.log'
 $w = Start-Writer $l4 '1..200 | ForEach-Object { W "line $_"; Start-Sleep -Milliseconds 200 }'
 $r = Run-Wait @('-Log', $l4, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '2.5')
 Check 'wait-job TIMEOUT (exit 3) while log grows' ($r.code -eq 3 -and $r.out -match 'still running, keep working or investigate') "code=$($r.code)"
-Check 'wait-job never blocks past its bound (+ startup slack)' ($r.sec -lt 12) "$([math]::Round($r.sec,1))s"
+# The wall time of a Run-Wait call is pwsh STARTUP + the bound. Startup on a shared machine with 20+
+# peer agents ranges 0.5 s to 30 s (measured 2026-11-19: a full-suite run under contention reported
+# 40.4 s here with the product bound respected), so an absolute second count is a load test, not a
+# bound test. Calibrate on the same invocation shape with a 0.3 s bound, same tick, and compare.
+$lb = Join-Path $tmp 'boundbase.log'
+Set-Content -LiteralPath $lb -Value 'nothing yet'
+$b1 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
+$b2 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
+$base = [math]::Min($b1, $b2)   # startup + ~0.3 s bound
+Check 'wait-job never blocks past its bound (+ measured pwsh startup)' ($r.sec -lt ($base + 2.5 + 3)) "$([math]::Round($r.sec,1))s total; startup baseline $([math]::Round($base,1))s; bound 2.5s"
 Check 'wait-job prints one line per change, not per tick' (@($r.out -split "`n" | Where-Object { $_ -match 'log \d+ bytes' }).Count -le 20)
 $w | Stop-Process -Force -ErrorAction SilentlyContinue
 # -MaxMin above the hard cap is clamped to 10 (shown in the banner)

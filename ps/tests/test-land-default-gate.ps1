@@ -52,6 +52,7 @@ try {
   $after = (git -C $repo ls-remote origin refs/heads/dev).Split("`t")[0]
   Check '2 failing default gate -> exit 6' ($code -eq 6) $o
   Check '2 nothing pushed' ($before -eq $after)
+  Check '2 failure names the gate command' ($o -match "'pnpm land:gate'") $o
   # 3. -Gate none -> no gate, journaled skip, lands
   Topic 'g3' 'g3.txt'
   $o = AQ land -Branch g3 -Onto dev -Gate none -Purpose 'land g3'
@@ -65,6 +66,7 @@ try {
   Topic 'g4' 'g4.txt'
   $o = AQ land -Branch g4 -Onto dev -Purpose 'land g4'
   Check '4 unconfigured repo: no gate' ($code -eq 0 -and @(Gates | Where-Object { $_ -match 'land gate g4' }).Count -eq 0) $o
+  Check '4 unconfigured repo: NO GATE warning printed' ($o -match 'NO GATE for') $o
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }

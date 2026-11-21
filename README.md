@@ -2,6 +2,10 @@
 
 A queue for coding agents that share one machine or one repository.
 
+> Maintaining this repo? [docs/agent-contract.md](docs/agent-contract.md) is the short version of what
+> will bite you: never edit the installed copy, finish editing before running the suite, every new
+> behaviour needs a mutation-checked suite, pathspec-only commits, and a take-over must say what it saved.
+
 ## Problem
 
 Run two or three agents in the same repo and they collide on things worktrees do not isolate: the incremental build cache (`.next`, `.turbo`, `*.tsbuildinfo`), the package store during `pnpm install`, the git index during a commit, the deploy target, the machine's RAM. Each tool has its own lock file, if any. Those locks race, carry no reason, are invisible to other tools and outlive the process that took them. Nobody can answer "who holds the deploy, why, and since when", and nobody can freeze production during an incident so that every agent respects it.
@@ -10,16 +14,20 @@ agentq is the coordinator I have run on my own machine since September 2026 acro
 
 ## Approach
 
-- **Resources** are plain strings: `build:<repo>`, `build:machine` (capacity 2), `install:<repo>`, `commit:<repo>`, `deploy:<repo>:<target>`.
+- **Resources** are plain strings: `build:<repo>`, `build:machine` (capacity 2), `install:<repo>`, `commit:<repo>` (index + commit only), `push:<repo>` (the fetch/merge/push phase, capacity 2, so one agent's pre-push gate does not hold another agent's commit), `deploy:<repo>:<target>`, `slot:<repo>:<slot>`.
 - **Tickets** with a capacity per resource, scheduled by lane + priority + aging (PowerShell v3, [ADR 0002](docs/adr/0002-v3-scheduler-lanes-overrides-watchdog.md)); the TypeScript ACP-Lock daemon below is still FIFO.
 - **Leases**: a ticket expires unless it heartbeats. A holder whose process died is released at once. Waiting extends the lease, so a long queue never looks stale.
 - **Freeze marks**: `agentq mark -r deploy:web:prod --state frozen --reason "incident: 500s since 08:12Z"`. New tickets are refused with the reason; current holders finish.
 - **Journal**: every acquire, release, expiry, break, mark and note is appended to a hash-chained JSONL file. `agentq log` shows what others did; `agentq verify-journal` proves nothing was edited.
+- **Take-overs are loud and reversible**: a lease reset on a slot is preceded by a backup (`refs/backup/wt/<repo>/<slot>/<stamp>`, fails closed) and the new holder is told who was there, with the ref and the exact restore command. `agentq recover [-Repo r] [-Slot s] [-Ref <ref|sha|slot/stamp>] [-To <my slot>] [-Apply]` lists them and restores one — a preview unless `-Apply`, and never into the shared clone or another live session's slot.
 - **Protocol**: [ACP-Lock 0.1](spec/acp-lock.md), JSON-RPC 2.0 over local HTTP with a bearer token, and the same operations as MCP tools.
+- **Fair share, not first-come**: while two or more sessions compete on a resource with capacity ≥ 2, waiters are interleaved by round over sessions and a session may hold at most `ceil(cap / sessions)` slots, so one agent's fan-out cannot sit as a block in front of another session's single job. On by default; `fairShare` in `bin/agentq-config.json` or `AGENTQ_NO_FAIRSHARE=1` turns it off, and a refusal is journaled once as `fair-share` with the session, the held count and the share ([ADR 0014](docs/adr/0014-scheduler-bottlenecks.md) D4).
+- **An ungated land says so**: a repo with no `-Gate` and no `landGate` config still lands — that beats a land that never happens — but the land journals `land-ungated` and prints one line naming the repo and the two ways to close it. Silence is how an unchecked merge reaches every other agent.
 
 ```text
 agentq run -r build:web -p "typecheck after zod bump" -- pnpm typecheck
 agentq status web
+agentq recover -Repo web -Slot task-2
 agentq mark -r deploy:web:prod --state frozen --reason "incident: 500s since 08:12Z"
 agentq note "handoff: do not touch apps/api until migration 0124 lands"
 agentq log --limit 20
@@ -158,6 +166,23 @@ agentq coordinates **cooperating** agents. It is a traffic light, not a lock on 
 - Another process running as the same OS user: it can read the token. Use a per-user state directory on shared hosts.
 - Self-declared identity: `session` and `purpose` are not authenticated in 0.2.
 - A malicious daemon: the hash chain detects later tampering with the file, not a coordinator that lies. Signed entries are planned.
+
+## Operations
+
+Run the coordinator's own test suite from the checkout with `pwsh -NoProfile -File ps/tests/run-all.ps1`.
+A full serial run is ~70 min on this machine; `-Parallel 4` runs the suites that do not need the machine
+to themselves four at a time and is the way to keep a pre-commit gate usable. `-Only a,b` / `-Skip a,b`
+narrow it, `-LastGreen` prints the last full green run and exits 0/1 (record:
+`.copilot-tmp/last-green.json`), and `ps/install.ps1` skips the suite entirely when the record matches the
+current tree.
+
+`agentq doctor` reads real machine state as well as the fixture state, so two of its checks have an escape
+hatch for tests and for a machine whose limits are not configured yet:
+
+- `AGENTQ_DOCTOR_NO_TASKS=1` skips the scheduled-task check.
+- `AGENTQ_DOCTOR_NO_MEMORY=1` skips the free-RAM/commit-floors check and prints one `skipped` summary row.
+  Use it when a known, deliberate disagreement between the floors would otherwise show up as a warning in
+  an unrelated report - the floors themselves are a real gate either way (ADR 0014 D3).
 
 ## Roadmap
 

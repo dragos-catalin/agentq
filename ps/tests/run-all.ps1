@@ -72,11 +72,19 @@ $suites = [ordered]@{
   'land install'   = @('-File', (Join-Path $PSScriptRoot 'test-land-install.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'admission'       = @('-File', (Join-Path $PSScriptRoot 'test-agentq-admission.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-21: the release `phase` is the last checkpoint ENTERED, not the step that failed; the display
+  # must show `last-phase=` + the run's own `exit=` separately, and the record keeps its `phase` field.
+  'release phase honesty' = @('-File', (Join-Path $PSScriptRoot 'test-release-phase-honesty.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'prune'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-prune.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'doctor'          = @('-File', (Join-Path $PSScriptRoot 'test-agentq-doctor.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'agentq-sync'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-sync.ps1'), '-Bin', $bin)
   'hook pre'        = @('-File', (Join-Path $PSScriptRoot 'test-hook-pre.ps1'), '-Hooks', $hooks)
   'install'         = @('-File', (Join-Path $PSScriptRoot 'test-install.ps1'), '-Src', $root)
+  # 2026-11-21 (ADR 0014): take-over + `recover` safety net, the commit/push split (D1), the
+  # per-session fair share of a resource (D4). Without these lines the suites existed and never ran.
+  'recover'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-recover.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'commit fast'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-commit-fast.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  'fair share'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-fairshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
 if ($List) { $names | ForEach-Object { Write-Host $_ }; exit 0 }
