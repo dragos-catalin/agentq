@@ -25,6 +25,10 @@ evidence and what is still open for each row.
 - **Pre-gate.** `agentq land` run from a leased task slot runs the gate on the rebased result in that slot before it
   takes the land ticket. A failing gate exits 6 before the queue. Config: `landPregate`, `landPregateRounds`.
   `AGENTQ_LAND_NO_PREGATE=1` turns it off. Journal: `land-pregate-ok`, `land-pregate-failed`, `land-pregate-skipped`.
+- **The gate command.** `landGate.<repo>` (config) is what the land runs; `gateSuites.<repo>` names the suites and
+  `run-all.ps1 -RepoSuites` resolves them, so the list has one home and cannot drift from what an
+  `install.ps1 -RepoSuites` gate runs. A missing key or a name that is no suite here exits 2, never a silent
+  run-everything. agentq's own gate: `landGate.agentq` -> `-RepoSuites -Parallel 4` (17 suites, ~7 min).
 - **Green ledger.** A tree that passed a gate command is remembered for `greenTtlHours` (168) and is not gated again in
   the queue. Journal: `land-gate-skipped-green`. `AGENTQ_NO_GREEN=1` turns it off.
 
