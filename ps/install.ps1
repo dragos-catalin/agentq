@@ -6,6 +6,10 @@
   -Suites a,b   run only these suites (names from tests/run-all.ps1 -List) instead of all of them:
                 the full set takes hours on a busy workstation, so a small fix is gated by the suites
                 that cover it. -SkipTests installs without any gate (say why in the commit / tracker).
+  -RepoSuites   run the repo's persisted gate list instead (bin/agentq-config.json -> gateSuites.<repo>),
+                the SAME list `landGate.<repo>` runs, so "the suites I usually run" lives in one place
+                and cannot drift from what the land gate checks. -Suites and -RepoSuites are exclusive.
+                The list is resolved by tests/run-all.ps1 (one implementation); a missing key refuses.
   -Parallel n   suites to run at once (default 4; 1 = the old one-after-another order). Measured on the
                 2026-11-20 set: 8 suites 416 s serial -> 185 s at -Parallel 8. Suites that must own the
                 machine (install, term interrupt, reap terminals, git-autosync, guard cloud) still run
@@ -29,7 +33,7 @@
   `agentq doctor` compares the live files against it.
   AGENTQ_INSTALL_DIR overrides the destination (tests).
 #>
-param([switch]$Check, [switch]$SkipTests, [switch]$Full, [string[]]$Suites, [int]$Parallel = 4, [switch]$Foreground)
+param([switch]$Check, [switch]$SkipTests, [switch]$Full, [string[]]$Suites, [switch]$RepoSuites, [int]$Parallel = 4, [switch]$Foreground)
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
 $cfgKey = 'bin\agentq-config.json'
@@ -103,6 +107,18 @@ $map = [ordered]@{
   # value). A suite in run-all belongs in this map too, or the install gate cannot run what it never
   # installed - the same gap `test-land-default-gate.ps1` had (see the note above).
   'tests\test-script-scope.ps1' = 'bin\test-script-scope.ps1'
+  # 2026-11-22 (objective (c)): the rest of the drift the new `install wiring` suite found - 8 files a
+  # gate suite references that this map never carried, so the INSTALLED gate could not run those suites
+  # at all (it runs from ~/.copilot, where those files did not exist). The tool counts double: without
+  # `bin\shared-clone-janitor.ps1` even the checkout cannot run `shared janitor`.
+  'bin\shared-clone-janitor.ps1' = 'bin\shared-clone-janitor.ps1'
+  'tests\test-agentq-shared-commit.ps1' = 'bin\test-agentq-shared-commit.ps1'
+  'tests\test-agentq-lease-liveness.ps1' = 'bin\test-agentq-lease-liveness.ps1'
+  'tests\test-land-install.ps1' = 'bin\test-land-install.ps1'
+  'tests\test-agentq-sync.ps1' = 'bin\test-agentq-sync.ps1'
+  'tests\test-install.ps1' = 'bin\test-install.ps1'
+  'tests\test-shared-clone-janitor.ps1' = 'bin\test-shared-clone-janitor.ps1'
+  'tests\test-install-wiring.ps1' = 'bin\test-install-wiring.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.
@@ -165,12 +181,14 @@ foreach ($k in $map.Keys) {
 }
 if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; exit 0 }
 if (-not $SkipTests) {
+  if ($RepoSuites -and $Suites) { throw 'install: pass either -Suites or -RepoSuites, not both' }
   $raArgs = @()
   if ($Suites) { $raArgs += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
+  if ($RepoSuites) { $raArgs += '-RepoSuites' }
   if ($Parallel -gt 1) { $raArgs += @('-Parallel', "$Parallel") }
   # Instant repeat: a full green run of THIS content is already the gate (run-all.ps1 writes the hash).
   $alreadyGreen = $false
-  if (-not $Suites -and -not $Full) {
+  if (-not $Suites -and -not $RepoSuites -and -not $Full) {
     $gf = Join-Path (Split-Path -Parent $src) '.copilot-tmp\last-green.json'
     $fresh = $false
     $fresh = Test-GreenRecordFresh $gf

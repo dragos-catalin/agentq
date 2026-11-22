@@ -1,7 +1,10 @@
 # Runs every ps/ test suite against THIS checkout (not the installed copy). Exit 0 only if all pass.
 # No arguments = every suite, one after another: ps/install.ps1 depends on that and on the exit code.
 #   -Only a,b / -Skip a,b   suite names (exact, case-insensitive; one comma-separated value also works)
-#   -List                   print the suite names, exit 0
+#   -RepoSuites             run the persisted gate list for this repo (bin/agentq-config.json ->
+#                           gateSuites.<repo>, env AGENTQ_CONFIG overrides the file). With -List it
+#                           prints the resolved names. A missing key or an unknown name exits 2.
+#   -List                   print the suite names (the resolved ones with -RepoSuites), exit 0
 #   -LogDir <dir>           full output of every suite in <dir>\<name>.log
 #   -TimeoutMin n           kill a suite (whole process tree) after n minutes and count it as failed
 #   -Parallel n            run up to n suites at once (default 1 = one after another). Suites that must
@@ -16,7 +19,7 @@
 # outside ps/ (env, a machine tool) - `install.ps1 -Full` and this -LastGreen are the way to check.
 # Exit: 0 all pass, 1 a suite failed or nothing ran, 2 bad arguments. More: README.md next to this file.
 [CmdletBinding(PositionalBinding = $false)]
-param([string[]]$Only, [string[]]$Skip, [switch]$List, [switch]$LastGreen, [string]$LogDir, [int]$TimeoutMin = 0, [int]$Parallel = 1,
+param([string[]]$Only, [string[]]$Skip, [switch]$List, [switch]$RepoSuites, [switch]$LastGreen, [string]$LogDir, [int]$TimeoutMin = 0, [int]$Parallel = 1,
   [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
 $ErrorActionPreference = 'Continue'
 # Without this a second bare word would bind to the next parameter (-Only a b = "skip b").
@@ -51,6 +54,10 @@ $suites = [ordered]@{
   'help'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-help.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # static guard for the 2026-11-22 class: a script-scope `$null` reset after a real value
   'script scope'   = @('-File', (Join-Path $PSScriptRoot 'test-script-scope.ps1'), '-Ps', $root)
+  # 2026-11-22: the WIRING between this table and install.ps1's map. A suite whose tool is not in the
+  # map is a suite the INSTALLED gate cannot run (`test-land-default-gate.ps1` was that for a week), and
+  # gateSuites.<repo> - the list landGate.<repo> runs - must name real suites that are all installed.
+  'install wiring' = @('-File', (Join-Path $PSScriptRoot 'test-install-wiring.ps1'), '-Ps', $root)
   # ADR 0003 wave 2/4
   'land finalize'  = @('-File', (Join-Path $PSScriptRoot 'test-land-finalize.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'post-land hook' = @('-File', (Join-Path $PSScriptRoot 'test-post-land.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
@@ -109,7 +116,39 @@ $suites = [ordered]@{
   'shared janitor'  = @('-File', (Join-Path $PSScriptRoot 'test-shared-clone-janitor.ps1'), '-Tool', (Join-Path $bin 'shared-clone-janitor.ps1'), '-Agentq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
-if ($List) { $names | ForEach-Object { Write-Host $_ }; exit 0 }
+# -RepoSuites: the suites THIS repo's gate runs, from bin/agentq-config.json -> gateSuites.<repo>
+# (env AGENTQ_CONFIG overrides the path, exactly as in every other consumer). One home for the list, so
+# a landGate or an install gate NAMES it instead of repeating 16 suite names that then drift apart -
+# owner 2026-11-22: the list lived only in an agent's scratch script. Loud on every failure mode: a
+# missing key, an unparseable config or a name that is not a suite here exits 2, never a silent
+# run-everything (an empty -Only means "all", which is the expensive wrong answer).
+if ($RepoSuites) {
+  $cfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $root 'bin\agentq-config.json' }
+  if (-not (Test-Path -LiteralPath $cfgPath)) { Write-Host "run-all: -RepoSuites: no config at $cfgPath"; exit 2 }
+  $cfgObj = $null
+  try { $cfgObj = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json -AsHashtable } catch { Write-Host "run-all: -RepoSuites: cannot parse $($cfgPath): $($_.Exception.Message)"; exit 2 }
+  # The repo NAME, not the directory leaf: agentq's Get-RepoInfo and run-build's Get-RepoLeafName both
+  # take the leaf of the parent of the git COMMON dir, so a leased slot (E:\gh\.wt\agentq\task-1) names
+  # the same repo as the main clone. A plain directory leaf would look up gateSuites.task-1 and refuse -
+  # and the land gate runs in exactly such a slot.
+  $top = Split-Path -Parent $root
+  $repoKey = ''
+  $common = "$(& git -C $top rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+  if ($LASTEXITCODE -eq 0 -and $common -and (Test-Path -LiteralPath $common)) { $repoKey = Split-Path (Split-Path ($common -replace '/', '\') -Parent) -Leaf }
+  if (-not $repoKey) { $repoKey = Split-Path -Leaf $top }
+  $gs = if ($cfgObj -is [Collections.IDictionary] -and $cfgObj.ContainsKey('gateSuites')) { $cfgObj['gateSuites'] } else { $null }
+  # NOTE: do NOT call any of these `$list` - variables are case-insensitive, so `$list` IS the -List
+  # switch parameter, and assigning an array to it throws "Boolean parameters accept only Boolean
+  # values". Cost one debugging round on 2026-11-22; the same shape as the clobber class the
+  # `script scope` suite guards, but a parameter collision instead of a `$null` reset.
+  $gateList = if ($gs -is [Collections.IDictionary] -and $gs.ContainsKey($repoKey)) { @($gs[$repoKey] | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) } else { @() }
+  if (-not $gateList.Count) { Write-Host "run-all: -RepoSuites: no gateSuites.$repoKey in $cfgPath - add the list there (or pass -Only '<names>')"; exit 2 }
+  $known = @{}; foreach ($n in $names) { $known[$n.ToLowerInvariant()] = $true }
+  $unknown = @($gateList | Where-Object { -not $known.ContainsKey("$_".ToLowerInvariant()) })
+  if ($unknown.Count) { Write-Host "run-all: -RepoSuites: gateSuites.$repoKey names no suite here: $($unknown -join ', ')"; Write-Host "valid names: $($names -join ', ')"; exit 2 }
+  $Only = $gateList
+}
+if ($List) { if ($Only) { $Only | ForEach-Object { Write-Host $_ } } else { $names | ForEach-Object { Write-Host $_ } }; exit 0 }
 
 # ---- the green record: hash of ps/ + the PowerShell build (a full green run writes it, install.ps1 reads it)
 # $root is ps/ (test paths are relative to it); the record lives at the REPO root, outside the hashed tree.
