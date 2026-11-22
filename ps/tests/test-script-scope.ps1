@@ -44,7 +44,9 @@ function Get-RuleA([hashtable]$src) {
   foreach ($name in $src.Keys) {
     $lines = $src[$name]
     for ($i = 0; $i -lt $lines.Count; $i++) {
-      if ($lines[$i] -notmatch '^\$script:') { continue }                       # a script-scope reset at column 0
+      # a script-scope reset at column 0. A bare `$X = $null` at column 0 is the same slot as `$script:X`
+      # in a `pwsh -File` script, so both forms are in scope.
+      if ($lines[$i] -notmatch '^\$(script:)?[A-Za-z_]') { continue }
       foreach ($a in (Get-Assignments $lines[$i])) {
         if (-not (Test-Nullish $a.Rhs)) { continue }
         $realBefore = $false; $readAfter = $false
@@ -136,6 +138,13 @@ $m = Get-Clobber $tmp
 $names = @(@($m.A) + @($m.B) | ForEach-Object Name | Sort-Object -Unique)
 Check '3 mutation: rule A catches the -Lane/-Priority/-Capacity pre-init' (@($m.A | Where-Object Name -in 'Lane', 'Priority', 'Capacity', 'CapacityGiven').Count -ge 4) ("names=" + ($names -join ','))
 Check '3 mutation: rule B catches the v2 ReadOnly wipe' (@($m.B | Where-Object Name -eq 'ReadOnly').Count -ge 1) ("names=" + ($names -join ','))
+# 4) the bare form (`$Lane = $null`, no `$script:` prefix) is the same slot in a `pwsh -File` script
+$bare = $tmp + 'b'
+New-Item -ItemType Directory -Force (Join-Path $bare 'bin') | Out-Null
+[IO.File]::WriteAllText((Join-Path $bare 'bin\agentq.ps1'), $t.Replace('Set-StrictMode -Version 3', "Set-StrictMode -Version 3`n" + '$Lane = $null'))
+$mb = Get-Clobber $bare
+Check '4 mutation: rule A catches the bare form too' (@($mb.A | Where-Object Name -eq 'Lane').Count -ge 1) ("names=" + (@($mb.A | ForEach-Object Name | Sort-Object -Unique) -join ','))
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $bare -ErrorAction SilentlyContinue
 
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }
