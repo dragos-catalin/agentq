@@ -39,6 +39,8 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   `landPregateFromMain` (default true), `landPregateScratchWaitMin` (default 1, 0 = skip at once). Measured the
   day before: a land of the gate slice spent its whole queue-side gate on a defect that came from main, which an
   in-slot pre-gate catches before queueing.
+- `agentq slo` counts that released slot per repo (`pregateSlotReleased`, table column `preSlot`): a land that
+  took a scratch slot for its pre-gate is visible in the ticket summary instead of only in the journal.
 - `install wiring` gained two file-level checks and their mutation: every suite's own `-File` is a map key (a
   suite the installer never carries cannot gate anything - the `test-land-default-gate.ps1` gap, generalised),
   and every map **destination** is unique and resolves inside the install root (a duplicate silently loses a
