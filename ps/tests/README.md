@@ -15,15 +15,15 @@ pwsh -NoProfile -File ps/tests/run-all.ps1 -Skip jobs -LogDir .copilot-tmp/logs 
 
 A full run takes a long time, hours on a busy machine. Use `-Only` while you work.
 
-| Switch or variable     | Meaning                                                                                     |
-| ---------------------- | ------------------------------------------------------------------------------------------- |
-| `-Only a,b`            | Run only these suites. Names are exact and not case-sensitive.                              |
-| `-Skip a,b`            | Leave these suites out.                                                                     |
-| `-List`                | Print the suite names and exit 0.                                                           |
+| Switch or variable     | Meaning                                                                                                                                                                                                                                                                                   |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-Only a,b`            | Run only these suites. Names are exact and not case-sensitive.                                                                                                                                                                                                                            |
+| `-Skip a,b`            | Leave these suites out.                                                                                                                                                                                                                                                                   |
+| `-List`                | Print the suite names and exit 0.                                                                                                                                                                                                                                                         |
 | `-RepoSuites`          | Run the persisted gate list of this repo (`bin/agentq-config.json` → `gateSuites.<repo>`; `AGENTQ_CONFIG` overrides the file). With `-List` it prints the resolved names. A missing key, an unreadable config or a name that is not a suite here exits 2 — never a silent run-everything. |
-| `-LogDir <dir>`        | Write the full output of every suite to `<dir>\<name>.log`, pass or fail.                   |
-| `-TimeoutMin n`        | Stop a suite and everything it started after `n` minutes and count it as failed. 0 = never. |
-| `AGENTQ_TEST_SKIP=a,b` | Same as `-Skip`. Lets a caller skip suites without changing its command line.               |
+| `-LogDir <dir>`        | Write the full output of every suite to `<dir>\<name>.log`, pass or fail.                                                                                                                                                                                                                 |
+| `-TimeoutMin n`        | Stop a suite and everything it started after `n` minutes and count it as failed. 0 = never.                                                                                                                                                                                               |
+| `AGENTQ_TEST_SKIP=a,b` | Same as `-Skip`. Lets a caller skip suites without changing its command line.                                                                                                                                                                                                             |
 
 Pass several names as one comma-separated value. A name that is not in `-List` is an error.
 
