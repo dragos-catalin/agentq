@@ -279,6 +279,14 @@ while ($i -lt $argv.Count) {
   $i++
 }$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
+# pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22)
+$script:Lane = $null
+$script:LandExit = $null
+$script:DoctorExit = $null
+$script:Priority = $null
+$script:i = $null
+$script:CapacityGiven = $null
+$script:Capacity = $null
 
 # ADR 0009 stage 0 (OQ-007): these verbs only READ the state folder. Before, `status` reaped dead
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
@@ -340,12 +348,33 @@ function Iso([datetime]$d) { $d.ToUniversalTime().ToString('o') }
 # (3 h off here), which made every holder look dead/stale. Always parse through this.
 function ParseUtc($s) { if ($s -is [datetime]) { return $s.ToUniversalTime() }; [DateTimeOffset]::Parse("$s", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
 
+# The LONG-LIVED process that owns this agentq call. Incident 2026-11-22: the owner was the PARENT pid,
+# which in agent harnesses (Copilot CLI/app, Claude Code, Codex) is the throw-away shell of ONE tool call.
+# Every lease looked "owner alive=False" seconds after it was taken and was expired + reset at 45 min
+# (63 of 82 expiries on 2026-11-21/22, most with 10-42 dirty files) - agents saw it as lost work.
+# Walk up to the first agent host; a plain terminal keeps the old answer (the interactive parent shell).
+$script:AgentHostNames = @('copilot', 'claude', 'codex', 'Code', 'Code - Insiders', 'cursor', 'windsurf', 'copilotapphost')
+$script:AgentHostPidCache = $null
+function Get-AgentHostPid {
+  if ($null -ne $script:AgentHostPidCache) { return $script:AgentHostPidCache }
+  $parent = 0
+  try {
+    $p = (Get-Process -Id $PID).Parent
+    if ($p) { $parent = $p.Id }
+    for ($i = 0; $p -and $i -lt 8; $i++) {
+      if ($script:AgentHostNames -contains $p.ProcessName) { $script:AgentHostPidCache = $p.Id; return $p.Id }
+      $p = $p.Parent
+    }
+  } catch {}
+  $script:AgentHostPidCache = $(if ($parent) { $parent } else { $PID })
+  $script:AgentHostPidCache
+}
 function Get-SessionId {
-  foreach ($v in $env:AGENTQ_SESSION, $env:COPILOT_SESSION_ID, $env:CLAUDE_SESSION_ID) { if ($v) { return $v } }
-  # Stable per terminal: the parent shell pid. Get-Process .Parent costs ~20 ms; the CIM query it
-  # replaced cost ~570 ms on EVERY agentq call (measured 2026-10-06).
-  $pp = try { (Get-Process -Id $PID).Parent.Id } catch { 0 }
-  "term-$pp"
+  # COPILOT_AGENT_SESSION_ID: the Copilot CLI/app session (stable across tool calls and CLI restarts).
+  foreach ($v in $env:AGENTQ_SESSION, $env:COPILOT_SESSION_ID, $env:COPILOT_AGENT_SESSION_ID, $env:CLAUDE_SESSION_ID, $env:CODEX_SESSION_ID) { if ($v) { return $v } }
+  # Stable per terminal/agent host. Get-Process .Parent costs ~20 ms; the CIM query it replaced cost
+  # ~570 ms on EVERY agentq call (measured 2026-10-06).
+  "term-$(Get-AgentHostPid)"
 }
 $Session = Get-SessionId
 
@@ -385,7 +414,6 @@ function Test-IsMainWorktree([object]$repo) {
 }
 function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
   if (-not $repo -or -not $repo.Top -or -not $repo.Common) { return }
-  if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1') { return }
   if (-not (Test-IsMainWorktree $repo)) { return }               # a linked worktree (leased slot): fine
   $norm = { param($p) ([IO.Path]::GetFullPath("$p")).TrimEnd('\', '/').ToLowerInvariant() }
   # Top is the worktree path, Common the shared .git: they are equal only in the shared clone itself.
@@ -398,7 +426,13 @@ function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
   if ($mode -ne 'refuse') { return }
   $slotsDir = Join-Path (Split-Path $repo.Top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $repo.Name)
   if (-not (Test-Path -LiteralPath $slotsDir)) { return }        # repo without slots: nothing to protect
-  [Console]::Error.WriteLine("agentq: REFUSED - $($repo.Top) is the SHARED clone of $($repo.Name), which agentq-config.json marks sharedCloneMode=refuse. A $verb here is what leaves the clone dirty and makes git-autosync refuse (2026-11-18: 15 unpushed commits on codai). Lease a slot: agentq lease -Purpose <why> [-Branch <topic>], work + commit + push there, then unlease. Deliberate one-off: set AGENTQ_SHARED_CLONE_COMMIT_OK=1 (journaled).")
+  # Owner-only override, journaled and with a reason (2026-11-22: agents copied the bypass from the
+  # refusal text itself and left unpushed commits on shared main again, so it is no longer advertised).
+  if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1' -and $env:AGENTQ_SHARED_CLONE_REASON) {
+    Write-Journal @{ event = 'shared-clone-override'; repo = $repo.Name; verb = $verb; reason = "$env:AGENTQ_SHARED_CLONE_REASON" }
+    return
+  }
+  [Console]::Error.WriteLine("agentq: REFUSED - $($repo.Top) is the SHARED clone of $($repo.Name) (sharedCloneMode=refuse). Agents never $verb here: it leaves the clone dirty, blocks git-autosync and collides with other agents. Lease a slot: agentq lease -Purpose <why> [-Branch <topic>], copy your changes there, commit + land, then unlease. Do NOT look for a bypass.")
   Write-Journal @{ event = 'shared-clone-refused'; repo = $repo.Name; verb = $verb; note = 'shared clone of a repo marked read-only' }
   exit 3
 }
