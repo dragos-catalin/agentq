@@ -184,6 +184,7 @@ assert.deepEqual(rep.landTicket.byRepo.r, {
     pregateConflict: 0,
     pregateSkipped: 0,
     gateSkippedGreen: 0,
+    pregateSlotReleased: 0,
 });
 // older journal lines (no chat fields) are neither lost-with-live-chat nor own-chat breaks
 assert.deepEqual(rep.slots.byRepo.r, {
@@ -268,6 +269,15 @@ const lines2 = [
     j({ ts: TS("00:59:20"), event: "land-pregate-failed", repo: "alpha", resource: "land:alpha", session: "L9" }),
     j({ ts: TS("00:59:30"), event: "land-pregate-conflict", repo: "alpha", resource: "land:alpha", session: "L9" }),
     j({ ts: TS("00:59:40"), event: "land-pregate-skipped", repo: "alpha", resource: "land:alpha", session: "L9" }),
+    j({
+        ts: TS("00:59:50"),
+        event: "land-pregate-slot-released",
+        repo: "alpha",
+        resource: "land:alpha",
+        session: "L9",
+        slot: "scratch-1",
+        exit: 0,
+    }),
     j({ ts: TS("01:00:00"), event: "acquired", resource: "land:alpha", session: "L1", waitSec: 1200 }),
     j({ ts: TS("01:00:20"), event: "land-gate-skipped-green", repo: "alpha", resource: "land:alpha", session: "L1" }),
     j({ ts: TS("01:00:50"), event: "land", repo: "alpha", resource: "land:alpha", session: "L1" }), // hold 50 s
@@ -448,6 +458,7 @@ try {
         pregateConflict: 1,
         pregateSkipped: 1,
         gateSkippedGreen: 3,
+        pregateSlotReleased: 1,
     });
     assert.deepEqual(rep2.landTicket.byRepo.beta, {
         lands: 2,
@@ -463,6 +474,7 @@ try {
         pregateConflict: 0,
         pregateSkipped: 0,
         gateSkippedGreen: 0,
+        pregateSlotReleased: 0,
     });
     assert.deepEqual(Object.keys(rep2.landTicket.byRepo), ["alpha", "beta"]);
 
@@ -551,7 +563,7 @@ try {
     assert.match(txt2, /total 1\.9 h in 7 d = 0\.3 h\/day; 12 waits, 4 over 10 min/);
     assert.match(txt2, /build:alpha\s+3\s+10\.0m\s+11\.7m\s+11\.7m\s+23\.4m\s+2\n/);
     assert.match(txt2, /LAND TICKET/);
-    assert.match(txt2, /alpha\s+4\s+2\s+5\s+44\.8m\s+9\.0m\s+20\.0m\s+1\s+19\.0m\s+2\s+1\s+1\s+1\s+3\n/);
+    assert.match(txt2, /alpha\s+4\s+2\s+5\s+44\.8m\s+9\.0m\s+20\.0m\s+1\s+19\.0m\s+2\s+1\s+1\s+1\s+3\s+1\n/);
     assert.match(txt2, /SLOTS LOST WITH A LIVE CHAT \(chat idle <= 30 min; lease-break 6, lease-expire 5 in window\)/);
     assert.match(txt2, /ALL\s+4\s+2\s+2\s+2\s+6\s+5/);
     assert.match(txt2, /HOOK COST/);

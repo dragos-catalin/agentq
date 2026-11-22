@@ -72,6 +72,8 @@ const LAND_STAGE0 = {
     "land-pregate-conflict": "pregateConflict",
     "land-pregate-skipped": "pregateSkipped",
     "land-gate-skipped-green": "gateSkippedGreen",
+    // a land started from the shared clone took a scratch slot for the pre-gate and gave it back
+    "land-pregate-slot-released": "pregateSlotReleased",
 };
 
 export function parseArgs(argv) {
@@ -175,6 +177,7 @@ const newLandTicket = () => ({
     pregateConflict: 0,
     pregateSkipped: 0,
     gateSkippedGreen: 0,
+    pregateSlotReleased: 0,
 });
 const newSlots = () => ({
     lostLiveChat: 0,
@@ -624,6 +627,7 @@ function summarizeLandTicket(landT) {
             pregateConflict: lt.pregateConflict,
             pregateSkipped: lt.pregateSkipped,
             gateSkippedGreen: lt.gateSkippedGreen,
+            pregateSlotReleased: lt.pregateSlotReleased,
         };
     }
     return { byRepo };
@@ -880,6 +884,7 @@ export function render(rep) {
                     "preConf",
                     "preSkip",
                     "skipGreen",
+                    "preSlot",
                 ],
                 lt.map(([n, s]) => [
                     n,
@@ -896,6 +901,7 @@ export function render(rep) {
                     s.pregateConflict,
                     s.pregateSkipped,
                     s.gateSkippedGreen,
+                    s.pregateSlotReleased,
                 ]),
             ),
         );
