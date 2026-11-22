@@ -279,14 +279,16 @@ while ($i -lt $argv.Count) {
   $i++
 }$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
-# pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22)
-$script:Lane = $null
+# Pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22). Only the two
+# exit codes need it; every other name here has its default in the initialiser block ABOVE the argument loop.
+# DO NOT re-add `$script:Lane` / `$script:Priority` / `$script:Capacity` / `$script:CapacityGiven` to this
+# block: in a script file the top-level scope IS the script scope, so `$script:Lane = $null` and
+# `$Lane = $null` are the SAME slot - written after the parse loop they wiped the flags just read, so every
+# `-Lane`, `-Priority` and `-Capacity` was silently ignored (all tickets got lane `gate` + priority 0 and
+# the v3 scheduler's soft slots and priority order never fired; the three red cases of test-agentq-v3.ps1,
+# 2026-11-22). The same slot aliasing is why `$script:i = $null` went too - it clobbered the arg index.
 $script:LandExit = $null
 $script:DoctorExit = $null
-$script:Priority = $null
-$script:i = $null
-$script:CapacityGiven = $null
-$script:Capacity = $null
 
 # ADR 0009 stage 0 (OQ-007): these verbs only READ the state folder. Before, `status` reaped dead
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and

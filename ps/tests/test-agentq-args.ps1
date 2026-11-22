@@ -34,5 +34,26 @@ try {
   # 4 lost '--' on run: explicit hint
   $o = @(& pwsh -NoProfile -Command "& '$Aq' run -Resource build -Purpose x pnpm install" 2>&1) -join "`n"
   Check '4 lost -- explained' ($o -match "must follow '--'") $o
+  # 5 the v3 scheduling flags reach the ticket, not just the parser. Regression 2026-11-22: a
+  # "pre-initialise so StrictMode cannot throw" block was written AFTER the parse loop, and because the
+  # top-level scope IS the script scope, `$script:Lane/$script:Priority/$script:Capacity = $null` wiped
+  # the flags just parsed - every ticket got lane `gate` + priority 0, so the v3 soft slots (quick burst,
+  # beside-batch) and the priority order never fired. That is what made three cases of
+  # test-agentq-v3.ps1 red. The flags are read off the ticket file, so this pins the parse -> ticket path.
+  $cfg = Join-Path $tmp 'agentq-config.json'
+  @{ machineCap = 1; quickBurst = 1; agingMin = 0; minFreeCommitGB = 0 } | ConvertTo-Json | Set-Content $cfg
+  $env:AGENTQ_CONFIG = $cfg; $env:AGENTQ_NO_ADMISSION = '1'
+  $a5 = @('-NoProfile', '-File', $Aq, 'run', '-Resource', 'build', '-Purpose', 'flags-probe', '-Lane', 'quick', '-Priority', '33', '-Capacity', '2', '-MinFreeGB', '0', '-TimeoutMin', '2', '--', 'pwsh', '-NoProfile', '-Command', 'Start-Sleep -Seconds 12')
+  $p5 = Start-Process pwsh -ArgumentList $a5 -WorkingDirectory $repo -PassThru -WindowStyle Hidden
+  $q5 = Join-Path $env:AGENTQ_HOME 'queues'
+  $t5 = @()
+  for ($k = 0; $k -lt 40 -and -not $t5.Count; $k++) {
+    Start-Sleep -Milliseconds 400
+    $t5 = @(Get-ChildItem $q5 -Recurse -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $_.purpose -eq 'flags-probe' })
+  }
+  $cap5 = @(Get-ChildItem $q5 -Recurse -Filter 'capacity' -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'build_repo' } | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() })
+  Check '5 -Lane/-Priority/-Capacity reach the ticket' (($t5.Count -ge 1) -and -not ($t5 | Where-Object { $_.lane -ne 'quick' -or [int]$_.prio -ne 33 }) -and ($cap5 -contains '2')) ("tickets=" + $t5.Count + " lane=" + (($t5 | ForEach-Object lane) -join ',') + " prio=" + (($t5 | ForEach-Object prio) -join ',') + " cap=" + ($cap5 -join ','))
+  $p5.WaitForExit(30000) | Out-Null
+  Remove-Item Env:AGENTQ_CONFIG, Env:AGENTQ_NO_ADMISSION -ErrorAction SilentlyContinue
 } finally { Pop-Location; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

@@ -15,7 +15,10 @@ $script:GateSec = $null
 $script:PickBad = $null
 $script:LandAcc = $null
 $script:SlotWorkCache = $null
-$script:ReadOnly = $null
+# `$script:ReadOnly` is NOT reset here: agentq.ps1 computes it (from the verb) at its line ~295 and only
+# dot-sources this file at ~1922, so `$script:ReadOnly = $null` here wiped it and turned every READ-ONLY
+# verb (status/log/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
+# comment in agentq.ps1 says was fixed. Verified by ps/tests/test-status-readonly.ps1 (2026-11-22).
 $script:GateExit = $null
 $script:PregateResult = $null
 
