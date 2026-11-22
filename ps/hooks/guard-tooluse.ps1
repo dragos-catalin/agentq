@@ -273,11 +273,70 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
   } catch { }
 }
 
+# ---- shared-clone predicate (mirrors agentq Assert-SharedCloneWriteAllowed, 2026-11-22) ------
+# A hook cannot import agentq.ps1, so the test is written ONCE here so Rule A (a raw git commit)
+# and Rule B (a plan/*.csv write) cannot drift apart. True ONLY for the repo's MAIN working tree
+# (a leased slot is a LINKED worktree: git-dir != git-common-dir) that agentq-config.json marks
+# sharedCloneMode=refuse (a per-repo sharedCloneModeRepos entry wins) and that HAS slots
+# (<parent-of-top>\.wt\<repo>). AGENTQ_SHARED_CLONE_COMMIT_OK=1 is agentq's own documented one-off
+# escape and disables it. Returns @{ top = <main worktree>; repo = <name> }, or $null. Never blocks.
+# All three paths come from ONE `git rev-parse`: on Windows each spawn is ~50-80 ms and Rule A/B are
+# the only rules that need git, so this is the whole discovery cost of the call.
+function Get-GuardSharedClone([string]$dir) {
+  if (-not $dir) { return $null }
+  if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1') { return $null }
+  try { $lines = @(& git -C $dir rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir 2>$null) } catch { return $null }
+  if ($LASTEXITCODE -ne 0 -or $lines.Count -lt 3) { return $null }   # not a repo, or cannot prove it
+  $top = "$($lines[0])".Trim(); $gd = "$($lines[1])".Trim(); $cd = "$($lines[2])".Trim()
+  $norm = { param($p) ([IO.Path]::GetFullPath("$p")).TrimEnd('\', '/').ToLowerInvariant() }
+  if ((& $norm $gd) -ne (& $norm $cd)) { return $null }    # a linked worktree (leased slot): fine
+  $commonRoot = Split-Path $cd -Parent
+  if ((& $norm $top) -ne (& $norm $commonRoot)) { return $null }
+  $scRepo = Split-Path $top -Leaf
+  $scMode = 'warn'
+  try {
+    $cfgF = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $env:USERPROFILE '.copilot\bin\agentq-config.json' }
+    if (Test-Path -LiteralPath $cfgF) {
+      $cj = Get-Content -LiteralPath $cfgF -Raw | ConvertFrom-Json
+      if ($cj.PSObject.Properties['sharedCloneMode'] -and $cj.sharedCloneMode) { $scMode = "$($cj.sharedCloneMode)" }
+      $scRepos = if ($cj.PSObject.Properties['sharedCloneModeRepos']) { $cj.sharedCloneModeRepos } else { $null }
+      if ($scRepos -and $scRepos.PSObject.Properties[$scRepo]) { $scMode = "$($scRepos.PSObject.Properties[$scRepo].Value)" }
+    }
+  } catch { return $null }
+  if ($scMode -ne 'refuse') { return $null }
+  $slotsDir = Join-Path (Split-Path $top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $scRepo)
+  if (-not (Test-Path -LiteralPath $slotsDir)) { return $null }
+  return [pscustomobject]@{ top = $top; repo = $scRepo }
+}
+# The path-based caller (Rule B) already knows the repo root and only needs the verdict.
+function Test-GuardSharedClone([string]$repoTop) {
+  $sc = Get-GuardSharedClone $repoTop
+  if ($sc) { return $sc.repo }
+  return $null
+}
+
 # ---- shared-clone source writes (2026-10-17) -----------------------------------------------
 # Drafts edited directly in the shared clone (E:\gh\<repo>) stay behind after the same work lands
 # from a worktree slot in another form; git-autosync then cannot fast-forward (codai/brivio/
 # dragoscatalin/dashy/vmui were 1-26 days behind on exactly that). Non-blocking advisory, emitted
 # by Flush-Stderr on the allow path. Scratch, docs/plan/markdown and non-repo paths are exempt.
+# CODAI_SHARED_CLONE_WRITE_OK is a DELIBERATE ONE-OFF ($env: set for the command at hand). A value
+# persisted at User/Machine scope (setx, System properties) is inherited by EVERY process, so
+# honouring it turned that one-off into a machine-wide disarm of this control: on 2026-11-20
+# HKCU:\Environment held '1', so for every agent the advisory never printed and the codai/brivio
+# `refuse` deny - for edits AND for a shell `git commit` - could never fire again. A persisted
+# value is now reported once, journaled as overrideScope='persisted-ignored', and ignored.
+function Get-SharedCloneOverride {
+  $scOvRaw = "$($env:CODAI_SHARED_CLONE_WRITE_OK)"
+  $scOvPersisted = "$([Environment]::GetEnvironmentVariable('CODAI_SHARED_CLONE_WRITE_OK', 'User'))$([Environment]::GetEnvironmentVariable('CODAI_SHARED_CLONE_WRITE_OK', 'Machine'))"
+  $allowed = [bool]$scOvRaw -and -not $scOvPersisted
+  $scope = if ($scOvRaw -and $scOvPersisted) { 'persisted-ignored' } elseif ($allowed) { 'process' } else { 'none' }
+  if ($scope -eq 'persisted-ignored' -and -not $script:ScOvWarned) {
+    $script:ScOvWarned = $true
+    [Console]::Error.WriteLine('guard: CODAI_SHARED_CLONE_WRITE_OK is set PERSISTENTLY (User/Machine scope) - that would disable the shared-clone advisory and the refuse deny for EVERY agent on this machine, so it is IGNORED. Clear it with: [Environment]::SetEnvironmentVariable("CODAI_SHARED_CLONE_WRITE_OK", $null, "User")')
+  }
+  @{ allowed = $allowed; scope = $scope }
+}
 $script:SharedWarn = $null
 if ($isEditTool) {
   $wp = $null
@@ -308,11 +367,11 @@ if ($isEditTool) {
             if ($scRepos -and $scRepos.PSObject.Properties[$scRepo]) { $scMode = "$($scRepos.PSObject.Properties[$scRepo].Value)" }
           }
         } catch { }
-        $scOverride = [bool]$env:CODAI_SHARED_CLONE_WRITE_OK
+        $scOv = Get-SharedCloneOverride; $scOverride = $scOv.allowed
         if ($scMode -ne 'off') {
           try {
             $jHome = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
-            $jl = @{ ts = [DateTime]::UtcNow.ToString('o'); event = 'shared-write'; repo = $scRepo; paths = @($rel.Replace('\', '/')); tool = $tool; mode = $scMode; override = $scOverride; session = "$($payload.session_id)" } | ConvertTo-Json -Compress
+            $jl = @{ ts = [DateTime]::UtcNow.ToString('o'); event = 'shared-write'; repo = $scRepo; paths = @($rel.Replace('\', '/')); tool = $tool; mode = $scMode; override = $scOverride; overrideScope = $scOv.scope; session = "$($payload.session_id)" } | ConvertTo-Json -Compress
             $jm = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
             try { [void]$jm.WaitOne(2000); [IO.File]::AppendAllText((Join-Path $jHome 'journal.jsonl'), $jl + "`n", [Text.UTF8Encoding]::new($false)) } finally { try { $jm.ReleaseMutex() } catch {}; $jm.Dispose() }
           } catch { }
@@ -328,50 +387,63 @@ if ($isEditTool) {
       }
     }
   }
-}
 
-# ---- shared-clone commits from a shell (2026-11-18) ------------------------------------------
-# The block above only sees edit tools, so a `git commit` typed into a terminal walked straight past it -
-# and that is the path that actually wedged codai: 15 unpushed commits on the shared main left it 93 behind
-# with git-autosync refusing for days, while the guard's edit-tool rule never fired for any of them. Same
-# config, same opt-out, hard denial: a commit belongs in a leased slot. The command text is matched, so a
-# commit buried inside a .ps1/.sh script is NOT covered here - for that case the agentq verbs themselves
-# refuse (Assert-SharedCloneWriteAllowed in agentq.ps1).
-# `git -C <path> commit` and `git commit` both match; `git log --grep commit` does not (the tokens before
-# `commit` must be flags, optionally with their value).
-if (-not $isEditTool -and $cmd -and $cmd -match '(?i)(^|[;&|]\s*)git\s+(?:-[^;&|\s]+(?:\s+[^;&|\s]+)?\s+)*commit\b') {
-  $ghRootC = if ($env:CODAI_GH_ROOT) { $env:CODAI_GH_ROOT } else { 'E:\gh' }
-  $targetC = $null
-  $mC = [regex]::Match($cmd, '(?i)\s-C\s+["'']?([^"''\s;|&]+)')
-  if ($mC.Success) { $targetC = $mC.Groups[1].Value }
-  if (-not $targetC) {
-    $mC = [regex]::Match($cmd, '(?i)(?:set-location|cd)\s+["'']?([A-Za-z]:\\[^"''\s;|&]+|[^"''\s;|&]+)')
-    if ($mC.Success) { $targetC = $mC.Groups[1].Value }
-  }
-  if (-not $targetC) {
-    foreach ($container in $payload.tool_input, $payload.toolInput) {
-      if (-not $targetC -and $container -and $container -isnot [string] -and $container.PSObject.Properties.Name -contains 'cwd') { $targetC = "$($container.cwd)" }
+  # ---- Rule B: a plan/*.csv written in the shared clone (2026-11-22) -------------------------
+  # Plan CSVs are DELIBERATELY exempt from the source-write rule above (they are tracker data an
+  # agent edits in place), yet they are exactly what wedged codai for ~4 h: two tracked tracker
+  # files (plan/dev-cloud-CANONICAL.csv|.md) left uncommitted made git-autosync refuse ("local
+  # edit(s) collide with incoming and are still being edited"), and it reverts colliding drafts.
+  # WARN, never deny: write the rows in your leased slot, or publish them.
+  if ($wp) {
+    $wpnB = $wp.Replace('/', '\') -replace '^(?i)file:\\+', ''
+    $rxB = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
+    if ($wpnB -match $rxB -and $Matches.repo -ne '.wt') {
+      $scRepoWildB = $Matches.repo   # the inner -match below clobbers $Matches
+      $relB = $Matches.rel.Replace('\', '/')
+      if ($relB -match '(?i)(^|/)plan/[^/]+\.csv$') {
+        $scRepoB = Test-GuardSharedClone (Join-Path $ghRoot $scRepoWildB)
+        if ($scRepoB) {
+          $script:SharedWarn = "WARNING (shared clone): writing $relB directly in the SHARED clone of $scRepoB. Tracker CSVs left uncommitted here block git-autosync - it cannot move main while they exist, and it reverts colliding drafts (2026-11-22: plan/dev-cloud-CANONICAL.csv wedged codai for ~4 h). Write the rows in your leased slot, or publish them: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" publish -Paths $relB -Message `"docs(plan): ...`" -Purpose `"why`" [-Onto main]."
+          [Console]::Error.WriteLine($script:SharedWarn)
+        }
+      }
     }
   }
-  if (-not $targetC -and $payload.cwd) { $targetC = "$($payload.cwd)" }
-  if ($targetC) {
-    $tnC = $targetC.Replace('/', '\') -replace '^(?i)file:\\+', ''
-    $rxC = '(?i)^' + [regex]::Escape($ghRootC.TrimEnd('\')) + '\\(?<repo>[^\\]+)'
-    if ($tnC -match $rxC -and $Matches.repo -ne '.wt') {
-      $scRepoC = $Matches.repo; $scModeC = 'warn'
-      try {
-        $cfgFC = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $env:USERPROFILE '.copilot\bin\agentq-config.json' }
-        if (Test-Path -LiteralPath $cfgFC) {
-          $cjC = Get-Content -LiteralPath $cfgFC -Raw | ConvertFrom-Json
-          if ($cjC.PSObject.Properties['sharedCloneMode'] -and $cjC.sharedCloneMode) { $scModeC = "$($cjC.sharedCloneMode)" }
-          $scReposC = if ($cjC.PSObject.Properties['sharedCloneModeRepos']) { $cjC.sharedCloneModeRepos } else { $null }
-          if ($scReposC -and $scReposC.PSObject.Properties[$scRepoC]) { $scModeC = "$($scReposC.PSObject.Properties[$scRepoC].Value)" }
-        }
-      } catch { }
-      if ($scModeC -eq 'refuse' -and -not $env:CODAI_SHARED_CLONE_WRITE_OK) {
-        [Console]::Error.WriteLine("BLOCKED by guard (HARD, ADR 0004, sharedCloneMode=refuse): a git commit run in the SHARED clone $targetC leaves unpushed commits behind, which is exactly what makes git-autosync refuse (2026-11-18: codai's shared main carried 15 and sat 93 commits behind). Commit from a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], then `agentq commit -ExpectRepo <slot>`. Deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1.")
-        Deny-Exit -HardBlock -HardBlockNote 'a git commit in the shared clone; commit from a leased slot (or set CODAI_SHARED_CLONE_WRITE_OK=1 for a journaled one-off)'
-      }
+}
+
+# ---- Rule A: a raw commit in the shell of a shared clone (2026-11-22) ------------------------
+# The block above only sees edit tools, so a `git commit` typed into a terminal walks straight past
+# it - and that is the path that wedges a clone. It is a WARNING, not a denial (D-40 warn-by-default:
+# the hard list stays force-push / reset --hard / clean -f / worktree remove --force). A warn
+# shadowed by a deny for the same input would be dead code, and agentq itself still REFUSES
+# `commit`/`land` in such a clone (Assert-SharedCloneWriteAllowed), so enforcement is not lost -
+# this names the verb to use instead. 2026-11-18: 15 unpushed commits on codai's shared main left it
+# 93 behind and git-autosync refusing for days; 2026-11-22 a single raw commit (5f3f1a3b) again left
+# an unpushed commit that autosync refused to move past. The command text is matched, so a commit
+# buried in a .ps1/.sh is not covered here (agentq's own verbs refuse that case). Fast prefilter
+# first - the git-commit shape - and only then the shared-clone discovery. `git -C <path> commit`
+# and `git commit` both match; `git log --grep commit` does not (the tokens before `commit` must be
+# flags, optionally with their value).
+if (-not $isEditTool -and $cmd -and $cmd -match '(?i)(^|[;&|]\s*)git\s+(?:-[^;&|\s]+(?:\s+[^;&|\s]+)?\s+)*commit\b') {
+  $targetA = $null
+  $mA = [regex]::Match($cmd, '(?i)\s-C\s+["'']?([^"''\s;|&]+)')
+  if ($mA.Success) { $targetA = $mA.Groups[1].Value }
+  if (-not $targetA) {
+    $mA = [regex]::Match($cmd, '(?i)(?:set-location|cd)\s+["'']?([A-Za-z]:\\[^"''\s;|&]+|[^"''\s;|&]+)')
+    if ($mA.Success) { $targetA = $mA.Groups[1].Value }
+  }
+  if (-not $targetA) {
+    foreach ($container in $payload.tool_input, $payload.toolInput) {
+      if (-not $targetA -and $container -and $container -isnot [string] -and $container.PSObject.Properties.Name -contains 'cwd') { $targetA = "$($container.cwd)" }
+    }
+  }
+  if (-not $targetA -and $payload.cwd) { $targetA = "$($payload.cwd)" }
+  if ($targetA) {
+    $tnA = $targetA.Replace('/', '\') -replace '^(?i)file:\\+', ''
+    $scA = Get-GuardSharedClone $tnA
+    if ($scA) {
+      $script:SharedWarn = "WARNING (shared clone): a git commit run in $($scA.top) (the SHARED clone of $($scA.repo)). A raw commit here becomes an UNPUSHED commit, and git-autosync cannot fast-forward the clone while one exists - it refuses (2026-11-22: 5f3f1a3b did exactly this to codai). Commit from a leased slot, or publish the paths: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" publish -Paths a,b -Message `"type(scope): msg`" -Purpose `"why`" [-Onto main]. Deliberate one-off: set AGENTQ_SHARED_CLONE_COMMIT_OK=1 (journaled)."
+      [Console]::Error.WriteLine($script:SharedWarn)
     }
   }
 }
@@ -722,9 +794,6 @@ foreach ($pat in $warn.Keys) {
 }
 
 # ------------------------------------------------------------------ writes --
-# Targeted edits (apply_patch / replace_string) are safe: they fail loudly on a
-# stale anchor instead of silently discarding. Only whole-file writes clobber.
-if ($tool -notmatch 'create_file|createFile|write_file|writeFile|WriteAllLines|create_new') { Flush-Stderr; exit 0 }
 # Targeted edits (apply_patch / replace_string) are safe: they fail loudly on a
 # stale anchor instead of silently discarding. Only whole-file writes clobber.
 if ($tool -notmatch 'create_file|createFile|write_file|writeFile|WriteAllLines|create_new') { Flush-Stderr; exit 0 }

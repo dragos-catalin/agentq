@@ -1,7 +1,10 @@
 param([string]$Tool)
 # Scenario tests for git-autosync.ps1 on throwaway repos under %TEMP%.
 $ErrorActionPreference = 'Stop'
-$tool = if ($Tool) { $Tool } else { Join-Path $PSScriptRoot 'git-autosync.ps1' }
+# Next to the test (the installed ~/.copilot/bin copy), else ../bin (the repo, run with no -Tool).
+$tool = if ($Tool) { $Tool }
+  elseif (Test-Path (Join-Path $PSScriptRoot 'git-autosync.ps1')) { Join-Path $PSScriptRoot 'git-autosync.ps1' }
+  else { Join-Path (Split-Path $PSScriptRoot -Parent) 'bin\git-autosync.ps1' }
 $root = Join-Path ([IO.Path]::GetTempPath()) ("gas-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory $root | Out-Null
 $env:GIT_AUTOSYNC_LOG = Join-Path $root 'autosync.log'
@@ -335,6 +338,73 @@ $n3 = @(Get-Content $jf).Count
 if ($rec2.verdict -ne $rec.verdict) { Ok ($n3 -eq $n2 + 1) "15b recovery ($($rec.verdict)->$($rec2.verdict)) writes exactly one line" }
 else { Ok ($n3 -eq $n2) '15b unchanged verdict writes no line' }
 Ok (((Get-Content $env:GIT_AUTOSYNC_STATE -Raw | ConvertFrom-Json).lastDoctorVerdict) -eq $rec2.verdict) '15b stored verdict tracks the latest'
+
+# 16 LONG REFUSE: a refusal open for >30 min must alert - a journal event + a loud block at the top of
+#    the pass output - at most once per 30 min per repo, keeping the FIRST-seen time, clearing on
+#    recovery, and re-alerting on a fresh refusal (codai 2026-11-22: ~4 h of silent "refuse: unpushed
+#    commit ... conflicts with origin/main" that alerted nobody). Never touches the real ~/.codai/coord.
+#    Isolation: its OWN coord root and its own pass mutex. A pass returns exit 3 for `skip:` (another
+#    pass holds the mutex) and for `error:` too, so sharing the suite's coord/mutex with the earlier
+#    sections - or with the real machine-wide daemon, which holds this mutex for minutes at a time -
+#    could make a case pass the exit-code check while nothing was recorded.
+$prevCoord = $env:GIT_AUTOSYNC_COORD; $prevMutex = $env:GIT_AUTOSYNC_MUTEX
+$env:GIT_AUTOSYNC_COORD = Join-Path $root 'coord16'
+$env:GIT_AUTOSYNC_MUTEX = 'Local\gas16-' + [guid]::NewGuid().ToString('N')
+$rf = Join-Path $env:GIT_AUTOSYNC_COORD 'autosync-state.json'
+$jr = Join-Path $env:GIT_AUTOSYNC_COORD 'journal.jsonl'
+function RefuseState { if (Test-Path $rf) { Get-Content $rf -Raw | ConvertFrom-Json -AsHashtable } else { @{} } }
+function SinceOf([string]$leaf) { $s = RefuseState; if ($s -and $s.ContainsKey($leaf) -and $s[$leaf]) { "$($s[$leaf]['since'])" } else { '' } }
+function ReasonOf([string]$leaf) { $s = RefuseState; if ($s -and $s.ContainsKey($leaf) -and $s[$leaf]) { "$($s[$leaf]['reason'])" } else { '' } }
+function AgeSince([string]$leaf, [int]$minutes) {
+  $s = RefuseState
+  if (-not $s -or -not $s.ContainsKey($leaf)) { return $false }
+  $s[$leaf]['since'] = ([DateTime]::UtcNow.AddMinutes(-$minutes)).ToString('o')
+  [IO.File]::WriteAllText($rf, ($s | ConvertTo-Json -Depth 6))
+  return $true
+}
+function LrJournal([string]$leaf) { @(Get-Content $jr -ErrorAction SilentlyContinue | Where-Object { $_ -match 'git-autosync-long-refuse' -and $_ -match [regex]::Escape($leaf) }).Count }
+function RunOut($r) { & pwsh -NoProfile -File $tool -Repo $r.a -ReplayRepos '*' 2>&1 | Out-String }
+
+$r = Fresh; Push-B $r 'x.txt' "theirs`n"; W "$($r.a)\x.txt" "ours`n"; $leaf = Split-Path $r.a -Leaf
+# 16a first refuse stamps `since` + records the reason
+$o16 = RunOut $r; $rc16 = $LASTEXITCODE
+Ok (($rc16 -eq 3) -and ($o16 -match 'refuse:')) "16a refused: $($o16.Trim())"
+Ok ((SinceOf $leaf) -and (ReasonOf $leaf) -like 'refuse*') '16a first refuse stamps since + reason'
+# 16b a refuse (aged to) 5 min old keeps the ORIGINAL since and does not alert yet
+Ok (AgeSince $leaf 5) '16b aged the recorded refusal'
+$five = SinceOf $leaf
+$out = RunOut $r
+Ok ((SinceOf $leaf) -eq $five) '16b keeps the ORIGINAL since on a later pass'
+Ok ($out -notmatch 'LONG REFUSE') '16b no alert before 30 min'
+# 16c 31 min after `since` -> alerts exactly once (loud block + one journal event + the next step)
+[void](AgeSince $leaf 31)
+$out = RunOut $r
+Ok ($out -match '== LONG REFUSE \(>30 min\) ==') '16c loud block header printed'
+Ok (($out -match [regex]::Escape($leaf)) -and ($out -match 'refusing for \d+m')) '16c block names the repo + duration'
+Ok (($out -match 'agentq status -All') -and ($out -match 'agentq publish')) '16c block carries the next step'
+Ok ((LrJournal $leaf) -eq 1) '16c journaled exactly once'
+# 16d still 31 min after `since`, but seconds after the alert -> inside the 30-min window, no second alert
+$out = RunOut $r
+Ok ($out -notmatch 'LONG REFUSE') '16d no duplicate alert inside the notify window'
+Ok ((LrJournal $leaf) -eq 1) '16d still exactly one journal event'
+# 16e recovery (the local file now equals upstream, so the clone can move) clears the entry
+W "$($r.a)\x.txt" "theirs`n"
+Ok ((Run $r) -eq 0) '16e recovered'
+Ok (-not (RefuseState).ContainsKey($leaf)) '16e entry cleared on recovery'
+# 16f a fresh refusal after recovery stamps a NEW since and alerts again once it ages past 30 min
+#    A refusal needs an INCOMING change to collide with, so push a new upstream commit to x.txt first -
+#    without it the clone is simply in sync and nothing is recorded.
+Push-B $r 'x.txt' "theirs3`n"
+W "$($r.a)\x.txt" "ours2`n"
+$o16f = RunOut $r
+Ok (($LASTEXITCODE -eq 3) -and ($o16f -match 'refuse:')) "16f refused again: $($o16f.Trim())"
+$fresh = SinceOf $leaf
+Ok ($fresh -and $fresh -ne $five) '16f fresh since differs from the old one'
+[void](AgeSince $leaf 31)
+$out = RunOut $r
+Ok ($out -match '== LONG REFUSE \(>30 min\) ==') '16f alerts again after recovery'
+Ok ((LrJournal $leaf) -eq 2) '16f a second journal event'
+$env:GIT_AUTOSYNC_COORD = $prevCoord; $env:GIT_AUTOSYNC_MUTEX = $prevMutex
 
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }
