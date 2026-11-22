@@ -109,7 +109,8 @@ try {
   Check '4 slot tree alone would pass, the rebased one fails -> exit 6 before the queue' ($code -eq 6 -and (Tip) -eq $before -and -not (Test-Path (Join-Path $l4.path 'bad.txt'))) $o
   git -C $repo fetch -q origin; git -C $repo checkout -q -B dev origin/dev; git -C $repo rm -q bad.txt; git -C $repo commit -qm 'remove bad'; git -C $repo push -q origin dev 2>$null
 
-  # 5. OQ-003: a re-land of an unchanged green tree does not run the gate again (under 1 min in land)
+  # 5. a land from the SHARED CLONE takes a scratch slot for the pre-gate and gives it back, and a re-land
+  #    of an unchanged green tree does not run the gate again (the point of OQ-003: under 1 min in land)
   git -C $repo fetch -q origin; git -C $repo checkout -q -B p5 origin/dev
   Set-Content (Join-Path $repo 'p5.txt') 'p5'; git -C $repo add p5.txt; git -C $repo commit -qm 'topic p5'; git -C $repo push -q origin p5 2>$null
   git -C $repo checkout -q dev
@@ -117,18 +118,46 @@ try {
   [IO.File]::WriteAllText((Join-Path $bare 'hooks\pre-receive'), "#!/bin/sh`nif [ -f `"`$GIT_DIR/reject`" ] || [ -f ./reject ]; then echo refused-by-test >&2; exit 1; fi`nexit 0`n")
   [IO.File]::WriteAllText((Join-Path $bare 'reject'), '')
   $o = LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5')
-  Check '5 first land: not from a slot -> pre-gate skipped, gate ran in the queue, push refused (exit 7)' ($code -eq 7 -and @(Gates '^land gate p5').Count -eq 1 -and @(Ev 'land-pregate-skipped' 'p5').Count -eq 1) $o
+  $scr = @(Ev 'land-pregate-slot-released' 'p5')
+  Check '5 first land from the clone: the pre-gate ran there, in a scratch slot (not the caller tree)' ($code -eq 7 -and @(Gates 'land pregate p5').Count -eq 1 -and (GateTrees 'land pregate p5')[0].root -match 'scratch-\d+$' -and $scr.Count -eq 1 -and "$($scr[0].slot)" -match '^scratch-\d+$') $o
+  Check '5 ... and the queue did not gate again (the pre-gate recorded the tree green)' (@(Gates '^land gate p5').Count -eq 0 -and @(Ev 'land-pregate-skipped' 'p5').Count -eq 0) ((Gates 'p5') -join ' | ')
+  $leaseFile = Join-Path $env:AGENTQ_HOME ("leases\$repoName\" + "$($scr[0].slot)" + '.json')
+  Check '5 ... and the scratch slot was given back (lease record removed)' ($scr.Count -eq 1 -and $scr[0].exit -eq 0 -and -not (Test-Path -LiteralPath $leaseFile)) "$leaseFile"
   Remove-Item (Join-Path $bare 'reject')
   $n0 = (Journal).Count
   $o = LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5 again')
   Check '5 re-land of the same tree lands' ($code -eq 0 -and (Remote 'p5.txt') -eq 'p5') $o
-  Check '5 ... without running the gate again' (@(Gates '^land gate p5').Count -eq 1 -and $o -match 'gate skipped') ((Gates 'p5') -join ' | ')
+  $gates5 = @(Gates 'land pregate p5').Count + @(Gates '^land gate p5').Count
+  $said5 = [bool]("$o" -match 'gate skipped')
+  Check '5 ... without running the gate again' ($gates5 -eq 1 -and $said5) ("gates=$gates5 said=$said5 || " + ((@("$o" -split "`n") | Select-Object -Last 8) -join ' / '))
   $j2 = @(Journal | Select-Object -Skip $n0)
   $acq = $j2 | Where-Object { $_.event -eq 'acquired' -and "$($_.resource)" -eq "land:$repoName" } | Select-Object -First 1
   $done = $j2 | Where-Object { $_.event -eq 'land' } | Select-Object -First 1
   $held = if ($acq -and $done) { ([DateTime]$done.ts - [DateTime]$acq.ts).TotalSeconds } else { -1 }
   Check '5 ... and held the land ticket under 60 s' ($held -ge 0 -and $held -lt 60) "held=$held s"
   Write-Host ("     land ticket held {0:N1} s for the re-land" -f $held)
+  # 5b. the shared-clone path is a config switch, and with it off the land says why (queue-side gate)
+  Cfg ",`"landPregateFromMain`":false"
+  git -C $repo fetch -q origin; git -C $repo checkout -q -B p5b origin/dev
+  Set-Content (Join-Path $repo 'p5b.txt') 'p5b'; git -C $repo add p5b.txt; git -C $repo commit -qm 'topic p5b'; git -C $repo push -q origin p5b 2>$null
+  git -C $repo checkout -q dev
+  $o = LandFrom $repo @('-Branch', 'p5b', '-Purpose', 'land p5b')
+  Check '5b landPregateFromMain=false -> the clone takes no slot, the reason is journaled, the queue gates' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p5b')[0].reason -match 'not run from a leased task slot' -and @(Gates '^land gate p5b').Count -eq 1 -and @(Ev 'land-pregate-slot-released' 'p5b').Count -eq 0) $o
+  # 5c. no free scratch slot: skip with the reason instead of running the gate anywhere (wait 0 = no wait)
+  Cfg ",`"landPregateScratchWaitMin`":0"
+  $hold = @(1..3 | ForEach-Object {
+    Push-Location $repo
+    try { $o = AQ lease -Role scratch -Slot "scratch-$_" -Purpose 'hold for 5c' -Ref origin/dev -Json } finally { Pop-Location }
+    $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  })
+  Check '5c the fixture holds all three scratch slots' (@($hold | Where-Object { $_.leaseId }).Count -eq 3) ($hold | ConvertTo-Json -Compress)
+  git -C $repo fetch -q origin; git -C $repo checkout -q -B p5c origin/dev
+  Set-Content (Join-Path $repo 'p5c.txt') 'p5c'; git -C $repo add p5c.txt; git -C $repo commit -qm 'topic p5c'; git -C $repo push -q origin p5c 2>$null
+  git -C $repo checkout -q dev
+  $o = LandFrom $repo @('-Branch', 'p5c', '-Purpose', 'land p5c')
+  Check '5c all scratch slots held -> pre-gate skipped with the reason, the queue gates, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p5c')[0].reason -match 'no scratch slot was free' -and @(Gates 'land pregate p5c').Count -eq 0 -and @(Gates '^land gate p5c').Count -eq 1) $o
+  foreach ($l in $hold) { $null = AQ unlease -Repo $l.path -LeaseId $l.leaseId }
+  Cfg
 
   # 6. when the pre-gate cannot run, the land still works and says why (gate in the queue as before)
   $l6 = Slot 'p6'; Commit $l6 'p6.txt' 'p6' 'p6'

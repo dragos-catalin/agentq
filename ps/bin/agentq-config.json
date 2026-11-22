@@ -95,6 +95,7 @@
     }
   },
   "landPregate": true,
+  "landPregateFromMain": true,
   "landPregateRounds": 2,
   "greenTtlHours": 168,
   "prune": {

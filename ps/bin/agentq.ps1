@@ -119,8 +119,11 @@ STAGE 0 OF THE ORCHESTRATOR PLAN (ADR 0009, tracker OQ-001..012, 2026-11)
   Chat keep-alive: the per-tool-call hook binds a chat to the lease of a slot it works in and refreshes it on
   every later tool call of that chat; a chat active within leaseDeadIdleMin counts like a live owner shell.
   Land pre-gate: `agentq land` from a leased task slot runs the gate on the rebased result in that slot BEFORE
-  taking the land ticket (exit 6 before the queue on failure); a tree that already passed a gate command is
-  not gated again (green ledger, greenTtlHours). Config `landPregate`; AGENTQ_LAND_NO_PREGATE=1 off.
+  taking the land ticket (exit 6 before the queue on failure). From the shared clone it takes a `scratch-N`
+  slot for the length of the gate and gives it back; with no free slot - or one whose install is known to have
+  failed - it skips the pre-gate and journals why. A tree that already passed a gate command is not gated
+  again (green ledger, greenTtlHours). Config `landPregate`, `landPregateFromMain`, `landPregateScratchWaitMin`;
+  AGENTQ_LAND_NO_PREGATE=1 off.
   agentq prune [-WhatIf] [-Days n] [-All] [-Json]   remove state nobody needs (also run by sweep).
   agentq doctor [-All] [-Src <checkout>/ps] [-Json] health report; exit 1 when a check fails.
   agentq slo [-Hours 168] [-Json]  adds queue time, waits over 10 min, hook cost per day, start-probe buckets
@@ -2011,7 +2014,7 @@ $script:AqHelp = [ordered]@{
   'feedback' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'feedback -Kind note|idea|bug|anomaly|praise -Message "..."'; d = 'tell the owner what worked or broke (journaled, shown on the hub)' }
   'lease-check' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'lease-check [-Json]'; d = 'diagnose my own lease binding (chat/session -> slot, liveness clock, work clock)' }
   'backup' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'backup -Path <worktree> [-Slot <name>] -Reason "..."'; d = 'proof-of-work snapshot of a slot -> refs/backup/... plus a bundle' }
-  'land' = @{ g = 'Land & release (ADR 0001)'; u = 'land -Branch <topic> -Onto <dev|main> -Purpose "why" [-Gate "<cmd>"] [-Also a,b] [-Force]'; d = 'land my branch: pre-gate the rebased result in my slot, then serialized merge+push (exit 5 conflict, 6 pre-gate)'; e = 'agentq land -Branch feat/x -Onto main -Purpose "ship" -Gate "pnpm typecheck"' }
+  'land' = @{ g = 'Land & release (ADR 0001)'; u = 'land -Branch <topic> -Onto <dev|main> -Purpose "why" [-Gate "<cmd>"] [-Also a,b] [-Force]'; d = 'land my branch: pre-gate the rebased result (my slot, or a scratch slot when started from the shared clone), then serialized merge+push (exit 5 conflict, 6 pre-gate)'; e = 'agentq land -Branch feat/x -Onto main -Purpose "ship" -Gate "pnpm typecheck"' }
   'publish' = @{ g = 'Land & release (ADR 0001)'; u = 'publish -Paths a,b -Message "type(scope): msg" -Purpose "why" [-Onto main] [-Base <ref>] [-Land] [-NoPush]'; d = 'commit my paths and, with -Land, land them in one step' }
   'release-begin' = @{ g = 'Land & release (ADR 0001)'; u = 'release-begin -Repo <r> -Target <t> -Sha <sha> [-Ref r] [-Follow branch] [-OwnerPid n]'; d = 'deploy-clean opens a release run (supersede-aware; see ADR 0001)' }
   'release-phase' = @{ g = 'Land & release (ADR 0001)'; u = 'release-phase -Phase <name> [-Unsafe]'; d = 'checkpoint of a release; a landing during a SAFE phase makes the next one exit 4 superseded' }

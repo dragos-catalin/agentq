@@ -22,9 +22,13 @@ evidence and what is still open for each row.
 
 ## Landing
 
-- **Pre-gate.** `agentq land` run from a leased task slot runs the gate on the rebased result in that slot before it
-  takes the land ticket. A failing gate exits 6 before the queue. Config: `landPregate`, `landPregateRounds`.
-  `AGENTQ_LAND_NO_PREGATE=1` turns it off. Journal: `land-pregate-ok`, `land-pregate-failed`, `land-pregate-skipped`.
+- **Pre-gate.** `agentq land` runs the gate on the rebased result before it takes the land ticket; a failing gate exits 6
+  before the queue. In a leased task slot it uses that slot. From the shared clone - which has no tree of the pre-gate's
+  own, and where the caller's tree must not move - it TAKES a scratch slot for the length of the gate and gives it back;
+  with no free scratch slot (or one whose install is known to have failed) the land skips the pre-gate and says so, so
+  the queue-side gate is never silently replaced by nothing. Config: `landPregate`, `landPregateRounds`,
+  `landPregateFromMain`, `landPregateScratchWaitMin`. `AGENTQ_LAND_NO_PREGATE=1` turns it off. Journal: `land-pregate-ok`,
+  `land-pregate-failed`, `land-pregate-skipped`, `land-pregate-slot-released`.
 - **The gate command.** `landGate.<repo>` (config) is what the land runs; `gateSuites.<repo>` names the suites and
   `run-all.ps1 -RepoSuites` resolves them, so the list has one home and cannot drift from what an
   `install.ps1 -RepoSuites` gate runs. A missing key or a name that is no suite here exits 2, never a silent

@@ -1506,17 +1506,26 @@ function Restore-LandDeps([object]$repo, [string]$wt, [string]$baseRev) {
 #    (tree hash, gate command) for greenTtlHours (168). The in-queue gate is skipped for such a tree
 #    (journal `land-gate-skipped-green`). The key is the exact tree, so a land whose result differs by
 #    one byte runs the gate as before.
-#  * Pre-gate: `agentq land` run from a leased task slot first builds the REBASED result (merge-tree of
+#  * Pre-gate: `agentq land` run from a leased task slot - or from the shared clone, which takes a
+#    scratch slot for the length of the gate - first builds the REBASED result (merge-tree of
 #    the topic onto the current origin/<onto>, no working tree involved), puts it in the slot (a
 #    temporary detached checkout of a local, never-pushed merge commit; the slot's branch and HEAD are
 #    restored afterwards), runs the gate there through run-build and records the tree as green. Only
 #    then is the land ticket taken. A failing gate ends the land with exit 6 BEFORE the queue
 #    (`land-pregate-failed`). When origin moved while the gate ran, one more round is tried
 #    (landPregateRounds, default 2); after that the land queues anyway and the in-queue gate decides.
-#    Skipped, with the reason journaled (`land-pregate-skipped`), when: not run from a leased task slot,
-#    the slot has uncommitted or untracked files, the merge needs the land resolver, or a lockfile
+#    Skipped, with the reason journaled (`land-pregate-skipped`), when: from the shared clone and no
+#    scratch slot could be taken or its install is known to have failed (`land-pregate-slot-released`
+#    records the slot it took and gave back), or `landPregateFromMain` is off for the repo; in a slot,
+#    when the slot has uncommitted or untracked files, the merge needs the land resolver, or a lockfile
 #    differs between the slot and the rebased result (its node_modules would be stale).
 #    Config `landPregate`: true | false | { <repo>: bool } (default true); AGENTQ_LAND_NO_PREGATE=1 off.
+#    Config `landPregateFromMain`: true | false | { <repo>: bool } (default true) - whether the shared
+#    clone may take a scratch slot for the gate. Cost of the default: one of `scratchSlots` is held for
+#    the length of the gate; the alternative is a red tree discovered only by the in-queue gate, which
+#    holds the whole land queue for a gate duration (measured baseline: p50 7.2 min).
+#    Config `landPregateScratchWaitMin`: how long to wait for a free scratch slot (default 1; 0 = skip at
+#    once instead of waiting).
 # The gate runs in a different directory (the slot) than the in-queue gate did (the land slot); the
 # repo's pre-push hook still runs at the push, in the land slot, as before.
 function Get-GateKey([string]$tree, [string]$gate) {
@@ -1570,9 +1579,78 @@ function Invoke-GateRun([string]$dir, [string]$purpose) {
   $script:GateExit = [int]$LASTEXITCODE
   $script:GateSec = [int][math]::Round($sw.Elapsed.TotalSeconds)
 }
+# Whether the pre-gate may take a scratch slot when `agentq land` is started from the shared clone.
+# Config: `landPregateFromMain` = true (default) or a map per repo name. The cost of the change is that a
+# land from the shared clone now occupies one of the `scratchSlots` for as long as the gate runs.
+function Get-LandPregateFromMain([string]$repoName) {
+  $c = Get-Config
+  if (-not $c.ContainsKey('landPregateFromMain')) { return $true }
+  $v = $c['landPregateFromMain']
+  if ($v -is [Collections.IDictionary]) { if ($v.Contains($repoName)) { return [bool]$v[$repoName] }; return $true }
+  [bool]$v
+}
+# May the pre-gate run in a slot whose dependency install is known to be unfinished? Only "unknown" passes.
+# `Prepare-Slot` writes <AGENTQ_HOME>/prep/<repo--slot>.json when it ran; no file means either it was
+# skipped (AGENTQ_NO_PREP=1, or the repo has no lockfile) or the slot was built by hand - in both cases the
+# gate is the honest answer, and refusing to run it would silently restore the queue-side gate. A file that
+# says `ready:false` means the install FAILED: gating that tree would fail for a reason that is not the
+# topic's, which is worse than skipping.
+function Test-SlotPrepReady([string]$repoName, [string]$slot) {
+  $f = Join-Path (Join-Path $Root 'prep') ((Safe "$repoName--$slot") + '.json')
+  if (-not [IO.File]::Exists($f)) { return $true }
+  try { return [bool](P (Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable) 'ready' $false) } catch { return $true }
+}
+# The pre-gate needs a tree of its OWN - it checks the rebased result out and runs the gate there, and the
+# caller's tree must not be moved. Until 2026-11-22 that meant `agentq land` had to be started INSIDE a
+# leased task slot, so a land from the shared clone skipped the pre-gate and spent a whole gate in the land
+# queue to discover a red tree (that is how the land-gate slice found the broken install map: the defect was
+# on main, and only the in-slot land could see it before queueing). A land from the shared clone now TAKES a
+# scratch slot for the duration of the gate and gives it back (Release-PregateSlot).
+# The lease runs as a CHILD process on purpose: New-Lease EXITS the process on every refusal path (exit 3
+# frozen/at capacity, exit 7 bound), so an in-process call would end the land instead of only skipping the
+# pre-gate. Returns the lease (path / slot / leaseId), or $null with the reason in $script:PregateScratchWhy.
+function Get-PregateScratchSlot($repo, [string]$onto) {
+  $script:PregateScratchWhy = ''
+  $aq = Join-Path $PSScriptRoot 'agentq.ps1'
+  $c = Get-Config
+  # `-MaxMin 0` gives up at once (a deadline a moment in the past); a land should not sit and wait long.
+  $waitMin = if ($c.ContainsKey('landPregateScratchWaitMin')) { [math]::Max(0, [int]$c['landPregateScratchWaitMin']) } else { 1 }
+  $out = @(& pwsh -NoProfile -File $aq lease -Role scratch -Json -Wait -MaxMin $waitMin -Ref "origin/$onto" -Purpose "land pre-gate for $Branch (held for the gate only)" 2>&1 | ForEach-Object { "$_" })
+  $code = [int]$LASTEXITCODE
+  if ($code) {
+    $why = @($out | Where-Object { $_ -match 'agentq:' } | Select-Object -First 1)
+    $txt = if ($why) { ": " + "$why".Trim() } else { '' }
+    $script:PregateScratchWhy = "no scratch slot was free for the pre-gate (lease exit $code$txt)"
+    return $null
+  }
+  $line = @($out | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1)
+  if (-not $line) { $script:PregateScratchWhy = 'the scratch lease printed no lease JSON'; return $null }
+  $l = try { "$line" | ConvertFrom-Json -AsHashtable } catch { $null }
+  if (-not $l -or -not (P $l 'path') -or -not (P $l 'leaseId')) { $script:PregateScratchWhy = 'the scratch lease JSON carried no path or leaseId'; return $null }
+  if (-not (Test-SlotPrepReady $repo.Name (Split-Path "$(P $l 'path')" -Leaf))) {
+    [void](Release-PregateSlot @{ path = (P $l 'path'); slot = (P $l 'slot'); leaseId = (P $l 'leaseId') } $repo.Name "prep not ready for $Branch")
+    $script:PregateScratchWhy = 'the scratch slot it got has a failed install (prep not ready), so the gate would fail for a reason that is not the topic''s'
+    return $null
+  }
+  $l
+}
+# Gives back the slot the pre-gate took. Always a CHILD process: Invoke-Unlease exits the process on its
+# refusal paths (exit 2 a foreign lease, exit 3 the live-chat guard) and an in-process call would end the
+# land instead of only losing the slot. Never throws: the land must not fail because a slot was not freed.
+function Release-PregateSlot($lease = $null, [string]$repoName = '', [string]$why = '') {
+  if (-not $lease) { $lease = $script:PregateOwnedSlot }
+  $script:PregateOwnedSlot = $null
+  if (-not $lease) { return }
+  $sp = "$(P $lease 'path')"
+  $uo = @(& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'agentq.ps1') unlease -Repo $sp -LeaseId "$(P $lease 'leaseId')" 2>&1 | ForEach-Object { "$_" })
+  $exit = [int]$LASTEXITCODE
+  if ($exit) { [Console]::Error.WriteLine("land: WARNING could not release the scratch slot $sp (lease $(P $lease 'leaseId'), exit $exit): $($uo -join ' ')") }
+  Write-Journal @{ event = 'land-pregate-slot-released'; resource = "land:$repoName"; branch = $Branch; slot = "$(P $lease 'slot')"; leaseId = "$(P $lease 'leaseId')"; path = $sp; exit = $exit; reason = $why; repo = $repoName }
+}
 # Result in $script:PregateResult: ok | failed | skipped. Uses $Gate, $Onto, $Branch from Invoke-Land.
 function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   $script:PregateResult = 'skipped'
+  $script:PregateOwnedSlot = $null
   $res = "land:$($repo.Name)"
   if (-not (Get-LandPregateOn $repo.Name)) { return }
   $skip = {
@@ -1582,7 +1660,13 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   }
   $cwdN = Norm-Dir (Get-Location).Path
   $slot = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and -not $_.stale -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
-  if (-not $slot) { & $skip 'not run from a leased task slot'; return }
+  if (-not $slot) {
+    if (-not (Get-LandPregateFromMain $repo.Name)) { & $skip 'not run from a leased task slot'; return }
+    $slot = Get-PregateScratchSlot $repo $Onto
+    if (-not $slot) { & $skip "not run from a leased task slot, and $($script:PregateScratchWhy)"; return }
+    $script:PregateOwnedSlot = $slot
+    Write-Output "land: pre-gate from the shared clone - took $($repo.Name)/$(P $slot 'slot') for the gate, released when it is done"
+  }
   $sp = "$(P $slot 'path')"
   $topicSha = "$(& git -C $main rev-parse --verify -q "$topicRef^{commit}" 2>$null)".Trim()
   if (-not $topicSha) { & $skip 'the topic does not resolve to a commit'; return }
@@ -1979,7 +2063,9 @@ function Invoke-Land {
   if ($Gate) {
     $pgRef = Resolve-LandRef $main $Branch
     if ($pgRef) {
-      Invoke-LandPregate $repo $main $pgRef
+      # finally, not a release at the end of Invoke-LandPregate: it has several return paths (skips, a green
+      # ledger hit, a red gate).
+      try { Invoke-LandPregate $repo $main $pgRef } finally { Release-PregateSlot $null $repo.Name 'pre-gate done' }
       if ($script:PregateResult -eq 'failed') { $script:LandExit = 6; return }
     }
   }

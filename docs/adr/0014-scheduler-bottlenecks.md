@@ -79,7 +79,10 @@ Options
 **NOT A DEFECT — already option A since b858cf2 (ADR 0009 stage 0), verified in the code 2026-11-21.**
 `Invoke-Land` calls `Invoke-LandPregate` at line **1928** and only creates the ticket at **1932**, so the
 expensive, independent part has always run _before_ the queue: the gate runs in the **caller's own leased
-slot** (`$sp`), on a `commit-tree` of the rebased result, and the slot is put back afterwards. On failure it
+slot** (`$sp`), on a `commit-tree` of the rebased result, and the slot is put back afterwards (amended
+2026-11-22: a land started from the shared clone, which has no slot of its own, now also runs it - it takes
+one `scratch-N` slot for the length of the gate and gives it back, `landPregateFromMain` /
+`landPregateScratchWaitMin`; with no free slot it still skips and the in-queue gate is the only one). On failure it
 journals `land-pregate-failed` with the message "BEFORE the queue - nothing queued, nothing pushed", so a
 red pre-gate costs the waiting agents _no_ queue time — the opposite of what this row claimed. It is on by
 default (`Get-LandPregateOn`: absent config key ⇒ `$true`; `AGENTQ_LAND_NO_PREGATE=1` opts out) and a tree
