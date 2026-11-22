@@ -820,7 +820,7 @@ $WindowMin = 15
 $leaf = Split-Path $path -Leaf
 $parent = Split-Path (Split-Path $path -Parent) -Leaf
 $needle = if ($parent) { "%$parent%$leaf" } else { "%$leaf" }
-$mine = $env:COPILOT_SESSION_ID
+$mine = if ($env:COPILOT_SESSION_ID) { $env:COPILOT_SESSION_ID } else { $env:COPILOT_AGENT_SESSION_ID }
 
 $stores = @()
 Get-ChildItem (Join-Path $HOME 'VS Code Insiders Profiles') -Directory -EA SilentlyContinue | ForEach-Object {

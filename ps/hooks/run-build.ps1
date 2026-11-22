@@ -230,7 +230,7 @@ foreach ($lf in Get-ChildItem $leaseDir -Recurse -Filter '*.json' -File -EA Sile
   try { $lp = (Get-Content -LiteralPath $lf.FullName -Raw | ConvertFrom-Json).path; if ($lp -and ($root.TrimEnd('\') + '\').StartsWith($lp.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { [IO.File]::SetLastWriteTimeUtc("$($lf.FullName).hb", [DateTime]::UtcNow) } } catch { }
 }
 
-$sessionId = if ($env:AGENTQ_SESSION) { $env:AGENTQ_SESSION } elseif ($env:COPILOT_SESSION_ID) { $env:COPILOT_SESSION_ID.Substring(0, [Math]::Min(8, $env:COPILOT_SESSION_ID.Length)) } else { 'unknown' }
+$sessionId = if ($env:AGENTQ_SESSION) { $env:AGENTQ_SESSION } elseif ($env:COPILOT_SESSION_ID) { $env:COPILOT_SESSION_ID.Substring(0, [Math]::Min(8, $env:COPILOT_SESSION_ID.Length)) } elseif ($env:COPILOT_AGENT_SESSION_ID) { $env:COPILOT_AGENT_SESSION_ID.Substring(0, [Math]::Min(8, $env:COPILOT_AGENT_SESSION_ID.Length)) } else { 'unknown' }
 
 # --- agentq queue (2026-09-27) ------------------------------------------------
 # Re-enter this script under `agentq run -Resource <class resource>` (`build` for web, or
