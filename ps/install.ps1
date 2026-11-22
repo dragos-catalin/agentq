@@ -99,6 +99,10 @@ $map = [ordered]@{
   # `agentq status -All -Json` lease list AND the per-slot lease files, and fails safe (skip, loud)
   # when neither is usable. Was live-only in ~/.copilot/bin and never carried by the repo before this.
   'bin\clean-build-artifacts.ps1' = 'bin\clean-build-artifacts.ps1'; 'tests\test-clean-build-artifacts.ps1' = 'bin\test-clean-build-artifacts.ps1'
+  # 2026-11-22: static guard for the script-scope clobber class (a top-level `$null` reset after a real
+  # value). A suite in run-all belongs in this map too, or the install gate cannot run what it never
+  # installed - the same gap `test-land-default-gate.ps1` had (see the note above).
+  'tests\test-script-scope.ps1' = 'bin\test-script-scope.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.
