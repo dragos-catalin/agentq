@@ -17,7 +17,7 @@ in ~/.codai/agentq-sync.key. Never printed.
   agentq-sync.ps1 -SetKey              read the key from STDIN (pipe it; never echo it)
   agentq-sync.ps1 -Once [-DryRun]      one push (DryRun: print the payload summary, no POST)
   agentq-sync.ps1 -Loop [-IntervalSec 15]
-  agentq-sync.ps1 -Install             scheduled task 'agentq-sync': ONE PUSH PER TICK (1-min repetition
+  agentq-sync.ps1 -Install             scheduled task 'agentq-sync': ONE PUSH PER TICK (5-min repetition
                                        + at-logon, IgnoreNew, bounded run) so every tick loads the current
                                        code (a -Loop process keeps the copy it loaded at start; see the
                                        git-autosync DAEMON note, ADR 0010). Replaces any running model first.
@@ -351,12 +351,54 @@ function Invoke-Op($op) {
   Write-JournalLine @{ event = 'mark'; resource = $op.resource; state = $op.state; reason = $op.reason; session = $op.session; hubOp = $op.id }
 }
 
+# The hub schema bounds every short field (zod `shortText(n)`), and ONE over-long value rejects the
+# WHOLE push (HTTP 400). The journal offset only advances on success, so a single oversized row keeps
+# re-sending itself and freezes the mirror forever (2026-11-22 16:57Z: two background-job labels of 220
+# and 205 chars against a 200 limit took the hub mirror down for hours, invisibly - the task still
+# exited 0 and only `-Status` showed the error). Clamp here, where the contract is known, instead of
+# trusting every producer.
+$script:FieldMax = @{ label = 200; command = 500; cwd = 300; repo = 300; log = 500; purpose = 2000;
+                      session = 200; branch = 200; path = 300; reason = 2000; cmd = 4000; ref = 200;
+                      follow = 200; phase = 40; sha = 64; supersedeSha = 64; pendingSha = 64 }
+function Clamp-Payload {
+  param($Rows, [string[]]$Fields = @(), [int]$Lines = 0)
+  foreach ($r in @($Rows)) {
+    if (-not $r) { continue }
+    $isHash = $r -is [System.Collections.IDictionary]
+    foreach ($f in $Fields) {
+      $max = $script:FieldMax[$f]
+      if (-not $max) { continue }
+      $cur = if ($isHash) { $r[$f] } else { $r.PSObject.Properties[$f]?.Value }
+      if ($cur -is [string] -and $cur.Length -gt $max) {
+        $cut = $cur.Substring(0, $max)
+        if ($isHash) { $r[$f] = $cut } else { $r.$f = $cut }
+        [Console]::Error.WriteLine("agentq-sync: clamped $f ($($cur.Length) -> $max) before the push")
+      }
+    }
+    if ($Lines -gt 0) {
+      $ls = if ($isHash) { $r['lines'] } else { $r.PSObject.Properties['lines']?.Value }
+      if ($ls) {
+        $kept = @(@($ls) | Select-Object -First 60 | ForEach-Object { if ($_ -is [string] -and $_.Length -gt $Lines) { $_.Substring(0, $Lines) } else { $_ } })
+        if ($isHash) { $r['lines'] = $kept } else { $r.lines = $kept }
+      }
+    }
+  }
+}
+
 function Invoke-Push {
   $state = Read-State
   $j = Get-NewLines $state.offset
+  # Clamp every schema-bounded field BEFORE the POST: one over-long value 400s the whole push and,
+  # because the offset only advances on success, the same row would be re-sent forever (see Clamp-Payload).
+  $tickets = @(Get-Tickets);  Clamp-Payload -Rows $tickets  -Fields 'session','purpose','cmd','repo'
+  $marks = @(Get-Marks);      Clamp-Payload -Rows $marks    -Fields 'reason','session'
+  $leases = @(Get-Leases);    Clamp-Payload -Rows $leases   -Fields 'path','branch','purpose','session'
+  $releases = @(Get-Releases); Clamp-Payload -Rows $releases -Fields 'sha','ref','follow','phase','supersedeSha','pendingSha','session'
+  $jobs = @(Get-Jobs);        Clamp-Payload -Rows $jobs     -Fields 'label','command','cwd','repo','log'
+  $daemons = @(Get-Daemons);  Clamp-Payload -Rows $daemons  -Lines 400
   $body = [ordered]@{
     host = $env:COMPUTERNAME; root = $Root; agentVersion = $Version
-    tickets = @(Get-Tickets); marks = @(Get-Marks); leases = @(Get-Leases); releases = @(Get-Releases); jobs = @(Get-Jobs); daemons = @(Get-Daemons); journal = @($j.lines); ackOps = @($state.ack)
+    tickets = $tickets; marks = $marks; leases = $leases; releases = $releases; jobs = $jobs; daemons = $daemons; journal = @($j.lines); ackOps = @($state.ack)
   }
   if ($DryRun) {
     "tickets=$($body.tickets.Count) marks=$($body.marks.Count) leases=$($body.leases.Count) releases=$($body.releases.Count) jobs=$($body.jobs.Count) daemons=$($body.daemons.Count) journal=$($body.journal.Count) offset $($state.offset)->$($j.offset) ack=$($body.ackOps.Count)"
@@ -404,7 +446,9 @@ if ($Status) {
   if (Test-Path -LiteralPath $dd) {
     foreach ($f in Get-ChildItem -LiteralPath $dd -Filter '*.json' -File -ErrorAction SilentlyContinue) {
       try { $rec = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -AsHashtable -DateKind String } catch { "  $($f.BaseName): unreadable"; continue }
-      $age = try { [int](([DateTime]::UtcNow - [DateTime]$rec['at']).TotalMinutes) } catch { -1 }
+      # ParseUtc, not a bare [DateTime] cast: a "…Z" string cast to [DateTime] comes back in LOCAL
+      # time, so UtcNow - that was off by the offset (EET +2: a 25 s old record printed "-120m ago").
+      $age = try { [int](([DateTime]::UtcNow - (ParseUtc $rec['at'])).TotalMinutes) } catch { -1 }
       "  {0,-16} {1,-5} failStreak {2}  {3}m ago  ({4} lines)" -f "$($rec['name'])", "$($rec['verdict'])", [int]$rec['failStreak'], $age, @($rec['lines']).Count
     }
   } else { '  (no daemon records yet)' }
@@ -432,15 +476,16 @@ if ($Install) {
     # One push per tick: the code is always current. IgnoreNew skips a tick whose predecessor still
     # runs (the in-loop mutex + the HTTP timeout bound a normal pass well under the cap); the 5-minute
     # cap ends a wedged push instead of blocking every later tick via IgnoreNew; StartWhenAvailable runs
-    # a tick missed to a reboot or sleep. 1 min = the Task Scheduler repetition floor (the old loop
-    # slept 15 s, shorter than the scheduler allows).
+    # a tick missed to a reboot or sleep. 5 min since 2026-11-23 (was 1 min = the scheduler floor): a
+    # pass measures ~1.0 s, so 1440 ticks/day cost ~24 min of CPU plus 1440 wscript/pwsh pairs to refresh
+    # a dashboard nobody polls that fast; a freeze set in the hub still lands within one tick.
     $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common"
     $trg = @(
       (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
-      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1))
+      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5))
     )
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
-    $desc = 'agentq -> hub.codai.ro mirror (one push per 1 min tick)'
+    $desc = 'agentq -> hub.codai.ro mirror (one push per 5 min tick)'
   }
   Register-ScheduledTask -TaskName 'agentq-sync' -Action $act -Trigger $trg -Settings $set -Description $desc -Force | Out-Null
   Start-ScheduledTask -TaskName 'agentq-sync'

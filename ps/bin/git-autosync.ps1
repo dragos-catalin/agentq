@@ -1171,13 +1171,15 @@ if ($Install) {
     # One pass per tick: the code is always current (see DAEMON in the header). IgnoreNew skips a tick
     # whose predecessor is still running; the 30-minute cap ends a wedged pass instead of letting it
     # block every later tick via IgnoreNew; StartWhenAvailable runs a tick missed to a reboot or sleep.
+    # 15 min since 2026-11-23 (was 2 min in this file, 5 min on the live task): one pass fetches every
+    # repo in the fleet, so a 2-minute tick re-fetched 24 repos for no reason.
     $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common"
     $trg = @(
       (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
-      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2))
+      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 15))
     )
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
-    $desc = 'fast-forward shared clones to upstream when safe (one pass per 2 min tick)'
+    $desc = 'fast-forward shared clones to upstream when safe (one pass per 15 min tick)'
   }
   Register-ScheduledTask -TaskName 'git-autosync' -Action $act -Trigger $trg -Settings $set -Description $desc -Force | Out-Null
   Start-ScheduledTask -TaskName 'git-autosync'

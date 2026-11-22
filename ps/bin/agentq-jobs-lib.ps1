@@ -35,6 +35,11 @@ function Read-Job([string]$id) {
   $null
 }
 function Write-JobRaw([hashtable]$job) {
+  # The label is display-only and the hub schema caps it at 200 (`agentqJobSchema.label`). A 220-char
+  # label from a `run-all -Only <long list>` job rejected the WHOLE hub push with HTTP 400 and, because
+  # the journal offset only advances on a successful push, the same row kept re-sending itself and froze
+  # the mirror for hours (2026-11-22 16:57Z -> 22:33Z). Clamp at the one place every record passes through.
+  if ($job['label'] -is [string] -and $job['label'].Length -gt 200) { $job['label'] = $job['label'].Substring(0, 200) }
   $f = Get-JobFile $job.id
   [IO.File]::WriteAllText("$f.tmp", ($job | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
   [IO.File]::Move("$f.tmp", $f, $true)
