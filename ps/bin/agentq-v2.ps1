@@ -9,6 +9,15 @@ $RepoArg = $Repo
 $LDir = Join-Path $SysRoot 'leases'
 $RDir = Join-Path $SysRoot 'releases'
 foreach ($d in $LDir, $RDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force $d | Out-Null } }
+# pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22)
+$script:LandSetOut = $null
+$script:GateSec = $null
+$script:PickBad = $null
+$script:LandAcc = $null
+$script:SlotWorkCache = $null
+$script:ReadOnly = $null
+$script:GateExit = $null
+$script:PregateResult = $null
 
 # ---- policy -------------------------------------------------------------------------------
 # AGENTQ_CONFIG overrides the file (tests); missing keys fall back to these defaults.
@@ -98,7 +107,7 @@ function With-Mutex([string]$name, [scriptblock]$body) {
 function Get-MainTop($repo) { Split-Path -Parent $repo.Common }
 function Get-SlotPath([string]$repoName, [string]$slot) { Join-Path (Join-Path (Get-WtRoot) $repoName) $slot }
 function Get-LeaseFile([string]$repoName, [string]$slot) { Join-Path (Join-Path $LDir $repoName) "$slot.json" }
-function Get-DefaultOwner { if ($OwnerPid -gt 0) { return $OwnerPid }; if ($env:AGENTQ_OWNER_PID) { return [int]$env:AGENTQ_OWNER_PID }; try { (Get-Process -Id $PID).Parent.Id } catch { $PID } }
+function Get-DefaultOwner { if ($OwnerPid -gt 0) { return $OwnerPid }; if ($env:AGENTQ_OWNER_PID) { return [int]$env:AGENTQ_OWNER_PID }; Get-AgentHostPid }
 function Short([string]$s, [int]$n = 10) { if (-not $s) { return '' }; $s.Substring(0, [math]::Min($n, $s.Length)) }
 
 # ---- lease activity beyond the slot (ADR 0003 W1-3) ---------------------------------------------
@@ -316,6 +325,13 @@ function Read-Leases([string]$repoName) {
         $xa = Get-LeaseExtraBeat $l
         if ($xa -and $xa -gt $beat) { $beat = $xa; $idle = ((Now) - $beat).TotalMinutes; $stale = (-not $held) -and ((($idle -gt $deadIdle) -and $chatOld) -or ($idle -gt $cfg.leaseMaxIdleMin)) }
       }
+      # UNSAVED WORK guard (2026-11-22): a slot with uncommitted or unpushed work is not reset after the
+      # short idle thresholds - an agent thinking/compacting for 45 min is not gone, and a reset (even
+      # with a backup ref) reads as "my work was lost". It is protected up to leaseDirtyIdleMin.
+      $unsaved = $false
+      if ($stale -and $lrole -in 'task', 'pinned', 'scratch' -and $idle -le [double](P $cfg 'leaseDirtyIdleMin' 240) -and $idle -le [double]$cfg.leaseMaxIdleMin) {
+        if (Test-SlotHasWork (P $l 'path' '')) { $stale = $false; $unsaved = $true }
+      }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
       $l | Add-Member -NotePropertyName beat -NotePropertyValue $beat -Force
       $l | Add-Member -NotePropertyName alive -NotePropertyValue $alive -Force
@@ -324,7 +340,7 @@ function Read-Leases([string]$repoName) {
       $l | Add-Member -NotePropertyName chatIdleMin -NotePropertyValue $(if ($chatAt) { [math]::Round(((Now) - $chatAt).TotalMinutes, 1) } else { $null }) -Force
       # why this lease is (or is not) taken by the next sweep: the threshold that applied, the chat grace,
       # -Hold, and a short reason. Used by `who` and by the lease-kept journal line Invoke-Sweep writes.
-      $why = if ($stale) { 'stale' } elseif ($held) { 'held' } elseif ($idle -le $deadIdle) { 'recent work' } elseif (-not $chatOld) { 'chat grace' } else { 'ok' }
+      $why = if ($stale) { 'stale' } elseif ($held) { 'held' } elseif ($unsaved) { 'unsaved work' } elseif ($idle -le $deadIdle) { 'recent work' } elseif (-not $chatOld) { 'chat grace' } else { 'ok' }
       $l | Add-Member -NotePropertyName thresholdMin -NotePropertyValue ([math]::Round($deadIdle, 1)) -Force
       $l | Add-Member -NotePropertyName graceMin -NotePropertyValue ([math]::Round($graceMin, 1)) -Force
       $l | Add-Member -NotePropertyName held -NotePropertyValue $held -Force
@@ -364,6 +380,18 @@ function Renew-ForCwd {
     $start = if ($RepoArg) { $RepoArg } else { (Get-Location).Path }
     if ((Norm-Dir $start).StartsWith((Norm-Dir (Get-WtRoot)))) { $l = Find-LeaseForPath $start; if ($l) { Touch-Lease $l } }
   } catch {}
+}
+function Test-SlotHasWork([string]$path) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $false }
+  if ($null -eq $script:SlotWorkCache) { $script:SlotWorkCache = @{} }
+  if ($script:SlotWorkCache.ContainsKey($path)) { return $script:SlotWorkCache[$path] }
+  $has = $false
+  try {
+    $head = (& git -C $path rev-parse --verify -q HEAD 2>$null)
+    if ($head) { $has = (-not (Test-GitClean $path)) -or (-not (Test-OnRemote $path $head)) }
+  } catch {}
+  $script:SlotWorkCache[$path] = $has
+  $has
 }
 function Test-GitClean([string]$path) { -not @(& git --no-optional-locks -C $path status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ }).Count }
 function Test-OnRemote([string]$path, [string]$sha) {
