@@ -100,6 +100,11 @@ $suites = [ordered]@{
   # `agentq status -All -Json` lease list AND the per-slot lease files, skip a slot either marks in
   # use, and fail SAFE (say `live NOT DETERMINED` + skip slot output) when the coord dir is unreadable.
   'clean artifacts' = @('-File', (Join-Path $PSScriptRoot 'test-clean-build-artifacts.ps1'), '-Tool', (Join-Path $bin 'clean-build-artifacts.ps1'))
+  # 2026-11-22: the shared-clone janitor. It builds throwaway bare origins + clones under %TEMP% and
+  # drives the REAL agentq publish, with the log/backup/coord roots and AGENTQ_HOME/AGENTQ_CONFIG all
+  # redirected into the scratch dir, so nothing touches a real shared clone. Dry-run by default; the
+  # -Apply scenario throws an unowned dirty set at it and proves the publish + path-scoped clean.
+  'shared janitor'  = @('-File', (Join-Path $PSScriptRoot 'test-shared-clone-janitor.ps1'), '-Tool', (Join-Path $bin 'shared-clone-janitor.ps1'), '-Agentq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
 if ($List) { $names | ForEach-Object { Write-Host $_ }; exit 0 }
