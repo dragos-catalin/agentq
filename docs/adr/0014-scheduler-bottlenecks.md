@@ -204,7 +204,7 @@ Nothing is refused (an ungated land still beats a land that never happens): the 
 
 1. `Get-MachineMemory` began with `if ($null -eq $script:MmFloors)` and `$script:MmFloors` was never
    declared. Under `Set-StrictMode` that **read** throws — `The variable '$script:MmFloors' cannot be
-   retrieved because it has not been set` — so every `agentq run` exited 1 before doing anything.
+retrieved because it has not been set` — so every `agentq run` exited 1 before doing anything.
    Fixed by declaring it next to the other script globals; the guarantee is now a comment on the
    declaration, not a memory.
 2. `$floors = @($queueGB, $queueGB * 2, …) | Sort-Object -Unique` did not compute what it reads like:
@@ -219,11 +219,11 @@ Nothing is refused (an ungated land still beats a land that never happens): the 
    `machine-memory` row at all — and a check that emits nothing cannot fail an assertion. `agentq doctor`
    looked healthy, the suite was green, and the same function was killing every `agentq run` in
    production. Two consequences, both applied:
-   - A check must never be able to *silently vanish*. The suite now asserts that with the switch off a
+   - A check must never be able to _silently vanish_. The suite now asserts that with the switch off a
      `machine-memory` row is produced again (pass or warn, never absent) — the absence was the bug.
    - `machine-memory` reads the real machine, so it cannot live inside a fixture suite that asserts exact
      warning counts: it gained `AGENTQ_DOCTOR_NO_MEMORY=1` (symmetric with `AGENTQ_DOCTOR_NO_TASKS=1`)
      and the suite sets it. Floor value `0` means "that gate is not configured" and is no longer counted
      as a distinct floor, which is what turned the row into noise on a machine with one gate off.
-   The suite's own summary-count assertion was a hard-coded constant that broke twice for the same
-   reason (a check added, a check skipped); it now counts the checks that **actually ran**.
+     The suite's own summary-count assertion was a hard-coded constant that broke twice for the same
+     reason (a check added, a check skipped); it now counts the checks that **actually ran**.

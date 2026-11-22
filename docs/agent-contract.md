@@ -65,7 +65,7 @@ bug?"; check the levels above yours before blaming the code.
    bypassed "because the test needs it".
 2. **The harness env vars are for hermetic suites, never for a real run.** `AGENTQ_NO_*`,
    `AGENTQ_FAKE_*`, `AGENTQ_TEST_SKIP`, `AGENTQ_NO_ADMISSION` exist so `run-all.ps1` does not depend on
-   how busy the machine is. They may skip an *admission* gate inside a suite; they may not relax a
+   how busy the machine is. They may skip an _admission_ gate inside a suite; they may not relax a
    refusal, and a shell that is doing real work must not set them. `AGENTQ_HELD` is read, not typed: it
    is how a parent agentq tells a nested gate that the `commit:<repo>` ticket is already held.
 3. **A CLI flag beats the config for that one invocation** (`-MinFreeGB`, `-Parallel`, `-Wait` /
