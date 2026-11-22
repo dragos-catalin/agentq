@@ -56,7 +56,7 @@ if (-not $Zone) { $Zone = $Registry[$Ws].zone }
 $Vm = "ws-$Ws"; $Bucket = "gs://$CtlProject-devcloud-jobs"
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
 $Journal = Join-Path $Root 'journal.jsonl'
-$Session = foreach ($v in $env:AGENTQ_SESSION, $env:COPILOT_SESSION_ID, $env:CLAUDE_SESSION_ID) { if ($v) { $v; break } }
+$Session = foreach ($v in $env:AGENTQ_SESSION, $env:COPILOT_SESSION_ID, $env:COPILOT_AGENT_SESSION_ID, $env:CLAUDE_SESSION_ID, $env:CODEX_SESSION_ID) { if ($v) { $v; break } }
 if (-not $Session) { $Session = "term-$(try { (Get-Process -Id $PID).Parent.Id } catch { 0 })" }
 
 function Out-Line([string]$s) { [Console]::Out.WriteLine($s) }
