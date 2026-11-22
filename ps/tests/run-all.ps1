@@ -49,6 +49,8 @@ $suites = [ordered]@{
   'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'args'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'help'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-help.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # static guard for the 2026-11-22 class: a script-scope `$null` reset after a real value
+  'script scope'   = @('-File', (Join-Path $PSScriptRoot 'test-script-scope.ps1'), '-Ps', $root)
   # ADR 0003 wave 2/4
   'land finalize'  = @('-File', (Join-Path $PSScriptRoot 'test-land-finalize.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'post-land hook' = @('-File', (Join-Path $PSScriptRoot 'test-post-land.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
