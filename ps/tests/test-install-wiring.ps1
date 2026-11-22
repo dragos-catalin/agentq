@@ -15,6 +15,10 @@
 #   8  an unknown name in the list is refused (exit 2) naming it
 #   9  MUTATION: a suite referencing a tool that is not in the map is DETECTED (checks 1 is not vacuous)
 #  10  MUTATION: an unknown name in gateSuites is DETECTED (check 4 is not vacuous)
+#  11  every suite's own -File is a map key (a suite the installer never carries cannot gate anything)
+#  12  every map DESTINATION is unique and inside the install root - a duplicate silently loses a file
+#      (last writer wins), an escaping one writes outside ~/.copilot. Both are file-level facts, so they
+#      are checked statically; MUTATION proves the two checks fire.
 [CmdletBinding(PositionalBinding = $false)]
 param([string]$Ps = (Join-Path $PSScriptRoot '..'))
 $ErrorActionPreference = 'Continue'
@@ -71,6 +75,29 @@ function Get-MapKeys([string]$InstallPath) {
   $keys = @()
   foreach ($mm in [regex]::Matches($body, "'([^']+)'\s*=\s*'([^']+)'")) { $keys += $mm.Groups[1].Value }
   $keys
+}
+# The same block, both sides: the destination is what a machine actually gets, and its invariants
+# (unique, inside the install root) are invisible to a check that only reads the source keys.
+function Get-MapEntries([string]$InstallPath) {
+  $text = Get-Content -LiteralPath $InstallPath -Raw
+  $m = [regex]::Match($text, '(?ms)\$map\s*=\s*\[ordered\]@\{.*?^\$dst')
+  if (-not $m.Success) { return @() }
+  $body = @($m.Value -split "`r?`n" | Where-Object { "$_".Trim() -notmatch '^#' }) -join "`n"
+  @([regex]::Matches($body, "'([^']+)'\s*=\s*'([^']+)'") | ForEach-Object { [pscustomobject]@{ Src = $_.Groups[1].Value; Dst = $_.Groups[2].Value } })
+}
+function Get-MapDestFindings($Entries, [string]$Root) {
+  $f = @()
+  foreach ($d in @($Entries | Group-Object { "$($_.Dst)".ToLowerInvariant() } | Where-Object { $_.Count -gt 1 })) {
+    $f += "destination '$($d.Name)' is claimed by $($d.Count) sources: $((@($d.Group | ForEach-Object { $_.Src })) -join ', ')"
+  }
+  $rootFull = ([IO.Path]::GetFullPath($Root) + '\')
+  foreach ($e in $Entries) {
+    $dst = "$($e.Dst)"
+    if (-not $dst.Trim() -or $dst -match '^[\\/]' -or $dst -match ':') { $f += "destination '$dst' (from $($e.Src)) is not a relative path"; continue }
+    $full = [IO.Path]::GetFullPath((Join-Path $Root $dst))
+    if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { $f += "destination '$dst' (from $($e.Src)) resolves outside the install root: $full" }
+  }
+  @($f)
 }
 # A reference is satisfied when ANY of its candidate source paths is a map key.
 function Get-MapDrift([string]$RunAllPath, [string]$InstallPath, [string[]]$Except = @()) {
@@ -138,6 +165,31 @@ foreach ($e in $trackExcept.Keys) {
   if ($tracked.ContainsKey($e.ToLowerInvariant())) { Note "the exception for $e is now STALE (the file is tracked) - drop it from the guard" }
   elseif ($mapKeys -notcontains $e) { Note "the exception for $e is STALE (no such map key) - drop it from the guard" }
 }
+
+# --- 11: every suite's own file is carried by the map ---------------------------------------------
+# install.ps1 says it in its own comment ("A suite in run-all belongs in this map too, or the install gate
+# cannot run what it never installed"): test-land-default-gate.ps1 was exactly that, and only a human
+# noticing kept it from happening again. The `-File` argument is the suite's own script; `$stage` is a copy
+# of tests\ + bin\, so both prefixes are tried (same table as the reference check).
+$suiteFiles = @()
+foreach ($m in [regex]::Matches($suiteBlock, "(?ms)^\s*'(?<n>[^']+)'\s*=\s*@\('-File',\s*\(Join-Path\s+[$](?<var>[A-Za-z_]\w*)\s+'(?<f>[^']+)'\)")) {
+  $var = $m.Groups['var'].Value; $f = $m.Groups['f'].Value
+  if (-not $prefixOf.ContainsKey($var)) { continue }
+  $cand = @($prefixOf[$var] | ForEach-Object { if ($_) { "$_\$f" } else { $f } })
+  $suiteFiles += [pscustomobject]@{ Name = $m.Groups['n'].Value; File = $f; Cand = $cand; Mapped = [bool]@($cand | Where-Object { $mapKeys -contains $_ }).Count }
+}
+# Anti-vacuity: nothing below can fail if the -File arguments were not extracted.
+Check 'the suite files are readable (not an empty match)' ($suiteFiles.Count -ge 45) "extracted $($suiteFiles.Count) suite files"
+$unmappedSuites = @($suiteFiles | Where-Object { -not $_.Mapped })
+Check 'every suite -File is a map key (the installed gate carries what it runs)' ($unmappedSuites.Count -eq 0) "$($unmappedSuites.Count): $((@($unmappedSuites | ForEach-Object { "$($_.Name) ($($_.Cand -join ' or '))" })) -join '; ')"
+
+# --- 12: the map destinations are unique and inside the install root -------------------------------
+$mapEntries = @(Get-MapEntries $install)
+Check 'the map destinations are readable (one entry per source key)' ($mapEntries.Count -ge 60 -and $mapEntries.Count -eq $mapKeys.Count) "entries=$($mapEntries.Count) keys=$($mapKeys.Count)"
+$installRoot = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
+$destFindings = @(Get-MapDestFindings $mapEntries $installRoot)
+Check "every map destination is unique and inside the install root ($installRoot)" ($destFindings.Count -eq 0) "$($destFindings.Count) finding(s): $($destFindings -join '; ')"
+foreach ($d in $destFindings) { Note "destination problem: $d" }
 
 # --- 4/5: the persisted gate list and the land gate -----------------------------------------------
 # Resolved the same way run-all does, so the guard tests what runs: bin/agentq-config.json unless
@@ -222,14 +274,34 @@ try {
   $tInstall = Join-Path $tmpPs 'install.ps1'
   Copy-Item $runAll $tRunAll; Copy-Item $install $tInstall; Copy-Item $cfgPath (Join-Path $tmpPs 'bin\agentq-config.json')
   $txt = Get-Content -LiteralPath $tRunAll -Raw
-  $mutant = "  'mutant suite'   = @('-File', (Join-Path `$PSScriptRoot 'test-install-wiring.ps1'), '-Tool', (Join-Path `$bin 'no-such-tool.ps1'))"
+  $mutant = "  'mutant suite'   = @('-File', (Join-Path `$PSScriptRoot 'test-install-wiring.ps1'), '-Tool', (Join-Path `$bin 'no-such-tool.ps1'))" + "`n" +
+            "  'unmapped suite' = @('-File', (Join-Path `$PSScriptRoot 'test-nowhere.ps1'))"
   $txt = [regex]::Replace($txt, "(?m)^(\s*'help'\s*=.*)$", ("`$1" + "`n" + $mutant))
   [IO.File]::WriteAllText($tRunAll, $txt, [Text.UTF8Encoding]::new($false))
   $mutDrift = @(Get-MapDrift $tRunAll $tInstall)
+  $mutBlock = Get-SuiteBlock $tRunAll
+  $mutSuiteFiles = @()
+  foreach ($mm in [regex]::Matches($mutBlock, "(?ms)^\s*'(?<n>[^']+)'\s*=\s*@\('-File',\s*\(Join-Path\s+[$](?<var>[A-Za-z_]\w*)\s+'(?<f>[^']+)'\)")) {
+    $cand = @($prefixOf[$mm.Groups['var'].Value] | ForEach-Object { if ($_) { "$_\$($mm.Groups['f'].Value)" } else { $mm.Groups['f'].Value } })
+    $mutSuiteFiles += [pscustomobject]@{ Name = $mm.Groups['n'].Value; Cand = $cand; Mapped = [bool]@($cand | Where-Object { $mapKeys -contains $_ }).Count }
+  }
   # The injection must be PROVEN to have happened, or the mutation proves nothing (first run: the 4-arg
   # [regex]::Replace overload does not exist, the text was unchanged, and the check passed vacuously).
   $injected = (Get-Content -LiteralPath $tRunAll -Raw).Contains('mutant suite')
   Check 'MUTATION a suite whose tool is not installed is detected' ($injected -and @($mutDrift | Where-Object { $_ -match 'no-such-tool' }).Count -gt 0) "injected=$injected drift=$($mutDrift -join '; ')"
+  $unmapped = @($mutSuiteFiles | Where-Object { -not $_.Mapped -and $_.Name -eq 'unmapped suite' })
+  Check 'MUTATION a suite whose own -File is not in the map is detected' ($injected -and $unmapped.Count -eq 1 -and ($unmapped[0].Cand -contains 'tests\test-nowhere.ps1')) "suites=$(($mutSuiteFiles | Where-Object { -not $_.Mapped } | ForEach-Object Name) -join ',')"
+
+  # MUTATION 12: a destination claimed twice, and one that escapes the install root, must be DETECTED.
+  $tInstall2 = Join-Path $tmp 'mut-dest-install.ps1'
+  $txt2 = Get-Content -LiteralPath $install -Raw
+  $inject2 = "  'tests\quirky-a.ps1' = 'bin\agentq.ps1'; 'tests\quirky-b.ps1' = '..\outside-the-root.ps1'"
+  $txt2 = [regex]::Replace($txt2, "(?m)^(\s*'bin\\agentq\.ps1'\s*=.*)$", ("`$1" + "`n" + $inject2))
+  [IO.File]::WriteAllText($tInstall2, $txt2, [Text.UTF8Encoding]::new($false))
+  $injected2 = (Get-Content -LiteralPath $tInstall2 -Raw).Contains('quirky-a.ps1')
+  $mEntries = @(Get-MapEntries $tInstall2)
+  $mFind = @(Get-MapDestFindings $mEntries $installRoot)
+  Check 'MUTATION a duplicate and an escaping destination are detected' ($injected2 -and $mEntries.Count -eq ($mapEntries.Count + 2) -and @($mFind | Where-Object { $_ -match 'quirky-a' }).Count -gt 0 -and @($mFind | Where-Object { $_ -match 'quirky-b' }).Count -gt 0) "injected=$injected2 entries=$($mEntries.Count) findings=$($mFind -join '; ')"
 } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Output "install wiring: pass=$pass fail=$fail"

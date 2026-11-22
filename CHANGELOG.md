@@ -32,6 +32,18 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   while the file itself stayed untracked since 9541a44, so a fresh clone threw
   `install: tests\test-release-phase-honesty.ps1 is in the map but not in this checkout`.
 
+- The pre-gate also runs for a land started from the **shared clone**: with no tree of its own it takes a
+  scratch slot for the length of the gate and gives it back (journal `land-pregate-slot-released`), and when no
+  scratch slot is free, or the one it got has a failed install, it skips the pre-gate with the reason journaled
+  instead of gating an unprepared tree or silently letting the queue pay for the discovery. Config
+  `landPregateFromMain` (default true), `landPregateScratchWaitMin` (default 1, 0 = skip at once). Measured the
+  day before: a land of the gate slice spent its whole queue-side gate on a defect that came from main, which an
+  in-slot pre-gate catches before queueing.
+- `install wiring` gained two file-level checks and their mutation: every suite's own `-File` is a map key (a
+  suite the installer never carries cannot gate anything - the `test-land-default-gate.ps1` gap, generalised),
+  and every map **destination** is unique and resolves inside the install root (a duplicate silently loses a
+  file, an escaping one writes outside `~/.copilot`). Measured on today's map: 98 destinations, 52 suites.
+
 ### Fixed
 
 - Shared-clone guard (ADR 0004): `sharedCloneMode: refuse` now **really denies** a source write instead of
@@ -48,7 +60,11 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq status`, `log`, `metrics` and `doctor` only read the state folder; dead tickets are reaped by working verbs and by `sweep`.
 - The guard honours `sharedCloneMode` under Windows PowerShell 5.1 (it was ignored in the editor).
 - A chat that releases its own slot from a script file is recorded as the releasing chat (`byChat`); before, only an `unlease` typed in the command counted.
-- The repository passes `prettier --check .` again (formatting only).
+- The repository passes `prettier --check .` again (formatting only): four committed files (`ps/tests/README.md`
+  and three documents under `docs/`) were not in prettier 3's canonical form, so `pnpm lint` - the first step of
+  CI - was red on main. Measurement trap behind the miss: prettier 3 honours `.gitignore`, so a `--check` run on
+  a path under `.copilot-tmp/` prints "All matched files use Prettier code style!" for _any_ content; the verdict
+  needed `--ignore-path` pointing at an empty file AND a control file that must fail.
 - run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
 - agentq-sync publishes v3 holders first so the hub's position model stays correct.
