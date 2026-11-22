@@ -146,11 +146,12 @@ Set-Content (Join-Path $wt 'slot.txt') 'q'
 Check 'slot commit still allowed' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
 Pop-Location
 $env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'
+$env:AGENTQ_SHARED_CLONE_REASON = 'test one-off'
 Push-Location $repo
 & pwsh -NoProfile -File $aq commit -Purpose 'escape' -Message 'test: deliberate one-off' -Paths shared.txt -NoPush 2>$null | Out-Null
 Check 'journaled opt-out allows a deliberate one-off' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
 Pop-Location
-Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
+Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK, Env:AGENTQ_SHARED_CLONE_REASON
 Set-Content $cfgPath $cfgText
 
 # 7. break removes a live ticket with a reason and journals it.
