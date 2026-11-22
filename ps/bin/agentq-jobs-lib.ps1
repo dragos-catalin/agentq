@@ -40,6 +40,10 @@ function Write-JobRaw([hashtable]$job) {
   # the journal offset only advances on a successful push, the same row kept re-sending itself and froze
   # the mirror for hours (2026-11-22 16:57Z -> 22:33Z). Clamp at the one place every record passes through.
   if ($job['label'] -is [string] -and $job['label'].Length -gt 200) { $job['label'] = $job['label'].Substring(0, 200) }
+  # expectedMin is a nullable INT in the hub schema (nullableInt(0, 100_000)): a fractional value from
+  # 'job-start -ExpectedMin 0.1' 400s the whole push. Keep the record integral (a sub-minute estimate -> 1).
+  $em = $job['expectedMin']
+  if ($em -is [double] -or $em -is [decimal] -or $em -is [single]) { $job['expectedMin'] = [int][Math]::Ceiling([double]$em) }
   $f = Get-JobFile $job.id
   [IO.File]::WriteAllText("$f.tmp", ($job | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
   [IO.File]::Move("$f.tmp", $f, $true)

@@ -385,6 +385,27 @@ function Clamp-Payload {
   }
 }
 
+# A fractional value in an int field ('expectedMin: 0.1' from `job-start -ExpectedMin 0.1`) makes
+# zod reject the WHOLE push the same way an over-long string does: "jobs: expected int, received number"
+# (2026-11-22, seen in the gateway's own 400 body). Store and send integers.
+function Coerce-Ints {
+  param($Rows, [string[]]$Fields = @())
+  foreach ($r in @($Rows)) {
+    if (-not $r) { continue }
+    $isHash = $r -is [System.Collections.IDictionary]
+    foreach ($f in $Fields) {
+      $cur = if ($isHash) { $r[$f] } else { $r.PSObject.Properties[$f]?.Value }
+      if ($null -eq $cur) { continue }
+      if (-not ($cur -is [double] -or $cur -is [decimal] -or $cur -is [single])) { continue }
+      $dv = [double]$cur
+      $iv = [int][Math]::Ceiling($dv)
+      if ($iv -eq $dv) { continue }   # already integral: JS 6.0 passes z.number().int(), no write needed
+      if ($isHash) { $r[$f] = $iv } else { $r.$f = $iv }
+      [Console]::Error.WriteLine("agentq-sync: coerced $f ($cur -> $iv) before the push")
+    }
+  }
+}
+
 function Invoke-Push {
   $state = Read-State
   $j = Get-NewLines $state.offset
@@ -392,10 +413,11 @@ function Invoke-Push {
   # because the offset only advances on success, the same row would be re-sent forever (see Clamp-Payload).
   $tickets = @(Get-Tickets);  Clamp-Payload -Rows $tickets  -Fields 'session','purpose','cmd','repo'
   $marks = @(Get-Marks);      Clamp-Payload -Rows $marks    -Fields 'reason','session'
-  $leases = @(Get-Leases);    Clamp-Payload -Rows $leases   -Fields 'path','branch','purpose','session'
-  $releases = @(Get-Releases); Clamp-Payload -Rows $releases -Fields 'sha','ref','follow','phase','supersedeSha','pendingSha','session'
-  $jobs = @(Get-Jobs);        Clamp-Payload -Rows $jobs     -Fields 'label','command','cwd','repo','log'
-  $daemons = @(Get-Daemons);  Clamp-Payload -Rows $daemons  -Lines 400
+  $leases = @(Get-Leases);    Clamp-Payload -Rows $leases   -Fields 'path','branch','purpose','session'; Coerce-Ints -Rows $leases -Fields 'pid'
+  $releases = @(Get-Releases); Clamp-Payload -Rows $releases -Fields 'sha','ref','follow','phase','supersedeSha','pendingSha','session'; Coerce-Ints -Rows $releases -Fields 'pid'
+  $jobs = @(Get-Jobs);        Clamp-Payload -Rows $jobs     -Fields 'label','command','cwd','repo','log'; Coerce-Ints -Rows $jobs -Fields 'pid','exitCode','expectedMin'
+  $daemons = @(Get-Daemons);  Clamp-Payload -Rows $daemons  -Lines 400; Coerce-Ints -Rows $daemons -Fields 'okCount','warnCount','failCount'
+  Coerce-Ints -Rows $tickets -Fields 'seq','capacity','pid'
   $body = [ordered]@{
     host = $env:COMPUTERNAME; root = $Root; agentVersion = $Version
     tickets = $tickets; marks = $marks; leases = $leases; releases = $releases; jobs = $jobs; daemons = $daemons; journal = @($j.lines); ackOps = @($state.ack)
@@ -479,7 +501,10 @@ if ($Install) {
     # a tick missed to a reboot or sleep. 5 min since 2026-11-23 (was 1 min = the scheduler floor): a
     # pass measures ~1.0 s, so 1440 ticks/day cost ~24 min of CPU plus 1440 wscript/pwsh pairs to refresh
     # a dashboard nobody polls that fast; a freeze set in the hub still lands within one tick.
-    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$pwsh`" $common"
+    # --wait so the launcher waits and propagates the push's exit code: without it a push that fails
+    # for hours still reports LastTaskResult 0 (2026-11-22: the hub mirror 400'd for 6.5 h unnoticed).
+    # The 5-minute ExecutionTimeLimit caps a wedged push (result 0x41306) instead of hanging the task.
+    $act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" --wait `"$pwsh`" $common"
     $trg = @(
       (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
       (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5))
