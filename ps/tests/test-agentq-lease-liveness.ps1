@@ -72,7 +72,10 @@ git -C $repo remote add origin $bare; git -C $repo push -q -u origin main 2>$nul
 Push-Location $repo
 try {
   # =============================== work clock: .work, not .hb/git, is the primary beat
-  Set-Cfg '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseChatGraceMin":20,"leaseMaxIdleMin":1440,"minFreeCommitGB":0}'
+  # leaseDirtyIdleMin 100: unchanged-work protection (2026-11-22) keeps a slot holding unsaved work up to
+  # that idle window. This block is about the .work clock on a DIRTY slot (the file is written below on
+  # purpose, to prove the backup-on-expiry), so the window must be SHORTER than the 3 h set below.
+  Set-Cfg '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseChatGraceMin":20,"leaseDirtyIdleMin":100,"leaseMaxIdleMin":1440,"minFreeCommitGB":0}'
   $env:AGENTQ_SESSION = 'wc'
   $o = AQ lease -Purpose 'work clock'
   Check 'work: lease granted' ($script:code -eq 0 -and (Test-Path (LFile 'task-1'))) $o

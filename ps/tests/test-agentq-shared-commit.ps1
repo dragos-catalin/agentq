@@ -83,8 +83,9 @@ Check '3 away commit landed the file' ((@(git -C $away show --name-only --format
 
 # 4. the documented opt-out still lets a deliberate one-off through in the main worktree
 $env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'
+$env:AGENTQ_SHARED_CLONE_REASON = 'test one-off'
 $r = Invoke-Commit $repo 'once.txt' 'test: deliberate one-off'
-Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
+Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK, Env:AGENTQ_SHARED_CLONE_REASON
 Check '4 AGENTQ_SHARED_CLONE_COMMIT_OK=1 allows the main worktree (exit 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
 Check '4 one-off landed the file' ((@(git -C $repo show --name-only --format= HEAD)) -contains 'once.txt')
 

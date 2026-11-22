@@ -14,7 +14,7 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 # leaseIdleMin 1: ADR 0012 makes a lease with a DEAD owner stale at leaseIdleMin (it no longer reads
 # leaseDeadIdleMin), so the "dead owner + idle > 1 min -> STALE" check below needs this knob set; without
 # it the dead-owner threshold is the default 45 and idle 3 would not be stale.
-'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseIdleMin":1,"leaseDeadIdleMin":1,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
+'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseIdleMin":1,"leaseDeadIdleMin":1,"leaseDirtyIdleMin":2,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
 $env:AGENTQ_CONFIG = $cfg
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
@@ -84,9 +84,16 @@ try {
   $lf = Join-Path $env:AGENTQ_HOME 'leases\repo\task-2.json'
   $j = Get-Content $lf -Raw | ConvertFrom-Json; $j.pid = 999999; $j | ConvertTo-Json | Set-Content $lf
   Set-Content (Join-Path $l2.path 'wip.txt') 'wip'
+  # 2026-11-22: a slot holding unsaved work is NOT expired at leaseIdleMin (agents lost work to expiries
+  # whose owner pid was a throw-away tool-call shell); it is kept until leaseDirtyIdleMin.
+  [IO.File]::SetLastWriteTimeUtc("$lf.hb", [DateTime]::UtcNow.AddSeconds(-90))
+  $st = AQ status -Json | ConvertFrom-Json
+  Check 'dead owner + dirty slot + idle < dirtyIdle -> kept' ((@($st.leases) | Where-Object slot -eq 'task-2').stale -eq $false)
+  $o = AQ sweep
+  Check 'sweep keeps a lease with unsaved work' ((Test-Path $lf) -and $o -notmatch 'expired repo/task-2') $o
   [IO.File]::SetLastWriteTimeUtc("$lf.hb", [DateTime]::UtcNow.AddMinutes(-3))
   $st = AQ status -Json | ConvertFrom-Json
-  Check 'dead owner + idle > deadIdle -> STALE' ((@($st.leases) | Where-Object slot -eq 'task-2').stale -eq $true)
+  Check 'dead owner + idle > dirtyIdle -> STALE' ((@($st.leases) | Where-Object slot -eq 'task-2').stale -eq $true)
   $o = AQ sweep
   Check 'sweep expires stale lease' ($o -match 'expired repo/task-2' -and -not (Test-Path $lf)) $o
   $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'lease-expire' })
