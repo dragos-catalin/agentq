@@ -1,10 +1,34 @@
 # Shared-clone writes: advisory in warn mode, HARD deny in refuse mode (ADR 0004 §4, wired 2026-11-18 -
 # the D-40 soft path had silently turned the documented deny into a warning), silent for slots/docs/scratch.
+# 2026-11-22: two NEW warnings (never denials) for the paths that actually wedge a shared clone - a raw
+# `git commit` typed into a shell (Rule A) and a plan/*.csv written in place (Rule B). D-40 keeps only
+# force-push, reset --hard, clean -f and worktree remove --force hard, and agentq itself still refuses
+# `commit`/`land` in a refuse clone, so the enforcement is not lost by warning here.
 param([string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'))
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('gsc-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-New-Item -ItemType Directory "$root\repo\.git", "$root\repo\src", "$root\other\.git", "$root\other\src", "$root\.wt\repo\task-1\src" -Force | Out-Null
+# Rule A resolves the repo with `git rev-parse`, so `repo` must be a REAL main worktree and the slot a
+# REAL linked worktree - a bare `.git` folder is not a worktree. The slot is created by git itself,
+# because `git worktree add` refuses a directory that already has anything in it.
+New-Item -ItemType Directory "$root\repo\src", "$root\other\.git", "$root\other\src" -Force | Out-Null
+Push-Location "$root\repo"
+try {
+  git init -q .
+  git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
+  git worktree add -q -b task-1 "$root\.wt\repo\task-1"
+} finally { Pop-Location }
+New-Item -ItemType Directory "$root\.wt\repo\task-1\src" -Force | Out-Null
 $env:CODAI_GH_ROOT = $root; $env:CODAI_WT_ROOT = "$root\.wt"; $env:AGENTQ_HOME = "$root\coord"
+# A persisted (User/Machine scope) CODAI_SHARED_CLONE_WRITE_OK is inherited by every process, so it
+# used to disarm the shared-clone advisory and the codai/brivio `refuse` deny for EVERY agent on the
+# machine (2026-11-20: HKCU:\Environment held '1'). The guard now reports it and ignores it - which
+# means the two assertions that exercise the DELIBERATE one-off cannot be tested honestly on such a
+# machine. They are skipped with this named reason instead of failing with two mysteries.
+$scPersisted = "$([Environment]::GetEnvironmentVariable('CODAI_SHARED_CLONE_WRITE_OK','User'))$([Environment]::GetEnvironmentVariable('CODAI_SHARED_CLONE_WRITE_OK','Machine'))"
+if ($scPersisted) {
+  "WARN CODAI_SHARED_CLONE_WRITE_OK is set PERSISTENTLY (value '$scPersisted'): the guard ignores it, and the 2 one-off assertions below are SKIPPED."
+  "     Until it is cleared, no agent can use the one-off on this machine. Clear it: [Environment]::SetEnvironmentVariable('CODAI_SHARED_CLONE_WRITE_OK', `$null, 'User')"
+}
 $fail = 0
 function Ok([bool]$c, [string]$m) { if ($c) { "PASS $m" } else { "FAIL $m"; $script:fail++ } }
 function Call([string]$tool, $ti, [string]$Exe = 'pwsh') {
@@ -27,7 +51,7 @@ $r = Call 'create_file' @{ filePath = "$root\repo\.copilot-tmp\s.ps1"; content =
 Ok ($r.out -notmatch 'SHARED clone') 'scratch: silent'
 $env:CODAI_SHARED_CLONE_WRITE_OK = '1'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
-Ok ($r.out -notmatch 'SHARED clone') 'opt-out env: silent'
+if ($scPersisted) { "SKIP opt-out env: silent (a persisted override is present - see WARN)" } else { Ok ($r.out -notmatch 'SHARED clone') 'opt-out env: silent' }
 Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
 # ADR 0004 (W4-1): journal line in warn mode, deny in refuse mode, per-repo override, opt-out journaled.
 $jf = Join-Path $env:AGENTQ_HOME 'journal.jsonl'
@@ -53,7 +77,7 @@ $r = Call 'replace_string_in_file' @{ filePath = "$root\.wt\repo\task-1\src\a.ts
 Ok ($r.out -notmatch '"deny"') 'refuse: slot writable'
 $env:CODAI_SHARED_CLONE_WRITE_OK = '1'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
-Ok ($r.out -notmatch '"deny"' -and (Lines)[-1].override -eq $true) 'refuse + opt-out env: allowed, journaled as override'
+if ($scPersisted) { "SKIP refuse + opt-out env: allowed, journaled as override (persisted override present)" } else { Ok ($r.out -notmatch '"deny"' -and (Lines)[-1].override -eq $true) 'refuse + opt-out env: allowed, journaled as override' }
 Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
 '{"sharedCloneMode":"refuse","sharedCloneModeRepos":{"repo":"warn"}}' | Set-Content $cfg
 $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\src\a.ts"; oldString = 'x'; newString = 'y' }
@@ -87,18 +111,34 @@ function CallCmd([string]$command) {
   [pscustomobject]@{ code = $LASTEXITCODE; out = ($out -join "`n") }
 }
 '{"sharedCloneModeRepos":{"repo":"refuse"}}' | Set-Content $cfg
+# Rule A. Every case passes a pathspec: `git commit` with NO `--` is caught by the older pathspec-less
+# rule, which is still a HARD block, and a hard block would exit before Rule A ever printed.
 $r = CallCmd "Set-Location $root\repo; git commit -m x -- a.ts"
-Ok ($r.out -match '"permissionDecision":"deny"') 'shell: git commit in the shared clone denied'
-$r = CallCmd "git -C $root\repo commit -m x"
-Ok ($r.out -match '"permissionDecision":"deny"') 'shell: git -C <shared clone> commit denied'
-$r = CallCmd "Set-Location $root\.wt\repo\task-1; git commit -m x"
-Ok ($r.out -notmatch '"deny"') 'shell: commit in a slot allowed'
+Ok ($r.code -eq 0 -and $r.out -match 'SHARED clone' -and $r.out -match 'agentq.ps1' -and $r.out -notmatch '"permissionDecision":"deny"') 'shell: a raw commit in the shared clone WARNS (never denies)'
+$r = CallCmd "git -C $root\repo commit -m x -- a.ts"
+Ok ($r.out -match 'SHARED clone' -and $r.out -notmatch '"deny"') 'shell: git -C <shared clone> commit warns'
+$r = CallCmd "Set-Location $root\.wt\repo\task-1; git commit -m x -- a.ts"
+Ok ($r.code -eq 0 -and $r.out -notmatch 'SHARED clone') 'shell: a commit in a leased slot is silent'
 $r = CallCmd "Set-Location $root\repo; git log --grep commit"
-Ok ($r.out -notmatch '"deny"') 'shell: another git command (log) allowed'
-$env:CODAI_SHARED_CLONE_WRITE_OK = '1'
-$r = CallCmd "Set-Location $root\repo; git commit -m x"
-Ok ($r.out -notmatch '"deny"') 'shell: journaled opt-out allows the commit'
-Remove-Item Env:CODAI_SHARED_CLONE_WRITE_OK
+Ok ($r.out -notmatch 'SHARED clone') 'shell: another git command (log) is silent'
+$r = CallCmd "Set-Location $root\other; git commit -m x -- a.ts"
+Ok ($r.out -notmatch 'SHARED clone') 'shell: a repo that is not refuse is silent'
+$env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'
+$r = CallCmd "Set-Location $root\repo; git commit -m x -- a.ts"
+Ok ($r.out -notmatch 'SHARED clone') 'shell: the journaled one-off (AGENTQ_SHARED_CLONE_COMMIT_OK) silences it'
+Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
+# Rule B: a plan CSV is exempt from the source-write rule above (tracker rows are edited in place),
+# which is exactly why it needs its own rule - those uncommitted rows are what wedged codai for ~4 h.
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\plan\dev-cloud-CANONICAL.csv"; oldString = 'x'; newString = 'y' }
+Ok ($r.code -eq 0 -and $r.out -match 'SHARED clone' -and $r.out -match 'dev-cloud-CANONICAL' -and $r.out -notmatch '"deny"') 'plan CSV in the shared clone: warned, not denied'
+$r = Call 'create_file' @{ filePath = "$root\repo\notes\plan\b.csv"; content = 'a' }
+Ok ($r.out -match 'SHARED clone' -and $r.out -match 'b\.csv') 'nested */plan/*.csv: warned'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\.wt\repo\task-1\plan\a.csv"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch 'SHARED clone') 'plan CSV in a leased slot: silent'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\repo\plan\notes.md"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch 'SHARED clone') 'a non-CSV under plan/: silent'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\other\plan\a.csv"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch 'SHARED clone') 'plan CSV outside a shared clone: silent'
 Remove-Item Env:AGENTQ_CONFIG
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

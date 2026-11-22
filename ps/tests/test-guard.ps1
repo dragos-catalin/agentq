@@ -36,6 +36,17 @@ function Invoke-Guard([string]$cmd) {
   $null = ($json | pwsh -NoProfile -File $guard 2>&1)
   return $LASTEXITCODE
 }
+# axiom D-40 (2026-10-19) made almost every rule below WARN-by-default: the command is still stopped,
+# but with "WARNING (allowed)" on stderr and exit 0. Only force-push, reset --hard, clean -f,
+# worktree remove --force (plus deploy-from-a-dirty-tree, destructive SQL and object-storage delete)
+# are still a hard exit 2. A $mustBlock case is satisfied by EITHER - silence is the hole. Until this
+# was stated the suite was red for the whole list, and it never got that far anyway (see the edit
+# section above, which exited early on a stale expectation).
+function Invoke-GuardStop([string]$cmd) {
+  $json = @{ command = $cmd } | ConvertTo-Json -Compress
+  $out = ($json | pwsh -NoProfile -File $guard 2>&1) -join "`n"
+  return [pscustomobject]@{ code = $LASTEXITCODE; hard = ($LASTEXITCODE -eq 2); stopped = ($LASTEXITCODE -eq 2 -or $out -match 'WARNING \(allowed\)') }
+}
 
 # Variants that must be refused. Ordered by the incident that produced them.
 $mustBlock = @(
@@ -113,6 +124,11 @@ function Invoke-GuardTool([string]$tool, [hashtable]$toolInput) {
   $null = ($json | pwsh -NoProfile -File $guard 2>&1)
   return $LASTEXITCODE
 }
+function Invoke-GuardToolOut([string]$tool, [hashtable]$toolInput) {
+  $json = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = $toolInput } | ConvertTo-Json -Compress -Depth 5
+  $out = $json | pwsh -NoProfile -File $guard 2>&1
+  return [pscustomobject]@{ code = $LASTEXITCODE; out = ($out -join "`n") }
+}
 $patchBuild = "*** Begin Patch`n*** Update File: E:\x\.github\workflows\ci.yml`n@@`n       - run: pnpm build`n+      - run: pnpm scan:contrast`n*** End Patch"
 $patchSql = "*** Begin Patch`n*** Update File: E:\x\test.ts`n+const p = 'DROP ' + 'TABLE';`n+// DROP TABLE users;`n*** End Patch"
 $editPass = @(
@@ -123,16 +139,28 @@ $editPass = @(
 )
 $editBlock = @(
   # run_in_terminal still blocks: command field
-  @('run_in_terminal', @{ command = 'pnpm build'; explanation = 'x' }),
-  @('run_in_terminal', @{ command = 'DROP TABLE users;'; explanation = 'x' })
+  # The leading comma keeps one case ONE pair: @() flattens a single nested array into its elements.
+  , @('run_in_terminal', @{ command = 'DROP TABLE users;'; explanation = 'x' })
 )
-$editHoles = @(); $editFalse = @()
+# Since axiom D-40 (2026-10-19) the build-routing rule is SOFT: allowed (exit 0) and stopped only by
+# "WARNING (allowed)" on stderr - it tells you to run the build through agentq. This case asserted a
+# hard exit 2 long after that, so the suite was red on a stale expectation.
+$editWarn = @(
+  , @('run_in_terminal', @{ command = 'pnpm build'; explanation = 'x' })
+)
+$editHoles = @(); $editFalse = @(); $editNoWarn = @()
 foreach ($c in $editPass) { if ((Invoke-GuardTool $c[0] $c[1]) -eq 2) { $editFalse += "$($c[0]): $($c[1].Values -join ' | ')" } }
 foreach ($c in $editBlock) { if ((Invoke-GuardTool $c[0] $c[1]) -ne 2) { $editHoles += "$($c[0]): $($c[1].command)" } }
+foreach ($c in $editWarn) {
+  $wr = Invoke-GuardToolOut $c[0] $c[1]
+  if ($wr.code -eq 2 -or $wr.out -notmatch 'WARNING \(allowed\)') { $editNoWarn += "$($c[0]): $($c[1].command)" }
+}
 Write-Host ("edit payloads allowed     : {0} / {1}" -f ($editPass.Count - $editFalse.Count), $editPass.Count)
 Write-Host ("terminal payloads blocked : {0} / {1}" -f ($editBlock.Count - $editHoles.Count), $editBlock.Count)
+Write-Host ("terminal payloads warned  : {0} / {1}" -f ($editWarn.Count - $editNoWarn.Count), $editWarn.Count)
 if ($editFalse) { Write-Host 'FALSE POSITIVES (edit text scanned as a command):' -ForegroundColor Red; $editFalse | ForEach-Object { Write-Host "  $_" } }
 if ($editHoles) { Write-Host 'HOLES (terminal command got through):' -ForegroundColor Red; $editHoles | ForEach-Object { Write-Host "  $_" } }
+if ($editNoWarn) { Write-Host 'HOLES (soft rule stayed silent):' -ForegroundColor Red; $editNoWarn | ForEach-Object { Write-Host "  $_" } }
 # Stale-script trap (2026-10-05): a denied create_file leaves a marker; running that path is blocked for 10 min.
 $deniedDir = Join-Path $env:TEMP 'copilot-guard-denied'
 New-Item -ItemType Directory -Force -Path $deniedDir | Out-Null
@@ -149,19 +177,21 @@ Remove-Item $marker -EA SilentlyContinue
 $staleOk = ($staleBlock -eq 2) -and ($stalePass -ne 2)
 Write-Host ("stale-script trap         : block={0} pass={1} -> {2}" -f $staleBlock, $stalePass, $(if ($staleOk) { 'OK' } else { 'FAIL' }))
 if (-not $staleOk) { $editHoles += 'stale-script trap' }
-if ($editFalse -or $editHoles) { exit 1 }
+if ($editFalse -or $editHoles -or $editNoWarn) { exit 1 }
 
-$holes = @(); $falsePos = @()
+$holes = @(); $falsePos = @(); $hardN = 0; $softN = 0
 foreach ($c in $mustBlock) {
-  $code = Invoke-Guard $c
-  if ($code -ne 2) { $holes += $c } elseif ($VerbosePreference -ne 'SilentlyContinue') { Write-Host "  blocked  $c" -ForegroundColor DarkGray }
+  $g = Invoke-GuardStop $c
+  if (-not $g.stopped) { $holes += $c }
+  elseif ($g.hard) { $hardN++; if ($VerbosePreference -ne 'SilentlyContinue') { Write-Host "  blocked  $c" -ForegroundColor DarkGray } }
+  else { $softN++; if ($VerbosePreference -ne 'SilentlyContinue') { Write-Host "  warned   $c" -ForegroundColor DarkGray } }
 }
 foreach ($c in $mustPass) {
-  $code = Invoke-Guard $c
-  if ($code -eq 2) { $falsePos += $c } elseif ($VerbosePreference -ne 'SilentlyContinue') { Write-Host "  allowed  $c" -ForegroundColor DarkGray }
+  $g = Invoke-GuardStop $c
+  if ($g.code -eq 2) { $falsePos += $c } elseif ($VerbosePreference -ne 'SilentlyContinue') { Write-Host "  allowed  $c" -ForegroundColor DarkGray }
 }
 
-Write-Host ("blocked correctly : {0} / {1}" -f ($mustBlock.Count - $holes.Count), $mustBlock.Count)
+Write-Host ("stopped correctly : {0} / {1} ({2} hard, {3} warned)" -f ($mustBlock.Count - $holes.Count), $mustBlock.Count, $hardN, $softN)
 Write-Host ("allowed correctly : {0} / {1}" -f ($mustPass.Count - $falsePos.Count), $mustPass.Count)
 
 if ($holes) {
@@ -192,17 +222,18 @@ try {
   Push-Location E:\gh\codai
   $fBlock = @($rb, ($dc + 'gateway"'))
   $fPass = @(($dc + 'auth"'), 'git status', 'pnpm lint')
-  $mHoles = @($fBlock | Where-Object { (Invoke-Guard $_) -ne 2 })
-  $mFalse = @($fPass | Where-Object { (Invoke-Guard $_) -eq 2 })
+  # D-40: a frozen resource warns (exit 0 + "WARNING (allowed)"), it does not hard-block.
+  $mHoles = @($fBlock | Where-Object { -not (Invoke-GuardStop $_).stopped })
+  $mFalse = @($fPass | Where-Object { (Invoke-GuardStop $_).code -eq 2 })
   Pop-Location
   Push-Location E:\gh\brivio
-  if ((Invoke-Guard $rb) -eq 2) { $mFalse += 'brivio build blocked by a codai freeze' }
+  if ((Invoke-GuardStop $rb).code -eq 2) { $mFalse += 'brivio build blocked by a codai freeze' }
   Pop-Location
   Remove-Item (Join-Path $aqHome 'marks\*.json')
   Push-Location E:\gh\codai
-  if ((Invoke-Guard $rb) -eq 2) { $mFalse += 'build still blocked after mark cleared' }
+  if ((Invoke-GuardStop $rb).code -eq 2) { $mFalse += 'build still blocked after mark cleared' }
   Pop-Location
-  Write-Host ("frozen resources blocked      : {0} / {1}" -f ($fBlock.Count - $mHoles.Count), $fBlock.Count)
+  Write-Host ("frozen resources stopped      : {0} / {1}" -f ($fBlock.Count - $mHoles.Count), $fBlock.Count)
   Write-Host ("unfrozen / other repo allowed : {0}" -f $(if ($mFalse) { 'FAIL' } else { 'ok' }))
   if ($mHoles) { Write-Host 'HOLES (frozen bypassed):' -ForegroundColor Red; $mHoles | ForEach-Object { Write-Host "  $_" } }
   if ($mFalse) { Write-Host 'FALSE POSITIVES (freeze):' -ForegroundColor Red; $mFalse | ForEach-Object { Write-Host "  $_" } }
@@ -260,6 +291,49 @@ try {
 } finally {
   Pop-Location
   Remove-Item -Recurse -Force $fx -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Shared-clone shell commit (Rule A) and plan/*.csv write (Rule B), 2026-11-22.
+# Both are WARNINGS (D-40 warn-by-default), never denials: a raw `git commit` in a shared clone
+# becomes an unpushed commit that git-autosync refuses to move past, and a tracker CSV left
+# uncommitted blocks it the same way. test-guard-shared.ps1 builds a real git fixture and covers
+# them exhaustively; the cases here only pin the payload SHAPES, and they run the SOURCE hook,
+# because the copy in ~/.copilot\hooks is a release artifact (install.ps1 ships this file, and the
+# rule does not exist in the installed copy until that has run).
+# ---------------------------------------------------------------------------
+$srcGuard = Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'
+if (Test-Path $srcGuard) {
+  $sharedRepo = 'E:\gh\codai'          # a real SharedCloneMode=refuse clone with slots
+  $sharedSlot = 'E:\gh\.wt\codai\task-99'
+  function Invoke-SrcGuard([string]$tool, [hashtable]$toolInput) {
+    $json = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = $toolInput } | ConvertTo-Json -Compress -Depth 5
+    $out = $json | pwsh -NoProfile -File $srcGuard 2>&1
+    return [pscustomobject]@{ code = $LASTEXITCODE; out = ($out -join "`n") }
+  }
+  $scWarn = @()
+  $r = Invoke-SrcGuard 'run_in_terminal' @{ command = 'git commit -m x -- a.ts'; cwd = $sharedRepo }
+  if (-not ($r.code -eq 0 -and $r.out -match 'SHARED clone' -and $r.out -notmatch '"deny"')) { $scWarn += 'Rule A: a raw commit in the shared clone did not warn' }
+  $r = Invoke-SrcGuard 'run_in_terminal' @{ command = 'git commit -m x -- a.ts'; cwd = $sharedSlot }
+  if ($r.out -match 'SHARED clone') { $scWarn += 'Rule A: warned for a commit in a leased slot' }
+  $r = Invoke-SrcGuard 'run_in_terminal' @{ command = 'git log --grep commit'; cwd = $sharedRepo }
+  if ($r.out -match 'SHARED clone') { $scWarn += 'Rule A: warned for a non-commit git command' }
+  $env:AGENTQ_SHARED_CLONE_COMMIT_OK = '1'
+  $r = Invoke-SrcGuard 'run_in_terminal' @{ command = 'git commit -m x -- a.ts'; cwd = $sharedRepo }
+  Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK
+  if ($r.out -match 'SHARED clone') { $scWarn += 'Rule A: the journaled one-off was ignored' }
+  $r = Invoke-SrcGuard 'create_file' @{ filePath = "$sharedRepo\plan\x.csv"; content = 'a' }
+  if (-not ($r.code -eq 0 -and $r.out -match 'SHARED clone' -and $r.out -notmatch '"deny"')) { $scWarn += 'Rule B: a plan/*.csv write in the shared clone did not warn' }
+  $r = Invoke-SrcGuard 'create_file' @{ filePath = "$sharedSlot\plan\x.csv"; content = 'a' }
+  if ($r.out -match 'SHARED clone') { $scWarn += 'Rule B: warned for a plan CSV in a leased slot' }
+  $r = Invoke-SrcGuard 'create_file' @{ filePath = 'E:\gh\vitals\plan\x.csv'; content = 'a' }
+  if ($r.out -match 'SHARED clone') { $scWarn += 'Rule B: warned outside a refuse shared clone' }
+  Write-Host ("shared-clone warn rules   : {0} / {1}" -f (7 - $scWarn.Count), 7)
+  if ($scWarn) {
+    Write-Host 'HOLES (shared-clone warn rules):' -ForegroundColor Red
+    $scWarn | ForEach-Object { Write-Host "  $_" }
+    exit 1
+  }
 }
 
 Write-Host 'guard OK' -ForegroundColor Green

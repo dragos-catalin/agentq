@@ -101,6 +101,13 @@ $CoordRoot = if ($env:GIT_AUTOSYNC_COORD) { $env:GIT_AUTOSYNC_COORD }
   elseif ($env:AGENTQ_HOME) { $env:AGENTQ_HOME }
   else { Join-Path (Join-Path $HOME '.codai') 'coord' }
 if ($env:GIT_AUTOSYNC_BACKUP_URL) { $BackupUrl = $env:GIT_AUTOSYNC_BACKUP_URL }
+# Per-repo refusal bookkeeping for the LONG-REFUSE alert (see Get-LongRefuse / the pass and -Status call
+# sites): a repo whose verdict starts with `refuse` keeps the FIRST time it was seen refusing, so a
+# refusal that outlives 30 min raises a journal event + a loud block (+ a toast if a helper exists)
+# instead of refusing in silence for hours (codai 2026-11-22: ~4 h of "refuse: unpushed commit ... conflicts
+# with origin/main; its owner must rebase" that alerted nobody). Keyed by repo leaf name, like the status
+# snapshot, and living in the coord root so a test that isolates GIT_AUTOSYNC_COORD isolates it too.
+$RefuseFile = if ($env:GIT_AUTOSYNC_REFUSE_STATE) { $env:GIT_AUTOSYNC_REFUSE_STATE } else { Join-Path $CoordRoot 'autosync-state.json' }
 $script:NoFetch = $false
 $LastMsg = @{}
 $CoordQ = Join-Path $HOME '.codai\coord\queues'
@@ -218,6 +225,74 @@ function Record-DoctorVerdict([string]$verdict, [int]$ok, [int]$warn, [int]$fail
     $st['lastDoctorVerdict'] = $verdict
     Set-State $st
   } catch { }
+}
+# --- LONG-REFUSE alert (owner 2026-11-22) ---------------------------------------------------------
+# A refusal open for more than 30 min used to be visible only by reading the log: on 2026-11-22 codai
+# printed "refuse: unpushed commit 5f3f1a3b conflicts with origin/main; its owner must rebase" for ~4 h
+# and nothing alerted anyone. These helpers turn that into a journal event + a loud block at the top of
+# the pass output (and in -Status) + (if a notification helper exists) a toast. They never change what
+# autosync decides - only how a long-lived refusal is surfaced.
+function Get-RefuseState {
+  if (Test-Path -LiteralPath $RefuseFile) { try { return (Get-Content -LiteralPath $RefuseFile -Raw | ConvertFrom-Json -AsHashtable) } catch { } }
+  @{}
+}
+function Set-RefuseState($s) {
+  # Atomic + collision-safe like Save-StatusMap: a tick, a manual pass and a -Status reader must never
+  # see a half-written file. One small read + one small write per pass (see the call sites).
+  $dir = Split-Path $RefuseFile -Parent
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+  $tmp = "$RefuseFile.$PID.$([guid]::NewGuid().ToString('N').Substring(0, 6)).new"
+  try {
+    [IO.File]::WriteAllText($tmp, ($s | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+    Move-Item -Force $tmp $RefuseFile -ErrorAction Stop
+  } catch { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+}
+function Format-Duration([int]$min) {
+  if ($min -lt 60) { "${min}m" }
+  elseif ($min -lt 1440) { "$([int]($min / 60))h $($min % 60)m" }
+  else { "$([int]($min / 1440))d $([int](($min % 1440) / 60))h" }
+}
+# Entries refused for more than $ThresholdMin minutes. $facts is the state file; $repos the configured
+# list (leaf -> full path, for the next-step hint). A key whose repo is no longer configured is still
+# reported, with '<repo path>' in place of a path.
+function Get-LongRefuse([hashtable]$facts, [string[]]$repos, [datetime]$now, [int]$ThresholdMin = 30) {
+  $pathOf = @{}; foreach ($rp in $repos) { $pathOf[(Split-Path $rp -Leaf)] = $rp }
+  $out = @()
+  foreach ($k in @($facts.Keys)) {
+    $e = $facts[$k]
+    if (-not $e) { continue }
+    $since = $null; try { if ($e['since']) { $since = [DateTime]$e['since'] } } catch { }
+    if (-not $since) { continue }
+    $min = [int](($now.ToUniversalTime() - $since.ToUniversalTime()).TotalMinutes)
+    if ($min -le $ThresholdMin) { continue }
+    $out += [pscustomobject]@{ repo = $k; since = $since.ToUniversalTime().ToString('o'); minutes = $min; reason = "$($e['reason'])"; path = $pathOf[$k] }
+  }
+  @($out | Sort-Object -Property minutes -Descending)
+}
+function Format-LongRefuseBlock($entries) {
+  $list = @($entries); if (-not $list.Count) { return @() }
+  $lines = [Collections.Generic.List[string]]::new()
+  $lines.Add('== LONG REFUSE (>30 min) ==')
+  foreach ($e in $list) {
+    $lines.Add(("{0} has been refusing for {1} (since {2})" -f $e.repo, (Format-Duration $e.minutes), $e.since))
+    $lines.Add("    reason: $($e.reason)")
+    $lines.Add('    next:   agentq status -All')
+    $lines.Add("            git -C $(if ($e.path) { $e.path } else { '<repo path>' }) status --porcelain")
+    $lines.Add('            fix it in a leased slot (agentq lease), then: agentq publish -Paths <files> -Message <msg> -Onto main')
+  }
+  @($lines)
+}
+# Best effort, NO new dependency (owner 2026-11-22): reuse a notification helper IF the repo has one.
+# ps\bin carries none today (checked 2026-11-22: no toast/notify/tell/BurntToast helper; console-signal.ps1
+# only signals processes), so this is a NO-OP unless GIT_AUTOSYNC_NOTIFY points at one that takes
+# -Title/-Message. A helper failure must never break a pass.
+function Send-AutosyncToast([string]$title, [string]$message) {
+  try {
+    $h = if ($env:GIT_AUTOSYNC_NOTIFY) { $env:GIT_AUTOSYNC_NOTIFY } else { Join-Path $PSScriptRoot 'notify.ps1' }
+    if (-not $h -or -not (Test-Path -LiteralPath $h)) { return $false }
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $h -Title $title -Message $message *> $null
+    return ($LASTEXITCODE -eq 0)
+  } catch { return $false }
 }
 # Count long-lived -Loop processes. The CIM query costs ~0.5 s and `agentq doctor` and `agentq-sync`
 # both run -Doctor within the same minute, so cache the answer for 45 s in the coord root (best effort:
@@ -958,6 +1033,10 @@ if ($Status) {
   $loopN = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -eq 'pwsh.exe' -and $_.CommandLine -match 'git-autosync' -and $_.CommandLine -match '-Loop' }).Count
   "mode: $(if ($loopN) { "long-lived loop running ($loopN) - code frozen at start" } else { 'one pass per tick (self-updating)' })"
+  # LONG REFUSE: from the state file, so it shows here without waiting for the next tick (the daemon may
+  # be wedged, or the next tick minutes away). Same block the pass prints at the top of its output.
+  $longSt = @(Get-LongRefuse (Get-RefuseState) $Repo ([DateTime]::UtcNow))
+  if ($longSt.Count) { Format-LongRefuseBlock $longSt | ForEach-Object { $_ }; '' }
   $sm = Get-StatusMap
   if ($sm.Count) {
     $ages = @($sm.Values | ForEach-Object { try { [int](([DateTime]::UtcNow - [DateTime]$_.at).TotalMinutes) } catch { 99999 } })
@@ -1149,6 +1228,30 @@ do {
       Get-ChildItem $ld -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
   }
+  # LONG-REFUSE bookkeeping: ONE read of the state, the alert block at the TOP of this pass's output,
+  # then the per-repo verdicts below update it, then ONE write at the end (see the tail of the loop).
+  # A repo already refusing on the first pass after this change has no history, so its `since` is
+  # stamped at THIS pass's start - its clock begins here, though the real refusal may have started
+  # earlier; a guess would be worse than a late-but-correct start.
+  $passStart = [DateTime]::UtcNow
+  $refuseSt = @{}; $refuseDirty = $false
+  if (-not $WhatIf) {
+    $refuseSt = Get-RefuseState
+    $alert = @()
+    foreach ($e in @(Get-LongRefuse $refuseSt $Repo $passStart)) {
+      $lna = $null; try { if ($refuseSt[$e.repo] -and $refuseSt[$e.repo]['lastNotifiedAt']) { $lna = [DateTime]$refuseSt[$e.repo]['lastNotifiedAt'] } } catch { }
+      if ($lna -and ($passStart.ToUniversalTime() - $lna.ToUniversalTime()).TotalMinutes -lt 30) { continue }
+      try { Write-DaemonJournal @{ event = 'git-autosync-long-refuse'; repo = $e.repo; since = $e.since; minutes = $e.minutes; reason = $e.reason } } catch { }
+      $refuseSt[$e.repo]['lastNotifiedAt'] = $passStart.ToUniversalTime().ToString('o')
+      $refuseDirty = $true
+      $alert += $e
+    }
+    if ($alert.Count) {
+      Format-LongRefuseBlock $alert | ForEach-Object { $_ }
+      [void](Send-AutosyncToast 'git-autosync: LONG REFUSE' ("$($alert.Count) repo(s) refused >30 min: " + (($alert | ForEach-Object { $_.repo }) -join ', ')))
+      ''
+    }
+  }
   $pass = @{}
   foreach ($r in $Repo) {
     # One pass at a time machine-wide: the -Loop task and a manual run must never interleave.
@@ -1169,6 +1272,16 @@ do {
     # 2026-11-19), and -Status / -Doctor / the -Install self-check must see a fresh verdict within
     # seconds of the pass starting. The end-of-pass block below still does the ONE prune of the table.
     if (-not $WhatIf) { $one = Get-StatusMap; $one[$leaf] = $pass[$leaf]; Save-StatusMap $one }
+    # LONG-REFUSE state: keep the FIRST-seen time while the repo stays refused; any non-refuse verdict
+    # clears it (a recovered repo must never keep a stale `since`). Reason is refreshed each pass.
+    if (-not $WhatIf) {
+      $m = "$($res.msg)"
+      if ($m -like 'refuse*') {
+        if (-not $refuseSt.ContainsKey($leaf)) { $refuseSt[$leaf] = @{ since = $passStart.ToUniversalTime().ToString('o'); reason = $m; lastNotifiedAt = '' } }
+        else { $refuseSt[$leaf]['reason'] = $m }
+        $refuseDirty = $true
+      } elseif ($refuseSt.ContainsKey($leaf)) { $refuseSt.Remove($leaf); $refuseDirty = $true }
+    }
     if ($res.code) { $rc = $res.code }
   }
   if ($pass.Count) {
@@ -1185,6 +1298,7 @@ do {
     }
     Save-StatusMap $sm
   }
+  if ($refuseDirty) { Set-RefuseState $refuseSt }
   if ($Loop) { $rc = 0; Start-Sleep -Seconds $IntervalSec }
 } while ($Loop)
 exit $rc
