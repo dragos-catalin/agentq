@@ -43,7 +43,30 @@
   "overridesPerHour": 6,
   "landGate": {
     "brivio": "pnpm land:gate",
-    "codai": "pnpm gate:store-copy"
+    "codai": "pnpm gate:platform",
+    "marcai": "pnpm guards",
+    "agentq": "pwsh -NoProfile -Command \"& (Join-Path (git rev-parse --show-toplevel) 'ps/tests/run-all.ps1') -RepoSuites -Parallel 4\""
+  },
+  "gateSuites": {
+    "agentq": [
+      "guard",
+      "guard shared",
+      "guard cloud",
+      "shared janitor",
+      "agentq v1",
+      "agentq v2",
+      "agentq v3",
+      "shared commit",
+      "publish",
+      "lease liveness",
+      "land precheck",
+      "install",
+      "args",
+      "help",
+      "script scope",
+      "install wiring",
+      "status readonly"
+    ]
   },
   "sharedCloneMode": "warn",
   "sharedCloneModeRepos": {
