@@ -9,6 +9,7 @@ installed copy. A suite runs only if it is in the table at the top of `run-all.p
 pwsh -NoProfile -File ps/tests/run-all.ps1                    # every suite, one after another
 pwsh -NoProfile -File ps/tests/run-all.ps1 -List              # print the suite names
 pwsh -NoProfile -File ps/tests/run-all.ps1 -Only 'args,slo'   # only these suites
+pwsh -NoProfile -File ps/tests/run-all.ps1 -RepoSuites        # the list this repo's gate runs
 pwsh -NoProfile -File ps/tests/run-all.ps1 -Skip jobs -LogDir .copilot-tmp/logs -TimeoutMin 25
 ```
 
@@ -19,11 +20,16 @@ A full run takes a long time, hours on a busy machine. Use `-Only` while you wor
 | `-Only a,b`            | Run only these suites. Names are exact and not case-sensitive.                              |
 | `-Skip a,b`            | Leave these suites out.                                                                     |
 | `-List`                | Print the suite names and exit 0.                                                           |
+| `-RepoSuites`          | Run the persisted gate list of this repo (`bin/agentq-config.json` → `gateSuites.<repo>`; `AGENTQ_CONFIG` overrides the file). With `-List` it prints the resolved names. A missing key, an unreadable config or a name that is not a suite here exits 2 — never a silent run-everything. |
 | `-LogDir <dir>`        | Write the full output of every suite to `<dir>\<name>.log`, pass or fail.                   |
 | `-TimeoutMin n`        | Stop a suite and everything it started after `n` minutes and count it as failed. 0 = never. |
 | `AGENTQ_TEST_SKIP=a,b` | Same as `-Skip`. Lets a caller skip suites without changing its command line.               |
 
 Pass several names as one comma-separated value. A name that is not in `-List` is an error.
+
+A new suite must also be added to `install.ps1`'s `$map`: the installed gate runs from `~/.copilot`, where a file
+the map does not carry does not exist. The `install wiring` suite fails when a suite's file or its tool is missing
+from the map, or when the map names a file no checkout has.
 
 ## Output
 

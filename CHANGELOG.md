@@ -22,6 +22,15 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   root, then dropped from the branch, so the clone moves instead of refusing until its owner rebases.
   Default off: the refusal is unchanged, and `-WhatIf` reports what would be parked. 2026-11-18: codai's
   shared main sat 15 commits ahead for days with autosync refusing, and no one owned the rebase.
+- A repo's own land gate: `landGate.<repo>` in `bin/agentq-config.json` (agentq runs its suite list) and
+  `gateSuites.<repo>` for the list itself, resolved by `run-all.ps1 -RepoSuites` (exit 2 on a missing key or a
+  name that is not a suite, never a silent run-everything). `install.ps1 -RepoSuites` runs the same list before
+  installing, so "the suites we run" has one home instead of an agent's scratch script. The static guard
+  `install wiring` compares the suite table with `install.ps1`'s map; it found 8 files a gate suite needs that
+  the map never carried (`bin\shared-clone-janitor.ps1` and 7 test files), and its first run proved main was
+  broken for every clean checkout: `run-all` registered `release phase honesty` and `install` mapped its file
+  while the file itself stayed untracked since 9541a44, so a fresh clone threw
+  `install: tests\test-release-phase-honesty.ps1 is in the map but not in this checkout`.
 
 ### Fixed
 
