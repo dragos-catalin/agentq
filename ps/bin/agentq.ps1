@@ -1743,6 +1743,8 @@ function Show-Status {
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
+    # B) the negative ledger for this land queue (branch -> {at,tree,reason}), read once per resource.
+    $qmap = if ($res -like 'land:*') { Get-LandQuarantine (Get-ResourceRepo $res) } else { $null }
     $live = @(Get-Live $res)
     $cap = Get-Capacity $res
     $wq = @($live | Where-Object { -not (Test-Held $_ $live $cap) } | Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
@@ -1759,11 +1761,19 @@ function Show-Status {
         } catch { }
         $wedgeTxt = "WEDGED(${wm}m)"
       }
+      # B) a ticket whose topic is quarantined shows the reason right in the row, so a waiter can see WHY
+      # its land is not being absorbed by the holder instead of only noticing that it never moves.
+      $qtxt = $null
+      if ($qmap -and $qmap.Count) {
+        $qb = "$(P $t 'landBranch' '')"
+        if ($qb -and $qmap.ContainsKey($qb)) { $qtxt = "$(P $qmap[$qb] 'reason') (at $(P $qmap[$qb] 'at' ''), tree $(Short "$(P $qmap[$qb] 'tree' '')") )" }
+      }
       $rows += [pscustomobject]@{
         resource = $res; role = $role; lane = "$(P $t 'lane' '-')"; prio = $(if (P $t 'v') { Get-EffPrio $t } else { '-' })
-        state = $(if ($t.stale -and $wedgeTxt) { "STALE($($t.beatAgeMin)m),$wedgeTxt" } elseif ($t.stale) { "STALE($($t.beatAgeMin)m)" } elseif ($wedgeTxt) { $wedgeTxt } else { 'ok' })
+        state = $(if ($t.stale -and $wedgeTxt) { "STALE($($t.beatAgeMin)m),$wedgeTxt" } elseif ($t.stale) { "STALE($($t.beatAgeMin)m)" } elseif ($wedgeTxt) { $wedgeTxt } elseif ($qtxt) { 'QUARANTINED' } else { 'ok' })
         ageMin = [math]::Round(((Now) - (ParseUtc $t.created)).TotalMinutes, 1)
         session = $t.session; purpose = $t.purpose; id = $t.id
+        landBranch = "$(P $t 'landBranch' '')"; quarantine = $qtxt
       }
     }
   }
@@ -1780,6 +1790,7 @@ function Show-Status {
     $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks; $o.bursts = $bursts
     $o.load = [ordered]@{ enabled = [bool]$ld.enabled; saturated = [bool]$ld.saturated; probeMs = $ld.last; medianMs = $ld.median; samples = $ld.n; ageSec = $ld.ageSec; thresholdMs = $ld.thresholdMs; src = "$($ld.src)" }
     $o.agents = [ordered]@{ limit = [int]$agl.limit; base = [int]$agl.base; state = "$($agl.state)"; why = "$($agl.why)"; inputIdleSec = $agl.idleSec; sampleAgeSec = $agl.ageSec; night = [bool]$agl.night; nightWindow = "$($agl.nightWindow)"; leased = [int]$leasedTasks }
+    $o.landQuarantine = @($rows | Where-Object { $_.quarantine } | ForEach-Object { [ordered]@{ resource = $_.resource; branch = $_.landBranch; reason = $_.quarantine } })
     $o | ConvertTo-Json -Depth 5; return
   }
   if ($marks) {
@@ -1799,6 +1810,13 @@ function Show-Status {
     Write-Output '== QUEUES'
     $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
+  # B) the quarantined topics of the land queues in scope, with the reason and its stamp: a red topic is
+  # skipped by the batch picker (journal land-topic-quarantined) and gates on its own turn.
+  $qrows = @($rows | Where-Object { $_.quarantine })
+  if ($qrows) {
+    Write-Output '== LAND QUARANTINE previous pre-gate failed; the batch picker skips these until a fresh pre-gate passes (explicit land -Branch <b>; TTL landQuarantineHours)'
+    $qrows | ForEach-Object { Write-Output ("{0,-16} {1,-28} {2}" -f $_.resource, $_.landBranch, $_.quarantine) }
+  }
   # == MINE (2026-11-23): the other half of the bump bug. The QUEUES table is repo-scoped unless -All,
   # and it never said WHICH row was the caller's, so a waiter could not read the id of its own ticket.
   # Print the caller's own waiting tickets (all repos) with the id, so `bump -Id <hash>` / `-Session <s>`

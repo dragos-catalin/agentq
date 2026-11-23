@@ -74,6 +74,43 @@ function AsSession([string]$sid, [scriptblock]$body) {
   $prev = $env:AGENTQ_SESSION; $env:AGENTQ_SESSION = $sid
   try { & $body } finally { $env:AGENTQ_SESSION = $prev }
 }
+# ---- helpers for the quarantine / dirty-scratch / wrong-clone cases (2026-11-23) -----------------
+$script:bgProcs = @()
+function QFile { Join-Path (Join-Path $env:AGENTQ_HOME 'land') "$repoName.json" }
+# branch -> { at, tree, reason }: the negative ledger the pre-gate failure feeds and the picker reads.
+function QMap { if (Test-Path -LiteralPath (QFile)) { (Get-Content -LiteralPath (QFile) -Raw | ConvertFrom-Json -AsHashtable) } else { @{} } }
+function QKeys { @((QMap).Keys) }
+function QueueDir { Join-Path (Join-Path $env:AGENTQ_HOME 'queues') "land_$repoName" }
+function QueuedCount { $d = QueueDir; if (Test-Path -LiteralPath $d) { @(Get-ChildItem -LiteralPath $d -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'adaptive.json' }).Count } else { 0 } }
+function WaitJournal([string]$evt, [string]$session, [int]$maxSec = 60) {
+  for ($i = 0; $i -lt ($maxSec * 2); $i++) { if (@(Journal | Where-Object { $_.event -eq $evt -and "$($_.session)" -eq $session }).Count) { return $true }; Start-Sleep -Milliseconds 500 }
+  $false
+}
+function WaitGates([string]$rx, [int]$maxSec = 60) {
+  for ($i = 0; $i -lt ($maxSec * 2); $i++) { if (@(Gates $rx).Count) { return $true }; Start-Sleep -Milliseconds 500 }
+  $false
+}
+# A land in its own session, in the background: the only way two lands can WAIT on each other (the land
+# queue is cap 1), which is what the batch picker needs to have a quarantined waiter in front of it.
+function Start-Land([string]$branch, [string]$session) {
+  $sf = Join-Path $tmp "land-$branch.ps1"; $of = Join-Path $tmp "land-$branch.out"
+  $body = @(
+    "`$env:AGENTQ_SESSION = '$session'"
+    "`$env:AGENTQ_LAND_NO_PREGATE = '1'"
+    "Set-Location -LiteralPath '$repo'"
+    "& pwsh -NoProfile -File '$Aq' land -Branch '$branch' -Onto dev -TimeoutMin 5 -Purpose 'land $branch' *>&1 | Out-File -Encoding utf8 '$of'"
+    "exit `$LASTEXITCODE"
+  ) -join "`n"
+  [IO.File]::WriteAllText($sf, $body)
+  $p = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $sf) -PassThru -WindowStyle Hidden
+  $script:bgProcs += $p
+  [pscustomobject]@{ p = $p; branch = $branch; out = $of }
+}
+function Stop-Land([int]$maxSec = 90) {
+  $deadline = (Get-Date).AddSeconds($maxSec)
+  foreach ($p in $script:bgProcs) { try { if (-not $p.HasExited) { [void]$p.WaitForExit([math]::Max(1000, [int](($deadline - (Get-Date)).TotalMilliseconds))) } } catch {} }
+  foreach ($p in $script:bgProcs) { try { if (-not $p.HasExited) { $p.Kill() } } catch {} }
+}
 try {
   # 1. green path: the gate runs ONCE, in the slot, before the land ticket; the queue does not gate again
   $l1 = Slot 'p1'; Commit $l1 'p1.txt' 'p1' 'p1'
@@ -268,6 +305,125 @@ try {
   Commit $l12 'p12.txt' 'p12' 'p12'
   $o = LandFrom $l12.path @('-Branch', 'p12', '-Gate', 'pnpm other:gate', '-Purpose', 'land p12')
   Check '8 another gate command on a new tree runs its own pre-gate' ($code -eq 0 -and @(Gates 'land pregate p12').Count -eq 1) $o
+
+  # B1. a topic whose PRE-GATE failed is QUARANTINED (a per-repo negative ledger) and comes back as soon as
+  #     a fresh explicit land passes its pre-gate. Without it, the topic was re-absorbed into the next
+  #     holder's cap-1 batch on every turn (measured 2026-11-23: one red topic held land:<repo> 60+ min).
+  $lq = Slot 'qb'; Commit $lq 'qb.txt' 'qb' 'qb'
+  Set-Content (Join-Path $lq.path 'bad.txt') 'x'; git -C $lq.path add bad.txt; git -C $lq.path commit -qm 'topic qb bad'
+  git -C $lq.path push -q origin qb 2>$null
+  $o = LandFrom $lq.path @('-Branch', 'qb', '-Purpose', 'land qb')
+  Check 'B1 a failed pre-gate quarantines the topic (negative ledger + journal)' ($code -eq 6 -and (QKeys) -contains 'qb' -and @(Ev 'land-pregate-quarantined' 'qb').Count -eq 1) ("$o || keys=" + ((QKeys) -join ','))
+  # NB: `$(QMap['qb'].reason)` in a double-quoted string is parsed as a COMMAND (and `Stop` aborts the run),
+  # so bind the entry to a variable first.
+  $qE = (QMap)['qb']
+  Check 'B1 ... the entry carries the tree and the failing gate command' ("$($qE.reason)" -match 'land:gate' -and "$($qE.tree)" -match '^[0-9a-f]{40}$' -and "$($qE.at)") ((QMap) | ConvertTo-Json -Compress)
+  git -C $lq.path rm -q bad.txt; git -C $lq.path commit -qm 'fix qb'; git -C $lq.path push -q origin qb 2>$null; git -C $repo fetch -q origin
+  $o = LandFrom $lq.path @('-Branch', 'qb', '-Purpose', 'land qb fixed')
+  Check 'B1 a fresh passing pre-gate lands it and CLEARS the quarantine' ($code -eq 0 -and (Remote 'qb.txt') -eq 'qb' -and @(Ev 'land-quarantine-cleared' 'qb').Count -eq 1 -and -not ((QKeys) -contains 'qb')) ("$o || keys=" + ((QKeys) -join ','))
+  # B1c. an entry older than landQuarantineHours is pruned on the next write (the TTL is read, not assumed)
+  $qm = QMap; $qm['zzz'] = [ordered]@{ at = (Get-Date).ToUniversalTime().AddHours(-8).ToString('o'); tree = ('0' * 40); reason = 'stale entry' }
+  ConvertTo-Json $qm -Depth 5 | Set-Content -LiteralPath (QFile)
+  $lqc = Slot 'qc'; Commit $lqc 'qc.txt' 'qc' 'qc'
+  Set-Content (Join-Path $lqc.path 'bad.txt') 'x'; git -C $lqc.path add bad.txt; git -C $lqc.path commit -qm 'topic qc bad'; git -C $lqc.path push -q origin qc 2>$null
+  $o = LandFrom $lqc.path @('-Branch', 'qc', '-Purpose', 'land qc')
+  Check 'B1c an entry older than landQuarantineHours (default 6) is pruned on the next write' ($code -eq 6 -and -not ((QKeys) -contains 'zzz') -and ((QKeys) -contains 'qc')) ("$o || keys=" + ((QKeys) -join ','))
+
+  # B2. a quarantined topic is NOT absorbed into another holder's batch, and `agentq status` shows why.
+  #     The land queue is cap 1, so the only way to have a quarantined WAITER in front of a new holder is a
+  #     blocker parked inside its gate (the fake gate holds while FAKE_GATE_HOLD exists).
+  git -C $repo fetch -q origin; git -C $repo checkout -q -B qq origin/dev
+  Set-Content (Join-Path $repo 'bad.txt') 'x'; git -C $repo add bad.txt; git -C $repo commit -qm 'topic qq bad'; git -C $repo push -q origin qq 2>$null
+  git -C $repo checkout -q dev
+  $o = AsSession 'pgq' { LandFrom $repo @('-Branch', 'qq', '-Purpose', 'land qq') }
+  Check 'B2 the topic the batch must skip is quarantined first' ($code -eq 6 -and ((QKeys) -contains 'qq')) ("$o || keys=" + ((QKeys) -join ','))
+  foreach ($b in 'blocker2', 'wq') {
+    git -C $repo checkout -q -B $b origin/dev
+    Set-Content (Join-Path $repo "$b.txt") $b; git -C $repo add "$b.txt"; git -C $repo commit -qm "topic $b"; git -C $repo push -q origin $b 2>$null
+    git -C $repo checkout -q dev
+  }
+  Cfg (",`"landBatch`":{`"$repoName`":true}")
+  Remove-Item Env:AGENTQ_LAND_BATCH -ErrorAction SilentlyContinue
+  $env:FAKE_GATE_HOLD = Join-Path $tmp 'hold'; [IO.File]::WriteAllText($env:FAKE_GATE_HOLD, '')
+  $blk = Start-Land 'blocker2' 'sblk'
+  Check 'B2 the blocker parks inside its gate and holds the cap-1 land queue' (WaitGates 'land gate blocker2') ((Gates '.') -join ' | ')
+  $wq = Start-Land 'wq' 'swq'; $null = WaitJournal 'queued' 'swq'
+  $qq = Start-Land 'qq' 'sqq'; $null = WaitJournal 'queued' 'sqq'
+  Check 'B2 two lands wait behind it (one of them quarantined)' ((QueuedCount) -ge 2) "queued=$(QueuedCount)"
+  $st = AQ status -All
+  Check 'B2 agentq status shows the quarantined topic with the reason' ("$st" -match 'QUARANTINED' -and "$st" -match 'qq' -and "$st" -match 'pre-gate failed' -and "$st" -match 'LAND QUARANTINE') ((@("$st" -split "`n") | Where-Object { $_ -match 'QUARANTINED|LAND QUARANTINE|qq ' }) -join ' / ')
+  Remove-Item -LiteralPath $env:FAKE_GATE_HOLD -ErrorAction SilentlyContinue
+  Stop-Land 150
+  Check 'B2 the green waiter landed while the quarantined topic was skipped' ((Remote 'wq.txt') -eq 'wq' -and (Remote 'blocker2.txt') -eq 'blocker2' -and "$(Remote 'bad.txt')" -eq '') ("blk=" + ((Get-Content -LiteralPath $blk.out -Raw -EA SilentlyContinue) -join '') + " || wq=" + ((Get-Content -LiteralPath $wq.out -Raw -EA SilentlyContinue) -join '') + " || qq=" + ((Get-Content -LiteralPath $qq.out -Raw -EA SilentlyContinue) -join ''))
+  # NB: `"$(Ev 'x' 'y')[0].ticket"` interpolates the COMMAND result and appends the literal "[0].ticket", so it
+  # was always truthy (a vacuous assertion) - bind the array first and index inside the subexpression.
+  $qev = @(Ev 'land-topic-quarantined' 'qq')
+  Check 'B2 the picker journaled land-topic-quarantined (and named the waiting ticket)' ($qev.Count -eq 1 -and "$($qev[0].ticket)") (Ev 'land-topic-quarantined' | ConvertTo-Json -Compress)
+  Check 'B2 ... and the batch gated only its own topic (the quarantined one was not absorbed)' ((@(GateTrees 'land gate wq')[0].purpose) -notmatch 'qq') ((Gates 'land gate wq') -join ' | ')
+  Check 'B2 ... and the quarantined topic gated on its own turn and failed' (@(Gates 'land gate qq').Count -ge 1) ((Gates '.') -join ' | ')
+  Remove-Item Env:AGENTQ_LAND_NO_PREGATE -ErrorAction SilentlyContinue
+  Cfg; $env:AGENTQ_LAND_BATCH = '0'
+
+  # A. a scratch slot handed back DIRTY by its previous tenant is RESET before the gate judges it. The
+  #    fixture reproduces the real mechanism: the repo's own lease-time prep step (codai has
+  #    scripts/slot-prep.ps1, and Prepare-Slot runs it on every lease) leaves a file in the slot, so the
+  #    lease that hands the slot to the pre-gate returns it dirty. 2026-11-23: 21 of one day's
+  #    `land-pregate-skipped` lines said "the slot has uncommitted or untracked files", and every one of
+  #    them pushed the whole ~21 min gate back INSIDE the cap-1 land mutex.
+  $prepSrc = @'
+param([Parameter(Mandatory)][string]$Worktree, [string]$Main)
+# fixture stand-in for codai's scripts/slot-prep.ps1: a lease-time step that leaves the slot dirty.
+if ((Split-Path $Worktree -Leaf) -notmatch '^scratch-') { exit 0 }
+if ($env:FAKE_PREP_DIRT -eq 'nested') {
+  # a nested repository: `git clean -fdq` refuses to delete it, so the slot stays dirty after a reset
+  git init -q (Join-Path $Worktree 'sub-dirt')
+  Set-Content (Join-Path $Worktree 'sub-dirt\b.txt') 'x'
+} else { Set-Content (Join-Path $Worktree 'prep-artifact.txt') 'prep' }
+exit 0
+'@
+  git -C $repo fetch -q origin; git -C $repo checkout -q -B dev origin/dev
+  New-Item -ItemType Directory -Force (Join-Path $repo 'scripts') | Out-Null
+  [IO.File]::WriteAllText((Join-Path $repo 'scripts\slot-prep.ps1'), $prepSrc)
+  git -C $repo add scripts/slot-prep.ps1; git -C $repo commit -qm 'fixture slot-prep'; git -C $repo push -q origin dev 2>$null; git -C $repo fetch -q origin
+  Remove-Item Env:AGENTQ_NO_PREP -ErrorAction SilentlyContinue
+  git -C $repo checkout -q -B pA1 origin/dev
+  Set-Content (Join-Path $repo 'pA1.txt') 'pA1'; git -C $repo add pA1.txt; git -C $repo commit -qm 'topic pA1'; git -C $repo push -q origin pA1 2>$null
+  git -C $repo checkout -q dev
+  $env:FAKE_PREP_DIRT = 'file'
+  $o = AsSession 'pgA1' { LandFrom $repo @('-Branch', 'pA1', '-Purpose', 'land pA1') }
+  $reset1 = @(Ev 'land-pregate-slot-reset' 'pA1'); $trees1 = @(GateTrees 'land pregate pA1')
+  Check 'A a dirty scratch slot is reset to the target ref before the gate judges it' ($reset1.Count -eq 1 -and "$($reset1[0].reason)" -match 'dirty when leased; reset' -and $trees1.Count -eq 1 -and "$($trees1[0].root)" -match 'scratch-\d+$') ("$o || reset=" + (($reset1 | ConvertTo-Json -Compress)))
+  Check 'A ... no generic skip, the gate runs, the topic lands' ($code -eq 0 -and (Remote 'pA1.txt') -eq 'pA1' -and @(Ev 'land-pregate-skipped' 'pA1').Count -eq 0 -and @(Gates '^land gate pA1').Count -eq 0) $o
+  Check 'A ... and the slot it reset is clean when the gate sees it' ($trees1.Count -eq 1 -and -not @(git -C "$($trees1[0].root)" status --porcelain 2>$null | Where-Object { $_ })) ((git -C "$($trees1[0].root)" status --porcelain 2>$null) -join ' / ')
+  git -C $repo checkout -q -B pA2 origin/dev
+  Set-Content (Join-Path $repo 'pA2.txt') 'pA2'; git -C $repo add pA2.txt; git -C $repo commit -qm 'topic pA2'; git -C $repo push -q origin pA2 2>$null
+  git -C $repo checkout -q dev
+  $env:FAKE_PREP_DIRT = 'nested'
+  $o = AsSession 'pgA2' { LandFrom $repo @('-Branch', 'pA2', '-Purpose', 'land pA2') }
+  $reset2 = @(Ev 'land-pregate-slot-reset' 'pA2'); $skip2 = @(Ev 'land-pregate-skipped' 'pA2'); $rel2 = @(Ev 'land-pregate-slot-released' 'pA2')
+  Check 'A a slot still dirty after the reset is given back with a PRECISE reason (not the generic one)' ($reset2.Count -eq 1 -and "$($reset2[0].reason)" -match 'left 1 dirty path' -and $skip2.Count -eq 1 -and "$($skip2[0].reason)" -match 'still dirty after a reset' -and $rel2.Count -eq 1 -and "$($rel2[0].reason)" -match 'still dirty') ("$o || reset=" + (($reset2 | ConvertTo-Json -Compress)) + ' || skip=' + (($skip2 | ConvertTo-Json -Compress)))
+  Check 'A ... and that land still goes through, with the gate in the queue' ($code -eq 0 -and (Remote 'pA2.txt') -eq 'pA2' -and @(Gates 'land pregate pA2').Count -eq 0 -and @(Gates '^land gate pA2').Count -eq 1) $o
+  foreach ($lf in @(Get-ChildItem -LiteralPath (Join-Path $env:AGENTQ_HOME "leases\$repoName") -Filter 'scratch-*.json' -File -ErrorAction SilentlyContinue)) {
+    $lk = try { Get-Content -LiteralPath $lf.FullName -Raw | ConvertFrom-Json } catch { $null }
+    if ($lk -and $lk.path -and $lk.leaseId) { $null = AQ unlease -Repo "$($lk.path)" -LeaseId "$($lk.leaseId)" -Force -Reason 'test A cleanup' }
+  }
+  Remove-Item Env:FAKE_PREP_DIRT -ErrorAction SilentlyContinue; $env:AGENTQ_NO_PREP = '1'
+
+  # C. a land started from a DIFFERENT clone of the same repo (the `land` slot is one per repo NAME, owned
+  #    by whichever clone created it) is refused EARLY, naming both clones, instead of dying inside
+  #    Initialize-Slot after a ticket and a gate slot were set up.
+  $other = Join-Path (Join-Path $tmp 'clone2') $repoName
+  New-Item -ItemType Directory -Force (Split-Path -Parent $other) | Out-Null
+  git clone -q $bare $other 2>$null; git -C $other config core.autocrlf false
+  git -C $other checkout -q -B c1 origin/dev
+  Set-Content (Join-Path $other 'c1.txt') 'c1'; git -C $other add c1.txt; git -C $other commit -qm 'topic c1'; git -C $other push -q origin c1 2>$null
+  $nQ = @(Journal | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -eq "land:$repoName" }).Count
+  $nG = @(Gates '.').Count
+  $o = AsSession 'pgC' { LandFrom $other @('-Branch', 'c1', '-Purpose', 'land c1') }
+  Check 'C a land from another clone of the same repo is REFUSED (exit 3, naming both clones)' ($code -eq 3 -and "$o" -match 'REFUSED' -and "$o" -match [regex]::Escape($repo) -and "$o" -match [regex]::Escape($other)) $o
+  $wcev = @(Ev 'land-wrong-clone' 'dev')
+  Check 'C ... journal land-wrong-clone names the resolved clone, the owner clone and the slot' ($wcev.Count -eq 1 -and "$($wcev[0].clone)" -match [regex]::Escape($other) -and "$($wcev[0].owner)" -match [regex]::Escape($repo)) (Ev 'land-wrong-clone' | ConvertTo-Json -Compress)
+  Check 'C ... nothing was queued and no gate ran' (@(Journal | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -eq "land:$repoName" }).Count -eq $nQ -and @(Gates '.').Count -eq $nG) ("queued now=$(@(Journal | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -eq "land:$repoName" }).Count) was=$nQ ; gates now=$(@(Gates '.').Count) was=$nG")
 } finally {
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'FAKE_GATE_TREE_LOG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_FLAKES', 'AGENTQ_NO_POSTLAND', 'AGENTQ_LAND_BATCH', 'AGENTQ_LAND_NO_PREGATE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$tmp`"" 2>$null

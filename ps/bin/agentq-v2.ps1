@@ -165,6 +165,27 @@ function With-Mutex([string]$name, [scriptblock]$body) {
 }
 function Get-MainTop($repo) { Split-Path -Parent $repo.Common }
 function Get-SlotPath([string]$repoName, [string]$slot) { Join-Path (Join-Path (Get-WtRoot) $repoName) $slot }
+# Which clone owns the worktree at $slotPath (the main top of its git common dir), or $null when the path
+# is not (yet) a worktree. Used by the land path to refuse a land resolved against a DIFFERENT clone than
+# the one that owns the repo's slot (see Test-LandCloneOwnsSlot / Invoke-Land).
+function Get-SlotOwnerMain([string]$slotPath) {
+  if (-not $slotPath) { return $null }
+  if (-not (Test-Path -LiteralPath (Join-Path $slotPath '.git'))) { return $null }
+  $cd = "$(& git -C $slotPath rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+  if (-not $cd) { return $null }
+  Split-Path -Parent ($cd -replace '/', [IO.Path]::DirectorySeparatorChar)
+}
+# C) The `land` slot is a single <wtroot>/<repoName>/land worktree per repo NAME, owned by whichever clone
+# created it. A land resolved against a DIFFERENT clone of the same repo would move another clone's slot
+# (and `Initialize-Slot` refuses it anyway, but only AFTER the ticket and the gate slot are set up).
+# Returns { slot, owner } when the land slot belongs to a clone other than $main, else $null.
+function Test-LandCloneOwnsSlot($repo, [string]$main) {
+  $land = Get-SlotPath $repo.Name 'land'
+  $owner = Get-SlotOwnerMain $land
+  if (-not $owner) { return $null }
+  if ((Norm-Dir $owner) -eq (Norm-Dir $main)) { return $null }
+  [pscustomobject]@{ slot = $land; owner = $owner }
+}
 function Get-LeaseFile([string]$repoName, [string]$slot) { Join-Path (Join-Path $LDir $repoName) "$slot.json" }
 function Get-DefaultOwner { if ($OwnerPid -gt 0) { return $OwnerPid }; if ($env:AGENTQ_OWNER_PID) { return [int]$env:AGENTQ_OWNER_PID }; Get-AgentHostPid }
 function Short([string]$s, [int]$n = 10) { if (-not $s) { return '' }; $s.Substring(0, [math]::Min($n, $s.Length)) }
@@ -1667,6 +1688,72 @@ function Set-GreenTree([string]$repoName, [string]$tree, [string]$gate, [int]$se
     }
   } catch {}
 }
+# ---- land quarantine (ADR 0009 stage 0; 2026-11-23) -----------------------------------------------
+# A topic whose PRE-GATE failed is remembered per repo (<AGENTQ_HOME>/land/<repo>.json - the NEGATIVE
+# mirror of the green ledger) for `landQuarantineHours` (default 6). The batch picker SKIPS such a topic
+# (journal `land-topic-quarantined`), so one red topic can no longer be absorbed into a holder's cap-1
+# batch and hold land:<repo> for a whole gate: measured 2026-11-23, that is how a single red topic kept
+# the queue for 60+ minutes with 12 waiters (the gate failed under the mutex, the batch bisected, and
+# every waiter paid for the round). It is NOT a ban: an explicit `agentq land -Branch <b>` runs a FRESH
+# pre-gate and CLEARS the entry on success (journal `land-quarantine-cleared`) - the topic comes back the
+# moment its own tree is green. Keyed by BRANCH (not tree): a fix that changes the tree keeps the branch.
+# Config `landQuarantineHours` (default 6); AGENTQ_NO_LAND_QUARANTINE=1 turns it off (read side).
+function Get-LandQuarantineFile([string]$repoName) { Join-Path (Join-Path $Root 'land') ((Safe $repoName) + '.json') }
+function Get-LandQuarantineHours { $c = Get-Config; if ($c -and $c.ContainsKey('landQuarantineHours')) { [double]$c['landQuarantineHours'] } else { 6.0 } }
+# Live map branch -> { at, tree, reason }, expired entries dropped (never returned; pruned on the next write).
+function Get-LandQuarantine([string]$repoName) {
+  $out = @{}
+  if ($env:AGENTQ_NO_LAND_QUARANTINE -eq '1') { return $out }
+  try {
+    $f = Get-LandQuarantineFile $repoName
+    if (-not [IO.File]::Exists($f)) { return $out }
+    $j = $null
+    try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String } catch { return $out }
+    if (-not $j) { return $out }
+    $ttl = Get-LandQuarantineHours
+    foreach ($k in @($j.Keys)) {
+      $e = $j[$k]; $at = "$(P $e 'at' '')"
+      if ($at -and ((Now) - (ParseUtc $at)).TotalHours -le $ttl) { $out[$k] = $e }
+    }
+  } catch {}
+  $out
+}
+function Test-LandQuarantined([string]$repoName, [string]$branch) {
+  if (-not $branch) { return $null }
+  $q = Get-LandQuarantine $repoName
+  if ($q.ContainsKey($branch)) { $q[$branch] } else { $null }
+}
+function Set-LandQuarantine([string]$repoName, [string]$branch, [string]$tree, [string]$reason) {
+  if (-not $branch) { return }
+  try {
+    With-Mutex "landq-$repoName" {
+      $f = Get-LandQuarantineFile $repoName
+      $j = @{}
+      if ([IO.File]::Exists($f)) { try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String } catch { $j = @{} } }
+      if (-not $j) { $j = @{} }
+      $ttl = Get-LandQuarantineHours
+      foreach ($k in @($j.Keys)) { $at = "$(P $j[$k] 'at' '')"; if ($at -and ((Now) - (ParseUtc $at)).TotalHours -gt $ttl) { $j.Remove($k) } }
+      $j[$branch] = [ordered]@{ at = (Iso (Now)); tree = "$tree"; reason = "$reason" }
+      if ($j.Count -gt 200) { foreach ($old in @($j.Keys | Sort-Object { "$($j[$_]['at'])" } | Select-Object -First ($j.Count - 200))) { $j.Remove($old) } }
+      Write-JsonAtomic $f $j
+    }
+  } catch {}
+}
+function Clear-LandQuarantine([string]$repoName, [string]$branch) {
+  if (-not $branch) { return $false }
+  $removed = $false
+  try {
+    $removed = With-Mutex "landq-$repoName" {
+      $f = Get-LandQuarantineFile $repoName
+      if (-not [IO.File]::Exists($f)) { return $false }
+      $j = $null
+      try { $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String } catch { $j = $null }
+      if (-not $j -or -not $j.Contains($branch)) { return $false }
+      $j.Remove($branch); Write-JsonAtomic $f $j; return $true
+    }
+  } catch {}
+  [bool]$removed
+}
 function Get-LandPregateOn([string]$repoName) {
   if ($env:AGENTQ_LAND_NO_PREGATE -eq '1') { return $false }
   $c = Get-Config
@@ -1731,6 +1818,27 @@ function Get-PregateScratchSlot($repo, [string]$onto) {
   if (-not $line) { $script:PregateScratchWhy = 'the scratch lease printed no lease JSON'; return $null }
   $l = try { "$line" | ConvertFrom-Json -AsHashtable } catch { $null }
   if (-not $l -or -not (P $l 'path') -or -not (P $l 'leaseId')) { $script:PregateScratchWhy = 'the scratch lease JSON carried no path or leaseId'; return $null }
+  # A) 2026-11-23: the rented scratch slot was NOBODY's to clean. `Release-PregateSlot` handed it back
+  # still dirty, the next land rented the SAME poisoned slot, hit the generic `Test-GitClean` skip below,
+  # and pushed the whole gate back into the cap-1 land mutex - measured: 21 of the `land-pregate-skipped`
+  # lines in one day said "the slot has uncommitted or untracked files". This is the slot JUST RENTED for
+  # the gate, never the caller's tree and never a slot this session already holds, so resetting it is safe
+  # by construction: re-initialise it to origin/<onto> (the ref it was leased at) with the repo's own
+  # idiom. If it is STILL dirty after that, the tree cannot be trusted for a gate, so give it back and
+  # skip with a reason that names the slot instead of the generic one. A clean slot is left untouched.
+  $sp0 = "$(P $l 'path')"
+  if (-not (Test-GitClean $sp0)) {
+    $resetErr = ''
+    try { Initialize-Slot (Get-MainTop $repo) $sp0 "origin/$onto" '' $false }
+    catch { $resetErr = "$($_.Exception.Message)" }
+    $dirty0 = @(& git --no-optional-locks -C $sp0 status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ })
+    Write-Journal @{ event = 'land-pregate-slot-reset'; resource = "land:$($repo.Name)"; branch = $Branch; slot = "$(P $l 'slot')"; repo = $repo.Name; reason = $(if ($resetErr) { "reset to origin/$onto threw: $resetErr" } elseif ($dirty0.Count) { "reset to origin/$onto left $($dirty0.Count) dirty path(s)" } else { 'rented scratch slot was dirty when leased; reset to origin/$onto before the gate' }) }
+    if ($resetErr -or $dirty0.Count) {
+      [void](Release-PregateSlot @{ path = $sp0; slot = (P $l 'slot'); leaseId = (P $l 'leaseId') } $repo.Name 'rented scratch slot is still dirty after a reset')
+      $script:PregateScratchWhy = "the rented scratch slot $sp0 is still dirty after a reset to origin/$onto$(if ($resetErr) { " ($resetErr)" } else { " ($($dirty0.Count) path(s))" }), so the gate would judge files that are not the topic's"
+      return $null
+    }
+  }
   if (-not (Test-SlotPrepReady $repo.Name (Split-Path "$(P $l 'path')" -Leaf))) {
     [void](Release-PregateSlot @{ path = (P $l 'path'); slot = (P $l 'slot'); leaseId = (P $l 'leaseId') } $repo.Name "prep not ready for $Branch")
     $script:PregateScratchWhy = 'the scratch slot it got has a failed install (prep not ready), so the gate would fail for a reason that is not the topic''s'
@@ -1839,6 +1947,10 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     }
     if ($script:GateExit) {
       Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = $Gate; repo = $repo.Name }
+      # B) Quarantine the topic so no later land re-absorbs it into the cap-1 mutex batch (see the block
+      # above Get-LandQuarantineFile). A fresh, passing pre-gate clears it (Invoke-Land).
+      Set-LandQuarantine $repo.Name $Branch $tree "$Gate (exit $($script:GateExit))"
+      Write-Journal @{ event = 'land-pregate-quarantined'; resource = $res; branch = $Branch; tree = $tree; reason = "$Gate failed (exit $($script:GateExit)); the topic is quarantined so a batch will not absorb it"; repo = $repo.Name }
       [Console]::Error.WriteLine("land: gate failed ($($script:GateExit)) for $Branch rebased onto origin/$Onto running '$Gate', BEFORE the queue - nothing queued, nothing pushed. Fix it in the slot and land again. (AGENTQ_LAND_NO_PREGATE=1 runs the gate in the queue instead.)")
       $script:PregateResult = 'failed'; return
     }
@@ -2230,6 +2342,22 @@ function Invoke-Land {
   $main = Get-MainTop $repo
   $res = "land:$($repo.Name)"
   $script:LandSrcSlot = $null
+  # C) 2026-11-23: the `land` slot is <wtroot>/<repoName>/land - ONE per repo NAME - and it is a worktree
+  # of whichever clone created it. A land started from a DIFFERENT clone of the same repo (e.g. a scratch
+  # clone at E:\gh\.r5clone\push\codai) resolves $main to that clone, and Initialize-Slot then dies inside
+  # the ticket with "directory exists but is not a worktree of $main". Detect it EARLY and refuse, naming
+  # the clone that owns the slot - never silently use another clone's slot. Deriving a per-clone slots root
+  # is NOT safe here: leases and Get-SlotPath key slots by repo NAME, so a slot inside the other clone would
+  # collide in the lease registry with this clone's land slot.
+  $own = Test-LandCloneOwnsSlot $repo $main
+  if ($own) {
+    Write-Journal @{ event = 'land-wrong-clone'; resource = $res; branch = $Onto; clone = "$main"; owner = "$($own.owner)"; slot = "$($own.slot)"; reason = "this land resolved the clone $main, but the land slot $($own.slot) belongs to $($own.owner)"; repo = $repo.Name }
+    # NB: no backticks inside this double-quoted string - a backtick starts an escape sequence there
+    # (`a is BEL), so the recipes are quoted with single quotes.
+    [Console]::Error.WriteLine("land: REFUSED - this land runs against the clone $main, but the land slot $($own.slot) belongs to the clone $($own.owner). Using it would move another clone's worktree. Nothing queued, nothing pushed.`n  Two working recipes:`n   (1) land from a leased slot of $($own.owner): there run 'agentq lease -Role scratch -Purpose <why>', cd into the printed path, then 'agentq land -Branch $Branch -Onto $Onto -Purpose <why>';`n   (2) publish the topic instead, from the clone you are in: 'agentq publish -Paths a,b -Message <type>(scope): msg -Purpose <why> -Base origin/main -Land'.")
+    $script:LandExit = 3
+    return
+  }
   Assert-NotMarked $res
   # ADR-0303 A (brivio): a repo may declare its default land gate in config (`landGate: { repo: cmd }`),
   # so every land runs it without each agent remembering -Gate. `-Gate none` opts out, journaled.
@@ -2278,6 +2406,16 @@ function Invoke-Land {
       # ledger hit, a red gate).
       try { Invoke-LandPregate $repo $main $pgRef } finally { Release-PregateSlot $null $repo.Name 'pre-gate done' }
       if ($script:PregateResult -eq 'failed') { $script:LandExit = 6; return }
+      # B) A fresh, PASSING pre-gate lifts the quarantine: the topic comes back on its own turn the moment
+      # its tree is green. Only a real pre-gate run clears it (a skip, or -Gate none, leaves it set).
+      if ($script:PregateResult -eq 'ok') {
+        $qprev = Test-LandQuarantined $repo.Name $Branch
+        if ($qprev) {
+          [void](Clear-LandQuarantine $repo.Name $Branch)
+          Write-Journal @{ event = 'land-quarantine-cleared'; resource = $res; branch = $Branch; reason = "a fresh pre-gate passed ($Gate); was quarantined at $(P $qprev 'at') for: $(P $qprev 'reason')"; repo = $repo.Name }
+          Write-Output "land: quarantine cleared for $Branch (a fresh pre-gate passed)"
+        }
+      }
     }
   }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
@@ -2321,6 +2459,15 @@ function Invoke-Land {
         if ($set.Count -ge $max) { break }
         $wb = "$($w.landBranch)"
         if (@($set | Where-Object { $_.branch -eq $wb }).Count) { continue }
+        # B) Never absorb a topic whose PRE-GATE failed: one red topic made the whole batch (and the cap-1
+        # land mutex) pay a gate, then bisect, for every waiter in the queue (2026-11-23). It gates on its
+        # own turn, where an explicit land re-runs its pre-gate and clears the quarantine when the tree is green.
+        $qq = Test-LandQuarantined $repo.Name $wb
+        if ($qq) {
+          Write-Journal @{ event = 'land-topic-quarantined'; resource = $res; branch = $wb; ticket = $w.id; tree = "$(P $qq 'tree')"; reason = "previous pre-gate failed for $wb ($(P $qq 'reason'), $(P $qq 'at')); not absorbed into this batch - it gates on its own turn"; repo = $repo.Name }
+          Write-Output "land: $wb is quarantined (pre-gate failed $(P $qq 'at'): $(P $qq 'reason')) - not absorbed into this batch"
+          continue
+        }
         $wr = Resolve-LandRef $main $wb
         if (-not $wr) { continue }
         & git -C $main merge-tree --write-tree --name-only --no-messages "origin/$Onto" $wr 2>$null | Out-Null
