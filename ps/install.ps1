@@ -84,6 +84,9 @@ $map = [ordered]@{
   'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'
   'tests\test-agentq-prune.ps1' = 'bin\test-agentq-prune.ps1'; 'tests\test-agentq-doctor.ps1' = 'bin\test-agentq-doctor.ps1'
   'tests\test-slo.mjs' = 'bin\test-slo.mjs'
+  # 2026-11-23: `bump -Id|-Session` (a waiter can target its OWN ticket) + the `== MINE session ...` line
+  # in `status`. Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
+  'tests\test-agentq-bump.ps1' = 'bin\test-agentq-bump.ps1'
   # 2026-11-21 (ADR 0014): slot take-over + `recover`, the commit/push split (D1), the per-session
   # fair share (D4). `test-land-default-gate.ps1` was in run-all but not in this map, so the installed
   # copy never carried it - the install gate could not run what it never installed.
