@@ -157,22 +157,42 @@ OkText $r.text 'linked worktree' 'E the reason names the linked worktree'
 Ok ((Dirty $slot).Count -eq 1) 'E the slot keeps its edit'
 Ok ((PublishRefs $e.o).Count -eq 0) 'E nothing was published'
 
-# ---- F: an active agentq commit/land ticket means another tool owns this repo right now
+# ---- F: only a HELD commit ticket owns the tree. A waiter is not a writer (it is blocked precisely
+#         because someone else holds the resource), and a land - held or queued - works in its own slot
+#         and never writes this clone. Counting queued tickets starved the janitor on 2026-11-23: E:\gh\codai
+#         refused to fast-forward for 2h44m while a permanently deep land queue made a ticket present at
+#         every tick.
 $f = New-Repo 'scj-f'
 Write-Cfg @{ 'scj-f' = 'refuse' } @($f.a)
 W (Join-Path $f.a 'base.txt') "old-enough-to-janitor`n"
 Age (Join-Path $f.a 'base.txt')
 $q = Join-Path $env:AGENTQ_HOME 'queues\commit_scj-f'
 New-Item -ItemType Directory -Force $q | Out-Null
+# F1: a QUEUED commit ticket does not own the tree -> the next gate decides
 W (Join-Path $q 't1.json') '{"resource":"commit:scj-f","pid":1}'
+$r = RunJ @('-Repo', $f.a, '-Apply', '-LiveWriterSec', '0', '-MaxFiles', '0')
+Ok ($r.code -eq 3) 'F1 exit 3'
+OkText $r.text 'too-many' 'F1 a queued (not held) commit ticket is not a skip - the next gate decides'
+Ok ((Dirty $f.a).Count -eq 1) 'F1 untouched (too-many still protects it)'
+# F2: a HELD commit ticket owns the tree
+W (Join-Path $q 't1.json') '{"resource":"commit:scj-f","pid":1,"held":true}'
 $r = RunJ @('-Repo', $f.a, '-Apply', '-LiveWriterSec', '0')
-Ok ($r.code -eq 3) 'F exit 3'
-OkText $r.text 'commit ticket active' 'F the reason names the active ticket'
-Ok ((Dirty $f.a).Count -eq 1) 'F untouched while the ticket is held'
+Ok ($r.code -eq 3) 'F2 exit 3'
+OkText $r.text 'commit ticket HELD' 'F2 the reason names the held ticket'
+Ok ((Dirty $f.a).Count -eq 1) 'F2 untouched while the ticket is held'
 Remove-Item -Recurse -Force $q
 $r = RunJ @('-Repo', $f.a, '-Apply', '-LiveWriterSec', '0', '-MaxFiles', '0')
-Ok ($r.code -eq 3) 'F with the ticket gone the next gate (too-many) decides'
-OkText $r.text 'too-many' 'F the ticket gate was the only reason before'
+Ok ($r.code -eq 3) 'F2 with the ticket gone the next gate (too-many) decides'
+OkText $r.text 'too-many' 'F2 the ticket gate was the only reason before'
+# F3: a HELD land ticket is a note, never a skip - the land works in its own slot, not here
+$lq = Join-Path $env:AGENTQ_HOME 'queues\land_scj-f'
+New-Item -ItemType Directory -Force $lq | Out-Null
+W (Join-Path $lq 't1.json') '{"resource":"land:scj-f","pid":1,"held":true}'
+$r = RunJ @('-Repo', $f.a, '-Apply', '-LiveWriterSec', '0', '-MaxFiles', '0')
+Ok ($r.code -eq 3) 'F3 exit 3'
+OkText $r.text 'land works in its own slot' 'F3 a held land ticket is noted, not treated as a writer'
+OkText $r.text 'too-many' 'F3 the too-many gate still decides'
+Remove-Item -Recurse -Force $lq
 
 # ---- G: only `refuse` repos are janitor targets
 $g = New-Repo 'scj-g'

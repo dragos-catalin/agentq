@@ -14,7 +14,13 @@ WHAT ONE PASS DOES, per repo whose config marks it `sharedCloneMode=refuse` and 
   1. `git status --porcelain` -> the dirty set. Empty -> nothing to do (the steady state, and the reason
      the log stays quiet).
   2. SKIP that repo (journal `skipped`, with the reason) when ANY of:
-       * an agentq `commit:<repo>` or `land:<repo>` ticket is active (any ticket file in the queue dir);
+       * an agentq `commit:<repo>` ticket is HELD (the queue's own `held` flag). A WAITER never blocks, and
+         a `land:<repo>` ticket never blocks either - held or queued - because a land works in its own slot
+         (Invoke-LandPregate takes a scratch slot; Initialize-Slot/gate/land-finalize/push all run in
+         E:\gh\.wt\<repo>\land) and never writes this clone. Before 2026-11-23 this gate counted ANY queued
+         ticket, so a permanently deep land queue starved the janitor at every 2-minute tick: E:\gh\codai
+         refused to fast-forward for 2h44m over a 2h-stale 35-path draft while 10 lands drained one at a
+         time, and the tool that exists to fix exactly that never ran;
        * a dirty file's mtime is newer than now - -LiveWriterSec (120 s): a live writer owns it;
        * a rebase/merge/cherry-pick is in progress (.git\rebase-merge, .git\rebase-apply, .git\MERGE_HEAD,
          .git\CHERRY_PICK_HEAD, .git\REVERT_HEAD, .git\index.lock);
@@ -267,18 +273,32 @@ function Invoke-Repo([string]$top) {
     $r.lines = $L.ToArray(); return $r
   }
 
-  # ---- gate: an agentq commit/land ticket is active for this repo
-  foreach ($kind in 'commit', 'land') {
-    $q = Join-Path $CoordQ "${kind}_$name"
-    if ((Test-Path -LiteralPath $q)) {
-      $tk = @(Get-ChildItem -LiteralPath $q -Filter '*.json' -File -ErrorAction SilentlyContinue)
-      if ($tk.Count) {
-        $r.decision = 'skip'; $r.reason = "agentq ${kind} ticket active ($($tk[0].Name))"; $r.code = 3
-        $L.Add("   skip: agentq $kind ticket active ($($tk[0].Name))")
-        Write-Journal @{ event = 'skipped'; repo = $name; reason = $r.reason; ticket = $tk[0].Name; tool = 'shared-clone-janitor' }
-        $r.lines = $L.ToArray(); return $r
-      }
+  # ---- gate: an agentq COMMIT ticket is HELD for this repo
+  # Reads the queue's own `held` flag; a waiter is not a writer (it is blocked precisely because someone
+  # else holds the resource). Only a HELD commit can be touching this shared index/worktree.
+  # A land ticket is NOT a reason to skip, held or not: Invoke-LandPregate takes its own scratch slot and
+  # every later step runs in `E:\gh\.wt\<repo>\land` (Initialize-Slot / gate / land-finalize / push), so it
+  # never writes this clone. Treating queued lands as "active" starved the janitor permanently on
+  # 2026-11-23: E:\gh\codai refused to fast-forward for 1h27m over a 2.1h-stale 35-path draft while 10
+  # lands drained one at a time, so a `land:codai` ticket was present at every single tick.
+  $q = Join-Path $CoordQ "commit_$name"
+  if ((Test-Path -LiteralPath $q)) {
+    $tk = @(Get-ChildItem -LiteralPath $q -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $held = @($tk | Where-Object {
+        try { $t = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json; [bool]$t.held } catch { $false }
+      })
+    if ($held.Count) {
+      $r.decision = 'skip'; $r.reason = "agentq commit ticket HELD ($($held[0].Name))"; $r.code = 3
+      $L.Add("   skip: agentq commit ticket HELD ($($held[0].Name))")
+      Write-Journal @{ event = 'skipped'; repo = $name; reason = $r.reason; ticket = $held[0].Name; tool = 'shared-clone-janitor' }
+      $r.lines = $L.ToArray(); return $r
     }
+    if ($tk.Count) { $L.Add("   note: $($tk.Count) commit ticket(s) queued, none HELD - waiters are not writers, continuing") }
+  }
+  $lq = Join-Path $CoordQ "land_$name"
+  if (Test-Path -LiteralPath $lq) {
+    $lt = @(Get-ChildItem -LiteralPath $lq -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($lt.Count) { $L.Add("   note: $($lt.Count) land ticket(s) present - land works in its own slot, not here, continuing") }
   }
 
   # ---- gate: too many dirty paths = a live agent, not debris
