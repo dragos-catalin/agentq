@@ -10,6 +10,12 @@ $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:CODAI_WT_ROOT = Join-Path $tmp 'wt'
 $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'
 Remove-Item Env:AGENTQ_LAND_BATCH -ErrorAction SilentlyContinue
+# The pre-gate (ADR 0009 stage 0) has its own suite (test-land-pregate.ps1) and is turned OFF here on
+# purpose: with it on, `Run-Scenario`'s blocker holds inside a PRE-GATE (the fake gate waits for the hold
+# flag wherever it runs), so no waiter ever reaches the queue, the batch never forms, and every topic is
+# gated on its own - the fixture then measures the pre-gate, not batching. Measured 2026-11-23: this suite
+# has been red since 48aea91 landed the pre-gate (2026-11-22), and red on pristine HEAD too.
+$env:AGENTQ_LAND_NO_PREGATE = '1'
 $env:AGENTQ_RUN_BUILD = Join-Path $PSScriptRoot 'fake-gate.ps1'
 $env:FAKE_GATE_LOG = Join-Path $tmp 'gates.log'
 $env:FAKE_GATE_HOLD = Join-Path $tmp 'hold.flag'
@@ -74,7 +80,9 @@ try {
   Check '1 blocker landed' ($r.blocker -eq 0) $outs
   Check '1 all three waiters exit 0' (@($r.codes.Values | Where-Object { $_ -ne 0 }).Count -eq 0) (($r.codes | ConvertTo-Json -Compress) + "`n" + $outs)
   Check '1 all three on origin' ((Remote 'x1.txt') -eq 'tA1' -and (Remote 'x2.txt') -eq 'tA2' -and (Remote 'x3.txt') -eq 'tA3') $outs
-  $gates = @(Get-Content $env:FAKE_GATE_LOG | Where-Object { $_ -match 'tA' })
+  # `-notmatch 'pregate'` keeps a stray pre-gate line (someone runs this fixture with the pre-gate on) from
+  # being counted as a queue gate: only the in-queue gate can name a `+` set.
+  $gates = @(Get-Content $env:FAKE_GATE_LOG | Where-Object { $_ -match 'tA' -and $_ -notmatch 'pregate' })
   Check '1 one gate for the batch' ($gates.Count -eq 1 -and $gates[0] -match 'tA1\+tA2\+tA3') ($gates -join ' | ')
   $bat = @(Events 'land-batch')
   Check '1 land-batch journaled (size 3, not bisected)' ($bat.Count -eq 1 -and $bat[0].size -eq 3 -and -not $bat[0].bisected) ($bat | ConvertTo-Json -Compress)
@@ -97,7 +105,7 @@ try {
   $r = Run-Scenario 'C' @('z1.txt', 'z2.txt')
   git -C $repo fetch -q origin
   Check '3 off: both land' ($r.codes['tC1'] -eq 0 -and $r.codes['tC2'] -eq 0 -and (Remote 'z2.txt') -eq 'tC2')
-  $gates = @(Get-Content $env:FAKE_GATE_LOG | Where-Object { $_ -match 'tC' })
+  $gates = @(Get-Content $env:FAKE_GATE_LOG | Where-Object { $_ -match 'tC' -and $_ -notmatch 'pregate' })
   Check '3 off: one gate per topic, no batch' ($gates.Count -eq 2 -and @(Events 'land-batch').Count -eq $nb) ($gates -join ' | ')
 } finally {
   Pop-Location

@@ -63,6 +63,14 @@ function LandFrom([string]$dir, [string[]]$more) {
   Push-Location $dir
   try { $a = @('land', '-Onto', 'dev', '-TimeoutMin', '5') + $more; AQ @a } finally { Pop-Location }
 }
+# Runs a step as a DIFFERENT session id. This fixture is ONE session that holds task-1..task-11, and since
+# 2026-11-23 `Invoke-LandPregate` prefers a clean slot THE CALLER'S SESSION holds (any role) before renting a
+# scratch one - so a case that means to exercise the "land from the clone root, take a scratch slot" path has
+# to stop looking like the session that holds task-1, or it legitimately pre-gates in task-1 instead.
+function AsSession([string]$sid, [scriptblock]$body) {
+  $prev = $env:AGENTQ_SESSION; $env:AGENTQ_SESSION = $sid
+  try { & $body } finally { $env:AGENTQ_SESSION = $prev }
+}
 try {
   # 1. green path: the gate runs ONCE, in the slot, before the land ticket; the queue does not gate again
   $l1 = Slot 'p1'; Commit $l1 'p1.txt' 'p1' 'p1'
@@ -111,13 +119,14 @@ try {
 
   # 5. a land from the SHARED CLONE takes a scratch slot for the pre-gate and gives it back, and a re-land
   #    of an unchanged green tree does not run the gate again (the point of OQ-003: under 1 min in land)
+  #    Run as `pg5`, not `test-pg`: this case is about the session that has NO slot of its own.
   git -C $repo fetch -q origin; git -C $repo checkout -q -B p5 origin/dev
   Set-Content (Join-Path $repo 'p5.txt') 'p5'; git -C $repo add p5.txt; git -C $repo commit -qm 'topic p5'; git -C $repo push -q origin p5 2>$null
   git -C $repo checkout -q dev
   # the remote refuses the first push (as a failing pre-push or a protected branch would)
   [IO.File]::WriteAllText((Join-Path $bare 'hooks\pre-receive'), "#!/bin/sh`nif [ -f `"`$GIT_DIR/reject`" ] || [ -f ./reject ]; then echo refused-by-test >&2; exit 1; fi`nexit 0`n")
   [IO.File]::WriteAllText((Join-Path $bare 'reject'), '')
-  $o = LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5')
+  $o = AsSession 'pg5' { LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5') }
   $scr = @(Ev 'land-pregate-slot-released' 'p5')
   Check '5 first land from the clone: the pre-gate ran there, in a scratch slot (not the caller tree)' ($code -eq 7 -and @(Gates 'land pregate p5').Count -eq 1 -and (GateTrees 'land pregate p5')[0].root -match 'scratch-\d+$' -and $scr.Count -eq 1 -and "$($scr[0].slot)" -match '^scratch-\d+$') $o
   Check '5 ... and the queue did not gate again (the pre-gate recorded the tree green)' (@(Gates '^land gate p5').Count -eq 0 -and @(Ev 'land-pregate-skipped' 'p5').Count -eq 0) ((Gates 'p5') -join ' | ')
@@ -127,7 +136,7 @@ try {
   Check '5 ... and the scratch slot was given back (lease record removed)' ($scr.Count -eq 1 -and $scr[0].exit -eq 0 -and -not (Test-Path -LiteralPath $leaseFile)) "$leaseFile"
   Remove-Item (Join-Path $bare 'reject')
   $n0 = (Journal).Count
-  $o = LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5 again')
+  $o = AsSession 'pg5' { LandFrom $repo @('-Branch', 'p5', '-Purpose', 'land p5 again') }
   Check '5 re-land of the same tree lands' ($code -eq 0 -and (Remote 'p5.txt') -eq 'p5') $o
   $gates5 = @(Gates 'land pregate p5').Count + @(Gates '^land gate p5').Count
   $said5 = [bool]("$o" -match 'gate skipped')
@@ -169,10 +178,54 @@ try {
   git -C $repo fetch -q origin; git -C $repo checkout -q -B p5c origin/dev
   Set-Content (Join-Path $repo 'p5c.txt') 'p5c'; git -C $repo add p5c.txt; git -C $repo commit -qm 'topic p5c'; git -C $repo push -q origin p5c 2>$null
   git -C $repo checkout -q dev
-  $o = LandFrom $repo @('-Branch', 'p5c', '-Purpose', 'land p5c')
+  # As `pg5c`, so the three holders above (this session's) really are foreign to it: a session that holds a
+  # clean slot of its own would pre-gate there instead, which is 5e's case, not this one.
+  $o = AsSession 'pg5c' { LandFrom $repo @('-Branch', 'p5c', '-Purpose', 'land p5c') }
   Check '5c all scratch slots held -> pre-gate skipped with the reason, the queue gates, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p5c')[0].reason -match 'no scratch slot was free' -and @(Gates 'land pregate p5c').Count -eq 0 -and @(Gates '^land gate p5c').Count -eq 1) $o
   foreach ($l in $hold) { $null = AQ unlease -Repo $l.path -LeaseId $l.leaseId }
   Cfg
+
+  # 5d. a land started from a SCRATCH slot uses THAT slot for the pre-gate. The role must not decide: the
+  #     gate only needs a clean, installed tree, and `Prepare-Slot` installs for scratch too. Before
+  #     2026-11-23 the filter was task/pinned, so this land looked like a land "from the shared clone",
+  #     could not take a SECOND scratch slot, and skipped the pre-gate - the whole gate then ran inside the
+  #     cap-1 land mutex (measured: 49 of a 99 min queue hold was gate runs, and 6 of the last ~10 lands
+  #     skipped with "no scratch slot was free").
+  Push-Location $repo
+  try { $raw5d = AQ lease -Role scratch -Slot 'scratch-1' -Purpose 'land from a scratch slot' -Ref origin/dev -Json } finally { Pop-Location }
+  $l5d = $raw5d -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  Check '5d the fixture holds a scratch slot' ([bool]$l5d.leaseId) $raw5d
+  git -C $l5d.path config core.autocrlf false
+  Set-Content (Join-Path $l5d.path 'p5d.txt') 'p5d'; git -C $l5d.path add p5d.txt; git -C $l5d.path commit -qm 'topic p5d'
+  git -C $l5d.path push -q origin "HEAD:refs/heads/p5d" 2>$null
+  git -C $repo fetch -q origin '+refs/heads/*:refs/remotes/origin/*'; git -C $repo branch -f p5d origin/p5d 2>$null
+  $head5d = git -C $l5d.path rev-parse HEAD
+  $o = LandFrom $l5d.path @('-Branch', 'p5d', '-Purpose', 'land p5d')
+  $trees5d = @(GateTrees 'land pregate p5d')
+  Check '5d pre-gate ran in the caller scratch slot, not in a second one' ($code -eq 0 -and (Remote 'p5d.txt') -eq 'p5d' -and $trees5d.Count -eq 1 -and "$($trees5d[0].root)" -eq "$($l5d.path)" -and @(Ev 'land-pregate-slot-released' 'p5d').Count -eq 0) (($trees5d | ConvertTo-Json -Compress) + ' || ' + $o)
+  Check '5d ... and the queue did not gate again (the tree went into the green ledger)' (@(Gates '^land gate p5d').Count -eq 0 -and @(Ev 'land-gate-skipped-green').Count -ge 1) ((Gates 'p5d') -join ' | ')
+  Check '5d ... and the scratch slot is back on its own commit, clean' ((git -C $l5d.path rev-parse HEAD) -eq $head5d -and -not (git -C $l5d.path status --porcelain))
+  $null = AQ unlease -Repo $l5d.path -LeaseId $l5d.leaseId -Reason 'test 5d done'
+
+  # 5e. a land launched from the SHARED CLONE ROOT while this session already holds a clean slot uses THAT
+  #     slot for the pre-gate. In real life agents run `agentq land` from the clone root, never from inside
+  #     their slot, so cwd containment finds nothing and the old code fell through to renting a fourth slot
+  #     (three scratches permanently leased) -> skip -> the whole gate ran inside the cap-1 land mutex.
+  Push-Location $repo
+  try { $raw5e = AQ lease -Role scratch -Slot 'scratch-1' -Purpose 'this session holds a slot' -Ref origin/dev -Json } finally { Pop-Location }
+  $l5e = $raw5e -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  Check '5e the fixture holds a scratch slot for this session' ([bool]$l5e.leaseId) ($raw5e -join ' ')
+  git -C $l5e.path config core.autocrlf false
+  Set-Content (Join-Path $l5e.path 'p5e.txt') 'p5e'; git -C $l5e.path add p5e.txt; git -C $l5e.path commit -qm 'topic p5e'
+  git -C $l5e.path push -q origin "HEAD:refs/heads/p5e" 2>$null
+  git -C $repo fetch -q origin '+refs/heads/*:refs/remotes/origin/*'; git -C $repo branch -f p5e origin/p5e 2>$null
+  $head5e = git -C $l5e.path rev-parse HEAD
+  $o = LandFrom $repo @('-Branch', 'p5e', '-Purpose', 'land p5e from the clone root')
+  $trees5e = @(GateTrees 'land pregate p5e')
+  Check '5e pre-gate ran in the slot this session holds, though the land came from the clone root' ($code -eq 0 -and (Remote 'p5e.txt') -eq 'p5e' -and $trees5e.Count -eq 1 -and "$($trees5e[0].root)" -eq "$($l5e.path)" -and @(Ev 'land-pregate-slot-released' 'p5e').Count -eq 0) (($trees5e | ConvertTo-Json -Compress) + ' || ' + $o)
+  Check '5e ... the queue did not gate again (the tree went into the green ledger)' (@(Gates '^land gate p5e').Count -eq 0 -and @(Ev 'land-gate-skipped-green').Count -ge 1) ((Gates 'p5e') -join ' | ')
+  Check '5e ... and the session''s own slot is back on its commit, clean' ((git -C $l5e.path rev-parse HEAD) -eq $head5e -and -not (git -C $l5e.path status --porcelain))
+  $null = AQ unlease -Repo $l5e.path -LeaseId $l5e.leaseId -Reason 'test 5e done'
 
   # 6. when the pre-gate cannot run, the land still works and says why (gate in the queue as before)
   $l6 = Slot 'p6'; Commit $l6 'p6.txt' 'p6' 'p6'

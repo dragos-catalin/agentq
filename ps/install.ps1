@@ -131,9 +131,19 @@ function Merge-ConfigMap([string]$prefix, $to, $from) {
   $o = [ordered]@{}
   foreach ($k in $to.Keys) {
     $path = if ($prefix) { "$prefix.$k" } else { "$k" }
-    if ($from.ContainsKey($k) -and ($to[$k] -is [Collections.IDictionary]) -and ($from[$k] -is [Collections.IDictionary])) {
-      $o[$k] = Merge-ConfigMap $path $to[$k] $from[$k]
-    } else { $o[$k] = $to[$k] }
+    $tv = $to[$k]; $fv = if ($from.ContainsKey($k)) { $from[$k] } else { $null }
+    $bothArr = ($tv -is [Collections.IList]) -and -not ($tv -is [string]) -and ($fv -is [Collections.IList]) -and -not ($fv -is [string])
+    if ($bothArr) {
+      # An ARRAY grows: it keeps the installed order and gains the checkout's items. Treating it as a
+      # scalar ("the installed copy wins") means a new list item NEVER reaches the live config - 2026-11-23:
+      # `gateSuites.agentq` gained the six land suites in the checkout, the merge kept the installed
+      # 17-name list, and the gate therefore ran without the very suites that cover the land engine.
+      $add = @($fv | Where-Object { $tv -notcontains $_ })
+      $o[$k] = @($tv) + $add
+      if ($add.Count) { $script:CfgAdded = @($script:CfgAdded) + @("$path += $($add -join ', ')") }
+    } elseif ($fv -is [Collections.IDictionary] -and $tv -is [Collections.IDictionary]) {
+      $o[$k] = Merge-ConfigMap $path $tv $fv
+    } else { $o[$k] = $tv }
   }
   foreach ($k in $from.Keys) {
     if (-not $to.ContainsKey($k)) {

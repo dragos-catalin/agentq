@@ -62,15 +62,18 @@ $h.WaitForExit(60000) | Out-Null; $w.WaitForExit(60000) | Out-Null
 # 3. quick burst: with machineCap 1 held by a gate, a quick lane run starts immediately.
 # Judged on the scheduler's own `waitSec` (ticket created -> granted) from the journal, not wall
 # clock: wall clock includes pwsh startup, which reached 17-19 s on a loaded machine (2026-10-18,
-# install.ps1 refused to install on this test alone). Holder sleeps 25 s, so a run that had to wait
-# shows waitSec >= ~20; one admitted beside it shows ~0-2.
+# install.ps1 refused to install on this test alone). Holder sleeps 60 s AND the quick run is only
+# started once the holder's own `acquired` event is in the journal: with run-all -Parallel 4 the
+# holder can be started so late that its sleep expired before the check, so the quick run was admitted
+# because the slot was FREE and `holderAlive` came out False - a vacuous pass/fail (measured 2026-11-23,
+# suite red with exit=1 pass=20 fail=1). A run that had to wait shows waitSec >= ~20; admitted beside it ~0-2.
 function WaitSecOf([string]$purpose) { $e = @(Journal | Where-Object { $_.event -eq 'acquired' -and $_.purpose -eq $purpose }) | Select-Object -Last 1; if ($e) { [double]$e.waitSec } else { -1 } }
-$h = Start-Run $repo2 'gate-holder' 'gate' 'Start-Sleep -Seconds 25'
-Wait-For { Get-ChildItem $mq -Filter '*.json' -ErrorAction SilentlyContinue } | Out-Null; Start-Sleep 1
+$h = Start-Run $repo2 'gate-holder' 'gate' 'Start-Sleep -Seconds 60'
+Wait-For { @(Journal | Where-Object { $_.event -eq 'acquired' -and $_.purpose -eq 'gate-holder' }).Count } 60 | Out-Null
 & pwsh -NoProfile -File $aq run -Resource build -Purpose 'lint' -Lane quick -MinFreeGB 0 -TimeoutMin 1 -Repo $repo -- pwsh -NoProfile -Command 'exit 0' 2>$null
 $rc = $LASTEXITCODE; $ws = WaitSecOf 'lint'; $holderAlive = -not $h.HasExited
 Check 'quick lane uses burst slot (no wait)' ($rc -eq 0 -and $ws -ge 0 -and $ws -lt 10 -and $holderAlive) "exit $rc waitSec=$ws holderAlive=$holderAlive"
-$h.WaitForExit(60000) | Out-Null
+$h.WaitForExit(90000) | Out-Null
 
 # 4. non-batch beside batch: batch holder does not block a gate run.
 $h = Start-Run $repo2 'batch-holder' 'batch' 'Start-Sleep -Seconds 25'

@@ -1506,7 +1506,9 @@ function Restore-LandDeps([object]$repo, [string]$wt, [string]$baseRev) {
 #    (tree hash, gate command) for greenTtlHours (168). The in-queue gate is skipped for such a tree
 #    (journal `land-gate-skipped-green`). The key is the exact tree, so a land whose result differs by
 #    one byte runs the gate as before.
-#  * Pre-gate: `agentq land` run from a leased task slot - or from the shared clone, which takes a
+#  * Pre-gate: `agentq land` run from a leased slot the caller STANDS IN (task, pinned or scratch - the
+#    tree only has to be clean and installed; 2026-11-23 measured that excluding `scratch` sent the gate
+#    back into the cap-1 queue for 49 min in a single land) - or from the shared clone, which takes a
 #    scratch slot for the length of the gate - first builds the REBASED result (merge-tree of
 #    the topic onto the current origin/<onto>, no working tree involved), puts it in the slot (a
 #    temporary detached checkout of a local, never-pushed merge commit; the slot's branch and HEAD are
@@ -1514,7 +1516,7 @@ function Restore-LandDeps([object]$repo, [string]$wt, [string]$baseRev) {
 #    then is the land ticket taken. A failing gate ends the land with exit 6 BEFORE the queue
 #    (`land-pregate-failed`). When origin moved while the gate ran, one more round is tried
 #    (landPregateRounds, default 2); after that the land queues anyway and the in-queue gate decides.
-#    Skipped, with the reason journaled (`land-pregate-skipped`), when: from the shared clone and no
+#    Skipped, with the reason journaled (`land-pregate-skipped`), when: not run from a leased slot and no
 #    scratch slot could be taken or its install is known to have failed (`land-pregate-slot-released`
 #    records the slot it took and gave back), or `landPregateFromMain` is off for the repo; in a slot,
 #    when the slot has uncommitted or untracked files, the merge needs the land resolver, or a lockfile
@@ -1659,7 +1661,29 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     Write-Output "land: pre-gate skipped ($why); the gate runs in the queue as before"
   }
   $cwdN = Norm-Dir (Get-Location).Path
-  $slot = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and -not $_.stale -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
+  # ANY leased slot the caller is standing in is a valid pre-gate tree: what the gate needs is a clean tree
+  # with a current dependency install, and `Prepare-Slot` installs for `task`, `pinned` AND `scratch`. The
+  # filter used to be task/pinned only, so a land started from a scratch slot was treated as a land "from
+  # the shared clone", then could not take a SECOND scratch slot (all of them were leased), and skipped the
+  # pre-gate entirely - the ~10 min gate then ran INSIDE the cap-1 land mutex. Measured 2026-11-23: 6 of the
+  # last ~10 lands skipped with "no scratch slot was free", and the queue holder (landing from scratch-3)
+  # spent 49 of its 99 min running gates under the mutex. `land` stays excluded (agentq manages that slot's
+  # HEAD while a land is in flight) and so does `release` (deploy-clean owns it for the length of a deploy).
+  $slot = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned', 'scratch' -and -not $_.stale -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
+  if ($slot) { Write-Output "land: pre-gate in the slot the caller stands in ($($repo.Name)/$(P $slot 'slot'), role $(P $slot 'role'))" }
+  # A land is usually started from the SHARED CLONE ROOT, not from inside the slot the same chat already
+  # holds - so the containment test above missed the one tree that was ready, and the land fell through to
+  # renting a fourth slot that did not exist. Measured 2026-11-23: three scratches permanently leased, so
+  # every land from the clone root skipped the pre-gate and ran the ~21 min gate INSIDE the cap-1 mutex.
+  # Prefer a slot this SESSION holds (any role a `Prepare-Slot` installs, excluding `land`/`release`), and
+  # only among the CLEAN ones: a dirty slot would have been skipped a few lines below anyway.
+  # This IS the "from the shared clone" path, so `landPregateFromMain` gates it exactly as it gates the
+  # scratch rental below: a repo with the flag off must not pre-gate from outside its own slot at all.
+  if (-not $slot -and (Get-LandPregateFromMain $repo.Name)) {
+    $mine = @(Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned', 'scratch' -and -not $_.stale -and (P $_ 'session') -eq $Session })
+    $slot = @($mine | Where-Object { Test-GitClean (Norm-Dir "$(P $_ 'path')") }) | Select-Object -First 1
+    if ($slot) { Write-Output "land: pre-gate in the slot this session already holds ($($repo.Name)/$(P $slot 'slot'), role $(P $slot 'role')) - the gate does not need the queue" }
+  }
   if (-not $slot) {
     if (-not (Get-LandPregateFromMain $repo.Name)) { & $skip 'not run from a leased task slot'; return }
     $slot = Get-PregateScratchSlot $repo $Onto
@@ -1907,6 +1931,7 @@ function Invoke-LandSet([object[]]$set) {
         $script:GateExit = 1; $script:GateSec = 0
         Invoke-GateRun $wt "land gate $names"
         $gx = $script:GateExit
+        if ($script:LandAcc) { $script:LandAcc.gateRuns = [int]$script:LandAcc.gateRuns + 1; $script:LandAcc.gateSec = [int]$script:LandAcc.gateSec + [int]$script:GateSec }
         if ($gx) {
           Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
           [Console]::Error.WriteLine("land: gate failed ($gx) for $names - '$Gate' exited non-zero; nothing pushed")
@@ -1995,12 +2020,26 @@ function Invoke-LandBisect([object[]]$set) {
   if (-not $r.failExit) { return }
   $fs = @($r.failSet)
   if ($fs.Count -gt 1 -and $r.failExit -in 6, 7, 8, 9, 10) {
-    $script:LandAcc.bisected = $true
-    $h = [int][math]::Ceiling($fs.Count / 2)
-    $left = @($fs[0..($h - 1)]); $right = @($fs[$h..($fs.Count - 1)])
-    Write-Output "land: batch of $($fs.Count) failed (exit $($r.failExit)) - bisecting: $(($left | ForEach-Object { $_.branch }) -join '+') | $(($right | ForEach-Object { $_.branch }) -join '+')"
-    Invoke-LandBisect $left
-    Invoke-LandBisect $right
+    $bc = Get-Config
+    $maxRuns = if ($bc.ContainsKey('landGateRunsMax')) { [math]::Max(1, [int]$bc['landGateRunsMax']) } else { 4 }
+    if ([int]$script:LandAcc.gateRuns -ge $maxRuns) {
+      # 2026-11-23: one failing batch of 4 held land:codai for 99 min, 49 of them gate runs under the cap-1
+      # mutex (journal: 13.5 + 9.9 + 9.6 + 15.9 min) - a recursive bisect costs O(N) FULL gates, and every
+      # land in the queue pays for them. Past the budget the rest of the batch simply fails and goes back to
+      # the queue, where each topic is pre-gated on its own turn (and a tree already in the green ledger is
+      # gated for free). Days of safety net, not a normal path: a green ledger hit keeps real runs low.
+      $namesLeft = (@($fs | ForEach-Object { $_.branch }) -join ', ')
+      Write-Journal @{ event = 'land-bisect-budget'; resource = $res; exit = $r.failExit; runs = [int]$script:LandAcc.gateRuns; sec = [int]$script:LandAcc.gateSec; left = @($fs | ForEach-Object { $_.branch }); reason = "stopped bisecting after $($script:LandAcc.gateRuns) gate run(s) ($($script:LandAcc.gateSec) s under the land ticket) with $($fs.Count) topic(s) unresolved"; repo = $repo.Name }
+      [Console]::Error.WriteLine("land: bisect budget reached ($([int]$script:LandAcc.gateRuns) gate run(s), $([int]$script:LandAcc.gateSec) s held) - $namesLeft go back to the queue. Land them one at a time: each is pre-gated BEFORE it queues, so a red one no longer holds land:$($repo.Name).")
+      foreach ($tp in $fs) { $script:LandAcc.results[$tp.branch] = @{ exit = $r.failExit; sha = ''; nothing = $false } }
+    } else {
+      $script:LandAcc.bisected = $true
+      $h = [int][math]::Ceiling($fs.Count / 2)
+      $left = @($fs[0..($h - 1)]); $right = @($fs[$h..($fs.Count - 1)])
+      Write-Output "land: batch of $($fs.Count) failed (exit $($r.failExit)) - bisecting: $(($left | ForEach-Object { $_.branch }) -join '+') | $(($right | ForEach-Object { $_.branch }) -join '+')"
+      Invoke-LandBisect $left
+      Invoke-LandBisect $right
+    }
   } else { foreach ($tp in $fs) { $script:LandAcc.results[$tp.branch] = @{ exit = $r.failExit; sha = ''; nothing = $false } } }
 }
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
@@ -2118,7 +2157,7 @@ function Invoke-Land {
       }
       if ($set.Count -gt 1) { Write-Output "land: batching $($set.Count) topics onto origin/${Onto}: $(($set | ForEach-Object { $_.branch }) -join ', ')" }
     }
-    $script:LandAcc = @{ results = @{}; dropped = @(); bisected = $false; shas = @() }
+    $script:LandAcc = @{ results = @{}; dropped = @(); bisected = $false; shas = @(); gateRuns = 0; gateSec = 0 }
     Invoke-LandBisect $set
     $acc = $script:LandAcc
     $acts = @()

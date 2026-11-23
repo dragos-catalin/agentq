@@ -87,6 +87,21 @@ try {
   $cg2 = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
   Check '3b a nested key the installed map lacks is added from the checkout' ($code -eq 0 -and $cg2['landGate']['keepme'] -eq 'local' -and $cg2['landGate'].Count -eq ($srcCfg['landGate'].Count + 1) -and $o -match 'added landGate\.') $o
 
+  # 3c. an ARRAY the installed config already has must GROW. Treating a list as a scalar ("the installed
+  # copy wins") means a new list item never reaches the live config: 2026-11-23 the checkout's
+  # `gateSuites.agentq` went from 17 to 25 names, the merge kept the installed 17, and the gate therefore
+  # ran without the six land suites - a land-engine change could land behind a gate that never exercised
+  # the land engine. Mutation: drop the array branch in Merge-ConfigMap and this Check goes red.
+  $ca = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  $ga = @($srcCfg['gateSuites']['agentq'])
+  $ca['gateSuites']['agentq'] = @(@($ga)[0], @($ga)[1]) + @('suite only the local copy has')
+  [IO.File]::WriteAllText($cfgDst, ($ca | ConvertTo-Json -Depth 8))
+  $o = Install $Src @('-SkipTests')
+  $ca2 = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  $got = @($ca2['gateSuites']['agentq'])
+  Check '3c an installed array gains the checkout items, keeping its own and its order' ($code -eq 0 -and $got.Count -eq ($ga.Count + 1) -and $got[0] -eq $ga[0] -and $got[1] -eq $ga[1] -and ($got -contains 'suite only the local copy has') -and $got[-1] -eq $ga[-1] -and $o -match 'gateSuites\.agentq \+=') "count=$($got.Count) got=$($got -join ', ') || $o"
+  Check '3c the union is in sync afterwards (a re-install changes nothing)' ((Install $Src @('-Check')) -match 'in sync')
+
   # 4. a hand-edited installed file: reported, restored, the edit kept in the backup
   Start-Sleep -Milliseconds 1100   # backup folders are named to the second
   $victim = Join-Path $dst 'hooks\hook-pre.ps1'

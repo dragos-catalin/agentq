@@ -43,7 +43,12 @@ try {
   git -C $repo fetch -q origin
   Check '1 land exits 0' ($code -eq 0) $o
   Check '1 announces the default gate' ($o -match 'default gate for .*pnpm land:gate') $o
-  Check '1 gate ran once for g1' (@(Gates | Where-Object { $_ -match 'land gate g1' }).Count -eq 1) ((Gates) -join ' | ')
+  # The gate runs ONCE, but since the pre-gate landed (2026-11-22, 48aea91) it runs BEFORE the land ticket
+  # when a slot is available, and the land reuses it through the green tree ledger - so the purpose logged in
+  # the slot is 'land pregate g1' rather than 'land gate g1'. The invariant this asserts is "exactly one gate
+  # run", not where it ran; pinning the label made the suite red on pristine HEAD (measured 2026-11-23 with a
+  # git archive HEAD copy, AGENTQ_CONFIG as below, the same FAIL).
+  Check '1 gate ran once for g1' (@(Gates | Where-Object { $_ -match '^land (pre)?gate g1$' }).Count -eq 1) ((Gates) -join ' | ')
   Check '1 landed' ((Remote 'g1.txt') -eq 'g1')
   # 2. default gate failing -> exit 6, nothing pushed
   Topic 'g2' 'bad.txt'

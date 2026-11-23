@@ -11,6 +11,14 @@ $env:CODAI_WT_ROOT = Join-Path $tmp 'wt'
 $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'; $env:AGENTQ_NO_FLAKES = '1'
 $env:AGENTQ_SESSION = 'test-PL'
 Remove-Item Env:AGENTQ_NO_POSTLAND, Env:AGENTQ_LAND_BATCH, Env:AGENTQ_NO_JOBOBJ -ErrorAction SilentlyContinue
+# Section 7 tests BATCHING: the blocker must hold the cap-1 land mutex while the two waiters queue, so that
+# one push carries both. Since the pre-gate landed (2026-11-22, 48aea91) and `landPregate` defaults to true,
+# the blocker's gate runs BEFORE the land ticket (the fake gate matches 'blocker' and blocks in the pre-gate),
+# so the mutex is never held while the waiters queue: they land one by one and `land-batch` never fires.
+# Measured on a pristine git archive HEAD copy 2026-11-23: the same 3 fails as with the working tree
+# (7 the two waiters were one batch / 7 two pushes = two post-land events (not three) / 7 two hook runs
+# runs=8 expected 7). The pre-gate has its own suite (test-land-pregate.ps1); this one is about post-land.
+$env:AGENTQ_LAND_NO_PREGATE = '1'
 $env:AGENTQ_RUN_BUILD = Join-Path $PSScriptRoot 'fake-gate.ps1'
 $env:FAKE_GATE_LOG = Join-Path $tmp 'gates.log'
 $env:FAKE_GATE_HOLD = Join-Path $tmp 'hold.flag'
@@ -259,7 +267,7 @@ try {
   foreach ($p in $script:procs) { try { if (-not $p.HasExited) { $p.Kill($true) } } catch {} }
   # A hook of this run that is still alive (sleep mode) holds nothing; stop it, identified by its command line.
   foreach ($f in @(Runs)) { $h = Read-Run $f; if ($h['PID']) { Stop-Hook ([int]$h['PID']) } }
-  foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'FAKE_GATE_HOLD', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_FLAKES', 'AGENTQ_NO_POSTLAND') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'FAKE_GATE_HOLD', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_FLAKES', 'AGENTQ_NO_POSTLAND', 'AGENTQ_LAND_NO_PREGATE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$tmp`"" 2>$null
 }
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS post-land'; exit 0 }
