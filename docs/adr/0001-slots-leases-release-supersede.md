@@ -115,7 +115,14 @@ Parallel agents work in parallel task slots; only landing is serial.
 ### 5. Machine-wide safety
 
 - `build:machine` capacity 2 + free RAM >= 6 GB **and free commit charge >= 12 GB** (2026-09-30: OOM with 50 GB RAM free).
-- Task slot cap 10 machine-wide, 3 per repo (initial values; now config `taskSlotsPerRepo` / `taskSlotsMachine`, 10 / 16 since 2026-10-18).
+- Task slot cap 10 machine-wide, 3 per repo (initial values; now config `taskSlotsPerRepo` / `taskSlotsMachine`, 10 / 22 since 2026-11-23).
+  The machine-wide cap is DERIVED, not hand-raised (2026-11-23): `taskSlotsMachine` is the CEILING and
+  `taskSlotsMachineFloor` (10) is always admitted; between them the cap is measured from the machine's real
+  resources (~8 GB disk + 2 GB commit charge per slot, keeping 20 GB disk free), so a hand-edited number can no
+  longer outrun the disk. A refusal journals `slot-admission-denied` with the numbers; `status` prints the cap in force.
+  Scratch slots are elastic by the same rule: `scratchSlots` (5) is the guaranteed floor, `scratchSlotsMax` (8) the
+  ceiling, `scratchMinFreeGB` (25) the gate - a hard floor of 3 starved the `land` pre-gate, which rents a scratch
+  slot for the length of the gate.
 - No global git config writes by any tool. All resources are per repo except `build:machine`.
 - Side locks are folded into agentq: brivio `deploy-mjs.lock` is skipped when `AGENTQ_HELD` contains `deploy:brivio`, and `deploy.mjs` builds services from `DEPLOY_WORKTREE` instead of creating its own worktree.
 

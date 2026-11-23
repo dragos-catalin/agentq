@@ -1,6 +1,7 @@
 {
   "taskSlotsPerRepo": 10,
   "taskSlotsMachine": 22,
+  "taskSlotsMachineFloor": 10,
   "releaseSlots": {
     "codai": 2
   },
@@ -15,7 +16,9 @@
   "leaseOwnerIdleMin": 90,
   "leaseChatGraceMin": 20,
   "leaseScratchIdleMin": 15,
-  "scratchSlots": 3,
+  "scratchSlots": 5,
+  "scratchSlotsMax": 8,
+  "scratchMinFreeGB": 25,
   "holdDefaultMin": 180,
   "unleasedRemoveIdleHours": 168,
   "minFreeCommitGB": 12,
@@ -73,7 +76,8 @@
       "help",
       "script scope",
       "install wiring",
-      "status readonly"
+      "status readonly",
+      "slot budget"
     ]
   },
   "sharedCloneMode": "warn",

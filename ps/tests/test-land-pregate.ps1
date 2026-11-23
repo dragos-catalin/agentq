@@ -34,7 +34,10 @@ $repoName = Split-Path -Leaf $repo
 $cfg = Join-Path $tmp 'cfg.json'
 # 12 slots: the cases below lease up to 11 task slots and release only some of them on the way (with 3,
 # the 4th lease waited for a free slot until the suite timed out).
-function Cfg([string]$extra = '') { "{`"taskSlotsPerRepo`":12,`"taskSlotsMachine`":14,`"minFreeCommitGB`":0,`"landGate`":{`"$repoName`":`"pnpm land:gate`"}$extra}" | Set-Content $cfg }
+# scratchSlotsMax:3 pins the scratch pool to exactly the floor for THIS fixture: cases 5/5c/5e exercise
+# "the pool is full" (the pre-gate skips), holding scratch-1..3 and expecting no scratch-4. The elastic pool
+# (an index beyond the floor when the machine has room) is covered by tests/test-slot-budget.ps1.
+function Cfg([string]$extra = '') { "{`"taskSlotsPerRepo`":12,`"taskSlotsMachine`":14,`"scratchSlotsMax`":3,`"minFreeCommitGB`":0,`"landGate`":{`"$repoName`":`"pnpm land:gate`"}$extra}" | Set-Content $cfg }
 Cfg
 $env:AGENTQ_CONFIG = $cfg
 # A leased task slot on a fresh topic branch; returns the lease.

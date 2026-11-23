@@ -144,6 +144,11 @@ $StaleOnly = $false; $IdleHours = [double]0; $Reclaim = $false; $Track = $false
 $Wait = $false; $MaxMin = $null; $MaxMinGiven = $false
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
+# -RebaseOnConflict (2026-11-23): a land pick conflict normally means "rebase the topic and land again",
+# but the merge is computed when the ticket reaches the head of the queue, so that advice cannot be
+# followed while the ticket is still queued. With this flag land rebases the topic onto origin/<onto> in
+# its own slot and retries the pick once. Off by default: without it the land path is unchanged.
+$RebaseOnConflict = $false
 # -Hold [-HoldMin n] (ADR 0012): the holder is running a long job OUTSIDE the slot and asks agentq to keep
 # the lease until then (journalled, bounded). Without it a lease is reclaimed when its slot has seen no work
 # for leaseIdleMin (45 min) / leaseOwnerIdleMin (90 min, live owner shell) - work, not "the chat is busy".
@@ -242,6 +247,7 @@ while ($i -lt $argv.Count) {
     'branch' { $Branch = & $next }
     'onto' { $Onto = & $next }
     'gate' { $Gate = & $next }
+    'rebaseonconflict' { $RebaseOnConflict = $true }
     'phase' { $Phase = & $next }
     'unsafe' { $Unsafe = $true }
     'code' { $Code = [int](& $next) }
@@ -2014,7 +2020,7 @@ $script:AqHelp = [ordered]@{
   'feedback' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'feedback -Kind note|idea|bug|anomaly|praise -Message "..."'; d = 'tell the owner what worked or broke (journaled, shown on the hub)' }
   'lease-check' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'lease-check [-Json]'; d = 'diagnose my own lease binding (chat/session -> slot, liveness clock, work clock)' }
   'backup' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'backup -Path <worktree> [-Slot <name>] -Reason "..."'; d = 'proof-of-work snapshot of a slot -> refs/backup/... plus a bundle' }
-  'land' = @{ g = 'Land & release (ADR 0001)'; u = 'land -Branch <topic> -Onto <dev|main> -Purpose "why" [-Gate "<cmd>"] [-Also a,b] [-Force]'; d = 'land my branch: pre-gate the rebased result (my slot, or a scratch slot when started from the shared clone), then serialized merge+push (exit 5 conflict, 6 pre-gate)'; e = 'agentq land -Branch feat/x -Onto main -Purpose "ship" -Gate "pnpm typecheck"' }
+  'land' = @{ g = 'Land & release (ADR 0001)'; u = 'land -Branch <topic> -Onto <dev|main> -Purpose "why" [-Gate "<cmd>"] [-Also a,b] [-Force] [-RebaseOnConflict]'; d = 'land my branch: pre-gate the rebased result (my slot, or a scratch slot when started from the shared clone), then serialized merge+push (exit 5 conflict, 6 pre-gate)'; e = 'agentq land -Branch feat/x -Onto main -Purpose "ship" -Gate "pnpm typecheck"' }
   'publish' = @{ g = 'Land & release (ADR 0001)'; u = 'publish -Paths a,b -Message "type(scope): msg" -Purpose "why" [-Onto main] [-Base <ref>] [-Land] [-NoPush]'; d = 'commit my paths and, with -Land, land them in one step' }
   'release-begin' = @{ g = 'Land & release (ADR 0001)'; u = 'release-begin -Repo <r> -Target <t> -Sha <sha> [-Ref r] [-Follow branch] [-OwnerPid n]'; d = 'deploy-clean opens a release run (supersede-aware; see ADR 0001)' }
   'release-phase' = @{ g = 'Land & release (ADR 0001)'; u = 'release-phase -Phase <name> [-Unsafe]'; d = 'checkpoint of a release; a landing during a SAFE phase makes the next one exit 4 superseded' }

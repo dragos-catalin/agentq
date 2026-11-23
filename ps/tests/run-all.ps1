@@ -81,6 +81,9 @@ $suites = [ordered]@{
   'land install'   = @('-File', (Join-Path $PSScriptRoot 'test-land-install.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'admission'       = @('-File', (Join-Path $PSScriptRoot 'test-agentq-admission.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-23: elastic scratch slots (an index beyond the floor needs room) + the resource-derived
+  # machine task-slot budget (AGENTQ_TEST_SLOT_BUDGET injects the measurement).
+  'slot budget'    = @('-File', (Join-Path $PSScriptRoot 'test-slot-budget.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-21: the release `phase` is the last checkpoint ENTERED, not the step that failed; the display
   # must show `last-phase=` + the run's own `exit=` separately, and the record keeps its `phase` field.
   'release phase honesty' = @('-File', (Join-Path $PSScriptRoot 'test-release-phase-honesty.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))

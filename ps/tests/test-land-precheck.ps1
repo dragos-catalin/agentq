@@ -78,6 +78,48 @@ try {
   git -C $repo fetch -q origin dev
   git -C $repo cat-file -e origin/dev:c.txt 2>$null
   Check 'reb content is on origin/dev' ($LASTEXITCODE -eq 0)
+  # 5. The in-slot conflict message must be self-sufficient (2026-11-23): the paths AND the exact
+  #    commands, naming the slot. The merge is computed when the ticket reaches the head of the queue,
+  #    not when it was queued, so "rebase and land again" cannot be followed while a long queue wait is
+  #    still ahead - the message has to say that too, or it is not actionable.
+  $env:AGENTQ_LAND_NO_PRECHECK = '1'
+  $t0 = Tip
+  $o = AQ land -Branch clash -Onto dev -Purpose 'conflict message'
+  Check 'in-slot conflict -> exit 5' ($code -eq 5) $o
+  Check 'message names the conflicted path' ($o -match 'CONFLICT picking\b' -and $o -match 'a\.txt') $o
+  Check 'message says nothing was pushed' ($o -match 'Nothing pushed') $o
+  Check 'message explains the merge is computed at ACQUIRE time' ($o -match 'ACQUIRE time') $o
+  Check 'message says origin moved underneath the queued branch' ($o -match 'moved underneath') $o
+  Check 'message says rebasing before queuing is not enough' ($o -match 'before you queued is not enough') $o
+  Check 'message prints the three commands, same slot, onto the CURRENT origin' ($o -match '(?s)git -C "([^"]+)" fetch origin dev.*git -C "\1" rebase origin/dev.*agentq land -Branch clash -Onto dev -Purpose') $o
+  Check 'message points at -RebaseOnConflict' ($o -match '\-RebaseOnConflict') $o
+  Check 'message conflict: nothing pushed' ((Tip) -eq $t0)
+  $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+  Check 'no rebase attempted without the switch' (-not @($j | Where-Object { "$($_.event)" -like 'land-rebase-*' }).Count)
+  # 6. -RebaseOnConflict: clash really does conflict with origin/dev, so the rebase conflicts too. It must
+  #    abort the rebase, say so, leave no rebase or throwaway branch behind, and push nothing.
+  $o = AQ land -Branch clash -Onto dev -Purpose 'rebase conflicts too' -RebaseOnConflict
+  Remove-Item Env:AGENTQ_LAND_NO_PRECHECK
+  Check '-RebaseOnConflict: still exit 5' ($code -eq 5) $o
+  Check '-RebaseOnConflict: says the rebase was aborted and the slot left clean' ($o -match 'rebasing .* onto origin/dev conflicts too' -and $o -match 'aborted') $o
+  Check '-RebaseOnConflict: still names the conflicted path' ($o -match 'a\.txt') $o
+  Check '-RebaseOnConflict: nothing pushed' ((Tip) -eq $t0)
+  $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+  Check '-RebaseOnConflict: journaled land-rebase-conflict' (@($j | Where-Object event -eq 'land-rebase-conflict').Count -ge 1)
+  $left = @(Get-ChildItem -LiteralPath (Join-Path $repo '.git') -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -in 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REBASE_HEAD' })
+  Check '-RebaseOnConflict: no rebase/cherry-pick left behind' (-not $left.Count) (($left | ForEach-Object FullName) -join ' | ')
+  Check '-RebaseOnConflict: no throwaway branch left' (-not "$(& git -C $repo branch --list 'agentq-rebase-*')".Trim())
+  # 7. -RebaseOnConflict on a branch that does NOT conflict is a no-op: it still lands, and it journals
+  #    no rebase at all (the flag only acts on a failed pick). Scenario 4 covers the same land with the
+  #    switch absent, so together they pin flag-absent == flag-present on a clean topic.
+  git -C $repo pull -q --no-rebase origin dev 2>$null
+  git -C $tw fetch -q origin; git -C $tw checkout -q -B ok2 origin/dev
+  Set-Content (Join-Path $tw 'd.txt') 'd'; git -C $tw add d.txt; git -C $tw commit -qm 'ok2'; git -C $tw push -q origin ok2 2>$null
+  $j0 = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+  $o = AQ land -Branch ok2 -Onto dev -Purpose 'clean with the switch' -RebaseOnConflict
+  Check '-RebaseOnConflict on a clean branch: lands' ($code -eq 0 -and $o -match 'landed ok2') $o
+  $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+  Check '-RebaseOnConflict on a clean branch: no rebase journaled' (@($j | Where-Object { "$($_.event)" -like 'land-rebase-*' }).Count -eq @($j0 | Where-Object { "$($_.event)" -like 'land-rebase-*' }).Count)
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_LAND_NO_PRECHECK') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }

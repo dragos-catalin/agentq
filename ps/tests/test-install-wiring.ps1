@@ -136,7 +136,7 @@ function Get-TrackedSet([string]$RepoRoot) {
 # while the file stayed untracked - so `install` threw in EVERY clean checkout (the land gate's slot
 # included) and the new gate found it on its first run, before the entry was committed with this slice.
 # The table and its stale notice stay, so a genuinely in-flight file can be excepted-and-printed.
-$trackExcept = @{}
+$trackExcept = @{ 'tests\test-slot-budget.ps1' = 'in-flight 2026-11-23: new suite for the elastic scratch pool + the machine task-slot budget; the lead commits it with this slice, then drop this exception' }
 
 # --- 1: every suite reference is installed -------------------------------------------------------
 $drift = @(Get-MapDrift $runAll $install)

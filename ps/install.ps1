@@ -119,6 +119,8 @@ $map = [ordered]@{
   'tests\test-install.ps1' = 'bin\test-install.ps1'
   'tests\test-shared-clone-janitor.ps1' = 'bin\test-shared-clone-janitor.ps1'
   'tests\test-install-wiring.ps1' = 'bin\test-install-wiring.ps1'
+  # 2026-11-23: elastic scratch pool + resource-derived machine task-slot budget
+  'tests\test-slot-budget.ps1' = 'bin\test-slot-budget.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.

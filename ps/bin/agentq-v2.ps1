@@ -14,6 +14,10 @@ $script:LandSetOut = $null
 $script:GateSec = $null
 $script:PickBad = $null
 $script:LandAcc = $null
+# the caller's task slot for the land conflict message (set in Invoke-Land). Deliberately NOT
+# $script:RebaseOnConflict: agentq.ps1's parser sets that before this file is dot-sourced, so a
+# default here would wipe the flag - the clobber class ps/tests/test-script-scope.ps1 guards.
+$script:LandSrcSlot = $null
 $script:SlotWorkCache = $null
 # `$script:ReadOnly` is NOT reset here: agentq.ps1 computes it (from the verb) at its line ~295 and only
 # dot-sources this file at ~1922, so `$script:ReadOnly = $null` here wiped it and turned every READ-ONLY
@@ -60,7 +64,59 @@ function Get-WtRoot { if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } elseif ($Is
 function Get-ReleaseSlotCount([string]$repoName) { $r = (Get-Config).releaseSlots; if ($r -and $r.ContainsKey($repoName)) { [int]$r[$repoName] } else { 1 } }
 # Index access, not property access: under StrictMode 3 `(Get-Config).scratchSlots` THROWS when the key is
 # absent (the default map has no scratchSlots), so a scratch lease failed before the default 3 could apply.
+# scratchSlots    = the GUARANTEED floor (always allocatable, reclaimed after leaseScratchIdleMin);
+# scratchSlotsMax = the hard CEILING. Between the two, a higher index is allocated ONLY when the machine has
+#   room: scratchMinFreeGB free on the slot volume AND the minFreeCommitGB commit guard. 2026-11-23: a HARD
+#   cap of 3 starved the `agentq land` pre-gate (it rents a scratch slot for the length of the gate), so three
+#   permanently-leased scratches pushed the ~14-21 min repo gate inside the cap-1 land mutex - one holder held
+#   it 157 min with 4-5 waiters, each land paying ~830 s under the mutex.
 function Get-ScratchSlotCount { $c = Get-Config; if ($c -and $c.ContainsKey('scratchSlots') -and $c['scratchSlots']) { [int]$c['scratchSlots'] } else { 3 } }
+function Get-ScratchSlotCeiling { $c = Get-Config; if ($c -and $c.ContainsKey('scratchSlotsMax') -and $c['scratchSlotsMax']) { [int]$c['scratchSlotsMax'] } else { 8 } }
+function Get-ScratchMinFreeGB { $c = Get-Config; if ($c -and $c.ContainsKey('scratchMinFreeGB') -and $null -ne $c['scratchMinFreeGB']) { [double]$c['scratchMinFreeGB'] } else { 25 } }
+# Measured machine resources used by slot admission, in ONE place. Injectable for tests:
+# AGENTQ_TEST_SLOT_BUDGET "<freeGB>,<freeCommitGB>" replaces the probe. Real path: free space on the slot
+# volume (E:) + the SAME free-commit-charge number the task admission guard uses (Get-MemInfo.FreeVirtualMemory).
+function Get-MachineBudget {
+  if ($env:AGENTQ_TEST_SLOT_BUDGET) {
+    $parts = "$($env:AGENTQ_TEST_SLOT_BUDGET)" -split ','
+    $g = if ($parts.Count -ge 1 -and "$($parts[0])".Trim() -ne '') { [double]$parts[0] } else { 0.0 }
+    $c = if ($parts.Count -ge 2 -and "$($parts[1])".Trim() -ne '') { [double]$parts[1] } else { 0.0 }
+    return [pscustomobject]@{ freeGB = $g; freeCommitGB = $c; source = 'test' }
+  }
+  $freeGB = 0.0
+  try {
+    $letter = ([IO.Path]::GetPathRoot((Get-WtRoot))).TrimEnd('\', ':')
+    if ($letter) { $d = Get-PSDrive -Name $letter -ErrorAction Stop; if ($null -ne $d.Free) { $freeGB = [math]::Round($d.Free / 1GB, 1) } }
+  } catch {}
+  $freeCommitGB = 0.0
+  try { $freeCommitGB = [math]::Round((Get-MemInfo).FreeVirtualMemory / 1MB, 1) } catch {}
+  [pscustomobject]@{ freeGB = $freeGB; freeCommitGB = $freeCommitGB; source = 'machine' }
+}
+# WHY this budget is measured, not a hand-raised number: session identity = the DIRECT parent process (the
+# VS Code window), so every terminal and subagent of one window shares one session; the measured pressure that
+# motivated the elastic scratch pool was ONE window holding 3 task + 2 scratch slots, and the 3-slot scratch
+# cap starved the land pre-gate. `taskSlotsMachine` was a fixed 22/26 raised by hand, while each slot is a real
+# worktree + node_modules (GBs), so the admission decision is derived from the machine's real resources:
+#   ceiling = taskSlotsMachine (config), the most this machine may ever run;
+#   floor   = taskSlotsMachineFloor (config, default 10) - the first `floor` task slots are ALWAYS admitted;
+#   per slot: a real worktree + node_modules (~8 GB disk here) + a little commit charge (keep 20 GB disk and
+#   minFreeCommitGB commit free). cap = clamp(derived, floor+1, ceiling): held < cap is admitted, so the first
+#   `floor` are never refused (a lease is only refused once the machine already holds > floor task slots).
+function Get-TaskSlotBudget {
+  $cfg = Get-Config
+  $ceiling = [int](P $cfg 'taskSlotsMachine' 26)
+  $floor = [int](P $cfg 'taskSlotsMachineFloor' 10)
+  if ($ceiling -lt 1) { $ceiling = 1 }
+  if ($floor -lt 0) { $floor = 0 }
+  $b = Get-MachineBudget
+  $keepFreeGB = 20.0; $perSlotGB = 8.0; $perSlotCommitGB = 2.0
+  $commitKeepGB = [double](P $cfg 'minFreeCommitGB' 12)
+  $byDisk = [int][math]::Floor([math]::Max(0.0, $b.freeGB - $keepFreeGB) / $perSlotGB)
+  $byCommit = [int][math]::Floor([math]::Max(0.0, $b.freeCommitGB - $commitKeepGB) / $perSlotCommitGB)
+  $derived = [math]::Min($byDisk, $byCommit)
+  $cap = [math]::Min($ceiling, [math]::Max($floor + 1, $derived))
+  [pscustomobject]@{ cap = [int]$cap; floor = $floor; ceiling = $ceiling; derived = [int]$derived; freeGB = $b.freeGB; freeCommitGB = $b.freeCommitGB }
+}
 function Get-PinnedSlots([string]$repoName) { $p = (Get-Config)['pinned']; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
 # The ONLY slot names that exist. Anything else is legacy and gets migrated away.
 function Get-SlotRole([string]$repoName, [string]$slot) {
@@ -68,7 +124,7 @@ function Get-SlotRole([string]$repoName, [string]$slot) {
   # scratch-N (ADR 0012): a SHORT-LIVED slot for work that must not consume a task slot - a subagent's
   # one-off task, a scratch edit. Not counted in taskSlotsPerRepo / taskSlotsMachine, reclaimed after
   # leaseScratchIdleMin (15 min) with no work. Unsaved state is still backed up before reclaiming.
-  if ($slot -match '^scratch-(\d+)$') { if ([int]$Matches[1] -ge 1 -and [int]$Matches[1] -le (Get-ScratchSlotCount)) { return 'scratch' }; return $null }
+  if ($slot -match '^scratch-(\d+)$') { if ([int]$Matches[1] -ge 1 -and [int]$Matches[1] -le (Get-ScratchSlotCeiling)) { return 'scratch' }; return $null }
   if ($slot -eq 'release') { return 'release' }
   if ($slot -match '^release-(\d+)$') { if ([int]$Matches[1] -ge 2 -and [int]$Matches[1] -le (Get-ReleaseSlotCount $repoName)) { return 'release' }; return $null }
   if ($slot -eq 'land') { return 'land' }
@@ -660,6 +716,10 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   # holder, bump my waiting tickets) and sweep (expire stale leases and dead tickets). Journaled by both.
   $waitStart = Now
   $escalated = $false
+  # elastic scratch pool + resource budget (2026-11-23): per-call flags, journalled ONCE across a -Wait poll.
+  $script:ScratchDenied = $false
+  $script:ScratchDeniedSaid = $false
+  $slotBudgetSaid = $false
   # One exit for both expiry sites: -Wait prints ONE line to stdout and exits 7; otherwise the legacy
   # stderr message + exit 3 (byte-identical to what callers parsed before).
   $expire = {
@@ -705,15 +765,41 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
     }
     # OQ-005: the machine-wide limit on task leases in force right now (owner presence + night schedule).
     $agl = Get-AgentLimit
+    # (B) the machine-wide task-slot budget is DERIVED from measured resources each poll, not a hand-raised
+    # number: Get-TaskSlotBudget clamps the measurement to [floor+1, taskSlotsMachine]. $tb is $null for
+    # non-task roles (release/land/pinned/scratch are never gated by it).
+    $tb = if ($role -eq 'task') { Get-TaskSlotBudget } else { $null }
     $got = With-Mutex "lease-$repoName" {
       $leases = @(Read-Leases $repoName)
       $cands = if (-not $slotValid) { @() }
       elseif ($slot) { @($slot) }
       elseif ($role -eq 'task') { @(1..$cfg.taskSlotsPerRepo | ForEach-Object { "task-$_" }) }
-      elseif ($role -eq 'scratch') { @(1..(Get-ScratchSlotCount) | ForEach-Object { "scratch-$_" }) }
+      elseif ($role -eq 'scratch') {
+        # Lowest free index from 1 upward. Indices 1..scratchSlots (the guaranteed floor) are always
+        # candidates; beyond the floor an index needs room on the machine (scratchMinFreeGB free on the
+        # slot volume AND the minFreeCommitGB commit guard). When the gate fails, trim to the floor and
+        # journal ONE `scratch-alloc-denied`, so a caller (and the SLO) can see WHY land starved.
+        $floor = Get-ScratchSlotCount; $ceil = Get-ScratchSlotCeiling
+        if ($ceil -le $floor) { @(1..$ceil | ForEach-Object { "scratch-$_" }) }
+        else {
+          $b = Get-MachineBudget
+          $needGB = Get-ScratchMinFreeGB
+          $needCommitGB = [double](P $cfg 'minFreeCommitGB' 12)
+          if (($b.freeGB -ge $needGB) -and ($b.freeCommitGB -ge $needCommitGB)) { @(1..$ceil | ForEach-Object { "scratch-$_" }) }
+          else {
+            $script:ScratchDenied = $true
+            if (-not $script:ScratchDeniedSaid) {
+              $script:ScratchDeniedSaid = $true
+              Write-Journal @{ event = 'scratch-alloc-denied'; reason = "the machine has no room beyond the scratchSlots floor (need $needGB GB free on the slot volume + $needCommitGB GB commit headroom)"; index = ($floor + 1); freeGB = $b.freeGB; needGB = $needGB; repo = $repoName }
+            }
+            @(1..$floor | ForEach-Object { "scratch-$_" })
+          }
+        }
+      }
       elseif ($role -eq 'release') { @('release') + @(2..([math]::Max(2, (Get-ReleaseSlotCount $repoName))) | Where-Object { $_ -le (Get-ReleaseSlotCount $repoName) } | ForEach-Object { "release-$_" }) }
       else { @($role) }
       $capHit = $false
+      $budgetHit = $false
       foreach ($s in $cands) {
         $cur = $leases | Where-Object { $_.slot -eq $s } | Select-Object -First 1
         if ($cur -and $cur.stale) { if (-not (Expire-Lease $cur "stale (idle $($cur.idleMin) min, owner alive=$($cur.alive)) - reclaimed by $Session")) { continue }; $cur = $null }
@@ -727,7 +813,11 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
           }
         }
         if ($cur) { continue }
-        if ($role -eq 'task' -and (Get-TaskLeaseCount) -ge $agl.limit) { $capHit = $true; break }
+        if ($role -eq 'task') {
+          $taskN = Get-TaskLeaseCount
+          if ($taskN -ge $agl.limit) { $capHit = $true; break }
+          if ($tb -and $taskN -ge $tb.cap) { $budgetHit = $true; break }
+        }
         $p = Get-SlotPath $repoName $s
         $st = Get-ProcStart $owner
         $l = [ordered]@{
@@ -743,16 +833,28 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
         Write-Journal @{ event = 'lease'; resource = "slot:${repoName}:$s"; ticket = $l.leaseId; purpose = $purpose; branch = "$branch"; repo = $repoName; loadWaitSec = (Get-LoadWaitSec) }
         return ([pscustomobject]$l | Add-Member -NotePropertyName file -NotePropertyValue $f -PassThru)
       }
-      if ($capHit) { 'MACHINE-CAP' } else { $null }
+      if ($capHit) { 'MACHINE-CAP' } elseif ($budgetHit) { 'SLOT-BUDGET' } else { $null }
     }
     if ($got -and $got -isnot [string]) { return $got }
     if ($got -eq 'MACHINE-CAP' -and $agl.limit -lt $agl.base -and -not $limitSaid) {
       $limitSaid = $true
       Write-Journal @{ event = 'agent-limit-hold'; resource = "slot:$repoName"; purpose = $purpose; limit = [int]$agl.limit; base = [int]$agl.base; reason = $agl.why; repo = $repoName }
     }
+    # (B) the derived machine budget refused this lease: ONE journal event + ONE stderr line per call.
+    if ($got -eq 'SLOT-BUDGET' -and -not $slotBudgetSaid) {
+      $slotBudgetSaid = $true
+      $heldN = Get-TaskLeaseCount
+      [Console]::Error.WriteLine("agentq: no new task slot - the derived machine budget ($($tb.cap)) is reached (held $heldN; freeGB $($tb.freeGB), freeCommitGB $($tb.freeCommitGB); floor $($tb.floor), ceiling $($tb.ceiling))")
+      Write-Journal @{ event = 'slot-admission-denied'; repo = $repoName; slot = 'task'; freeGB = $tb.freeGB; freeCommitGB = $tb.freeCommitGB; budget = [int]$tb.cap; held = $heldN }
+    }
     if ($noWait -or (Now) -gt $deadline) {
-      $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" } else { "no free $role slot in $repoName" }
-      $whyWait = if ($got -eq 'MACHINE-CAP') { "the machine-wide task slot cap ($($agl.limit)) is reached" } else { 'it is still held' }
+      $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" }
+        elseif ($got -eq 'SLOT-BUDGET') { "the derived machine task-slot budget ($($tb.cap)) is reached (freeGB $($tb.freeGB), freeCommitGB $($tb.freeCommitGB))" }
+        elseif ($role -eq 'scratch' -and $script:ScratchDenied) { "no free scratch slot in $repoName and the machine has no room for another beyond the scratchSlots floor (need $(Get-ScratchMinFreeGB) GB free on the slot volume + minFreeCommitGB commit headroom)" }
+        else { "no free $role slot in $repoName" }
+      $whyWait = if ($got -eq 'MACHINE-CAP') { "the machine-wide task slot cap ($($agl.limit)) is reached" }
+        elseif ($got -eq 'SLOT-BUDGET') { "the derived machine task-slot budget ($($tb.cap)) is reached (freeGB $($tb.freeGB))" }
+        else { 'it is still held' }
       & $expire $whyWait $why
     }
     if (-not $announced) { [Console]::Error.WriteLine("agentq: waiting for a free $role slot in $repoName ..."); $announced = $true }
@@ -1877,9 +1979,45 @@ function Start-PostLand([string]$repoName, [string]$main, [string]$branch, [stri
 # One attempt to land a set of topics as ONE push (up to 3 rounds when origin moves). Uses $repo,
 # $main, $wt, $res from Invoke-Land. Result in $script:LandSetOut:
 #   results[branch] = @{ exit; sha; nothing }, failExit (whole-set failure), failSet, dropped, sha.
+# The land conflict error must be self-sufficient (2026-11-23): the conflicted paths (de-duplicated - a
+# file lands in both the unmerged and the marker list), WHY a queued branch re-conflicts (the merge is
+# computed when the ticket reaches the head of the queue, not when it was queued), and the exact fix.
+# Advice that cannot be followed while a long queue wait is still ahead is not actionable.
+function Write-LandConflictNote([hashtable]$bad, [string]$branch, [string]$onto, [string]$note) {
+  $paths = @(@($bad.paths) | Where-Object { $_ } | Select-Object -Unique)
+  $slot = if ($script:LandSrcSlot) { "$($script:LandSrcSlot)" } else { '<your task slot>' }
+  $resName = if ($repo) { "$($repo.Name)" } else { '<repo>' }
+  $q = [char]34
+  [Console]::Error.WriteLine("land: CONFLICT picking $(Short $bad.sha) onto origin/${onto}: $($paths -join ', '). Nothing pushed.")
+  [Console]::Error.WriteLine("  The merge is computed at ACQUIRE time (when this land reaches the head of land:${resName}), not when it was queued, so a branch that waited behind a long queue can conflict with an origin/$onto that moved underneath it - rebasing before you queued is not enough.$note")
+  [Console]::Error.WriteLine("  Rebase onto the CURRENT origin/$onto and land again:")
+  [Console]::Error.WriteLine("    git -C $q$slot$q fetch origin $onto")
+  [Console]::Error.WriteLine("    git -C $q$slot$q rebase origin/$onto")
+  [Console]::Error.WriteLine("    agentq land -Branch $branch -Onto $onto -Purpose $q<why>$q")
+  [Console]::Error.WriteLine("  (or re-run land with -RebaseOnConflict and it tries that rebase in its own slot and retries the pick once)")
+}
+# -RebaseOnConflict: rebase the topic's tip onto origin/<onto> in the LAND slot on a throwaway branch, so
+# the topic branch itself is never checked out or moved and nothing is ever force-pushed. Clean -> HEAD is
+# left on the throwaway branch for a single retry of the pick (the caller detaches back to origin/<onto>
+# and re-picks); a conflict -> the rebase is aborted and reported and no rebase is left in progress.
+# Returns 'rebased' or 'failed'.
+function Invoke-LandRebaseOnConflict([string]$wt, [string]$ref, [string]$onto, [string]$tmp) {
+  & git -C $wt checkout -q -B $tmp $ref 2>&1 | Out-Null
+  if ($LASTEXITCODE) { [Console]::Error.WriteLine("land: -RebaseOnConflict: cannot check out $ref in the land slot"); return 'failed' }
+  & git -C $wt -c core.editor=true rebase "origin/$onto" 2>&1 | ForEach-Object { Write-Output "  rebase: $_" }
+  if ($LASTEXITCODE) {
+    & git -C $wt rebase --abort 2>$null | Out-Null
+    Write-Journal @{ event = 'land-rebase-conflict'; resource = $res; ref = $ref; branch = $onto; reason = "rebasing onto origin/$onto conflicts as well - aborted, land slot clean"; repo = $repo.Name }
+    [Console]::Error.WriteLine("land: -RebaseOnConflict: rebasing $ref onto origin/$onto conflicts too - the rebase was aborted and the land slot left clean.")
+    return 'failed'
+  }
+  Write-Journal @{ event = 'land-rebase-clean'; resource = $res; ref = $ref; branch = $onto; reason = "rebased onto origin/$onto in the land slot; the pick is retried once"; repo = $repo.Name }
+  return 'rebased'
+}
 function Invoke-LandSet([object[]]$set) {
   $o = @{ results = @{}; failExit = 0; failSet = @(); dropped = @(); sha = '' }
   $script:LandSetOut = $o
+  $rebaseTried = @{}   # -RebaseOnConflict: a topic is rebased at most once per land attempt (the pick is retried once)
   $flakeRetried = $false
   $active = @($set)
   $label = ($set | ForEach-Object { $_.branch }) -join '+'
@@ -1901,10 +2039,43 @@ function Invoke-LandSet([object[]]$set) {
       $bad = $script:PickBad
       if ($bad) {
         & git -C $wt reset -q --hard $before 2>$null
+        # -RebaseOnConflict (opt-in, default off): rebase the topic onto origin/<onto> in the LAND slot on
+        # a throwaway branch and retry the pick ONCE. The topic branch is never checked out, nothing is
+        # force-pushed, and the rebase (and the throwaway branch) is always cleared before leaving.
+        $rebaseNote = ''
+        if ($script:RebaseOnConflict -and -not $rebaseTried.ContainsKey($tp.branch)) {
+          $rebaseTried[$tp.branch] = $true
+          $tmpR = "agentq-rebase-$(Safe "$($tp.branch)")"
+          if ((Invoke-LandRebaseOnConflict $wt $tp.ref $Onto $tmpR) -eq 'rebased') {
+            # clean rebase: rebuild the picks from origin/<onto> and try them once more
+            & git -C $wt checkout -q --detach $before 2>&1 | Out-Null
+            $picks2 = @(Get-LandPicks $wt "refs/heads/$tmpR")
+            if ($picks2.Count) { Add-LandPicks $wt $picks2 }
+            if (-not $script:PickBad) {
+              & git -C $wt branch -q -D $tmpR 2>$null | Out-Null
+              if (-not $picks2.Count) {
+                Write-Output "land: $($tp.branch) is already on origin/$Onto after the -RebaseOnConflict rebase (nothing to pick)"
+                $o.results[$tp.branch] = @{ exit = 0; sha = "$(& git -C $wt rev-parse HEAD)".Trim(); nothing = $true }
+              } else {
+                Write-Output "land: -RebaseOnConflict rebased $($tp.branch) onto origin/$Onto in the land slot and the pick is clean"
+                $picked += $tp
+              }
+              continue
+            }
+            $bad = $script:PickBad
+            $rebaseNote = " Rebasing $($tp.branch) onto origin/$Onto in the land slot was clean, but the retried pick still conflicts."
+          } else {
+            $rebaseNote = " -RebaseOnConflict already rebased this pick in the land slot: rebasing onto origin/$Onto conflicts as well, so the rebase was aborted and the slot left clean."
+          }
+          & git -C $wt cherry-pick --abort 2>$null | Out-Null
+          & git -C $wt rebase --abort 2>$null | Out-Null
+          & git -C $wt checkout -q --detach $before 2>&1 | Out-Null
+          & git -C $wt branch -q -D $tmpR 2>$null | Out-Null
+        }
         $active = @($active | Where-Object { $_.branch -ne $tp.branch })
         if ($tp.own -or $set.Count -eq 1) {
           Write-Journal @{ event = 'land-conflict'; resource = $res; sha = $bad.sha; paths = @($bad.paths); reason = "conflict picking $(Short $bad.sha) onto origin/$Onto"; repo = $repo.Name }
-          [Console]::Error.WriteLine("land: CONFLICT picking $(Short $bad.sha) onto origin/${Onto}: $(@($bad.paths) -join ', '). Nothing pushed. Rebase $($tp.branch) on origin/$Onto in your task slot, push it, and land again.")
+          Write-LandConflictNote $bad $tp.branch $Onto $rebaseNote
           $o.results[$tp.branch] = @{ exit = 5; sha = ''; nothing = $false }
         } else {
           Write-Journal @{ event = 'land-batch-drop'; resource = $res; sha = $bad.sha; paths = @($bad.paths); branch = $Onto; reason = "$($tp.branch) conflicts with an earlier topic of the batch; it lands on its own turn"; repo = $repo.Name }
@@ -2058,6 +2229,7 @@ function Invoke-Land {
   $why = if ($Purpose) { $Purpose } else { "land $Branch -> $Onto" }
   $main = Get-MainTop $repo
   $res = "land:$($repo.Name)"
+  $script:LandSrcSlot = $null
   Assert-NotMarked $res
   # ADR-0303 A (brivio): a repo may declare its default land gate in config (`landGate: { repo: cmd }`),
   # so every land runs it without each agent remembering -Gate. `-Gate none` opts out, journaled.
@@ -2112,6 +2284,7 @@ function Invoke-Land {
   $cwdN = Norm-Dir (Get-Location).Path
     $srcLease = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
   if (-not $srcLease) { $srcLease = Read-Leases $repo.Name | Where-Object { $_.session -eq $Session -and $_.role -in 'task', 'pinned' } | Sort-Object { "$(P $_ 'created' '')" } | Select-Object -First 1 }
+  $script:LandSrcSlot = if ($srcLease) { "$(P $srcLease 'path')" } else { $null }
   $tc = if ($srcLease) { @(P $srcLease 'claims' @()) } else { @() }
   try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
@@ -2342,6 +2515,13 @@ function Get-V2Status([string]$repoName) {
   [pscustomobject]@{ leases = $leases; releases = $rels }
 }
 function Format-V2Status($v) {
+  # The machine-wide task-slot cap IN FORCE is a measurement since 2026-11-23 - min(agent limit, derived
+  # budget) - not the configured ceiling `taskSlotsMachine`. Without this line an operator reads
+  # `== AGENTS limit 26 of 26 task slots` and cannot see why a task lease was refused; the same numbers are in
+  # the refusal message and in the journal `slot-admission-denied`. Get-TaskSlotBudget is one PSDrive read plus
+  # one CIM read, cheap enough for `status` (and it is NOT called by agentq-sync, which reads the raw files).
+  $tb = Get-TaskSlotBudget
+  Write-Output ("== SLOT BUDGET cap {0} of {1} task slots in force (floor {2}, measured {3}; free {4} GB on the slot volume, {5} GB commit headroom)" -f $tb.cap, $tb.ceiling, $tb.floor, $tb.derived, $tb.freeGB, $tb.freeCommitGB)
   if ($v.releases) {
     # `phase` in the record is the LAST checkpoint the run entered (release-phase), and `state` is the
     # run's own outcome. The two are independent: a FAILED run is NOT a failed phase, and nothing in the
@@ -2380,5 +2560,6 @@ function ConvertTo-V2Json($v) {
         idleMin = $_.idleMin; chatIdleMin = $_.chatIdleMin; branch = $_.branch; session = $_.session; purpose = $_.purpose
         path = $_.path; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); alive = $_.alive; stale = $_.stale } })
     releases = @($v.releases | ForEach-Object { $_ | Select-Object * -ExcludeProperty file })
+    slotBudget = (Get-TaskSlotBudget)
   }
 }
