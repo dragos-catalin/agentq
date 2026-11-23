@@ -28,8 +28,8 @@
     "max": 6,
     "cpuHigh": 85,
     "cpuLow": 55,
-    "minFreeRamGB": 24,
-    "minFreeCommitGB": 24,
+    "minFreeRamGB": 12,
+    "minFreeCommitGB": 12,
     "everySec": 15
   },
   "quickBurst": 2,
@@ -111,6 +111,7 @@
   "landPregateRounds": 2,
   "landPregateScratchWaitMin": 5,
   "landGateRunsMax": 4,
+  "landRequeueMax": 3,
   "greenTtlHours": 168,
   "prune": {
     "agentsDays": 3,
