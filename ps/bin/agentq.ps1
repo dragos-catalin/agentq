@@ -1734,10 +1734,34 @@ function Invoke-Commit {
   } finally { Drop-Ticket $t; Drop-Ticket $tPush }
 }
 
+# r7 (land ETA): an honest wait estimate for a land:<repo> waiter, from data the journal already has.
+# land:<repo> is capacity-1, so a hold ends with the next `acquired` or with the holder's own
+# `land`/`land-gate-failed`/`land-push-failed`/`land-conflict` event. Read-only; returns $null when
+# there is less than 3 holds of history, so the caller prints `unknown (no history)` instead of a number.
+function Get-LandHoldStats([string]$repoName, [int]$days = 3) {
+  $res = "land:$repoName"; $since = (Now).AddDays(-$days)
+  $evs = @(Read-Journal 2000 $since $repoName | Where-Object { "$(JProp $_ 'resource')" -eq $res } | Sort-Object { ParseUtc (JProp $_ 'ts') })
+  $terminal = @('land', 'land-gate-failed', 'land-push-failed', 'land-conflict', 'land-ungated', 'land-batch')
+  $holds = @(); $lastAcq = $null
+  for ($i = 0; $i -lt $evs.Count; $i++) {
+    if ("$(JProp $evs[$i] 'event')" -ne 'acquired') { continue }
+    $at = ParseUtc (JProp $evs[$i] 'ts'); $sess = "$(JProp $evs[$i] 'session')"; $lastAcq = $at
+    for ($j = $i + 1; $j -lt $evs.Count; $j++) {
+      $ev = "$(JProp $evs[$j] 'event')"; $et = ParseUtc (JProp $evs[$j] 'ts')
+      if ($et -le $at) { continue }
+      if ($ev -eq 'acquired' -or (($terminal -contains $ev) -and "$(JProp $evs[$j] 'session')" -eq $sess)) { $holds += ($et - $at).TotalSeconds; break }
+    }
+  }
+  if ($holds.Count -lt 3) { return $null }
+  $s = @($holds | Sort-Object); $n = $s.Count
+  [pscustomobject]@{ n = $n; p50 = [int]$s[[math]::Floor(($n - 1) * 0.5)]; p90 = [int]$s[[math]::Floor(($n - 1) * 0.9)]; lastAcq = $lastAcq }
+}
+
 function Show-Status {
   $repo = Get-RepoInfo $Repo
   $dirs = @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)
   $rows = @()
+  $landEta = @{}
   foreach ($d in $dirs) {
     $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
@@ -1745,12 +1769,24 @@ function Show-Status {
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
     # B) the negative ledger for this land queue (branch -> {at,tree,reason}), read once per resource.
     $qmap = if ($res -like 'land:*') { Get-LandQuarantine (Get-ResourceRepo $res) } else { $null }
+    # r7: hold-time history for this land queue (null when the journal has too little history).
+    $hs = if ($res -like 'land:*') { Get-LandHoldStats (Get-ResourceRepo $res) 3 } else { $null }
+    if ($res -like 'land:*') { $landEta[$res] = $hs }
     $live = @(Get-Live $res)
     $cap = Get-Capacity $res
     $wq = @($live | Where-Object { -not (Test-Held $_ $live $cap) } | Sort-Object @{ e = { Get-EffPrio $_ }; Descending = $true }, @{ e = { [long]$_.seq } })
     foreach ($t in $live) {
       $isHeld = Test-Held $t $live $cap
       $role = if ($isHeld) { if (P $t 'yielded' $false) { 'HOLD(idle)' } else { 'HOLD' } } else { "wait#$([array]::IndexOf(@($wq | ForEach-Object id), $t.id) + 1)$(if (-not (P $t 'ready' $true)) { '~' })" }
+      # r7: an ETA for a waiter, from the hold history of THIS queue - always a range, never a promise,
+      # and never a number when the journal has too little history to support one.
+      $etaTxt = $null
+      if (-not $isHeld -and $res -like 'land:*') {
+        $pos = [array]::IndexOf(@($wq | ForEach-Object id), $t.id) + 1
+        $etaTxt = if (-not $hs) { 'unknown (no history)' }
+          elseif (($pos * $hs.p50) -ge 3600) { '>60m TIMEOUT' }
+          else { "~$([math]::Round($pos * $hs.p50 / 60))-$([math]::Round([math]::Min($pos * $hs.p90, 3600) / 60))m" + $(if (($pos * $hs.p90) -ge 3600) { '+' } else { '' }) }
+      }
       # WEDGED: run-build saw its build log silent for -WedgeMin (sidecar <ticket>.wedged, JSON {since,quietMin,log,pid}).
       $wedgeTxt = $null
       if (Test-Path -LiteralPath "$($t.file).wedged") {
@@ -1773,7 +1809,7 @@ function Show-Status {
         state = $(if ($t.stale -and $wedgeTxt) { "STALE($($t.beatAgeMin)m),$wedgeTxt" } elseif ($t.stale) { "STALE($($t.beatAgeMin)m)" } elseif ($wedgeTxt) { $wedgeTxt } elseif ($qtxt) { 'QUARANTINED' } else { 'ok' })
         ageMin = [math]::Round(((Now) - (ParseUtc $t.created)).TotalMinutes, 1)
         session = $t.session; purpose = $t.purpose; id = $t.id
-        landBranch = "$(P $t 'landBranch' '')"; quarantine = $qtxt
+        landBranch = "$(P $t 'landBranch' '')"; quarantine = $qtxt; eta = $etaTxt
       }
     }
   }
@@ -1808,7 +1844,14 @@ function Show-Status {
   Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'
-    $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
+    $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id, eta -AutoSize | Out-String -Width 240 | Write-Output
+    # r7: the queue's own numbers behind the ETA, so the range can be judged instead of trusted.
+    foreach ($rn in @($landEta.Keys)) {
+      $h = $landEta[$rn]; $waiting = @($rows | Where-Object { $_.resource -eq $rn -and "$($_.role)" -like 'wait#*' }).Count
+      $dist = if ($h) { "p50 $([math]::Round($h.p50 / 60, 1))m / p90 $([math]::Round($h.p90 / 60, 1))m (n=$($h.n), 3d)" } else { 'no history - ETA unknown' }
+      $held = if ($h -and $h.lastAcq) { [math]::Round(((Now) - $h.lastAcq).TotalMinutes, 0) } else { '?' }
+      Write-Output "== LAND ETA $rn`: depth $($waiting + 1) ($waiting waiting); holder ${held}m in; hold $dist; queue timeout 60m (estimate from history, not a promise)"
+    }
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
   # B) the quarantined topics of the land queues in scope, with the reason and its stamp: a red topic is
   # skipped by the batch picker (journal land-topic-quarantined) and gates on its own turn.

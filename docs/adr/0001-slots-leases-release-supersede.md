@@ -112,6 +112,28 @@ A release run holds `deploy:<repo>:<target>` and the `release` slot. Its state i
 
 Parallel agents work in parallel task slots; only landing is serial.
 
+**Pre-gate (stage 0, ADR 0009).** Before the ticket is taken, the gate runs on the REBASED result in a clean
+tree: the slot the caller stands in, a slot this session already holds, or a scratch slot rented for the length
+of the gate and given back. Three failure modes measured on 2026-11-23 are closed here:
+
+- **a rented scratch slot handed back DIRTY by its previous tenant is reset** to `origin/<onto>` before the gate
+  judges it (journal `land-pregate-slot-reset`), because the reset targets the slot JUST RENTED for the gate and
+  never the caller's tree nor a slot this session already holds. If it is still dirty afterwards it is given back
+  and the pre-gate is skipped with a reason naming the slot, instead of the generic "uncommitted or untracked
+  files" skip that pushed the whole gate back inside the cap-1 land mutex (21 such skips in one day).
+- **a topic whose pre-gate FAILED is quarantined** for `landQuarantineHours` (default 6) in
+  `<AGENTQ_HOME>/land/<repo>.json` — the negative mirror of the green ledger, keyed by BRANCH (a fix keeps the
+  branch), pruned on the next write, `AGENTQ_NO_LAND_QUARANTINE=1` disabling the read. The batch picker SKIPS
+  such a topic (journal `land-topic-quarantined`) instead of absorbing it into a holder's cap-1 batch, where one
+  red topic once held `land:<repo>` for 60+ min with 12 waiters. It is NOT a ban: an explicit
+  `agentq land -Branch <b>` runs a fresh pre-gate and clears the entry on success (journal
+  `land-quarantine-cleared`).
+- **a land resolved against a clone that does not own the slot is refused early**, exit 3 and journal
+  `land-wrong-clone`, naming the resolved clone, the clone that owns `<wtroot>/<repo>/land` and the two working
+  recipes (lease a slot of the owning clone, or `publish -Base origin/main -Land`), instead of dying inside
+  `Initialize-Slot` after a ticket and a gate slot were set up. The `land` slot is ONE per repo NAME, so a
+  per-clone slots root is not derivable: leases and `Get-SlotPath` key slots by repo name.
+
 ### 5. Machine-wide safety
 
 - `build:machine` capacity 2 + free RAM >= 6 GB **and free commit charge >= 12 GB** (2026-09-30: OOM with 50 GB RAM free).
@@ -129,6 +151,8 @@ Parallel agents work in parallel task slots; only landing is serial.
 ### 6. Visibility
 
 `agentq status` shows queues, marks, **leases** (slot, role, holder, branch, age, idle, STALE) and **releases** (target, sha, phase, committed, supersede/pending). `agentq-sync` sends `leases[]` and `releases[]` to codai, and the hub `/ops/agentq` shows them (codai migration 0137).
+
+It also lists the land queues' **quarantined topics** (`== LAND QUARANTINE`, JSON `landQuarantine`), the reason and its stamp on each ticket row (`state = QUARANTINED`), so a waiter sees WHY its land is not being absorbed instead of only noticing that it never moves.
 
 ## Failure modes
 

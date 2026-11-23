@@ -81,6 +81,19 @@ Check '5 config autosync.daemons=[] disables collection' ($r.out -match 'daemons
 $st = (& pwsh -NoProfile -File $sync -Status 2>&1 | ForEach-Object { "$_" }) -join "`n"
 Check '6 -Status lists the configured daemons' ($st -match 'daemons: 1 configured \(git-autosync\)') $st
 Check '6 -Status shows the last daemon verdict' ($st -match 'git-autosync\s+ok\s+failStreak 0') $st
+# The age must be the TRUE UTC age of the record. The fixture writes a fixed old timestamp, so the
+# absolute value is large - what matters is that it is not shifted by the local offset: a bare
+# [DateTime] cast of the "…Z" field comes back in LOCAL time, which printed "-120m ago" on EET (and
+# a 120-minute-too-old age for an old timestamp), so the hub and the local view disagreed on freshness.
+# Exact comparison (1 min tolerance for the clock between the two reads): the offset cannot hide inside it.
+# Mutation: revert the line to `[DateTime]$rec['at']` and this goes red by exactly the UTC offset.
+$ageStr = [regex]::Match($st, 'git-autosync\s+ok\s+failStreak 0\s+(-?\d+)m ago').Groups[1].Value
+# -DateKind String: without it `at` comes back as a [datetime] and stringifying it loses the Z (the
+# local wall-clock is then re-read as local, which shifts the expectation by the offset - the same
+# class of bug this assertion guards against, in the test itself).
+$recAt = (Get-Content (Join-Path $env:AGENTQ_HOME 'daemons\git-autosync.json') -Raw | ConvertFrom-Json -AsHashtable -DateKind String)['at']
+$expectAge = [int](([DateTime]::UtcNow - [DateTimeOffset]::Parse("$recAt", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime).TotalMinutes)
+Check '6 -Status age is the true UTC age (a Z-timestamp is not read as local time)' ($ageStr -ne '' -and [int]$ageStr -ge 0 -and [Math]::Abs([int]$ageStr - $expectAge) -le 1) "printed=$ageStr expected=$expectAge`n$st"
 
 # 7 per-pass job-registry reap: ONE sync pass marks a job still `running` whose pid is dead (or was
 #   recycled) as `dead` (+ reapedBy), and leaves a live job alone. This is `jobs.ps1 reap` made

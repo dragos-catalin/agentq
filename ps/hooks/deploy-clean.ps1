@@ -147,7 +147,10 @@ try {
       } finally { Pop-Location; Remove-Item Env:DEPLOY_SHA, Env:DEPLOY_REF, Env:DEPLOY_WORKTREE -ErrorAction SilentlyContinue }
     }
     $endState = if ($code -eq 0) { 'done' } elseif ($code -eq 4) { 'superseded' } else { 'failed' }
-    $end = (& pwsh -NoProfile -File $agentq release-end -State $endState | Select-Object -Last 1) | ConvertFrom-Json
+    # -Code: the wrapped command's exit code is recorded next to `last-phase`, never ON the phase. The
+    # phase is the last checkpoint entered; the failure can be anywhere after it, so the two are shown
+    # apart (2026-11-21: exit 1 with phase=github was misread as "the GitHub step failed").
+    $end = (& pwsh -NoProfile -File $agentq release-end -State $endState -Code $code | Select-Object -Last 1) | ConvertFrom-Json
     Remove-Item Env:AGENTQ_RELEASE_FILE -ErrorAction SilentlyContinue
     Write-Host "deploy-clean: === run $run $($end.state)  sha=$sha  exit=$code  next=$(if ($end.next) { $end.next } else { '-' }) ==="
     if ($end.state -eq 'superseded') { $code = 0 }

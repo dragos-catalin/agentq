@@ -408,8 +408,17 @@ function Read-Leases([string]$repoName) {
       # UNSAVED WORK guard (2026-11-22): a slot with uncommitted or unpushed work is not reset after the
       # short idle thresholds - an agent thinking/compacting for 45 min is not gone, and a reset (even
       # with a backup ref) reads as "my work was lost". It is protected up to leaseDirtyIdleMin.
+      # A pre-gate lease (stamped by Get-PregateScratchSlot) borrows the tree for one gate: it lives exactly
+      # as long as its land process and never past its deadline, whatever the session heartbeat says.
+      $pgDead = $false
+      $pgPid = [int](P $l 'pregatePid' 0)
+      if ($pgPid) {
+        $pgAlive = Test-Alive ([pscustomobject]@{ pid = $pgPid; procStart = (P $l 'pregateProcStart' $null) })
+        $pgU = try { $pu = P $l 'pregateUntil' $null; if ($pu) { ParseUtc $pu } else { $null } } catch { $null }
+        if (-not $pgAlive -or ($pgU -and (Now) -gt $pgU)) { $stale = $true; $pgDead = $true }
+      }
       $unsaved = $false
-      if ($stale -and $lrole -in 'task', 'pinned', 'scratch' -and $idle -le [double](P $cfg 'leaseDirtyIdleMin' 240) -and $idle -le [double]$cfg.leaseMaxIdleMin) {
+      if ($stale -and -not $pgDead -and $lrole -in 'task', 'pinned', 'scratch' -and $idle -le [double](P $cfg 'leaseDirtyIdleMin' 240) -and $idle -le [double]$cfg.leaseMaxIdleMin) {
         if (Test-SlotHasWork (P $l 'path' '')) { $stale = $false; $unsaved = $true }
       }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force
@@ -1829,6 +1838,20 @@ function Get-PregateScratchSlot($repo, [string]$onto) {
   if (-not $line) { $script:PregateScratchWhy = 'the scratch lease printed no lease JSON'; return $null }
   $l = try { "$line" | ConvertFrom-Json -AsHashtable } catch { $null }
   if (-not $l -or -not (P $l 'path') -or -not (P $l 'leaseId')) { $script:PregateScratchWhy = 'the scratch lease JSON carried no path or leaseId'; return $null }
+  # 2026-11-23 leak: a land killed mid-gate (timeout, Stop-Process) never reaches its `finally`, and the
+  # rented lease then inherits the SESSION heartbeat, so sweep kept it forever and the pool saturated.
+  # Stamp the lease with THIS land process and a deadline; Read-Leases treats it as stale the moment either
+  # the land process is gone or the deadline passes (docs/ops/2026-11-23-pregate-scratch-slot-leak.md).
+  try {
+    $lf = Get-LeaseFile $repo.Name "$(P $l 'slot')"
+    $raw = Get-Content -LiteralPath $lf -Raw | ConvertFrom-Json -AsHashtable
+    if ("$(P $raw 'leaseId')" -eq "$(P $l 'leaseId')") {
+      $pgMin = if ($c.ContainsKey('landPregateLeaseMin')) { [math]::Max(5, [int]$c['landPregateLeaseMin']) } else { 45 }
+      $pst = Get-ProcStart $PID
+      $raw['pregatePid'] = $PID; $raw['pregateProcStart'] = $(if ($pst) { Iso $pst } else { $null }); $raw['pregateUntil'] = Iso ((Now).AddMinutes($pgMin))
+      Write-JsonAtomic $lf $raw
+    }
+  } catch { [Console]::Error.WriteLine("land: WARNING could not stamp the pre-gate lease: $($_.Exception.Message)") }
   # A) 2026-11-23: the rented scratch slot was NOBODY's to clean. `Release-PregateSlot` handed it back
   # still dirty, the next land rented the SAME poisoned slot, hit the generic `Test-GitClean` skip below,
   # and pushed the whole gate back into the cap-1 land mutex - measured: 21 of the `land-pregate-skipped`
