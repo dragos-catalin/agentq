@@ -117,6 +117,12 @@ $suites = [ordered]@{
   # redirected into the scratch dir, so nothing touches a real shared clone. Dry-run by default; the
   # -Apply scenario throws an unowned dirty set at it and proves the publish + path-scoped clean.
   'shared janitor'  = @('-File', (Join-Path $PSScriptRoot 'test-shared-clone-janitor.ps1'), '-Tool', (Join-Path $bin 'shared-clone-janitor.ps1'), '-Agentq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-23: `bump` accepted no target selector and its bare form matched tickets by SESSION - a
+  # waiter running `agentq bump -By 20` raised TWO OTHER sessions' tickets, and `status` never printed
+  # its own ticket id so it could not target one. The fix (mutually exclusive -Id|-Session, the id
+  # always reported, the `== MINE session` line) is pinned here; the matching install.ps1 map entry is
+  # checked by 'install wiring' - a suite in this table but not in the map never reaches the gate.
+  'bump selector'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-bump.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
 # -RepoSuites: the suites THIS repo's gate runs, from bin/agentq-config.json -> gateSuites.<repo>
