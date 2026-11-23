@@ -576,18 +576,24 @@ if ($cmd -match '(^|[;&|({]\s*|\bthen\s+)git(\.exe)?(\s+-C\s+\S+|\s+-c\s+\S+)*\s
 # incident freeze is not bypassed by a direct command. Marks live in ~/.codai/coord/marks.
 $markDir = if ($env:AGENTQ_HOME) { Join-Path $env:AGENTQ_HOME 'marks' } else { Join-Path $env:USERPROFILE '.codai\coord\marks' }
 if ((Test-Path $markDir) -and $cmd -notmatch 'agentq\.ps1') {
-  $marks = @(Get-ChildItem $markDir -Filter '*.json' -File -EA SilentlyContinue | ForEach-Object { try { Get-Content $_.FullName -Raw | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+  # F3 (2026-11-23): classify the command BEFORE reading the marks and before the `git rev-parse`.
+  # Which repo the cwd is in is a property of the directory, not of the command, and it is only needed
+  # to match a mark to a class - so when no class matches, neither the dir scan nor the git spawn
+  # (~50-80 ms on Windows) can change the outcome and both are pure overhead on every terminal call
+  # while any freeze mark exists. Empty class list -> no mark can match -> nothing to read.
+  $classes = @()
+  if ($cmd -match '\b(pnpm|npm|yarn|turbo|next|tsc|cargo|gradlew?)\b.*\b(build|typecheck|test)\b|run-build\.ps1') { $classes += 'build' }
+  if ($cmd -match '(^|[;&|({]\s*)git(\.exe)?\b[^;|&]*\s(commit|push)\b') { $classes += 'commit' }
+  if ($cmd -match '\b(pnpm|npm|yarn)\s+(install|i|ci|add|remove)\b') { $classes += 'install' }
+  if ($cmd -match 'deploy-clean\.ps1|deploy-[a-z0-9-]+\.(ps1|mjs)|scripts[\\/]deploy\.mjs|\bgcloud\s+(run|builds)\b|\bvercel\b|\bterraform\s+apply\b|\bdocker\s+(build|push)\b') { $classes += 'deploy' }
+  $marks = @()
+  if ($classes.Count) { $marks = @(Get-ChildItem $markDir -Filter '*.json' -File -EA SilentlyContinue | ForEach-Object { try { Get-Content $_.FullName -Raw | ConvertFrom-Json } catch { $null } } | Where-Object { $_ }) }
   if ($marks) {
     $repoName = $null
     try {
       $cd = git rev-parse --path-format=absolute --git-common-dir 2>$null
       if ($LASTEXITCODE -eq 0 -and $cd) { $repoName = (Split-Path -Leaf (Split-Path -Parent $cd.Replace('/', '\'))).ToLowerInvariant() }
     } catch { }
-    $classes = @()
-    if ($cmd -match '\b(pnpm|npm|yarn|turbo|next|tsc|cargo|gradlew?)\b.*\b(build|typecheck|test)\b|run-build\.ps1') { $classes += 'build' }
-    if ($cmd -match '(^|[;&|({]\s*)git(\.exe)?\b[^;|&]*\s(commit|push)\b') { $classes += 'commit' }
-    if ($cmd -match '\b(pnpm|npm|yarn)\s+(install|i|ci|add|remove)\b') { $classes += 'install' }
-    if ($cmd -match 'deploy-clean\.ps1|deploy-[a-z0-9-]+\.(ps1|mjs)|scripts[\\/]deploy\.mjs|\bgcloud\s+(run|builds)\b|\bvercel\b|\bterraform\s+apply\b|\bdocker\s+(build|push)\b') { $classes += 'deploy' }
     foreach ($m in $marks) {
       $r = "$($m.resource)"
       $kind = ($r -split ':')[0]

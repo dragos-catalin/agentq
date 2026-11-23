@@ -50,6 +50,21 @@ if (-not $isVsCode -and $raw -match '"toolArgs"') {
 $realOut = [Console]::Out
 $realErr = [Console]::Error
 
+# F1/F2 (2026-11-23): the tool name and session drive two decisions below. Read them with a REGEX,
+# exactly like Write-HookCost does - a full ConvertFrom-Json of a megabyte apply_patch payload with
+# embedded file text costs ~88 ms as the process's first JSON parse (measured 2026-11-23), and the
+# tool name is a short field that never needs it.
+$toolName = ''; $sessId = ''
+$mT = [regex]::Match($rawIn, '"(?:tool_name|toolName)"\s*:\s*"([^"\\]{1,80})"'); if ($mT.Success) { $toolName = $mT.Groups[1].Value }
+$mS = [regex]::Match($rawIn, '"(?:session_id|sessionId)"\s*:\s*"([^"\\]{1,80})"'); if ($mS.Success) { $sessId = $mS.Groups[1].Value }
+# F1: the tools that can only READ. The AXIOM gate is path/command based, so it can never deny one of
+# them (the gate's own answer to read_file on a denied path is empty - pinned by the F1 case in
+# ps\tests\test-hook-pre.ps1, and by "read tools are not judged"). Running it for a read is observe-only work on the
+# critical path of every call, and its node cold start measures ~108 ms here. An ALLOW list on purpose:
+# terminal tools, edits, unknown names and a malformed payload (no tool name) all keep the gate.
+$gateReadOnly = '^(read_file|read_notebook_cell_output|copilot_getNotebookSummary|grep_search|file_search|list_dir|semantic_search|get_errors|memory|session_store_sql|fetch_webpage|codai_web_search|codai_web_fetch|vscode_websearchforcopilot_webSearch|read_page|screenshot_page|terminal_last_command|terminal_selection|vscode_listCodeUsages|resolve_memory_file_uri|get_task_output|find-skills|who-owns-file)$'
+$runGate = $toolName -notmatch $gateReadOnly
+
 # One line per call; called right before every exit of this script. Regex, not ConvertFrom-Json: the
 # payload can be megabytes (file contents) and only two short fields are needed.
 function Write-HookCost([bool]$Denied) {
@@ -108,7 +123,7 @@ function Deny([string]$Reason, [string]$Json) {
 $axiomEnforce = $false
 $axOwnRun = $false
 $axiomCmd = Join-Path $env:APPDATA 'npm\axiom.cmd'
-if (Test-Path $axiomCmd) {
+if ($runGate -and (Test-Path $axiomCmd)) {
   $axDir = $null; try { $axDir = "$(($raw | ConvertFrom-Json).cwd)" } catch { }
   if (-not $axDir) { $axDir = (Get-Location).Path }
   $ownAxiom = $false
@@ -147,7 +162,14 @@ foreach ($child in 'guard-tooluse.ps1', 'guard-rules-surface.ps1') {
   if ($r.Err) { $warnings.Add($r.Err) }
 }
 # Allowed: physical signal (never blocks, never fails the call).
-$null = Invoke-Child 'copilot-signal.ps1'
+# F2 (2026-11-23): the signal script has work ONLY for askQuestions (POST an ask) or to cancel a live
+# ask (DELETE, its preToolUse branch when this session still has an ask mark). For every other tool it
+# re-reads stdin and re-parses the whole payload - a megabyte apply_patch diff included - to decide
+# nothing, and that is on the critical path of every call. Run it only when there is something to
+# signal. The mark path is byte-for-byte the one the child itself tests, so an active ask is still
+# cancelled and a malformed payload (empty session) still reaches it, unchanged.
+$askMark = Join-Path $HOME ('.codai\signal-ask\' + ($sessId -replace '[^A-Za-z0-9_-]', '') + '.ask')
+if ($toolName -match 'askQuestions' -or (Test-Path -LiteralPath $askMark)) { $null = Invoke-Child 'copilot-signal.ps1' }
 # Repo with its own AXIOM profile and no gate hook of its own: the gate runs here with the flags the
 # repo hook used, and its answer goes to the harness unchanged (deny, or additionalContext in warn
 # mode). AFTER the guards on purpose: if the gate hangs, the hook timeout fails open and only the

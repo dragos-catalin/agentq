@@ -39,7 +39,14 @@ if ($raw -match '(?i)\.copilot[\\/]+hooks[\\/]|\.claude[\\/]+rules[\\/]') {
 exit 0
 '@
   [IO.File]::WriteAllText((Join-Path $stage 'guard-rules-surface.ps1'), $standIn)
-  [IO.File]::WriteAllText((Join-Path $stage 'copilot-signal.ps1'), "exit 0`n")
+  # Countable stand-in (same contract: allow, exit 0): one line per invocation, so the F2 cases can
+  # assert SPAWN COUNT instead of timing.
+  $sigStandIn = @'
+$sigLog = $env:HOOKCOST_SIGNAL_LOG
+if ($sigLog) { try { [IO.File]::AppendAllText($sigLog, "sig`n") } catch { } }
+exit 0
+'@
+  [IO.File]::WriteAllText((Join-Path $stage 'copilot-signal.ps1'), $sigStandIn)
   $Hook = Join-Path $stage 'hook-pre.ps1'
   Write-Host "  layout: repository (staged in $stage with a stand-in rules-surface guard)"
 } else { Write-Host "  layout: installed ($hookDir)" }
@@ -119,6 +126,42 @@ try {
     $ro = "$([char]0x219)$([char]0x21B)$([char]0x103)"   # s-comma, t-comma, a-breve: outside ASCII and outside the OEM code page
     Case 'non-ASCII path reaches the gate and comes back byte for byte' ($vw + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$warn\blocked\$ro.txt"; content = 'x' } }) 'allow-context' ([regex]::Escape("blocked/$ro.txt"))
   } else { Write-Host '  SKIP  9 AXIOM gate cases (the axiom command is not installed on this machine)' }
+
+  # --- F1/F2 (2026-11-23): the read fast path skips the AXIOM gate and the signal script ---
+  # Contract: hook-pre.ps1 must not run the path/command-based AXIOM gate for a tool that can only READ
+  # (it could never deny one - see "read tools are not judged" above), and must not invoke
+  # copilot-signal.ps1 when there is nothing to signal. Proven by a SPAWN observable, never by timing:
+  # the gate leaves a trace in its own repo when it judges a denied write, and the staged signal stand-in
+  # appends one line per invocation. The write case is a MUTATION check - it proves the read assertion can
+  # fail (if the gate stopped leaving a trace, or the read started running the gate).
+  if ($hasAxiom) {
+    $ro = New-Repo 'ro' '{"deny":["blocked/**"]}'
+    $vr = @{ hook_event_name = 'PreToolUse'; session_id = 'test-hook-pre'; cwd = $ro }
+    Case 'F1 read: a read-only tool in a repo whose gate judges writes is allowed' ($vr + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$ro\blocked\x.txt" } }) 'allow'
+    Ok (-not (Gate-Wrote $ro)) 'F1 read: the AXIOM gate was NOT run for the read-only call (no trace in .axiom)' "trace=$(if (Gate-Wrote $ro) { 'present' } else { 'none' })"
+    Case 'F1 write (mutation check): the same repo still judges a write' ($vr + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$ro\blocked\x.txt"; content = 'x' } }) 'deny-json' 'AXIOM GATE DENY path\.deny'
+    Ok (Gate-Wrote $ro) 'F1 write: the write DID reach the gate, so the read assertion is sensitive'
+  } else { Write-Host '  SKIP  4 F1 cases (the axiom command is not installed on this machine)' }
+  if ($stage) {
+    $sigLog = Join-Path $coord 'signal.log'
+    [IO.File]::WriteAllText($sigLog, '')
+    $env:HOOKCOST_SIGNAL_LOG = $sigLog
+    function Sig-Count { if (Test-Path $sigLog) { @(Get-Content -LiteralPath $sigLog | Where-Object { $_ }).Count } else { 0 } }
+    $n0 = Sig-Count
+    Case 'F2 read: a read-only call with no live ask is allowed' ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }) 'allow'
+    Ok ((Sig-Count) -eq $n0) "F2 read: the signal script was NOT invoked (count stayed $n0)" "now=$(Sig-Count)"
+    $null = Invoke-Hook ($vs + @{ tool_name = 'vscode_askQuestions'; tool_input = @{ questions = @(@{ header = 'hc'; question = 'q' }) } })
+    Ok ((Sig-Count) -eq $n0 + 1) 'F2 ask: askQuestions DOES invoke the signal script (the ask is still announced)'
+    $askDir = Join-Path $HOME '.codai\signal-ask'
+    $askMark = Join-Path $askDir 'test-hook-pre.ask'
+    New-Item -ItemType Directory -Force -Path $askDir | Out-Null
+    [IO.File]::WriteAllText($askMark, 'x')
+    $n2 = Sig-Count
+    Case 'F2 cancel: with a live ask mark a non-ask call is still allowed' ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }) 'allow'
+    Ok ((Sig-Count) -eq $n2 + 1) 'F2 cancel: a live ask mark still invokes the script on the next call (the reset is preserved)'
+    Remove-Item $askMark -Force -ErrorAction SilentlyContinue
+    Remove-Item Env:HOOKCOST_SIGNAL_LOG -ErrorAction SilentlyContinue
+  } else { Write-Host '  SKIP  4 F2 cases (installed layout: the real signal script runs and its spawns are not countable here)' }
 
   # --- cost log (ADR 0009 stage 0, OQ-012): one line per call, never changes a decision ---
   $cl = @(Cost-Lines)
