@@ -156,6 +156,57 @@ Start-Sleep -Milliseconds 800
 $reg4 = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o4.id).json") -Raw | ConvertFrom-Json
 $alive = @(@($reg4.pid) + $kids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
 Check 'jobs kill kills the whole tree and marks killed' ($reg4.state -eq 'killed' -and $alive.Count -eq 0) "state=$($reg4.state) alive=$($alive -join ',')"
+
+# --- jobs kill argument forms: -JobId, positional, several ids, comma list, bad flag, bad id ---------
+function Run-Jobs([string[]]$a) {
+  $out = @(& pwsh -NoProfile -File $jobs @a 2>&1 | ForEach-Object { "$_" })
+  @{ code = $LASTEXITCODE; out = ($out -join "`n") }
+}
+function Start-Long([string]$label) {
+  (& pwsh -NoProfile -File $start -Label $label -Command '"long"; Start-Sleep 120' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
+}
+function Job-Killed([string]$id) {
+  $r = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$id.json") -Raw | ConvertFrom-Json
+  $a = @(@($r.pid) | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+  @{ state = $r.state; alive = $a.Count }
+}
+# (a) -JobId (the form every other tool uses) must work
+$k1 = Start-Long 'argform -JobId'; Start-Sleep -Milliseconds 600
+$r = Run-Jobs @('kill', '-JobId', $k1.id)
+Start-Sleep -Milliseconds 800
+$k = Job-Killed $k1.id
+Check 'jobs kill -JobId works (named form) and kills the tree' ($r.code -eq 0 -and $k.state -eq 'killed' -and $k.alive -eq 0 -and $r.out -match "killed $([regex]::Escape($k1.id))") "code=$($r.code) state=$($k.state) out=$($r.out)"
+# (b) the positional form must keep working
+$k2 = Start-Long 'argform positional'; Start-Sleep -Milliseconds 600
+$r = Run-Jobs @('kill', $k2.id)
+Start-Sleep -Milliseconds 800
+$k = Job-Killed $k2.id
+Check 'jobs kill <id> positional form still works' ($r.code -eq 0 -and $k.state -eq 'killed' -and $k.alive -eq 0) "code=$($r.code) state=$($k.state)"
+# several positional ids in one call
+$k3 = Start-Long 'argform multi a'; $k4 = Start-Long 'argform multi b'; Start-Sleep -Milliseconds 600
+$r = Run-Jobs @('kill', $k3.id, $k4.id)
+Start-Sleep -Milliseconds 1200
+$k3r = Job-Killed $k3.id; $k4r = Job-Killed $k4.id
+Check 'jobs kill takes several positional ids' ($r.code -eq 0 -and $k3r.state -eq 'killed' -and $k4r.state -eq 'killed' -and $k3r.alive -eq 0 -and $k4r.alive -eq 0) "code=$($r.code) $($k3r.state)/$($k4r.state)"
+# one comma/space separated value
+$k5 = Start-Long 'argform comma a'; $k6 = Start-Long 'argform comma b'; Start-Sleep -Milliseconds 600
+$r = Run-Jobs @('kill', "$($k5.id),$($k6.id)")
+Start-Sleep -Milliseconds 1200
+$k5r = Job-Killed $k5.id; $k6r = Job-Killed $k6.id
+Check 'jobs kill accepts a comma-separated id list' ($r.code -eq 0 -and $k5r.state -eq 'killed' -and $k6r.state -eq 'killed') "code=$($r.code) $($k5r.state)/$($k6r.state)"
+# (c) a genuinely unknown flag still fails loudly and names the accepted ones
+$r = Run-Jobs @('list', '-Bogus')
+Check 'jobs rejects an unknown flag and names the accepted flags' ($r.code -ne 0 -and $r.out -match "unknown argument '-Bogus'" -and $r.out -match '-JobId') "code=$($r.code) out=$($r.out)"
+# (d) an unknown id lists the running jobs instead of a bare refusal, and kills nothing
+$k7 = Start-Long 'argform live for bad-id'; Start-Sleep -Milliseconds 600
+$r = Run-Jobs @('kill', 'no-such-job-xyz')
+$helpful = ($r.out -match [regex]::Escape("no job 'no-such-job-xyz'")) -and (($r.out -match [regex]::Escape($k7.id)) -or ($r.out -match 'jobs\.ps1 list'))
+Check 'jobs kill on an unknown id lists the running job ids (or how to get them)' ($r.code -eq 2 -and $helpful) "code=$($r.code) out=$($r.out)"
+& pwsh -NoProfile -File $jobs kill $k7.id | Out-Null   # the bad-id call must have left it alive
+Start-Sleep -Milliseconds 800
+$k7r = Job-Killed $k7.id
+Check 'a bad-id kill does not touch a running job' ($k7r.state -eq 'killed') "state=$($k7r.state)"
+
 # DEAD: registry says running, pid gone, no EXIT marker
 $deadId = 'dead-0001'; $deadLog = Join-Path $cwd 'dead.log'; Set-Content -LiteralPath $deadLog -Value 'partial'
 @{ id = $deadId; label = 'ghost'; command = 'x'; cwd = $cwd; pid = 999999; pidStart = 1; log = $deadLog; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-3).ToString('o'); state = 'running'; ownerPid = 999999; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME "jobs\$deadId.json")

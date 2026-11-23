@@ -4,7 +4,9 @@ jobs — inspect and manage background jobs registered by job-start.ps1.
   jobs.ps1 list [-All] [-Json]   id, label, state, runtime, expected, last-output age, log
                                  (finished jobs older than 24 h hidden unless -All)
   jobs.ps1 show <id> [-Tail 30]  registry json + computed state + log tail
-  jobs.ps1 kill <id>             taskkill /T /F the job's process tree; state killed
+  jobs.ps1 kill <id> [<id>...]   taskkill /T /F each job's process tree; state killed.
+                                 an id may be positional, named (-JobId <id> / -Id <id>), several at
+                                 once, or one comma/space separated value
   jobs.ps1 prune [-Days 7]       delete finished/dead/killed entries older than -Days
   jobs.ps1 reap [-WhatIf] [-Json]  reconcile the registry: a job still `running`/`starting` whose pid is
                                  dead or was recycled is marked `dead` (+ endedAt, reapedBy). A live job is
@@ -21,7 +23,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 . (Join-Path $PSScriptRoot 'agentq-jobs-lib.ps1')
 
-$Verb = 'list'; $Target = $null; $All = $false; $Json = $false; $Kill = $false; $WhatIf = $false; $Days = 7; $Tail = 30
+$Verb = 'list'; $Targets = [Collections.Generic.List[string]]::new(); $All = $false; $Json = $false; $Kill = $false; $WhatIf = $false; $Days = 7; $Tail = 30
+# A job id may be given positionally (jobs.ps1 kill <id>), named (-JobId <id> / -Id <id>), several at
+# once, or as one comma/space separated value. Every id lands in $Targets; the single-id verb (show)
+# requires exactly one, the multi-id verb (kill) iterates them all.
+function Add-JobTarget([string]$value) {
+  foreach ($t in ("$value" -split '[,\s]+' | Where-Object { $_ -ne '' })) { [void]$script:Targets.Add($t) }
+}
 $argv = @($args); $i = 0
 if ($argv.Count -and "$($argv[0])" -notlike '-*') { $Verb = "$($argv[0])".ToLowerInvariant(); $i = 1 }
 while ($i -lt $argv.Count) {
@@ -31,10 +39,14 @@ while ($i -lt $argv.Count) {
     'json' { $Json = $true }
     'kill' { $Kill = $true }
     'whatif' { $WhatIf = $true }
-    'days' { $i++; $Days = [double]$argv[$i] }
-    'tail' { $i++; $Tail = [int]$argv[$i] }
-    'id' { $i++; $Target = "$($argv[$i])" }
-    default { if ($a -notlike '-*' -and -not $Target) { $Target = $a } else { throw "jobs: unknown argument '$a'" } }
+    'days' { $i++; if ($i -ge $argv.Count) { throw 'jobs: -Days needs a value' }; $Days = [double]$argv[$i] }
+    'tail' { $i++; if ($i -ge $argv.Count) { throw 'jobs: -Tail needs a value' }; $Tail = [int]$argv[$i] }
+    'id' { $i++; if ($i -ge $argv.Count) { throw 'jobs: -Id/-JobId needs a value' }; Add-JobTarget "$($argv[$i])" }
+    'jobid' { $i++; if ($i -ge $argv.Count) { throw 'jobs: -Id/-JobId needs a value' }; Add-JobTarget "$($argv[$i])" }
+    default {
+      if ($a -notlike '-*') { Add-JobTarget $a }
+      else { throw "jobs: unknown argument '$a' (accepted: -All, -Json, -Kill, -WhatIf, -Days <n>, -Tail <n>, -Id <id>, -JobId <id>)" }
+    }
   }
   $i++
 }
@@ -58,11 +70,30 @@ function Show-List {
   } | Format-Table -AutoSize | Out-String -Width 260
 }
 
+function Show-UnknownId([string]$id) {
+  [Console]::Error.WriteLine("jobs: no job '$id' in $(Get-JobDir)")
+  $live = @(Get-AllJobs | ForEach-Object { Get-JobView $_ } | Where-Object { $_.state -in 'running', 'suspect', 'starting' })
+  if ($live.Count) {
+    [Console]::Error.WriteLine('running jobs (kill -JobId <id>):')
+    foreach ($v in $live) { [Console]::Error.WriteLine(("  {0}  {1}  ({2})" -f $v.id, $v.label, $v.state)) }
+  } else { [Console]::Error.WriteLine('no running jobs; list every registered job with: jobs.ps1 list [-All]') }
+}
+
 function Get-Target {
-  if (-not $Target) { throw "jobs ${Verb}: job id required" }
-  $j = Read-Job $Target
-  if (-not $j) { [Console]::Error.WriteLine("jobs: no job '$Target' in $(Get-JobDir)"); exit 2 }
+  if (-not $script:Targets.Count) { throw "jobs ${Verb}: job id required" }
+  if ($script:Targets.Count -gt 1) { throw "jobs ${Verb}: expected one job id, got $($script:Targets.Count) - use 'jobs kill' for several" }
+  $j = Read-Job $script:Targets[0]
+  if (-not $j) { Show-UnknownId $script:Targets[0]; exit 2 }
   $j
+}
+
+function Get-Targets {
+  if (-not $script:Targets.Count) { throw "jobs ${Verb}: job id required" }
+  foreach ($id in $script:Targets) {
+    $j = Read-Job $id
+    if (-not $j) { Show-UnknownId $id; exit 2 }
+    $j
+  }
 }
 
 function Show-Job {
@@ -81,13 +112,15 @@ function Stop-Tree([int]$procId) {
 }
 
 function Invoke-Kill {
-  $j = Get-Target
-  $procId = [int]$j['pid']
-  if (Test-JobPidAlive $procId $j['pidStart']) { Stop-Tree $procId | ForEach-Object { "  $_" } }
-  else { "pid $procId is not running (or was recycled); marking killed" }
-  Update-Job $j['id'] @{ state = 'killed'; endedAt = (Get-JobIso ([DateTime]::UtcNow)) }
-  try { [IO.File]::AppendAllText("$($j['log'])", "KILLED by jobs.ps1 kill at $(Get-JobIso ([DateTime]::UtcNow))`n") } catch { }
-  "killed $($j['id'])"
+  $targets = @(Get-Targets)   # resolve every id first, so a bad id aborts before killing anything
+  foreach ($j in $targets) {
+    $procId = [int]$j['pid']
+    if (Test-JobPidAlive $procId $j['pidStart']) { Stop-Tree $procId | ForEach-Object { "  $_" } }
+    else { "pid $procId is not running (or was recycled); marking killed" }
+    Update-Job $j['id'] @{ state = 'killed'; endedAt = (Get-JobIso ([DateTime]::UtcNow)) }
+    try { [IO.File]::AppendAllText("$($j['log'])", "KILLED by jobs.ps1 kill at $(Get-JobIso ([DateTime]::UtcNow))`n") } catch { }
+    "killed $($j['id'])"
+  }
 }
 
 function Invoke-Prune {
