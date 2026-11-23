@@ -1559,6 +1559,17 @@ function Invoke-FlakesVerb {
   Write-Output '== recent land trees'
   foreach ($t in @($r.trees) | Select-Object -First 10) { Write-Output ("  {0} {1} green={2} attempts={3} lastFailed={4}" -f "$($t.ts)".Substring(0, 16), (Short $t.tree), $t.green, $t.attempts, $t.lastFailed) }
 }
+# How long a land ticket waits for its turn. The generic -TimeoutMin default (60) was made for builds; on
+# land it was the queue's attrition engine (2026-11-23: 10 x "timed out after 60 min" in 90 min, 11
+# waiters, main still for 90+ min - each timed-out agent re-queued at the BACK). A dead waiter is already
+# reaped by pid, so a long bound only keeps live agents in line. Config `landWaitMin` (default 360);
+# an explicit -TimeoutMin still wins.
+function Get-LandWaitMin {
+  if ($TimeoutGiven) { return $TimeoutMin }
+  $c = Get-Config
+  if ($c -and $c.ContainsKey('landWaitMin') -and [int]$c['landWaitMin'] -gt 0) { return [int]$c['landWaitMin'] }
+  360
+}
 # ---- land batching (ADR 0003 W2-5) ----------------------------------------------------------------
 # Opt-in per repo (config landBatch { repo: true }; defaults codai + brivio; AGENTQ_LAND_BATCH=0 off).
 # The land holder absorbs up to landBatchMax-1 waiting land tickets for the same -Onto and the same
@@ -2433,7 +2444,7 @@ function Invoke-Land {
   try {
     $script:WaitAborted = $false
     $script:WaitAbort = { Test-Path -LiteralPath $myResult }.GetNewClosure()
-    Wait-Turn $t $TimeoutMin $null
+    Wait-Turn $t (Get-LandWaitMin) $null
     $script:WaitAbort = $null
     if ($script:WaitAborted -or (Test-Path -LiteralPath $myResult)) {
       # Absorbed into another holder's batch (W2-5): its result is ours.

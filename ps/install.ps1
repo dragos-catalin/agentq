@@ -78,7 +78,7 @@ $map = [ordered]@{
   # read-only status; hook-pre.ps1 now lives in this repository (OQ-010).
   'bin\agentq-probe.ps1' = 'bin\agentq-probe.ps1'; 'bin\agentq-prune.ps1' = 'bin\agentq-prune.ps1'; 'bin\agentq-doctor.ps1' = 'bin\agentq-doctor.ps1'
   'hooks\hook-pre.ps1' = 'hooks\hook-pre.ps1'; 'tests\test-hook-pre.ps1' = 'hooks\test-hook-pre.ps1'
-  'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'
+  'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'; 'tests\test-land-wait.ps1' = 'bin\test-land-wait.ps1'
   'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
   # 2026-11-21: the release `phase` is the last checkpoint, not the failed step - display + schema pinned
   'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'
