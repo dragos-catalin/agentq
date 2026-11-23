@@ -1938,7 +1938,23 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   $sp = "$(P $slot 'path')"
   $topicSha = "$(& git -C $main rev-parse --verify -q "$topicRef^{commit}" 2>$null)".Trim()
   if (-not $topicSha) { & $skip 'the topic does not resolve to a commit'; return }
-  if (-not (Test-GitClean $sp)) { & $skip 'the slot has uncommitted or untracked files'; return }
+  # 2026-11-23: a dirty tree was the TOP cause of the gate running INSIDE the cap-1 land mutex - measured
+  # 171 of the `land-pregate-skipped` lines in 48 h said exactly this (138 codai + 33 brivio), and every
+  # one of them pushed a 5-40 min gate (p90; 3 h max) under the mutex and made the whole queue wait. The
+  # tree we picked was the one the CALLER (or its session) holds, dirty because the agent is still working
+  # in it. A dirty tree only disqualifies the GATE, not the pre-gate: rent the resettable scratch slot
+  # instead (Get-PregateScratchSlot re-initialises it to origin/<onto>, so it never judges foreign files)
+  # and skip only when no scratch can be had either. A rented scratch is reset above and never reaches here.
+  if (-not (Test-GitClean $sp)) {
+    if (-not $script:PregateOwnedSlot -and (Get-LandPregateFromMain $repo.Name)) {
+      $alt = Get-PregateScratchSlot $repo $Onto
+      if ($alt) {
+        $slot = $alt; $script:PregateOwnedSlot = $alt; $sp = "$(P $slot 'path')"
+        Write-Output "land: pre-gate in a rented scratch slot ($($repo.Name)/$(P $slot 'slot')) - the slot the caller stands in has uncommitted files; released when the gate is done"
+      }
+    }
+    if (-not (Test-GitClean $sp)) { & $skip 'the slot has uncommitted or untracked files'; return }
+  }
   $c = Get-Config
   $rounds = if ($c.ContainsKey('landPregateRounds')) { [math]::Max(1, [int]$c['landPregateRounds']) } else { 2 }
   for ($round = 1; $round -le $rounds; $round++) {

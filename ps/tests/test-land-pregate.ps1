@@ -37,7 +37,7 @@ $cfg = Join-Path $tmp 'cfg.json'
 # scratchSlotsMax:3 pins the scratch pool to exactly the floor for THIS fixture: cases 5/5c/5e exercise
 # "the pool is full" (the pre-gate skips), holding scratch-1..3 and expecting no scratch-4. The elastic pool
 # (an index beyond the floor when the machine has room) is covered by tests/test-slot-budget.ps1.
-function Cfg([string]$extra = '') { "{`"taskSlotsPerRepo`":12,`"taskSlotsMachine`":14,`"scratchSlotsMax`":3,`"minFreeCommitGB`":0,`"landGate`":{`"$repoName`":`"pnpm land:gate`"}$extra}" | Set-Content $cfg }
+function Cfg([string]$extra = '') { "{`"taskSlotsPerRepo`":15,`"taskSlotsMachine`":17,`"scratchSlotsMax`":3,`"minFreeCommitGB`":0,`"landGate`":{`"$repoName`":`"pnpm land:gate`"}$extra}" | Set-Content $cfg }
 Cfg
 $env:AGENTQ_CONFIG = $cfg
 # A leased task slot on a fresh topic branch; returns the lease.
@@ -267,12 +267,34 @@ try {
   Check '5e ... and the session''s own slot is back on its commit, clean' ((git -C $l5e.path rev-parse HEAD) -eq $head5e -and -not (git -C $l5e.path status --porcelain))
   $null = AQ unlease -Repo $l5e.path -LeaseId $l5e.leaseId -Reason 'test 5e done'
 
-  # 6. when the pre-gate cannot run, the land still works and says why (gate in the queue as before)
+  # 6. a dirty CALLER slot is no longer a reason to skip the pre-gate: it rents the resettable scratch slot
+  #    and gates the rebased result there (6b). It skips ONLY when no scratch can be had either - that is
+  #    6, with the pool held full by the fixture. Measured 2026-11-23: 171 of the `land-pregate-skipped`
+  #    lines in 48 h said "the slot has uncommitted or untracked files", each pushing a 5-40 min gate into
+  #    the cap-1 land mutex.
+  Cfg ",`"landPregateScratchWaitMin`":0"
+  $hold6 = @(1..3 | ForEach-Object {
+    Push-Location $repo
+    try { $o = AQ lease -Role scratch -Slot "scratch-$_" -Purpose 'hold for 6' -Ref origin/dev -Json -Wait -MaxMin 0 } finally { Pop-Location }
+    $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  })
+  Check '6 the fixture holds all three scratch slots' (@($hold6 | Where-Object { $_.leaseId }).Count -eq 3) ($hold6 | ConvertTo-Json -Compress)
   $l6 = Slot 'p6'; Commit $l6 'p6.txt' 'p6' 'p6'
   Set-Content (Join-Path $l6.path 'scratch.txt') 'uncommitted'
   $o = LandFrom $l6.path @('-Branch', 'p6', '-Purpose', 'land p6')
-  Check '6 dirty slot -> pre-gate skipped with the reason, gate in the queue, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p6')[0].reason -match 'uncommitted' -and @(Gates '^land gate p6').Count -eq 1 -and @(Gates 'land pregate p6').Count -eq 0) $o
+  Check '6 dirty slot + no free scratch -> pre-gate skipped with the reason, gate in the queue, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p6')[0].reason -match 'uncommitted' -and @(Gates '^land gate p6').Count -eq 1 -and @(Gates 'land pregate p6').Count -eq 0) $o
   Check '6 the uncommitted file was not touched' ((Get-Content (Join-Path $l6.path 'scratch.txt')) -eq 'uncommitted')
+  foreach ($l in $hold6) { $null = AQ unlease -Repo $l.path -LeaseId $l.leaseId -Reason 'test 6 done' }
+  # 6b. a dirty CALLER slot with a FREE scratch: the pre-gate rents the scratch, gates the rebased result
+  #     there, leaves the caller's tree untouched, releases the scratch, and the queue does not gate again.
+  $l6b = Slot 'p6b'; Commit $l6b 'p6b.txt' 'p6b' 'p6b'
+  Set-Content (Join-Path $l6b.path 'scratch.txt') 'uncommitted'
+  $o = LandFrom $l6b.path @('-Branch', 'p6b', '-Purpose', 'land p6b')
+  $t6b = @(GateTrees 'land pregate p6b')
+  Check '6b dirty caller slot -> pre-gate runs in a rented scratch slot, not in the queue' ($code -eq 0 -and (Remote 'p6b.txt') -eq 'p6b' -and $t6b.Count -eq 1 -and "$($t6b[0].root)" -match 'scratch-\d+$' -and @(Ev 'land-pregate-skipped' 'p6b').Count -eq 0 -and @(Ev 'land-pregate-slot-released' 'p6b').Count -eq 1) ("$o || " + ($t6b | ConvertTo-Json -Compress))
+  Check '6b the queue did not gate again (the tree went into the green ledger)' (@(Gates '^land gate p6b').Count -eq 0 -and @(Ev 'land-gate-skipped-green').Count -ge 1) ($o -join ' | ')
+  Check '6b the caller''s uncommitted file was not touched and its slot is still on p6b' ((Get-Content (Join-Path $l6b.path 'scratch.txt')) -eq 'uncommitted' -and (git -C $l6b.path symbolic-ref --short HEAD) -eq 'p6b')
+  Cfg
   $l7 = Slot 'p7'; Commit $l7 'p7.txt' 'p7' 'p7'
   AdvanceDev 'pnpm-lock.yaml' 'lockfileVersion: 9'
   $o = LandFrom $l7.path @('-Branch', 'p7', '-Purpose', 'land p7')

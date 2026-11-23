@@ -48,6 +48,15 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Fixed
 
+- Land pre-gate no longer stands aside for a dirty CALLER slot. A land started from the slot its chat is
+  still working in has uncommitted files by definition, and the pre-gate used to SKIP there - which pushed
+  the whole gate (p50 7 min, p90 20-40 min, max 3 h) back INSIDE the cap-1 `land:<repo>` mutex. Measured:
+  171 of the `land-pregate-skipped` journal lines in 48 h said exactly "the slot has uncommitted or untracked
+  files" (138 codai + 33 brivio), and the queue holder was seen spending 49 of its 99 minutes running gates
+  under the mutex. It now rents the resettable scratch slot for the gate (the same `Get-PregateScratchSlot`
+  the shared-clone path uses; reset to `origin/<onto>` so it can never judge files that are not the topic's),
+  leaves the caller's tree untouched, and releases it when the gate is done. It skips only when no scratch
+  can be had either.
 - Shared-clone guard (ADR 0004): `sharedCloneMode: refuse` now **really denies** a source write instead of
   returning `WARNING (allowed)`. The axiom D-40 soft path downgraded the documented refusal, and the journal
   proves the writes went through anyway: 710 `shared-write` events for codai (mode `refuse`) between
