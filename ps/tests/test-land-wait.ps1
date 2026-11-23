@@ -3,6 +3,8 @@
 # re-queued at the back. Here landWaitMin=1 while a blocker holds the land: the waiter must give up after
 # 1 min (proving the config, not 60, bounds the wait). The blocker's push then hands the pre-push hook the
 # tree it gated (AGENTQ_LAND_GREEN_TREE/_GATE). Isolated in %TEMP%; ~75 s.
+# `landRequeueMax: 0` keeps that single window explicit: the requeue-on-timeout behaviour has its own suite
+# (test-land-reap.ps1), which would otherwise make this waiter land once the blocker released.
 param([string]$Aq = (Join-Path $PSScriptRoot '..\bin\agentq.ps1'))
 $ErrorActionPreference = 'Stop'
 $Aq = (Resolve-Path $Aq).Path
@@ -23,7 +25,7 @@ git init -q -b dev $repo; git -C $repo config user.email t@t; git -C $repo confi
 Set-Content (Join-Path $repo 'a.txt') 'a'; git -C $repo add a.txt; git -C $repo commit -qm init
 git -C $repo remote add origin $bare; git -C $repo push -q -u origin dev 2>$null
 $cfg = Join-Path $tmp 'cfg.json'
-'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"minFreeCommitGB":0,"landBatchMax":1,"landWaitMin":1}' | Set-Content $cfg
+'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"minFreeCommitGB":0,"landBatchMax":1,"landWaitMin":1,"landRequeueMax":0}' | Set-Content $cfg
 $env:AGENTQ_CONFIG = $cfg
 $tw = Join-Path $tmp 'topic'
 git -C $repo worktree add -q --detach $tw origin/dev 2>$null

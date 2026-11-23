@@ -1708,6 +1708,24 @@ function Set-GreenTree([string]$repoName, [string]$tree, [string]$gate, [int]$se
     }
   } catch {}
 }
+# 2026-11-23: the land auto-reap needs "did SOMEONE pass a gate for this repo recently", not "is MY tree
+# green": the waiter's tree is the rebased merge result, which it cannot reconstruct before it holds the
+# lock. Set-GreenTree stamps `by` = the session that ran the gate, so a holder that ran a gate has an entry.
+function Test-GreenBySession([string]$repoName, [string]$session) {
+  if (-not $session -or $env:AGENTQ_NO_GREEN -eq '1') { return $false }
+  try {
+    $f = Get-GreenFile $repoName
+    if (-not [IO.File]::Exists($f)) { return $false }
+    $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable -DateKind String
+    if (-not $j) { return $false }
+    $c = Get-Config
+    $ttl = if ($c.ContainsKey('greenTtlHours')) { [double]$c['greenTtlHours'] } else { 168.0 }
+    foreach ($e in $j.Values) {
+      if ("$(P $e 'by' '')" -eq $session -and (((Now) - (ParseUtc "$(P $e 'at' '')")).TotalHours -le $ttl)) { return $true }
+    }
+  } catch {}
+  $false
+}
 # ---- land quarantine (ADR 0009 stage 0; 2026-11-23) -----------------------------------------------
 # A topic whose PRE-GATE failed is remembered per repo (<AGENTQ_HOME>/land/<repo>.json - the NEGATIVE
 # mirror of the green ledger) for `landQuarantineHours` (default 6). The batch picker SKIPS such a topic
@@ -2382,6 +2400,37 @@ function Invoke-LandBisect([object[]]$set) {
     }
   } else { foreach ($tp in $fs) { $script:LandAcc.results[$tp.branch] = @{ exit = $r.failExit; sha = ''; nothing = $false } } }
 }
+# 2026-11-23: a land HOLDER that gated GREEN but never landed, whose heartbeat went STALE, holds
+# land:<repo> forever (measured: 85.9 min on one topic, gate already green, its pid healthy, released only
+# by a MANUAL `agentq break -Id`). Get-Live reaps by pid liveness, so an ALIVE-but-wedged holder survives -
+# and the heartbeat thread job cannot be stopped by load, so "heartbeat stale + pid alive" is the wedged
+# signature. From the waiting side, while it polls (Wait-All -> $script:WaitPoll), a land waiter looks for
+# such a holder whose session already has a GREEN tree for this repo and for which NO land/land-batch event
+# has appeared since it took the ticket, and breaks it so this waiter can take the freed cap-1 lock.
+# Journaled `land-autoreap`. A holder whose gate is NOT green is never touched: that may be a long gate.
+function Invoke-LandWedgeReap($repo) {
+  if ($script:ReadOnly) { return $false }
+  $res = "land:$($repo.Name)"
+  $live = @(Get-Live $res); if (-not $live) { return $false }
+  $cap = Get-Capacity $res
+  $did = $false
+  foreach ($h in @($live | Where-Object { Test-Held $_ $live $cap })) {
+    if (-not $h.stale) { continue }                                # only within the stale window
+    if (-not (Test-Alive $h)) { continue }                         # a dead pid is reaped by Get-Live already
+    $sess = "$(P $h 'session' '')"; if (-not $sess) { continue }
+    if (-not (Test-GreenBySession $repo.Name $sess)) { continue }   # gate not green -> could be a real long gate
+    $since = ParseUtc $h.created
+    $done = @(Read-Journal 0 $since $repo.Name | Where-Object { $ev = "$(JProp $_ 'event')"; ($ev -eq 'land' -or $ev -eq 'land-batch') -and ("$(JProp $_ 'resource')" -eq $res) })
+    if ($done.Count) { continue }                                  # a land event exists -> the holder is progressing/finished
+    $heldSec = [int][math]::Round(((Now) - $since).TotalSeconds)
+    $reason = "gate is green but no land event appeared within the stale window; pid $($h.pid) is alive yet wedged ($($h.beatAgeMin) min since the last heartbeat)"
+    Write-Journal @{ event = 'land-autoreap'; resource = $res; ticket = $h.id; holderSession = $sess; heldSec = $heldSec; staleMin = $h.beatAgeMin; reason = $reason; repo = $repo.Name }
+    Remove-Ticket $h "land-autoreap: $reason" 'break'
+    [Console]::Error.WriteLine("agentq: land-autoreap - broke wedged holder $($h.id) (session $sess, $($h.beatAgeMin) min stale, held $([math]::Round($heldSec / 60.0, 1)) min) on ${res} - its gate is green but nothing landed")
+    $did = $true
+  }
+  $did
+}
 # One land slot per repo: pick the topic's not-yet-upstream commits onto origin/<onto>, resolve the
 # documented conflicts, gate, push (never forced), notify running releases. Exit 0 landed / already
 # landed, 5 conflict, 6 gate failed, 7 push refused, 8 CHANGELOG grew > 1.5x (refused before push),
@@ -2490,7 +2539,11 @@ function Invoke-Land {
   try {
     $script:WaitAborted = $false
     $script:WaitAbort = { Test-Path -LiteralPath $myResult }.GetNewClosure()
-    Wait-Turn $t (Get-LandWaitMin) $null
+    # While land:<repo> is held this waiter polls Wait-All, which runs the per-poll hook below: it reaps a
+    # WEDGED holder (gate green, no land event, heartbeat stale) so the cap-1 lock is not stuck forever
+    # (2026-11-23). Cleared on BOTH the absorbed-in-a-batch return and the finally.
+    $script:WaitPoll = { Invoke-LandWedgeReap $repo }.GetNewClosure()
+    try { Wait-Turn $t (Get-LandWaitMin) $null } finally { $script:WaitPoll = $null }
     $script:WaitAbort = $null
     if ($script:WaitAborted -or (Test-Path -LiteralPath $myResult)) {
       # Absorbed into another holder's batch (W2-5): its result is ours.
@@ -2560,6 +2613,7 @@ function Invoke-Land {
     $script:LandExit = [int]$own.exit
   } finally {
     $script:WaitAbort = $null
+    $script:WaitPoll = $null
     # A holder that dies mid-batch hands every absorbed waiter back to the queue.
     if (-not $peersDone) { foreach ($tp in @($set | Where-Object { -not $_.own })) { try { Update-Ticket $tp.ticket @{ batchedBy = '' } } catch {} } }
     if ($hb) { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }

@@ -329,6 +329,12 @@ $MDir = Join-Path $SysRoot 'marks'
 $Journal = Join-Path $SysRoot 'journal.jsonl'
 $JournalD = Join-Path $SysRoot 'journal.d'
 foreach ($d in $Root, $QDir, $MDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force $d | Out-Null } }
+# Optional state Wait-All reads/writes. This file runs under Set-StrictMode, where READING an unset
+# script-scope variable is an error - so both exist from the start. agentq-v2.ps1 sets WaitPoll (a
+# per-poll hook, currently Invoke-LandWedgeReap) while a land waiter polls; LandRequeue counts the
+# land requeues tried in this process (one land per process).
+$script:WaitPoll = $null
+$script:LandRequeue = 0
 # Journal file for one event: in system mode a repo's events go to journal.d/<repo>.jsonl (group r-<repo>)
 # when that file's directory exists, so their purposes/commands stay inside the repo's group.
 function Get-JournalFor([hashtable]$e) {
@@ -984,6 +990,11 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
     # ADR 0003 W2-5: a land waiter absorbed into another holder's batch stops waiting once its result exists.
     if ($script:WaitAbort -and (& $script:WaitAbort)) { $script:WaitAborted = $true; return }
     foreach ($t in $tickets) { Assert-NotMarked $t.resource; [IO.File]::SetLastWriteTimeUtc("$($t.file).hb", (Now)) }
+    # A land waiter installs a per-poll hook (Invoke-LandWedgeReap in agentq-v2.ps1): it reaps a WEDGED
+    # land HOLDER (heartbeat stale, gate green, no land event) so the freed cap-1 lock goes to this waiter
+    # instead of needing a manual `agentq break -Id` (2026-11-23: 85.9 min on one topic, gate already green).
+    # `$null =`: the hook RETURNS a bool, and an emitted value from here would land on agentq's STDOUT.
+    if ($script:WaitPoll) { try { $null = & $script:WaitPoll } catch {} }
     # OQ-004: refresh the load sample (at most every admission.everySec, one sampler at a time) BEFORE
     # the scheduler mutex, so a slow process start on a saturated machine never holds the scheduler.
     if (@($tickets | Where-Object { $_.resource -eq 'build:machine' }).Count) { $null = Get-AdmissionLoad }
@@ -1023,6 +1034,28 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
       $announced = Now
     }
     if ((Now) -gt $deadline) {
+      # 2026-11-23: a LAND that hit its window used to LEAVE the queue (exit 3) - with 8+ waiters ahead the
+      # attempts "evaporated" (measured 10 x "timed out after 60 min" in 90 min, each re-queued by hand at
+      # the BACK), so a deep land queue never advanced. Instead the SAME ticket goes back to the HEAD of its
+      # queue (seq 0, below every live seq; prio/bump = its ORIGINAL priority kept) and waits one more window,
+      # bounded by `landRequeueMax` (default 3). Journaled `land-requeue`. Only after the cap does it give up,
+      # so it can never loop forever. A non-land resource keeps the old give-up behaviour.
+      $isLand = @($tickets | Where-Object { "$($_.resource)".StartsWith('land:') }).Count -gt 0
+      if ($isLand -and -not $script:ReadOnly) {
+        $maxRequeue = 3
+        try { $lc = Get-Config; if ($lc.ContainsKey('landRequeueMax') -and $null -ne $lc['landRequeueMax']) { $maxRequeue = [math]::Max(0, [int]$lc['landRequeueMax']) } } catch {}
+        if ($script:LandRequeue -lt $maxRequeue) {
+          $script:LandRequeue++
+          foreach ($t in $tickets) {
+            $waitedSec = [int][math]::Round(((Now) - (ParseUtc $t.created)).TotalSeconds)
+            Update-Ticket $t @{ seq = [long]0 }
+            Write-Journal @{ event = 'land-requeue'; resource = $t.resource; ticket = $t.id; waitedSec = $waitedSec; attempts = [int]$script:LandRequeue; max = $maxRequeue; seq = [long]0; purpose = $t.purpose }
+          }
+          [Console]::Error.WriteLine("agentq: land wait expired after $timeoutMin min - put back at the HEAD of the queue (attempt $($script:LandRequeue)/$maxRequeue); nothing lost")
+          $deadline = (Now).AddMinutes($timeoutMin)
+          continue
+        }
+      }
       foreach ($t in $tickets) { Remove-Ticket $t "timed out after $timeoutMin min" 'timeout' }
       [Console]::Error.WriteLine("agentq: gave up waiting for $(($tickets | ForEach-Object resource) -join ',') after $timeoutMin min")
       exit 3

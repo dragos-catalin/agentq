@@ -80,6 +80,9 @@ $suites = [ordered]@{
   'land pregate'    = @('-File', (Join-Path $PSScriptRoot 'test-land-pregate.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'pregate lease reap' = @('-File', (Join-Path $PSScriptRoot 'test-pregate-lease-reap.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land wait'      = @('-File', (Join-Path $PSScriptRoot 'test-land-wait.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-23: the waiter reaps a wedged land holder whose gate is green (land-autoreap) and puts its own
+  # ticket back at the HEAD of the queue when its window expires instead of leaving (land-requeue).
+  'land reap'      = @('-File', (Join-Path $PSScriptRoot 'test-land-reap.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land install'   = @('-File', (Join-Path $PSScriptRoot 'test-land-install.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'admission'       = @('-File', (Join-Path $PSScriptRoot 'test-agentq-admission.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
