@@ -81,7 +81,7 @@ v3 SCHEDULER (devcloud F1, 2026-10-11)
   quick/interactive get `quickBurst` extra slots; non-batch jobs may run beside batch holders
   (batch runs at Idle CPU). Idle-yield: a holder whose process tree burned < idleCpuSec over
   idleYieldMin stops counting against the machine cap until CPU returns.
-  agentq bump    [-Id t] -By 20 -Reason "..."            raise my waiting ticket (cap bumpMax)
+  agentq bump    [-Id t | -Session s] -By 20 -Reason "..."  raise MY waiting ticket; -Session/-Id target one explicitly (cap bumpMax)
   agentq burst   [-Resource build:machine] -By 1 -Minutes 30 -Reason "..."  temporary extra slot
                   (refused when RAM/commit headroom < 2x the gate; cap burstMax/burstMaxMin)
   agentq propose [-Reason "..."]  diagnose my wait and APPLY safe remedies (break dead/STALE >2x
@@ -137,6 +137,13 @@ EXIT CODES: 0 ok; command's own exit code for `run`; 3 = frozen/blocked or timed
 # ("parameter name '' is ambiguous"). Everything after the first `--` is the command.
 $Verb = 'status'; $Resource = $null; $Purpose = $null; $Message = $null; $Paths = @()
 $Repo = $null; $ExpectRepo = $null; $State = $null; $Reason = $null; $Id = $null
+# -Session <id> (2026-11-23): tick the SELECTOR for `bump`. Bare `bump` matches the caller's own
+# session; -Session names a session explicitly and -Id names one ticket, so a waiter can bump ONLY its
+# own ticket instead of the sibling whose session the bare form happened to resolve to (the reported
+# bug: `bump -By 20` from one session raised a land + a perf(gate) land to 105/100). Kept out of
+# $script: - the script scope IS the top scope, so a $script: reset after the parse loop would wipe it
+# (the 2026-11-22 class that silently dropped -Lane/-Priority/-Capacity).
+$PickSession = $null
 $Capacity = 1; $TimeoutMin = 60; $StaleMin = 10; $Last = 30; $Hours = 12; $MinFreeGB = 6
 $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGiven = $false
 $StaleOnly = $false; $IdleHours = [double]0; $Reclaim = $false; $Track = $false
@@ -219,6 +226,7 @@ while ($i -lt $argv.Count) {
     'state' { $State = & $next }
     'reason' { $Reason = & $next }
     'id' { $Id = & $next }
+    'session' { $PickSession = & $next }
     'capacity' { $Capacity = [int](& $next); $CapacityGiven = $true }
     'timeoutmin' { $TimeoutMin = [int](& $next); $TimeoutGiven = $true }
     'stalemin' { $StaleMin = [int](& $next) }
@@ -1011,7 +1019,7 @@ function Wait-All([object[]]$tickets, [hashtable]$gates, [int]$timeoutMin) {
         "$($t.resource) [$($t.lane)] $why; held by: $who"
       }
       [Console]::Error.WriteLine("agentq: waiting — $($msgs -join ' | ')")
-      [Console]::Error.WriteLine("        stuck? agentq propose -Reason '...' | agentq bump -By 20 -Reason '...' | agentq burst -Resource build:machine -Reason '...'")
+      [Console]::Error.WriteLine("        stuck? agentq propose -Reason '...' | agentq bump [-Id <hash>] -By 20 -Reason '...' | agentq burst -Resource build:machine -Reason '...'")
       $announced = Now
     }
     if ((Now) -gt $deadline) {
@@ -1111,21 +1119,54 @@ function Find-MyTickets {
     $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
     if (-not $sample) { continue }
     $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
-    $out += @(Get-Live $res | Where-Object { (-not $Id -and $_.session -eq $Session) -or ($Id -and $_.id -eq $Id) })
+    # Selector, in order of preference (2026-11-23): -Id names ONE ticket; -Session names a session;
+    # bare matches the CALLER's own session. Before this there was no -Session, and the bare form
+    # silently matched whichever session the env resolved to - so a waiter could bump a SIBLING's ticket.
+    $out += @(Get-Live $res | Where-Object {
+        if ($Id) { "$($_.id)" -eq "$Id" }
+        elseif ($PickSession) { "$($_.session)" -eq "$PickSession" }
+        else { "$($_.session)" -eq $Session }
+      })
+  }
+  $out
+}
+# Every live ticket of ONE session, across EVERY repo (Find-MyTickets honours -Id/-Session and the
+# caller's own session only); with $OnlyWaiting it drops the held ones. `status` uses it to print a
+# session's OWN waiting ticket ids - the other half of the bump bug: the id was never visible, so a
+# waiter could not target `bump -Id <hash>` even though -Id existed.
+function Get-SessionTickets([string]$sess, [bool]$OnlyWaiting) {
+  $out = @()
+  foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
+    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
+    if (-not $sample) { continue }
+    $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
+    $live = @(Get-Live $res); $cap = Get-Capacity $res
+    foreach ($t in $live) {
+      if ("$($t.session)" -ne "$sess") { continue }
+      $held = Test-Held $t $live $cap
+      if ($OnlyWaiting -and $held) { continue }
+      $t | Add-Member -NotePropertyName heldState -NotePropertyValue $held -Force
+      $out += $t
+    }
   }
   $out
 }
 function Invoke-Bump {
+  if ($Id -and $PickSession) { [Console]::Error.WriteLine('agentq bump: -Id and -Session are mutually exclusive - name ONE target'); exit 2 }
   Assert-OverrideBudget 'bump'
   $by = if ($By) { $By } else { 20 }
   $max = [int](Get-Config).bumpMax
+  # Name the selector in the output and in the error, so nothing is ever silent about WHICH ticket moved.
+  $selector = if ($Id) { "id $Id" } elseif ($PickSession) { "session $PickSession" } else { "session $Session (mine)" }
   $mine = @(Find-MyTickets | Where-Object { -not (P $_ 'held' $false) })
-  if (-not $mine) { [Console]::Error.WriteLine("agentq bump: no waiting ticket for session $Session$(if ($Id) { " / id $Id" }) (pass -Id <ticket>)"); exit 2 }
+  if (-not $mine) { [Console]::Error.WriteLine("agentq bump: no waiting ticket for $selector - list them with 'agentq status' (the == MINE line), then target one: 'agentq bump -Id <hash>' or 'agentq bump -Session <id>'"); exit 2 }
+  # ALWAYS print which ticket(s) it bumped (id + session): the bare form used to bump silently and,
+  # when its session resolved to another session, bumped a SIBLING's ticket ahead of mine (2026-11-23).
   foreach ($t in $mine) {
     $nb = [math]::Min($max, [int](P $t 'bump' 0) + $by)
     Update-Ticket $t @{ bump = $nb; bumpReason = $Reason }
-    Write-Journal @{ event = 'bump'; resource = $t.resource; ticket = $t.id; by = $by; bump = $nb; reason = $Reason; purpose = $t.purpose }
-    Write-Output "bumped $($t.id) on $($t.resource) to +$nb ($Reason)"
+    Write-Journal @{ event = 'bump'; resource = $t.resource; ticket = $t.id; holderSession = $t.session; by = $by; bump = $nb; reason = $Reason; purpose = $t.purpose }
+    Write-Output "bumped ticket $($t.id) [session $($t.session)] on $($t.resource) to +$nb ($Reason)"
   }
 }
 function Invoke-Burst {
@@ -1758,6 +1799,13 @@ function Show-Status {
     Write-Output '== QUEUES'
     $rows | Format-Table resource, role, lane, prio, state, ageMin, session, purpose, id -AutoSize | Out-String -Width 240 | Write-Output
   } else { Write-Output "== QUEUES: idle$(if (-not $All -and $repo) { " for $($repo.Name) (use -All for every repo)" })" }
+  # == MINE (2026-11-23): the other half of the bump bug. The QUEUES table is repo-scoped unless -All,
+  # and it never said WHICH row was the caller's, so a waiter could not read the id of its own ticket.
+  # Print the caller's own waiting tickets (all repos) with the id, so `bump -Id <hash>` / `-Session <s>`
+  # has a target. Read-only: Get-Live/Get-Capacity never write on a read-only verb.
+  $mine = @(Get-SessionTickets $Session $true)
+  if ($mine) { Write-Output ("== MINE session {0}: {1}" -f $Session, (($mine | ForEach-Object { "$($_.id) on $($_.resource)" }) -join '; ')) }
+  else { Write-Output ("== MINE session {0}: no waiting ticket" -f $Session) }
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
   # Discoverability (2026-11-20): an agent that only ever reads `status` must still learn where the rest
   # of the tool is. One line, always last, never in -Json (that path returned above, parsers).
@@ -2000,7 +2048,7 @@ $script:AqHelp = [ordered]@{
   'log' = @{ g = 'Queue & run'; u = 'log [-Last 30] [-All] [-Json]'; d = 'recent journal: queued/start/done/fail/break/mark/note/commit' }
   'since' = @{ g = 'Queue & run'; u = 'since [-Hours 12] [-Json]'; d = 'what changed in this repo: journal + git log' }
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
-  'bump' = @{ g = 'Fairness & overrides (v3)'; u = 'bump [-Id <ticket>] -By 20 -Reason "..."'; d = 'raise my waiting ticket in the scheduler order (cap bumpMax)' }
+  'bump' = @{ g = 'Fairness & overrides (v3)'; u = 'bump [-Id <ticket> | -Session <id>] -By 20 -Reason "..."'; d = 'raise a waiting ticket in the scheduler order (MY ticket by default; -Session/-Id name one explicitly; cap bumpMax)' }
   'burst' = @{ g = 'Fairness & overrides (v3)'; u = 'burst [-Resource build:machine] [-By 1] [-Minutes 30] -Reason "..."'; d = 'temporary extra slot, refused when RAM/commit headroom is under 2x the gate' }
   'propose' = @{ g = 'Fairness & overrides (v3)'; u = 'propose [-Reason "..."]'; d = 'diagnose my wait and APPLY safe remedies (break dead/STALE >2x, bump long waits, short burst)' }
   'metrics' = @{ g = 'Fairness & overrides (v3)'; u = 'metrics [-Hours 24] [-Json]'; d = 'wait/hold p50/p90 per resource x lane x kind' }
