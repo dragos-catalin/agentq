@@ -2213,6 +2213,7 @@ function Invoke-LandSet([object[]]$set) {
     if (-not $picked.Count) { return }
     $names = ($picked | ForEach-Object { $_.branch }) -join '+'
     if (-not (Restore-LandDeps $repo $wt $baseRev)) { $o.failExit = 10; return }
+    $greenForPush = $null
     if ($Gate) {
       # OQ-003: the exact tree about to be pushed already passed this gate (in the caller's slot, or in
       # an earlier land attempt): do not hold the land ticket for a second run of the same check.
@@ -2233,6 +2234,7 @@ function Invoke-LandSet([object[]]$set) {
         }
         Set-GreenTree $repo.Name $gateTree $Gate $script:GateSec 'land'
       }
+      $greenForPush = $gateTree
     }
     # Repo-owned land finalize (ADR 0003 W3, changelog fragments): assembles changes/*.md into ONE
     # chore(release) commit on the CURRENT origin/<onto>, so two topics never claim the same version.
@@ -2259,6 +2261,10 @@ function Invoke-LandSet([object[]]$set) {
       $o.failExit = 8; return
     }
     $pushed = $false; $noVerify = $false; $isRace = $false
+    # The pre-push hook may re-run the land gate (codai .husky/pre-push runs `pnpm gate:platform`): tell it
+    # which tree just passed which gate so it can skip a second run of the same check on the SAME tree. A
+    # finalize commit changes the tree, so the hook compares HEAD^{tree} and gates anything else.
+    if ($greenForPush) { $env:AGENTQ_LAND_GREEN_TREE = $greenForPush; $env:AGENTQ_LAND_GREEN_GATE = $Gate }
     $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
     if (-not $LASTEXITCODE) { $pushed = $true } else {
       $isRace = [bool]($out -match $LandRaceRe)
@@ -2286,6 +2292,7 @@ function Invoke-LandSet([object[]]$set) {
         }
       }
     }
+    Remove-Item Env:AGENTQ_LAND_GREEN_TREE, Env:AGENTQ_LAND_GREEN_GATE -ErrorAction SilentlyContinue
     if ($pushed) {
       $o.sha = "$(& git -C $wt rev-parse HEAD)".Trim()
       if (-not $noVerify) { Pass-Flakes $repo.Name $wt }

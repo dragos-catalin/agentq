@@ -1,7 +1,8 @@
 # Land waiters use config `landWaitMin`, not the generic -TimeoutMin default (60). On 2026-11-23 the 60-min
 # default made the codai land queue advance only by expiry: 10 waiters "timed out after 60 min" in 90 min and
 # re-queued at the back. Here landWaitMin=1 while a blocker holds the land: the waiter must give up after
-# 1 min (proving the config, not 60, bounds the wait). Isolated in %TEMP%; ~75 s.
+# 1 min (proving the config, not 60, bounds the wait). The blocker's push then hands the pre-push hook the
+# tree it gated (AGENTQ_LAND_GREEN_TREE/_GATE). Isolated in %TEMP%; ~75 s.
 param([string]$Aq = (Join-Path $PSScriptRoot '..\bin\agentq.ps1'))
 $ErrorActionPreference = 'Stop'
 $Aq = (Resolve-Path $Aq).Path
@@ -33,6 +34,11 @@ function Topic([string]$name, [string]$file) {
   git -C $tw push -q origin $name 2>$null
   git -C $repo fetch -q origin 2>$null
 }
+# The land push tells the pre-push hook which tree just passed which gate (codai's hook skips its second
+# `gate:platform` on that exact tree). The hook records what it was told and what it is pushing.
+$hookLog = Join-Path $tmp 'prepush.log'
+$hook = Join-Path $repo '.git\hooks\pre-push'
+"#!/bin/sh`necho `"`$AGENTQ_LAND_GREEN_TREE|`$(git rev-parse 'HEAD^{tree}')|`$AGENTQ_LAND_GREEN_GATE`" >> '$($hookLog -replace '\\', '/')'`nexit 0`n" | Set-Content -NoNewline $hook
 $procs = @()
 try {
   Set-Content $env:FAKE_GATE_HOLD 'x'
@@ -54,6 +60,10 @@ try {
   Check 'gave up near 1 min, not 60' ($sw.Elapsed.TotalSeconds -ge 55 -and $sw.Elapsed.TotalSeconds -lt 300) "$($sw.Elapsed.TotalSeconds)s"
   Remove-Item $env:FAKE_GATE_HOLD -Force
   Check 'blocker still lands' ($b.WaitForExit(240000) -and $b.ExitCode -eq 0) (Get-Content $bOut -Raw -ErrorAction SilentlyContinue)
+  $h = @(Get-Content $hookLog -ErrorAction SilentlyContinue)
+  $parts = if ($h.Count) { $h[-1].Split('|') } else { @('', '', '') }
+  Check 'pre-push told the gated tree' ($h.Count -ge 1 -and $parts[0] -and $parts[0] -eq $parts[1]) ($h -join ' / ')
+  Check 'pre-push told the gate command' ($parts[2] -eq 'gate') ($h -join ' / ')
 } finally {
   foreach ($p in $procs) { if (-not $p.HasExited) { try { $p.Kill($true) } catch {} } }
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
