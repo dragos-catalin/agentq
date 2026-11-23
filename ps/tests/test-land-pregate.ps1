@@ -121,7 +121,9 @@ try {
   $scr = @(Ev 'land-pregate-slot-released' 'p5')
   Check '5 first land from the clone: the pre-gate ran there, in a scratch slot (not the caller tree)' ($code -eq 7 -and @(Gates 'land pregate p5').Count -eq 1 -and (GateTrees 'land pregate p5')[0].root -match 'scratch-\d+$' -and $scr.Count -eq 1 -and "$($scr[0].slot)" -match '^scratch-\d+$') $o
   Check '5 ... and the queue did not gate again (the pre-gate recorded the tree green)' (@(Gates '^land gate p5').Count -eq 0 -and @(Ev 'land-pregate-skipped' 'p5').Count -eq 0) ((Gates 'p5') -join ' | ')
-  $leaseFile = Join-Path $env:AGENTQ_HOME ("leases\$repoName\" + "$($scr[0].slot)" + '.json')
+  $scratchDir = Join-Path $env:AGENTQ_HOME ("leases\$repoName")
+  $heldAfter5 = if (Test-Path -LiteralPath $scratchDir) { @(Get-ChildItem -LiteralPath $scratchDir -Filter 'scratch-*.json' -File -ErrorAction SilentlyContinue) } else { @() }
+  $leaseFile = if ($scr.Count -eq 1) { Join-Path $scratchDir ("$($scr[0].slot)" + '.json') } else { (($heldAfter5 | ForEach-Object { $_.FullName }) -join ', ') }
   Check '5 ... and the scratch slot was given back (lease record removed)' ($scr.Count -eq 1 -and $scr[0].exit -eq 0 -and -not (Test-Path -LiteralPath $leaseFile)) "$leaseFile"
   Remove-Item (Join-Path $bare 'reject')
   $n0 = (Journal).Count
@@ -145,9 +147,22 @@ try {
   Check '5b landPregateFromMain=false -> the clone takes no slot, the reason is journaled, the queue gates' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p5b')[0].reason -match 'not run from a leased task slot' -and @(Gates '^land gate p5b').Count -eq 1 -and @(Ev 'land-pregate-slot-released' 'p5b').Count -eq 0) $o
   # 5c. no free scratch slot: skip with the reason instead of running the gate anywhere (wait 0 = no wait)
   Cfg ",`"landPregateScratchWaitMin`":0"
+  # The scratch slot case 5's land took MUST be gone before 5c holds all three. A land that leaks it (the
+  # `finally { Release-PregateSlot }` in Invoke-Land removed) is exactly what makes the fixture below sit on
+  # a slot that is still held. Fail HERE, naming the leaked lease file, before any lease has a chance to wait.
+  $leaked = if (Test-Path -LiteralPath $scratchDir) { @(Get-ChildItem -LiteralPath $scratchDir -Filter 'scratch-*.json' -File -ErrorAction SilentlyContinue) } else { @() }
+  Check '5c the scratch slot case 5 took was given back (no scratch lease is held)' ($leaked.Count -eq 0) ("leaked lease file(s): " + (($leaked | ForEach-Object { $_.FullName }) -join ', ') + ' - the land never released its pre-gate scratch slot')
+  # A leaked slot would make the fixture below wait on a slot that is still held; give the leaked lease back
+  # (the failure is already recorded), so the suite leaves no slot behind and 5c stays bounded.
+  foreach ($lf in $leaked) {
+    $lk = try { Get-Content -LiteralPath $lf.FullName -Raw | ConvertFrom-Json } catch { $null }
+    if ($lk -and $lk.path -and $lk.leaseId) { $null = AQ unlease -Repo "$($lk.path)" -LeaseId "$($lk.leaseId)" -Reason 'cleanup: pre-gate scratch slot leaked by the land' }
+  }
+  # Bounded on purpose: -Wait -MaxMin 0 grabs a free slot on the first check but gives up at once on a held
+  # one instead of blocking, so a leak makes the fixture FAIL (fewer than three held) rather than hang.
   $hold = @(1..3 | ForEach-Object {
     Push-Location $repo
-    try { $o = AQ lease -Role scratch -Slot "scratch-$_" -Purpose 'hold for 5c' -Ref origin/dev -Json } finally { Pop-Location }
+    try { $o = AQ lease -Role scratch -Slot "scratch-$_" -Purpose 'hold for 5c' -Ref origin/dev -Json -Wait -MaxMin 0 } finally { Pop-Location }
     $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
   })
   Check '5c the fixture holds all three scratch slots' (@($hold | Where-Object { $_.leaseId }).Count -eq 3) ($hold | ConvertTo-Json -Compress)
