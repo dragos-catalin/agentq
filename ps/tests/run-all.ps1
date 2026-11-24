@@ -128,6 +128,13 @@ $suites = [ordered]@{
   # always reported, the `== MINE session` line) is pinned here; the matching install.ps1 map entry is
   # checked by 'install wiring' - a suite in this table but not in the map never reaches the gate.
   'bump selector'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-bump.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-24: a worktree whose gitdir is gone (no valid HEAD) made `Backup-Slot` throw on EVERY sweep -
+  # the lease stayed, so the same lost worktree was journalled as `lease-expire-failed` again on each tick
+  # (lostWorkIncidents grew forever) and the useless slot never left the pool. It is now ORPHANED once:
+  # moved under `<wtroot>\_orphans\<repo>-<slot>-<stamp>` with a MOVED.txt naming repo/slot/leaseId/session
+  # + the backup error, lease released, every file kept. The second half of the suite pins the trigger as
+  # NOT widened: every OTHER backup failure still fails closed, keeps the lease and stays visible.
+  'orphan broken slot' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-orphan-broken-slot.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
 # -RepoSuites: the suites THIS repo's gate runs, from bin/agentq-config.json -> gateSuites.<repo>

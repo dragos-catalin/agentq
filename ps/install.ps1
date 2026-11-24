@@ -85,6 +85,10 @@ $map = [ordered]@{
   # 2026-11-23: the `pregate lease reap` suite was in run-all.ps1 but missing from this map, so the wiring
   # gate failed on it three times (map drift, -File not a map key, gateSuites not fully installed).
   'tests\test-pregate-lease-reap.ps1' = 'bin\test-pregate-lease-reap.ps1'
+  # 2026-11-24: a broken worktree (gitdir gone -> no valid HEAD) is orphaned ONCE (moved to _orphans,
+  # lease released, files kept) instead of failing the backup and re-counting on every sweep. Paired with
+  # the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
+  'tests\test-agentq-orphan-broken-slot.ps1' = 'bin\test-agentq-orphan-broken-slot.ps1'
   'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
   # 2026-11-21: the release `phase` is the last checkpoint, not the failed step - display + schema pinned
   'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'

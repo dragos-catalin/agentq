@@ -701,8 +701,62 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   Add-SlotHistory $l.repo $l.slot $event (P $l 'session') $backupRef '' $why
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
-# Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed).
+# A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
+# succeed on a later sweep: failing closed kept the lease for ever and re-counted the SAME directory on
+# every sweep (2026-11-23: `agentq slo` reported lostWorkIncidents 6, 5 of them one broken worktree, and
+# the slot stayed held). The predicate is Backup-Slot's guard - an absent path is "nothing to back up",
+# which is NOT broken, and anything else about a failed backup keeps today's fail-closed behaviour.
+function Test-BrokenSlot([string]$path) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $false }
+  $head = (& git -C $path rev-parse --verify -q HEAD 2>$null)
+  [bool]($LASTEXITCODE -or -not $head)
+}
+# Terminal outcome for that ONE case: move the directory out of the slot pool under <wtroot>\_orphans
+# (every file preserved, nothing deleted) with a MOVED.txt naming repo/slot/leaseId/session and the
+# backup error, then release the lease with ref ''. Remove-LeaseRecord writes the single `lease-orphan`
+# journal event, so the incident is recorded ONCE and no later sweep can find the slot again. A tree that
+# cannot be moved keeps the lease and a visible failure (lease-orphan-failed), like every other failure.
+function Orphan-Slot($l, [string]$why) {
+  # `orph`-prefixed locals ONLY: PowerShell variable names are case-insensitive and dynamically scoped, so
+  # a local `$root` here would BE the script-scope `$Root` (the coord dir) for every callee - Add-SlotHistory
+  # then wrote its history into <wtroot>\_orphans\slots (seen live 2026-11-24, same trap as the `script
+  # scope` suite guards).
+  $orphPath = "$(P $l 'path')"
+  $orphErr = "backup refused: $orphPath has no valid HEAD (broken worktree)"
+  $orphRoot = Join-Path (Get-WtRoot) '_orphans'
+  New-Item -ItemType Directory -Force $orphRoot | Out-Null
+  $orphBase = "$($l.repo)-$($l.slot)-$((Get-Date).ToString('yyyyMMdd-HHmm'))"
+  $orphDir = Join-Path $orphRoot $orphBase
+  for ($i = 2; Test-Path -LiteralPath $orphDir; $i++) { $orphDir = Join-Path $orphRoot "$orphBase-$i" }
+  try { Move-Item -LiteralPath $orphPath -Destination $orphDir -ErrorAction Stop }
+  catch {
+    Write-Journal @{ event = 'lease-orphan-failed'; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); path = $orphPath; reason = "$why; $orphErr; move failed: $($_.Exception.Message)"; repo = $l.repo }
+    [Console]::Error.WriteLine("agentq: cannot orphan broken slot ${orphPath}: $($_.Exception.Message) - lease kept (journal: lease-orphan-failed)")
+    return $false
+  }
+  $orphNote = @(
+    'agentq: this worktree was ORPHANED by the sweep - it had no valid HEAD, so no backup was possible.'
+    'Every file in this directory is preserved; nothing was deleted.'
+    ''
+    "repo:    $($l.repo)"
+    "slot:    $($l.slot)"
+    "leaseId: $(P $l 'leaseId')"
+    "session: $(P $l 'session')"
+    "purpose: $(P $l 'purpose')"
+    "moved:   $(Iso (Now))"
+    "from:    $orphPath"
+    "why:     $why"
+    "backup:  FAILED (terminal): $orphErr"
+  )
+  [IO.File]::WriteAllText((Join-Path $orphDir 'MOVED.txt'), (($orphNote -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+  Remove-LeaseRecord $l 'lease-orphan' $why ''
+  $true
+}
+# Expire = back up (proven) THEN drop the record. A failed backup keeps the lease (fail closed) - EXCEPT a
+# broken worktree, which is terminal: it is orphaned above, so the lease goes and the slot comes back.
+# Returns $true (expired), $false (kept: backup failed) or 'orphaned', which Invoke-Sweep prints on its own.
 function Expire-Lease($l, [string]$why) {
+  if (Test-BrokenSlot (P $l 'path')) { if (Orphan-Slot $l $why) { return 'orphaned' }; return $false }
   try { $ref = Backup-Slot (P $l 'path') $l.repo $l.slot $why -CommitsOnly:((P $l 'role') -eq 'release') }
   catch { Write-Journal @{ event = 'lease-expire-failed'; resource = "slot:$($l.repo):$($l.slot)"; reason = "$why; $($_.Exception.Message)"; repo = $l.repo }; return $false }
   Remove-LeaseRecord $l 'lease-expire' $why $ref
@@ -1226,7 +1280,7 @@ function Invoke-Recover {
 }
 
 function Invoke-Sweep {
-  $n = 0; $kept = 0
+  $n = 0; $kept = 0; $orph = 0
   foreach ($l in Read-Leases $null) {
     if (-not $l.stale) {
       # AUDITABLE "why not stale" (idea 3): a lease past its threshold that a chat grace or -Hold keeps is
@@ -1237,7 +1291,9 @@ function Invoke-Sweep {
       }
       continue
     }
-    if (Expire-Lease $l "stale (idle $($l.idleMin) min, owner alive=$($l.alive))") { $n++; Write-Output "expired $($l.repo)/$($l.slot) ($($l.session) '$($l.purpose)')" }
+    $ex = Expire-Lease $l "stale (idle $($l.idleMin) min, owner alive=$($l.alive))"
+    if ($ex -eq 'orphaned') { $orph++; Write-Output "orphaned $($l.repo)/$($l.slot): no valid HEAD to back up - moved under _orphans (lease released, files kept)" }
+    elseif ($ex) { $n++; Write-Output "expired $($l.repo)/$($l.slot) ($($l.session) '$($l.purpose)')" }
     else { $kept++; Write-Output "KEPT $($l.repo)/$($l.slot): backup failed (journal: lease-expire-failed)" }
   }
   [void](Read-Releases $null)   # side effect: dead runs are recorded as failed
@@ -1259,7 +1315,7 @@ function Invoke-Sweep {
   if ($env:AGENTQ_NO_PRUNE -ne '1') {
     try { . (Join-Path $PSScriptRoot 'agentq-prune.ps1'); $pr = Invoke-Prune -Quiet; if ($pr -and $pr.ContainsKey('total')) { $pruned = [int]$pr.total } } catch { Write-Output "prune skipped: $_" }
   }
-  Write-Output "sweep: expired=$n kept=$kept reaped=$reaped pruned=$pruned"
+  Write-Output "sweep: expired=$n orphaned=$orph kept=$kept reaped=$reaped pruned=$pruned"
 }
 
 # `agentq who [<repo>]` (ADR 0012): one line per lease answering "is this slot really in use?" - who holds
