@@ -50,6 +50,23 @@ Check 'frozen resource refuses run (exit 3)' ($LASTEXITCODE -eq 3) "got $LASTEXI
 & pwsh -NoProfile -File $aq run -Resource 'deploy:web' -Purpose 'x' -- pwsh -NoProfile -Command 'exit 0' 2>$null
 Check 'cleared resource runs' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
 
+# 3b. a land:<repo> freeze older than landFreezeMaxMin (30) is EXPIRED and broken by the next land; a
+# fresh one still refuses. Policy: docs/RELEASE_TRAIN.md - at most the max, never for a whole train
+# (2026-11-24: an ad-hoc orchestrator held land:brivio frozen ~3 h across its own nightly retry loop).
+& pwsh -NoProfile -File $aq mark -Resource 'land:repo' -State frozen -Reason 'release train: dev tip pinned' | Out-Null
+& pwsh -NoProfile -File $aq acquire -Resource 'land:repo' -Purpose 'fresh' 2>$null | Out-Null
+Check 'fresh land freeze refuses acquire (exit 3)' ($LASTEXITCODE -eq 3) "got $LASTEXITCODE"
+# Age the mark the way a dead orchestrator leaves it (an old `at`, no fresh note), then break it.
+$lf = Get-Item (Join-Path $env:AGENTQ_HOME 'marks\land_repo.json')
+$mj = Get-Content $lf.FullName -Raw | ConvertFrom-Json
+$mj.at = [DateTime]::UtcNow.AddMinutes(-45).ToString('o')
+[IO.File]::WriteAllText($lf.FullName, ($mj | ConvertTo-Json))
+& pwsh -NoProfile -File $aq acquire -Resource 'land:repo' -Purpose 'expired' 2>$null | Out-Null
+Check 'expired land freeze is broken, acquire proceeds (exit 0)' ($LASTEXITCODE -eq 0) "got $LASTEXITCODE"
+Check 'expired land mark file removed' (-not (Test-Path $lf.FullName))
+$jj = Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json }
+Check 'journal records freeze-expired with the holder' (@($jj | Where-Object { $_.event -eq 'freeze-expired' }).Count -ge 1)
+
 # 4. dead holder is reaped: a ticket whose pid is gone does not block.
 $qd = Join-Path $env:AGENTQ_HOME 'queues\build_repo'  # repo name = common-git-dir parent = 'repo'
 New-Item -ItemType Directory -Force $qd | Out-Null

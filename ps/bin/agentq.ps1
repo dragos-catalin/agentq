@@ -24,7 +24,10 @@ MODEL
     -StaleMin (default 10) marks the ticket STALE (visible in status, reason recorded);
     `agentq break` removes it with a reason.
   * A resource can be MARKED frozen|blocked with a reason (~/.codai/coord/marks/). `run`
-    and `acquire` refuse a frozen/blocked resource and print who froze it and why.
+    and `acquire` refuse a frozen/blocked resource and print who froze it and why. A
+    `land:<repo>` mark older than `landFreezeMaxMin` (30) minutes is EXPIRED: the next
+    land breaks it, records why, and proceeds (docs/RELEASE_TRAIN.md: never for a whole
+    train). Incident/provider/deploy marks never expire.
   * Everything is appended to ~/.codai/coord/journal.jsonl (one JSON per line):
     queued, start, done(exit,dur), fail, break, mark, unmark, note, commit(sha,paths).
     `status`, `log`, `since` read it — this is how agents learn what others did.
@@ -920,9 +923,33 @@ function Get-Mark([string]$res) {
   if (Test-Path $f) { Get-Content $f -Raw | ConvertFrom-Json -DateKind String } else { $null }
 }
 
+# Policy (docs/RELEASE_TRAIN.md): a `land:<repo>` freeze is at most `landFreezeMaxMin` (30) minutes and is
+# never held for a whole train; an older mark with no fresh note is expired and may be broken by any land,
+# which records why. Other marks (incident/provider/deploy/slot) never expire: they are cleared by hand.
+# 2026-11-24: an ad-hoc release orchestrator held `land:brivio` frozen ~3 h across its own nightly retry
+# loop, so two lanes queued for hours behind a freeze the policy already called breakable. Config `-1`
+# disables the expiry for a repo that genuinely needs a long pin (and must then clear it by hand).
+function Get-LandFreezeMaxMin {
+  $c = Get-Config
+  if ($c.ContainsKey('landFreezeMaxMin') -and $null -ne $c['landFreezeMaxMin']) { return [double]$c['landFreezeMaxMin'] }
+  30.0
+}
+function Test-MarkExpired($m) {
+  if (-not $m -or "$($m.resource)" -notmatch '^land:') { return $false }
+  $max = Get-LandFreezeMaxMin
+  if ($max -lt 0 -or -not $m.at) { return $false }
+  try { ((Now) - (ParseUtc $m.at)).TotalMinutes -ge $max } catch { $false }
+}
 function Assert-NotMarked([string]$res) {
   $m = Get-Mark $res
   if ($m) {
+    if (Test-MarkExpired $m) {
+      $age = try { [int][math]::Round(((Now) - (ParseUtc $m.at)).TotalMinutes) } catch { 0 }
+      [Console]::Error.WriteLine("agentq: $res was $($m.state.ToUpper()) since $($m.at) by $($m.session) - EXPIRED after $age min (max $([int](Get-LandFreezeMaxMin)) min, docs/RELEASE_TRAIN.md); breaking it and proceeding")
+      Remove-Item (Join-Path $MDir ((Safe $res) + '.json')) -Force -ErrorAction SilentlyContinue
+      Write-Journal @{ event = 'freeze-expired'; resource = $res; session = $m.session; ageMin = $age; reason = $m.reason }
+      return
+    }
     [Console]::Error.WriteLine("agentq: $res is $($m.state.ToUpper()) since $($m.at) by $($m.session): $($m.reason)")
     [Console]::Error.WriteLine("        clear it (only if the reason no longer holds): agentq mark -Resource $res -State clear -Reason '<why>'")
     exit 3
@@ -1864,7 +1891,7 @@ function Show-Status {
   }
   if ($marks) {
     Write-Output '== MARKS'
-    $marks | ForEach-Object { Write-Output ("{0,-34} {1,-8} since {2} by {3}: {4}" -f $_.resource, $_.state.ToUpper(), $_.at, $_.session, $_.reason) }
+    $marks | ForEach-Object { $x = if (Test-MarkExpired $_) { "  [EXPIRED after $([int](Get-LandFreezeMaxMin)) min - the next land breaks it]" } else { '' }; Write-Output ("{0,-34} {1,-8} since {2} by {3}: {4}{5}" -f $_.resource, $_.state.ToUpper(), $_.at, $_.session, $_.reason, $x) }
   }
   if (-not $ld.enabled) { Write-Output '== LOAD admission by load is off (config admission.enabled / AGENTQ_NO_ADMISSION)' }
   elseif ($null -eq $ld.last) { Write-Output "== LOAD no start probe yet (a sample is taken by agentq run/lease and by the sync loop); admission OPEN" }
