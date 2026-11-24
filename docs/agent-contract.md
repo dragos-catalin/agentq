@@ -60,9 +60,12 @@ When two sources disagree, this is the order. It is the answer to "the gate refu
 bug?"; check the levels above yours before blaming the code.
 
 1. **A mark beats everything.** `frozen` / `blocked` on a resource refuses run, commit and deploy with
-   exit 3. No flag, env var or config key below overrides it. Only `agentq mark -State clear -Reason`
-   lifts it, and only once the thing that caused it is actually over. A frozen resource is never
-   bypassed "because the test needs it".
+   exit 3. No flag, env var or config key below overrides it — with ONE exception, on `land:<repo>`
+   marks only: a mark older than `landFreezeMaxMin` (config `landFreezeMaxMin`, default 30 min,
+   `-1` disables) is EXPIRED, and the next land removes it itself, says so and journals
+   `freeze-expired`. Every other mark (`incident` / `provider` / `deploy` / `slot`) never expires and
+   is lifted only by `agentq mark -State clear -Reason '<why>'`, once the thing that caused it is
+   actually over. A frozen resource is never bypassed "because the test needs it".
 2. **The harness env vars are for hermetic suites, never for a real run.** `AGENTQ_NO_*`,
    `AGENTQ_FAKE_*`, `AGENTQ_TEST_SKIP`, `AGENTQ_NO_ADMISSION` exist so `run-all.ps1` does not depend on
    how busy the machine is. They may skip an _admission_ gate inside a suite; they may not relax a
