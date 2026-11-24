@@ -83,6 +83,9 @@ $suites = [ordered]@{
   # 2026-11-23: the waiter reaps a wedged land holder whose gate is green (land-autoreap) and puts its own
   # ticket back at the HEAD of the queue when its window expires instead of leaving (land-requeue).
   'land reap'      = @('-File', (Join-Path $PSScriptRoot 'test-land-reap.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-24: a successful land reaps its auto-generated `publish/*` SOURCE branch (466 piled up on
+  # origin, 201 provably merged); a human-named branch, the target, or the branch a slot is on is kept.
+  'land reap branch' = @('-File', (Join-Path $PSScriptRoot 'test-land-reap-branch.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land install'   = @('-File', (Join-Path $PSScriptRoot 'test-land-install.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'admission'       = @('-File', (Join-Path $PSScriptRoot 'test-agentq-admission.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'status readonly' = @('-File', (Join-Path $PSScriptRoot 'test-status-readonly.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))

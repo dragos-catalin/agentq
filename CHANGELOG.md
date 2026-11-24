@@ -48,6 +48,15 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Fixed
 
+- `agentq land` (and `publish -Land`) now reaps its own auto-generated `publish/*` SOURCE branch after a
+  landed push - and only that: a human-named branch, the target itself, and the branch a working slot is on
+  are kept. Origin had accumulated **466** `publish/*` branches, **201** provably already merged into `main`
+  (every commit's patch-id present); `publish` mints `publish/<session>-<ts>` and nothing ever deleted it
+  (one session alone left ~100). A topic absorbed into a batch is reaped by the holder that landed it (the
+  waiter returns early on the batch result). A failed delete is journaled (`land-reap-failed`) and never fails
+  the land; the delete uses `git push --no-verify` because husky's client pre-push runs a CODE gate
+  (`scripts/ci/check-rollout-vm-hardening.mjs`) that cannot apply to deleting a ref. Output: one
+  `reaped publish/x (landed into <target>)` or `kept publish/x: <reason>` line.
 - Land pre-gate no longer stands aside for a dirty CALLER slot. A land started from the slot its chat is
   still working in has uncommitted files by definition, and the pre-gate used to SKIP there - which pushed
   the whole gate (p50 7 min, p90 20-40 min, max 3 h) back INSIDE the cap-1 `land:<repo>` mutex. Measured:

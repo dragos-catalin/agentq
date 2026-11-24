@@ -82,6 +82,9 @@ $map = [ordered]@{
   # 2026-11-23: land-autoreap (a wedged holder whose gate is green) + land-requeue (put the ticket back at
   # the HEAD on window expiry, bounded by landRequeueMax). Paired with the run-all.ps1 entry.
   'tests\test-land-reap.ps1' = 'bin\test-land-reap.ps1'
+  # 2026-11-24: reap the auto-generated `publish/*` source branch after a successful land. Paired with the
+  # run-all.ps1 entry - 'install wiring' pins the two.
+  'tests\test-land-reap-branch.ps1' = 'bin\test-land-reap-branch.ps1'
   # 2026-11-23: the `pregate lease reap` suite was in run-all.ps1 but missing from this map, so the wiring
   # gate failed on it three times (map drift, -File not a map key, gateSuites not fully installed).
   'tests\test-pregate-lease-reap.ps1' = 'bin\test-pregate-lease-reap.ps1'

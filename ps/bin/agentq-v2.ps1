@@ -707,13 +707,16 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
 # A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
-# A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
 # succeed on a later sweep: failing closed kept the lease for ever and re-counted the SAME directory on
 # every sweep (2026-11-23: `agentq slo` reported lostWorkIncidents 6, 5 of them one broken worktree, and
 # the slot stayed held). So the sweep ORPHANS it (Orphan-Slot) - and because that is TERMINAL, the verdict
-# must be CONFIRMED first: a single `rev-parse` can fail transiently on a healthy worktree (index/worktree
-# race; 2026-11-24 a flaky probe orphaned a sound fixture slot and turned a green suite red). One retry,
-# and the verdict is derived from the backup attempt itself - never from a second, independent probe.
+# must be CONFIRMED first: one retry, and the verdict is derived from the backup attempt itself - never
+# from a second, independent probe.
+#
+# ROOT CAUSE of the 2026-11-24 "the sweep orphaned a healthy slot" report was NOT a flaky probe. It was the
+# comparison in Invoke-Sweep: `$ex -eq 'orphaned'`. In PowerShell a NON-STRING left operand coerces the
+# right one, so `$true -eq 'orphaned'` is TRUE - every successful expiry ($true) printed as an orphan, and
+# `agentq slo` counted lost-work incidents that never happened. Written as `'orphaned' -eq $ex` now.
 function Get-SlotHead([string]$path) {
   if (-not $path -or -not (Test-Path -LiteralPath $path)) { return '' }
   foreach ($attempt in 1, 2) {
@@ -772,7 +775,8 @@ function Expire-Lease($l, [string]$why) {
   catch {
     # The backup attempt is the single source of truth: Backup-Slot's own guard is the one terminal case
     # (no valid HEAD -> nothing to back up, ever). Deriving it here instead of from a second probe keeps the
-    # two from disagreeing, which is what orphaned a healthy slot on 2026-11-24.
+    # two from disagreeing. Note the string must be on the LEFT of -eq (see Invoke-Sweep): `'orphaned' -eq
+    # $ex`, never `$ex -eq 'orphaned'`, which is true for any non-empty string.
     if ("$($_.Exception.Message)" -match 'has no valid HEAD') { if (Orphan-Slot $l $why) { return 'orphaned' }; return $false }
     Write-Journal @{ event = 'lease-expire-failed'; resource = "slot:$($l.repo):$($l.slot)"; reason = "$why; $($_.Exception.Message)"; repo = $l.repo }; return $false
   }
@@ -1309,7 +1313,11 @@ function Invoke-Sweep {
       continue
     }
     $ex = Expire-Lease $l "stale (idle $($l.idleMin) min, owner alive=$($l.alive))"
-    if ($ex -eq 'orphaned') { $orph++; Write-Output "orphaned $($l.repo)/$($l.slot): no valid HEAD to back up - moved under _orphans (lease released, files kept)" }
+    # The string goes on the LEFT: PowerShell coerces the RIGHT operand to the LEFT operand's type, so
+    # `$ex -eq 'orphaned'` was TRUE for every non-empty string - including the boolean `$true` that
+    # Expire-Lease returns on an ordinary expiry. Every successful expiry printed "orphaned" and `agentq
+    # slo` counted lost-work incidents that never happened (root-caused 2026-11-24 with a probe of $ex).
+    if ('orphaned' -eq $ex) { $orph++; Write-Output "orphaned $($l.repo)/$($l.slot): no valid HEAD to back up - moved under _orphans (lease released, files kept)" }
     elseif ($ex) { $n++; Write-Output "expired $($l.repo)/$($l.slot) ($($l.session) '$($l.purpose)')" }
     else { $kept++; Write-Output "KEPT $($l.repo)/$($l.slot): backup failed (journal: lease-expire-failed)" }
   }
