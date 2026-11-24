@@ -417,8 +417,14 @@ function Read-Leases([string]$repoName) {
         $pgU = try { $pu = P $l 'pregateUntil' $null; if ($pu) { ParseUtc $pu } else { $null } } catch { $null }
         if (-not $pgAlive -or ($pgU -and (Now) -gt $pgU)) { $stale = $true; $pgDead = $true }
       }
+      # A DEAD OWNER is not "an agent thinking": measured 2026-11-24, 18 codai slots were held by a shell
+      # whose pid was long gone and whose tree had a little uncommitted work, so `sweep` reaped none of
+      # them and `lease` had to refuse. Once the owner pid has been gone longer than leaseOwnerGoneIdleMin
+      # the unsaved-work guard stops applying; sweep may then reclaim the slot, and Expire-Lease backs the
+      # tree up (fail-closed) BEFORE resetting it.
+      $ownerGone = (-not $alive) -and ($idle -gt [double](P $cfg 'leaseOwnerGoneIdleMin' 120))
       $unsaved = $false
-      if ($stale -and -not $pgDead -and $lrole -in 'task', 'pinned', 'scratch' -and $idle -le [double](P $cfg 'leaseDirtyIdleMin' 240) -and $idle -le [double]$cfg.leaseMaxIdleMin) {
+      if ($stale -and -not $pgDead -and -not $ownerGone -and $lrole -in 'task', 'pinned', 'scratch' -and $idle -le [double](P $cfg 'leaseDirtyIdleMin' 240) -and $idle -le [double]$cfg.leaseMaxIdleMin) {
         if (Test-SlotHasWork (P $l 'path' '')) { $stale = $false; $unsaved = $true }
       }
       $l | Add-Member -NotePropertyName file -NotePropertyValue $f.FullName -Force

@@ -12,6 +12,7 @@
   "autosync": { "daemons": ["git-autosync"] },
   "leaseDeadIdleMin": 120,
   "leaseMaxIdleMin": 360,
+  "leaseOwnerGoneIdleMin": 120,
   "leaseIdleMin": 45,
   "leaseOwnerIdleMin": 90,
   "leaseChatGraceMin": 20,
@@ -112,6 +113,7 @@
   "landPregateScratchWaitMin": 5,
   "landGateRunsMax": 4,
   "landRequeueMax": 3,
+  "landFreezeMaxMin": 30,
   "greenTtlHours": 168,
   "prune": {
     "agentsDays": 3,

@@ -239,6 +239,32 @@ try {
   Check 'reclaim: takes a grace-held slot (new leaseId)' ($script:code -eq 0 -and $newId -ne $holdId) $o
   $rj = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'lease-reclaim' } | Select-Object -Last 1)
   Check 'reclaim: journaled lease-reclaim' ($rj.Count -eq 1 -and $rj.ticket -eq $holdId) ($rj | ConvertTo-Json -Compress)
+
+  # ownerGone (2026-11-24): the unsaved-work guard exists so a slot whose tree carries uncommitted work is
+  # not reset under a live owner. A DEAD owner is not "an agent thinking": measured 2026-11-24, 18 codai
+  # slots were held by shells whose pid was long gone while `sweep` reaped none of them and `lease` refused.
+  # Once the owner pid has been gone longer than leaseOwnerGoneIdleMin the guard yields; Expire-Lease still
+  # backs the tree up (fail-closed) before resetting it.
+  Clear-Leases
+  Set-Cfg '{"taskSlotsPerRepo":3,"taskSlotsMachine":5,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseChatGraceMin":20,"leaseDirtyIdleMin":240,"leaseOwnerGoneIdleMin":120,"leaseMaxIdleMin":1440,"minFreeCommitGB":0}'
+  $env:AGENTQ_SESSION = 'ownergone'
+  $o = AQ lease -Purpose 'dead owner with dirty work'
+  Check 'ownerGone: lease granted' ($script:code -eq 0 -and (Test-Path (LFile 'task-1'))) $o
+  Set-Owner 'task-1' $false
+  $slotPath = (Get-Content (LFile 'task-1') -Raw | ConvertFrom-Json).path
+  'dirty' | Set-Content (Join-Path $slotPath 'dirty.txt')
+  # control: dead owner, dirty tree, idle 110 (< 120) -> the guard still protects it
+  Set-Times 'task-1' 110 110 110
+  $l = L 'task-1'
+  Check 'ownerGone: dead owner idle 110 (< 120) + dirty -> still protected (why=unsaved work)' ($l -and -not $l.stale -and $l.why -eq 'unsaved work') ($l | ConvertTo-Json -Compress)
+  # the fix: idle 130 (> 120) -> the guard yields, the slot is stale and sweep may reclaim it
+  Set-Times 'task-1' 130 130 130
+  $l = L 'task-1'
+  Check 'ownerGone: dead owner idle 130 (> 120) + dirty -> stale (guard yields)' ($l -and $l.stale -and $l.why -eq 'stale') ($l | ConvertTo-Json -Compress)
+  $o = AQ sweep
+  Check 'ownerGone: sweep reclaimed it' ($o -match 'expired repo/task-1' -and -not (Test-Path (LFile 'task-1'))) $o
+  $refs = @(& git -C $repo ls-remote origin 'refs/backup/wt/repo/task-1/*' 2>$null | Where-Object { $_ })
+  Check 'ownerGone: the dirty tree was backed up to a ref before expiry (fail-closed)' ($refs.Count -ge 1) ($refs -join '; ')
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_AGENT_LIMIT', 'AGENTQ_NO_PRUNE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
