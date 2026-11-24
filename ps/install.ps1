@@ -43,6 +43,8 @@ $map = [ordered]@{
   'hooks\deploy-clean.ps1' = 'hooks\deploy-clean.ps1'; 'hooks\run-build.ps1' = 'hooks\run-build.ps1'; 'hooks\guard-tooluse.ps1' = 'hooks\guard-tooluse.ps1'
   'tests\test-agentq.ps1' = 'bin\test-agentq.ps1'; 'tests\test-agentq-v2.ps1' = 'bin\test-agentq-v2.ps1'; 'tests\test-agentq-v3.ps1' = 'bin\test-agentq-v3.ps1'
   'tests\test-worktree-v2.ps1' = 'hooks\test-worktree-v2.ps1'; 'tests\test-guard-v2.ps1' = 'hooks\test-guard-v2.ps1'
+  # 2026-11-25: a formatter may never run with its own DEFAULT config over a repo that has no config
+  'tests\test-guard-format.ps1' = 'hooks\test-guard-format.ps1'
   'tests\test-land-changelog.ps1' = 'bin\test-land-changelog.ps1'
   'bin\repo-migrate.ps1' = 'bin\repo-migrate.ps1'; 'tests\test-repo-migrate.ps1' = 'bin\test-repo-migrate.ps1'
   # background jobs: bounded wait + registry (mirrored by agentq-sync)

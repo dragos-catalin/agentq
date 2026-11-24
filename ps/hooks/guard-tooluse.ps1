@@ -783,6 +783,152 @@ if ($isDeploy -and -not $viaCleanWrapper) {
   }
 }
 
+# ------------------------------------------------------------- formatters --
+# 2026-11-24 (owner: "se intampla in multe repo-uri ... rezolva corect sa nu se mai intample").
+# An agent that runs a formatter over files it did not write rewrites the WHOLE file in that
+# formatter's settings - and when the repo declares NO config for it, those are the tool's
+# DEFAULTS: a foreign style. Measured on this machine: brivio has `"prettier": "catalog:"` plus a
+# `format` script and no prettier config anywhere, and 40 of 40 randomly sampled brivio .tsx files
+# FAIL `prettier --check` -> a single `prettier --write <file>` rewrites it end to end (2026-11-24:
+# 705 lines, recoverable byte-exact only because HEAD == origin/dev; with uncommitted edits in that
+# file there is no such recovery - git holds the pre-edit blob, not the agent's work).
+# A config that EXISTS is a different matter: the formatter then applies the repo's own settings,
+# which is exactly what the repo's pre-commit/lint-staged path does anyway - allowed (with a note).
+# The repo's own `pnpm format` is the same trap and is judged too, because it shells out to the
+# same binary with the same missing config.
+#
+# TWO classes, because the config conventions differ (2026-11-24, same ticket):
+#  - STRICT (prettier/eslint/biome/dprint/oxfmt/clang-format): these have a config file every repo
+#    that uses them is expected to own, and their defaults differ wildly from repo style -> REFUSE.
+#  - SOFT (rustfmt/gofmt/ktlint: either no config file exists at all, or it is optional, and the
+#    tool's defaults ARE the community style) -> WARN. A refusal there would block normal work
+#    (`cargo fmt` in a Rust repo that is already rustfmt-clean, `gofmt -w` anywhere).
+function Test-FormatterConfigured([string]$start, [string]$stop, [string]$kind) {
+  # prettier/eslint/biome/dprint resolve their config from the FILE's directory upward, so a
+  # monorepo app package may carry its own; walk from $start up to (and including) $stop.
+  $names = switch ($kind) {
+    'prettier' { @('.prettierrc', '.prettierrc.json', '.prettierrc.json5', '.prettierrc.yml', '.prettierrc.yaml', '.prettierrc.js', '.prettierrc.cjs', '.prettierrc.mjs', '.prettierrc.ts', '.prettierrc.toml', 'prettier.config.js', 'prettier.config.cjs', 'prettier.config.mjs', 'prettier.config.ts') }
+    'eslint' { @('eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'eslint.config.ts', '.eslintrc', '.eslintrc.json', '.eslintrc.js', '.eslintrc.cjs', '.eslintrc.yml', '.eslintrc.yaml') }
+    'biome' { @('biome.json', 'biome.jsonc') }
+    'dprint' { @('dprint.json', 'dprint.jsonc', '.dprint.json', '.dprint.jsonc') }
+    'oxfmt' { @('.oxfmtrc.json', '.oxfmtrc.jsonc', 'oxfmt.json') }
+    'clang-format' { @('.clang-format', '_clang-format', '.clang-format-ignore') }
+    'rustfmt' { @('rustfmt.toml', '.rustfmt.toml') }
+    # gofmt has NO config file by design (it is the canonical style) - nothing can satisfy it, so it
+    # can only ever warn. Same for ktfmt (flags only); ktlint reads .editorconfig.
+    'gofmt' { @() }
+    'ktlint' { @('.editorconfig') }
+    default { @() }
+  }
+  $d = $start; $levels = 0
+  while ($d -and $levels -lt 12) {
+    foreach ($n in $names) { if (Test-Path -LiteralPath (Join-Path $d $n)) { return $true } }
+    # package.json only carries a config in a TOP-LEVEL key, and only prettier (1970) and eslint
+    # (eslintConfig) use that convention. A plain text match here is WRONG: every repo that depends
+    # on prettier has `"prettier": "catalog:"` inside devDependencies - measured 2026-11-24, it made
+    # brivio (no config at all) look configured and the whole rule silently allowed everything.
+    $key = if ($kind -eq 'prettier') { 'prettier' } elseif ($kind -eq 'eslint') { 'eslintConfig' } else { $null }
+    if ($key) {
+      $pj = Join-Path $d 'package.json'
+      if (Test-Path -LiteralPath $pj) {
+        try {
+          $j = [IO.File]::ReadAllText($pj) | ConvertFrom-Json
+          if ($j -and ($j.PSObject.Properties.Name -contains $key)) { return $true }
+        } catch { }
+      }
+    }
+    if ($stop -and $d -eq $stop) { break }
+    $parent = Split-Path -Parent $d
+    if (-not $parent -or $parent -eq $d) { break }
+    $d = $parent; $levels++
+  }
+  return $false
+}
+# Which formatter, and does this invocation WRITE? (check-only runs are always safe)
+$fmtTool = $null; $fmtWrites = $false
+if ($cmd -match '(?i)\bprettier\b') { $fmtTool = 'prettier'; $fmtWrites = ($cmd -match '(?i)(--write|-w\b)') }
+elseif ($cmd -match '(?i)\bdprint\b') { $fmtTool = 'dprint'; $fmtWrites = ($cmd -match '(?i)\bdprint\b[^;|&]*\bfmt\b') }
+elseif ($cmd -match '(?i)\bbiome\b') { $fmtTool = 'biome'; $fmtWrites = ($cmd -match '(?i)\bbiome\b[^;|&]*\bformat\b[^;|&]*--write\b') }
+elseif ($cmd -match '(?i)\boxfmt\b') { $fmtTool = 'oxfmt'; $fmtWrites = $true }
+elseif ($cmd -match '(?i)\bclang-format\b') { $fmtTool = 'clang-format'; $fmtWrites = ($cmd -match '(?i)(\s-i\b|--in-place)') }
+elseif ($cmd -match '(?i)\beslint\b') { $fmtTool = 'eslint'; $fmtWrites = ($cmd -match '(?i)--fix\b') }
+# rustfmt writes in place UNLESS --check; `cargo fmt` always writes (and takes OPTIONS after `--`).
+elseif ($cmd -match '(?i)\bcargo\s+fmt\b') { $fmtTool = 'rustfmt'; $fmtWrites = ($cmd -notmatch '(?i)--check') }
+elseif ($cmd -match '(?i)\brustfmt\b') { $fmtTool = 'rustfmt'; $fmtWrites = ($cmd -notmatch '(?i)--check') }
+elseif ($cmd -match '(?i)\bgofmt\b') { $fmtTool = 'gofmt'; $fmtWrites = ($cmd -match '(?i)(\s-w\b|--write\b)') }
+elseif ($cmd -match '(?i)\bktlint\b') { $fmtTool = 'ktlint'; $fmtWrites = ($cmd -match '(?i)(\s-F\b|--format\b)') }
+elseif ($cmd -match '(?i)\bktfmt\b') { $fmtTool = 'ktlint'; $fmtWrites = $true }
+elseif ($cmd -match '(?i)\b(pnpm|npm|yarn|bun)\b[^;|&]*\b(run\s+)?(format|fmt|lint:fix)\b') { $fmtTool = 'repo-script'; $fmtWrites = $true }
+
+if ($fmtTool -and $fmtWrites) {
+  # The cwd of the terminal hosting the call decides which repo is about to be rewritten.
+  $fmtCwd = "$($payload.cwd)"
+  if (-not $fmtCwd -or -not (Test-Path -LiteralPath $fmtCwd)) { $fmtCwd = (Get-Location).Path }
+  $fmtRepo = $null
+  try {
+    $top = @(& git -C $fmtCwd rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $top.Count -and "$($top[0])".Trim()) { $fmtRepo = "$($top[0])".Trim().Replace('/', '\') }
+  } catch { }
+  if ($fmtRepo) {
+    # `pnpm format` hides the real tool in package.json - read the script, not the verb.
+    $fmtScript = ''
+    if ($fmtTool -eq 'repo-script') {
+      $pj = Join-Path $fmtRepo 'package.json'
+      try { $fmtScript = [IO.File]::ReadAllText($pj) } catch { }
+      if ($fmtScript -match '(?i)"(?:format|fmt|lint:fix)"\s*:\s*"([^"]{0,400})"') { $fmtScript = $Matches[1] } else { $fmtScript = '' }
+      if ($fmtScript -match '(?i)\bprettier\b') { $fmtTool = 'prettier' }
+      elseif ($fmtScript -match '(?i)\bbiome\b') { $fmtTool = 'biome' }
+      elseif ($fmtScript -match '(?i)\bdprint\b') { $fmtTool = 'dprint' }
+      elseif ($fmtScript -match '(?i)\boxfmt\b') { $fmtTool = 'oxfmt' }
+      elseif ($fmtScript -match '(?i)\beslint\b') { $fmtTool = 'eslint' }
+      else { $fmtTool = '' }   # a script we cannot attribute - nothing to judge here
+    }
+    if ($fmtTool) {
+      # Named paths: which directories are about to be written, and the "mixture tell" of the
+      # cross-checkout trap (`[error] No files matching the pattern: apps/...` next to a success
+      # line, memory 2026-11-23 - relative paths resolve against the TERMINAL cwd, so they land in
+      # whichever clone the terminal sits in).
+      $fmtDirs = @($fmtRepo); $miss = @()
+      foreach ($m in [regex]::Matches($cmd, '(?i)([A-Za-z0-9_][A-Za-z0-9_.\-]*[\\/][A-Za-z0-9_*?.\-\\/]*\.(ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|mdx|css|scss|sass|less|py|sql|kt|kts|rs|go|rb|php|vue|svelte|yml|yaml|html))')) {
+        $n = $m.Value
+        if ($n -match '[*?]') { continue }
+        $abs = if ([IO.Path]::IsPathRooted($n)) { $n } else { Join-Path $fmtCwd $n }
+        if (Test-Path -LiteralPath $abs) {
+          $dd = Split-Path -Parent $abs
+          if ($dd -and $dd.StartsWith($fmtRepo, [StringComparison]::OrdinalIgnoreCase)) { $fmtDirs += $dd }
+        } else { $miss += $n }
+      }
+      $fmtCfg = $false
+      foreach ($dd in ($fmtDirs | Select-Object -Unique)) {
+        if (Test-FormatterConfigured -start $dd -stop $fmtRepo -kind $fmtTool) { $fmtCfg = $true; break }
+      }
+      if (-not $fmtCfg) {
+        $fmtStrict = $fmtTool -in 'prettier', 'eslint', 'biome', 'dprint', 'oxfmt', 'clang-format'
+        $what = 'BLOCKED by guard-command hook'
+        if (-not $fmtStrict) { $what = 'WARNING (guard-command)' }
+        [Console]::Error.WriteLine("$what`: $fmtRepo declares NO $fmtTool config, so '$cmd' runs the formatter with its DEFAULT settings and can rewrite whole files in a style the repo does not use. Measured 2026-11-24: brivio has no prettier config and 40/40 sampled .tsx files fail `prettier --check` -> one --write touched 705 lines. Recovering by blob is possible ONLY while HEAD == origin/dev; with uncommitted edits in that file the agent's own work is what a restore destroys.")
+        [Console]::Error.WriteLine("Do instead: (1) fix only the lines you changed, by hand - a formatting gate that wants the whole file reformatted is a repo decision, not yours; (2) if the repo DOES own a config (it may live in the app package, not the root), run the repo's own script and read `git diff --stat` before keeping it; (3) if formatting really is the task, add/confirm a config that states the repo's real style FIRST, then format in a separate commit. Deliberate one-off: type the command yourself in a terminal (hooks do not see the user's own shell).")
+        if ($fmtStrict) {
+          # HARD: this deny must not be downgraded to "WARNING (allowed)" (D-40 soft path would do
+          # exactly that, and the 2026-11-18 shared-clone lesson is that a downgraded refusal is a
+          # refusal that does not happen). The escape is not an agent marker - the user types the
+          # command himself if a repo-wide reformat is really wanted.
+          Deny-Exit -HardBlock -HardBlockNote 'a formatter with no repo config rewrites whole files in a foreign style; with uncommitted edits in that file, the agent work is what a restore destroys'
+        } else {
+          # gofmt/rustfmt/ktlint: the defaults ARE the community style and a config is optional or
+          # nonexistent, so a refusal would block normal work. Advisory only - but say WHY, so the
+          # agent checks `git diff --stat` before keeping a whole-file rewrite.
+          [Console]::Error.WriteLine("WARNING (guard-command): $fmtTool is not refused for this reason ($fmtTool has no config file, or its defaults are the community style), but confirm the blast radius: run it on the file you are editing, then read `git diff --stat` - if it reformats lines you never touched, keep only your own hunks.")
+        }
+      }
+      if ($miss.Count) {
+        [Console]::Error.WriteLine("WARNING (guard-command): $($miss.Count) name(s) in this command do not exist under the cwd repo $fmtRepo - e.g. '$($miss[0])'. That mixture (some paths resolve, some 'No files matching the pattern') is the cross-checkout trap: relative paths resolve against the TERMINAL cwd, so the formatter is about to rewrite files in whichever clone that terminal sits in (2026-11-23: a prettier run from a clone rewrote the SHARED clone's files). Use absolute paths, or cd into the repo that owns them.")
+      } elseif ($fmtTool -in 'prettier', 'eslint', 'biome', 'dprint', 'oxfmt') {
+        [Console]::Error.WriteLine("NOTE (guard-command): '$cmd' rewrites files with $fmtTool. It found a config, so it uses the repo's settings - but check `git diff --stat` right after: if it reformats lines you never touched, restore those hunks and keep only your change.")
+      }
+    }
+  }
+}
 # Not dangerous alone, but destructive to OTHER concurrent sessions sharing this
 # clone. Warn and let it through: the agent sees the note and can coordinate.
 $warn = [ordered]@{
