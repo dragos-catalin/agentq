@@ -64,6 +64,10 @@ $suites = [ordered]@{
   'land precheck'  = @('-File', (Join-Path $PSScriptRoot 'test-land-precheck.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land reclaim'   = @('-File', (Join-Path $PSScriptRoot 'test-land-reclaim.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
+  # 2026-11-25: (a) a journal write that loses a race must never abort the operation it describes - a
+  # sharing violation on journal.jsonl killed a land pre-gate BEFORE its gate had run; (b) the land
+  # PRE-gate runs at Normal, like the queued land gate, not the lane default BelowNormal.
+  'journal + land priority' = @('-File', (Join-Path $PSScriptRoot 'test-journal-write-race.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'flakes'         = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-flakes.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS flakes selftest' }")
   'land batch'     = @('-File', (Join-Path $PSScriptRoot 'test-land-batch.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land default gate' = @('-File', (Join-Path $PSScriptRoot 'test-land-default-gate.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))

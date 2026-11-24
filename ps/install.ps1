@@ -139,6 +139,10 @@ $map = [ordered]@{
   'tests\test-install-wiring.ps1' = 'bin\test-install-wiring.ps1'
   # 2026-11-23: elastic scratch pool + resource-derived machine task-slot budget
   'tests\test-slot-budget.ps1' = 'bin\test-slot-budget.ps1'
+  # 2026-11-25: a journal write that loses a race must never abort the operation it describes, and the
+  # land PRE-gate must run at Normal like the queued land gate. Paired with the run-all.ps1 entry in
+  # this same commit - 'install wiring' pins the two.
+  'tests\test-journal-write-race.ps1' = 'bin\test-journal-write-race.ps1'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.

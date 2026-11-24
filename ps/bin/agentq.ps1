@@ -505,12 +505,30 @@ function Set-RepoGroupDir([string]$dir, [string]$repoName) {
 }
 function Get-ResourceRepo([string]$res) { $p = @($res -split ':'); if ($p.Count -ge 2) { $p[1] } else { $null } }
 
+# Append one line to a journal file, retrying while any other writer holds it. The journal is
+# DIAGNOSTICS: not being able to write it must never abort the operation it describes. 2026-11-25: a
+# sharing violation on journal.jsonl threw straight out of Write-Journal and killed a land pre-gate
+# before its gate had run at all ("land: gate failed (1) ... nothing queued, nothing pushed") - while
+# several chats held tickets on this box. The mutex below only serialises the writers that take it;
+# the heartbeat job's idle-yield lines take none, so it can always lose the race.
+# 25 attempts, a 25 ms delay growing to a 200 ms cap - about 4.3 s of patience: long enough to
+# outlast a sibling writer that holds the file for a couple of seconds, short enough never to stall
+# the operation long.  Out of patience the LINE is lost, the operation continues (see above).
+function Append-JournalLine([string]$path, [string]$line) {
+  $enc = [Text.UTF8Encoding]::new($false)
+  for ($i = 1; $i -le 25; $i++) {
+    try { [IO.File]::AppendAllText($path, $line + "`n", $enc); return $true } catch { Start-Sleep -Milliseconds ([Math]::Min(25 * $i, 200)) }
+  }
+  $false
+}
 function Write-Journal([hashtable]$e) {
   $e.ts = Iso (Now); if (-not $e.ContainsKey('session')) { $e.session = $Session }
   $line = ($e | ConvertTo-Json -Compress -Depth 6)
-  $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
-  try { [void]$m.WaitOne(5000); [IO.File]::AppendAllText((Get-JournalFor $e), $line + "`n", [Text.UTF8Encoding]::new($false)) }
-  finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
+  $m = $null
+  try { $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })") } catch {}
+  if ($m) { try { [void]$m.WaitOne(5000) } catch {} }
+  try { [void](Append-JournalLine (Get-JournalFor $e) $line) }
+  finally { if ($m) { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() } }
 }
 
 function Get-ProcStart([int]$procId) {
@@ -1597,9 +1615,9 @@ function Invoke-Run {
             $idle = ($span -ge ($yieldMin - 0.5)) -and ($burn -lt $cpuSec)
             $busyAgain = $yielded -and $samples.Count -ge 2 -and (($samples[$samples.Count - 1].cpu - $samples[$samples.Count - 2].cpu) -ge $cpuSec)
             if ($idle -and -not $yielded) { $yielded = $true; SetFlag $mfile $true
-              [IO.File]::AppendAllText($journal, (@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-yield'; resource = 'build:machine'; session = $session; reason = "cpu $([math]::Round($burn,1))s in $([math]::Round($span,1)) min" } | ConvertTo-Json -Compress) + "`n") }
+              [void](Append-JournalLine $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-yield'; resource = 'build:machine'; session = $session; reason = "cpu $([math]::Round($burn,1))s in $([math]::Round($span,1)) min" } | ConvertTo-Json -Compress) + "`n")) }
             elseif ($busyAgain) { $yielded = $false; SetFlag $mfile $false
-              [IO.File]::AppendAllText($journal, (@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-resume'; resource = 'build:machine'; session = $session } | ConvertTo-Json -Compress) + "`n") }
+              [void](Append-JournalLine $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-resume'; resource = 'build:machine'; session = $session } | ConvertTo-Json -Compress) + "`n")) }
           } catch {}
         }
         $tick++; Start-Sleep -Seconds 20
@@ -1615,7 +1633,9 @@ function Invoke-Run {
         . $libJ
         $wByLane = @{ interactive = 9; quick = 8; gate = 7; heavy = 4; batch = 2 }
         $lw = "$($tickets[0].lane)"; $wt = if ($wByLane.ContainsKey($lw)) { $wByLane[$lw] } else { 5 }
-        if ($held -like 'land:*' -or $Purpose -match '^land gate') { $wt = 9 }
+        # 'land pregate' is the SAME gate, only run before the ticket - it must not be starved either
+        # (2026-11-25: a pre-gate at BelowNormal lost the box to sibling gates and was reaped as dead).
+        if ($held -like 'land:*' -or $Purpose -match '^land (pre)?gate') { $wt = 9 }
         $jobInfo = Enter-AgentqJob $wt
         if ($jobInfo.error) { Write-Journal @{ event = 'jobobj-failed'; resource = $held; reason = $jobInfo.error; repo = $repo.Name } }
         else { $jobInfo.weight = $wt }
@@ -1626,7 +1646,9 @@ function Invoke-Run {
     # cores busy, 2026-10-19). A priority class does compete with them, and children inherit it.
     # interactive/land stay Normal; quick/gate/heavy BelowNormal; batch Idle. AGENTQ_RUN_PRIORITY overrides.
     $pcByLane = @{ interactive = 'Normal'; quick = 'BelowNormal'; gate = 'BelowNormal'; heavy = 'BelowNormal'; batch = 'Idle' }
-    $pc = if ($env:AGENTQ_RUN_PRIORITY) { $env:AGENTQ_RUN_PRIORITY } elseif ($held -like 'land:*' -or $Purpose -match '^land gate') { 'Normal' } elseif ($pcByLane.ContainsKey("$($tickets[0].lane)")) { $pcByLane["$($tickets[0].lane)"] } else { 'BelowNormal' }
+    # 'land pregate' matches with 'land gate' on purpose: the owner's rule is the land gate runs Normal
+    # while ordinary builds stay BelowNormal, and the pre-gate IS the land gate.
+    $pc = if ($env:AGENTQ_RUN_PRIORITY) { $env:AGENTQ_RUN_PRIORITY } elseif ($held -like 'land:*' -or $Purpose -match '^land (pre)?gate') { 'Normal' } elseif ($pcByLane.ContainsKey("$($tickets[0].lane)")) { $pcByLane["$($tickets[0].lane)"] } else { 'BelowNormal' }
     try { (Get-Process -Id $PID).PriorityClass = [Diagnostics.ProcessPriorityClass]$pc; if ($jobInfo) { $jobInfo.priority = $pc } } catch {}
     try {
       $exe = $cmdArgs[0]; $argv = @($cmdArgs | Select-Object -Skip 1)
