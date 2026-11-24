@@ -74,6 +74,22 @@ function Case($name, [hashtable]$p, [string]$expect, [string]$match) {
   if ($why) { Write-Host "  FAIL  $name ($why)"; $script:fail++ } else { Write-Host "  ok    $name" }
 }
 function Ok([bool]$c, [string]$name, [string]$detail = '') { if ($c) { Write-Host "  ok    $name" } else { Write-Host "  FAIL  $name $detail"; $script:fail++ } }
+# A valid owner-issued ticket (rules-ticket.ps1 -Issue) makes a trust-surface write LEGAL by design, so a
+# deny case must not depend on whether a ticket happens to be open while the suite runs. These two cases
+# point the guard at an EMPTY rules dir (no ticket) for their duration: the assertion is about the GUARD,
+# not about the ambient ticket. Without this the suite fails on a machine that legitimately holds one
+# (observed 2026-11-24: "expected deny-json, got allow rc=0" for both).
+$noTicketDir = Join-Path $env:TEMP ("hook-pre-noticket-{0}" -f [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Force -Path $noTicketDir
+$savedRulesDir = $env:CODAI_RULES_DIR
+function With-NoTicket([scriptblock]$Body) {
+  $env:CODAI_RULES_DIR = $noTicketDir
+  try { & $Body }
+  finally {
+    if ($null -ne $savedRulesDir) { $env:CODAI_RULES_DIR = $savedRulesDir }
+    else { Remove-Item Env:CODAI_RULES_DIR -ErrorAction SilentlyContinue }
+  }
+}
 # Throwaway repos. `Profile` = the repo's own AXIOM gate profile (none = the user-level one applies);
 # `RepoHook` = the repo registers the gate as its own preToolUse hook (then hook-pre must NOT run it).
 $fxRoot = Join-Path $env:TEMP ("hook-pre-fx-{0}" -f [guid]::NewGuid().ToString('N'))
@@ -103,7 +119,7 @@ try {
   Case 'VS Code benign terminal command is allowed' ($vs + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = 'git status' } }) 'allow'
   Case 'VS Code soft guard rule (stage everything) only warns since 2026-10-19: allowed' ($vs + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = $addAll } }) 'allow'
   Case 'VS Code HARD guard rule (force push) arrives as JSON + exit 0' ($vs + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = $forcePush } }) 'deny-json' 'Force-push'
-  Case 'VS Code guard-rules-surface deny arrives as JSON + exit 0' ($vs + @{ tool_name = 'create_file'; tool_input = @{ filePath = $surface; content = '{}' } }) 'deny-json'
+  With-NoTicket { Case 'VS Code guard-rules-surface deny arrives as JSON + exit 0' ($vs + @{ tool_name = 'create_file'; tool_input = @{ filePath = $surface; content = '{}' } }) 'deny-json' }
   Case 'VS Code ordinary repo write is allowed' ($vs + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$plain\x.txt"; content = 'x' } }) 'allow'
   Case 'CLI toolArgs string is inspected: soft rule allowed' @{ toolName = 'bash'; toolArgs = (@{ command = $addAll } | ConvertTo-Json -Compress); cwd = $plain } 'allow'
   Case 'CLI toolArgs string is inspected: HARD rule denied by exit code' @{ toolName = 'bash'; toolArgs = (@{ command = $forcePush } | ConvertTo-Json -Compress); cwd = $plain } 'deny-exit'
@@ -119,7 +135,7 @@ try {
     Case 'own profile, no repo hook: a write the profile allows is allowed' ($vo + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$own\ok.txt"; content = 'x' } }) 'allow'
     Case 'own profile, no repo hook: read tools are not judged' ($vo + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$own\blocked\x.txt" } }) 'allow'
     Case 'own profile, no repo hook: a HARD guard deny still wins' ($vo + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = $forcePush } }) 'deny-json' 'Force-push'
-    Case 'own profile, no repo hook: rules-surface deny still wins' ($vo + @{ tool_name = 'create_file'; tool_input = @{ filePath = $surface; content = '{}' } }) 'deny-json' 'self-modify-trust-surface'
+    With-NoTicket { Case 'own profile, no repo hook: rules-surface deny still wins' ($vo + @{ tool_name = 'create_file'; tool_input = @{ filePath = $surface; content = '{}' } }) 'deny-json' 'self-modify-trust-surface' }
     Case 'own profile, no repo hook, CLI dialect: the gate answer is passed on' @{ toolName = 'create'; toolArgs = (@{ path = "$own\blocked\y.txt"; file_text = 'x' } | ConvertTo-Json -Compress); cwd = $own } 'deny-json' 'path\.deny'
     $vw = @{ hook_event_name = 'PreToolUse'; session_id = 'test-hook-pre'; cwd = $warn }
     Case 'warn-mode profile: allowed, the warning reaches the model as additionalContext' ($vw + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$warn\blocked\x.txt"; content = 'x' } }) 'allow-context' 'AXIOM GATE WARN path\.deny'
@@ -220,6 +236,8 @@ try {
 finally {
   Remove-Item $fxRoot -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item $coord -Recurse -Force -ErrorAction SilentlyContinue
+  if ($noTicketDir) { Remove-Item $noTicketDir -Recurse -Force -ErrorAction SilentlyContinue }
+  if ($null -ne $savedRulesDir) { $env:CODAI_RULES_DIR = $savedRulesDir } else { Remove-Item Env:CODAI_RULES_DIR -ErrorAction SilentlyContinue }
   if ($stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
   if ($null -ne $oldHome) { $env:AGENTQ_HOME = $oldHome } else { Remove-Item Env:AGENTQ_HOME -ErrorAction SilentlyContinue }
   if ($null -ne $oldWt) { $env:CODAI_WT_ROOT = $oldWt } else { Remove-Item Env:CODAI_WT_ROOT -ErrorAction SilentlyContinue }
