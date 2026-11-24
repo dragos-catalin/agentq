@@ -123,7 +123,9 @@ try {
   Case 'VS Code ordinary repo write is allowed' ($vs + @{ tool_name = 'create_file'; tool_input = @{ filePath = "$plain\x.txt"; content = 'x' } }) 'allow'
   Case 'CLI toolArgs string is inspected: soft rule allowed' @{ toolName = 'bash'; toolArgs = (@{ command = $addAll } | ConvertTo-Json -Compress); cwd = $plain } 'allow'
   Case 'CLI toolArgs string is inspected: HARD rule denied by exit code' @{ toolName = 'bash'; toolArgs = (@{ command = $forcePush } | ConvertTo-Json -Compress); cwd = $plain } 'deny-exit'
-  Case 'CLI rules-surface write is denied' @{ toolName = 'str_replace'; toolArgs = (@{ path = "$env:USERPROFILE\.claude\rules\zz.md"; old_str = 'a'; new_str = 'b' } | ConvertTo-Json -Compress); cwd = $plain } 'deny-exit'
+  # An owner rules ticket covering the path makes the write LEGAL by design, so this case must
+  # run against a rules dir that carries no ticket - otherwise it reports a false failure.
+  With-NoTicket { Case 'CLI rules-surface write is denied' @{ toolName = 'str_replace'; toolArgs = (@{ path = "$env:USERPROFILE\.claude\rules\zz.md"; old_str = 'a'; new_str = 'b' } | ConvertTo-Json -Compress); cwd = $plain } 'deny-exit' }
   Case 'malformed payload is allowed (fail open, no crash)' @{ junk = 1 } 'allow'
 
   # --- AXIOM gate in-process (repo with its own profile) ---
