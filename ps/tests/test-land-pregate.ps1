@@ -282,8 +282,24 @@ try {
   $l6 = Slot 'p6'; Commit $l6 'p6.txt' 'p6' 'p6'
   Set-Content (Join-Path $l6.path 'scratch.txt') 'uncommitted'
   $o = LandFrom $l6.path @('-Branch', 'p6', '-Purpose', 'land p6')
-  Check '6 dirty slot + no free scratch -> pre-gate skipped with the reason, gate in the queue, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p6')[0].reason -match 'uncommitted' -and @(Gates '^land gate p6').Count -eq 1 -and @(Gates 'land pregate p6').Count -eq 0) $o
-  Check '6 the uncommitted file was not touched' ((Get-Content (Join-Path $l6.path 'scratch.txt')) -eq 'uncommitted')
+  # 2026-11-24: a dirty slot with only UNTRACKED files is no longer a reason to skip the pre-gate when no
+  # scratch slot can be had. The caller stands in that slot, the untracked files are its own, checkout
+  # never removes them - so the pre-gate runs THERE and the queue stops paying for the whole repo gate
+  # under the cap-1 mutex. The verdict is untrusted, so a failure is neither quarantined nor fatal.
+  $t6 = @(GateTrees 'land pregate p6')
+  Check '6 no free scratch + untracked-only dirty caller slot -> pre-gate runs in the CALLER slot, queue does not gate' ($code -eq 0 -and (Remote 'p6.txt') -eq 'p6' -and $t6.Count -eq 1 -and "$($t6[0].root)" -eq "$($l6.path)" -and @(Gates '^land gate p6').Count -eq 0 -and @(Ev 'land-pregate-skipped' 'p6').Count -eq 0) ("$o || " + ($t6 | ConvertTo-Json -Compress))
+  Check '6 ... the substitution is journaled as untrusted (foreign untracked paths + the failed rental)' (@(Ev 'land-pregate-foreign-untracked' 'p6').Count -eq 1 -and (Ev 'land-pregate-foreign-untracked' 'p6')[0].untracked -ge 1 -and (Ev 'land-pregate-foreign-untracked' 'p6')[0].scratch -match 'no scratch slot was free')
+  Check '6 ... the tree that landed is the tree that was gated' ((git -C $repo rev-parse 'origin/dev^{tree}') -eq "$($t6[0].tree)")
+  Check '6 the uncommitted file was not touched and the slot is back on its branch' ((Get-Content (Join-Path $l6.path 'scratch.txt')) -eq 'uncommitted' -and (git -C $l6.path symbolic-ref --short HEAD) -eq 'p6')
+  # 6a. the fallback must NOT apply to a TRACKED modification: the gate would judge a file that is not the
+  #     topic's, and `git checkout --detach` could carry or refuse it. A tracked-dirty caller slot still
+  #     skips, names the uncommitted file, and lets the (clean) land slot run the gate.
+  $l6a = Slot 'p6a'; Commit $l6a 'p6a.txt' 'v1' 'p6a'
+  Set-Content (Join-Path $l6a.path 'p6a.txt') 'v2-tracked-edit'
+  $o = LandFrom $l6a.path @('-Branch', 'p6a', '-Purpose', 'land p6a')
+  Check '6a tracked-dirty caller slot + no free scratch -> still skips, gate in the queue, lands' ($code -eq 0 -and @(Ev 'land-pregate-skipped' 'p6a').Count -eq 1 -and @(Ev 'land-pregate-skipped' 'p6a')[0].reason -match 'uncommitted or untracked' -and @(Ev 'land-pregate-foreign-untracked' 'p6a').Count -eq 0 -and @(Gates 'land pregate p6a').Count -eq 0 -and @(Gates '^land gate p6a').Count -eq 1) $o
+  Check '6a ... and the skip names the failed rental too' ((Ev 'land-pregate-skipped' 'p6a')[0].reason -match 'no scratch slot was free')
+  Check '6a ... the caller''s tracked edit is untouched' ((Get-Content (Join-Path $l6a.path 'p6a.txt')) -eq 'v2-tracked-edit')
   foreach ($l in $hold6) { $null = AQ unlease -Repo $l.path -LeaseId $l.leaseId -Reason 'test 6 done' }
   # 6b. a dirty CALLER slot with a FREE scratch: the pre-gate rents the scratch, gates the rebased result
   #     there, leaves the caller's tree untouched, releases the scratch, and the queue does not gate again.

@@ -483,6 +483,11 @@ function Test-SlotHasWork([string]$path) {
   $has
 }
 function Test-GitClean([string]$path) { -not @(& git --no-optional-locks -C $path status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ }).Count }
+# Tracked-only cleanliness: a TRACKED modification disqualifies a slot as a gate tree (the gate would judge
+# files that are not the topic's, and `git checkout --detach` could carry or refuse them). Non-ignored
+# UNTRACKED files do not: checkout never removes them, and the caller that owns them is the one landing.
+function Test-GitCleanTracked([string]$path) { -not @(& git --no-optional-locks -C $path status --porcelain --untracked-files=no 2>$null | Where-Object { $_ }).Count }
+function Get-UntrackedPaths([string]$path) { @(& git --no-optional-locks -C $path status --porcelain --untracked-files=normal 2>$null | Where-Object { $_ -match '^\?\?' } | ForEach-Object { $_.Substring(2).Trim() }) }
 function Test-OnRemote([string]$path, [string]$sha) {
   if (-not $sha) { return $false }
   [bool]@(& git -C $path for-each-ref --count=1 --contains $sha --format='%(refname)' refs/remotes 2>$null | Where-Object { $_ }).Count
@@ -497,8 +502,8 @@ function Test-OnRemote([string]$path, [string]$sha) {
 # commits are worth keeping.
 function Backup-Slot([string]$path, [string]$repoName, [string]$slot, [string]$why, [switch]$CommitsOnly) {
   if (-not $path -or -not (Test-Path -LiteralPath $path)) { return '' }
-  $head = (& git -C $path rev-parse --verify -q HEAD 2>$null)
-  if ($LASTEXITCODE -or -not $head) { throw "backup: $path has no valid HEAD (broken worktree) - inspect by hand" }
+  $head = Get-SlotHead $path
+  if (-not $head) { throw "backup: $path has no valid HEAD (broken worktree) - inspect by hand" }
   $clean = $CommitsOnly -or (Test-GitClean $path)
   if ($clean -and (Test-OnRemote $path $head)) { return '' }
   $commit = $head; $big = @()
@@ -702,14 +707,21 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
 }
 # A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
+# A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
 # succeed on a later sweep: failing closed kept the lease for ever and re-counted the SAME directory on
 # every sweep (2026-11-23: `agentq slo` reported lostWorkIncidents 6, 5 of them one broken worktree, and
-# the slot stayed held). The predicate is Backup-Slot's guard - an absent path is "nothing to back up",
-# which is NOT broken, and anything else about a failed backup keeps today's fail-closed behaviour.
-function Test-BrokenSlot([string]$path) {
-  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $false }
-  $head = (& git -C $path rev-parse --verify -q HEAD 2>$null)
-  [bool]($LASTEXITCODE -or -not $head)
+# the slot stayed held). So the sweep ORPHANS it (Orphan-Slot) - and because that is TERMINAL, the verdict
+# must be CONFIRMED first: a single `rev-parse` can fail transiently on a healthy worktree (index/worktree
+# race; 2026-11-24 a flaky probe orphaned a sound fixture slot and turned a green suite red). One retry,
+# and the verdict is derived from the backup attempt itself - never from a second, independent probe.
+function Get-SlotHead([string]$path) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return '' }
+  foreach ($attempt in 1, 2) {
+    $head = (& git -C $path rev-parse --verify -q HEAD 2>$null)
+    if (-not $LASTEXITCODE -and $head) { return "$head" }
+    if ($attempt -eq 1) { Start-Sleep -Milliseconds 250 }
+  }
+  ''
 }
 # Terminal outcome for that ONE case: move the directory out of the slot pool under <wtroot>\_orphans
 # (every file preserved, nothing deleted) with a MOVED.txt naming repo/slot/leaseId/session and the
@@ -756,9 +768,14 @@ function Orphan-Slot($l, [string]$why) {
 # broken worktree, which is terminal: it is orphaned above, so the lease goes and the slot comes back.
 # Returns $true (expired), $false (kept: backup failed) or 'orphaned', which Invoke-Sweep prints on its own.
 function Expire-Lease($l, [string]$why) {
-  if (Test-BrokenSlot (P $l 'path')) { if (Orphan-Slot $l $why) { return 'orphaned' }; return $false }
   try { $ref = Backup-Slot (P $l 'path') $l.repo $l.slot $why -CommitsOnly:((P $l 'role') -eq 'release') }
-  catch { Write-Journal @{ event = 'lease-expire-failed'; resource = "slot:$($l.repo):$($l.slot)"; reason = "$why; $($_.Exception.Message)"; repo = $l.repo }; return $false }
+  catch {
+    # The backup attempt is the single source of truth: Backup-Slot's own guard is the one terminal case
+    # (no valid HEAD -> nothing to back up, ever). Deriving it here instead of from a second probe keeps the
+    # two from disagreeing, which is what orphaned a healthy slot on 2026-11-24.
+    if ("$($_.Exception.Message)" -match 'has no valid HEAD') { if (Orphan-Slot $l $why) { return 'orphaned' }; return $false }
+    Write-Journal @{ event = 'lease-expire-failed'; resource = "slot:$($l.repo):$($l.slot)"; reason = "$why; $($_.Exception.Message)"; repo = $l.repo }; return $false
+  }
   Remove-LeaseRecord $l 'lease-expire' $why $ref
   $true
 }
@@ -1971,6 +1988,10 @@ function Release-PregateSlot($lease = $null, [string]$repoName = '', [string]$wh
 function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   $script:PregateResult = 'skipped'
   $script:PregateOwnedSlot = $null
+  # Foreign untracked paths present in the tree the gate ran in (set only by the last-resort fallback in
+  # the dirty-slot block below). Non-empty means the verdict is UNTRUSTED: a failure must not quarantine
+  # the topic and must not fail the land, because the clean land slot can give the honest answer.
+  $script:PregateUntracked = @()
   $res = "land:$($repo.Name)"
   if (-not (Get-LandPregateOn $repo.Name)) { return }
   $skip = {
@@ -2027,7 +2048,32 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
         Write-Output "land: pre-gate in a rented scratch slot ($($repo.Name)/$(P $slot 'slot')) - the slot the caller stands in has uncommitted files; released when the gate is done"
       }
     }
-    if (-not (Test-GitClean $sp)) { & $skip 'the slot has uncommitted or untracked files'; return }
+    # Last resort (2026-11-24): no scratch slot was free and this is the slot the CALLER STANDS IN - its
+    # own tree, owned by the agent that is landing. A TRACKED modification still disqualifies the gate (it
+    # would judge files that are not the topic's, and `git checkout --detach` could carry or refuse them);
+    # the caller's own non-ignored UNTRACKED files do not: checkout never removes them, the branch is
+    # restored by the finally below, and the agent that runs this land already runs its own gate in this
+    # very tree. The verdict is marked UNTRUSTED, so a failure here is neither quarantined nor fatal - the
+    # clean land slot gives the honest answer in the queue. Measured 2026-11-24: of ~198
+    # `land-pregate-skipped` lines in 48 h, 164 were "no pre-gate tree obtainable" (136 of them printed
+    # "the slot has uncommitted or untracked files" AFTER the rental had already failed, hiding it), and
+    # each one ran the whole 5-40 min repo gate (p90 ~30 min) INSIDE the cap-1 land mutex.
+    if (-not $script:PregateUntracked.Count -and (Test-GitCleanTracked $sp)) {
+      $standHere = @(Read-Leases $repo.Name | Where-Object { -not $_.stale -and (P $_ 'session') -eq $Session -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) })
+      if ($standHere.Count) {
+        $script:PregateUntracked = @(Get-UntrackedPaths $sp)
+        if ($script:PregateUntracked.Count) {
+          Write-Output "land: pre-gate in the caller's own slot ($($repo.Name)/$(P $slot 'slot')) - no scratch slot was free and it carries only untracked files ($($script:PregateUntracked.Count)); the verdict is untrusted, so a failure here is not quarantined and the queue decides"
+          Write-Journal @{ event = 'land-pregate-foreign-untracked'; resource = $res; branch = $Branch; slot = "$(P $slot 'slot')"; paths = @($script:PregateUntracked | Select-Object -First 40); untracked = $script:PregateUntracked.Count; scratch = "$($script:PregateScratchWhy)"; repo = $repo.Name }
+        }
+      }
+    }
+    if (-not $script:PregateUntracked.Count -and -not (Test-GitClean $sp)) {
+      $whyDirty = 'the slot has uncommitted or untracked files'
+      if ($script:PregateScratchWhy) { $whyDirty = "$whyDirty; $($script:PregateScratchWhy)" }
+      & $skip $whyDirty
+      return
+    }
   }
   $c = Get-Config
   $rounds = if ($c.ContainsKey('landPregateRounds')) { [math]::Max(1, [int]$c['landPregateRounds']) } else { 2 }
@@ -2071,6 +2117,16 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     }
     if ($script:GateExit) {
       Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = $Gate; repo = $repo.Name }
+      # The gate ran in the caller's own tree, which carried untracked paths that are not the topic's, so
+      # the failure may not be the topic's either. Quarantining on it would block a green topic for 6 h and
+      # failing the land would make the agent chase a defect it does not have: hand the verdict to the
+      # clean land slot instead (it runs the same gate on the same tree without the foreign files).
+      if ($script:PregateUntracked.Count) {
+        Write-Journal @{ event = 'land-pregate-untrusted-fail'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; paths = @($script:PregateUntracked | Select-Object -First 40); reason = "the gate failed in the caller's own slot while it carried $($script:PregateUntracked.Count) foreign untracked path(s); not quarantined - the clean land slot decides in the queue"; repo = $repo.Name }
+        [Console]::Error.WriteLine("land: the pre-gate failed ($($script:GateExit)) in a tree that carried $($script:PregateUntracked.Count) untracked path(s) that are not the topic's, so this is NOT treated as the topic's failure: nothing is quarantined, nothing pushed, and the clean land slot re-gates the same tree in the queue.")
+        $script:PregateResult = 'skipped'
+        return
+      }
       # B) Quarantine the topic so no later land re-absorbs it into the cap-1 mutex batch (see the block
       # above Get-LandQuarantineFile). A fresh, passing pre-gate clears it (Invoke-Land).
       Set-LandQuarantine $repo.Name $Branch $tree "$Gate (exit $($script:GateExit))"
@@ -2495,6 +2551,28 @@ function Invoke-LandWedgeReap($repo) {
 # per topic; an absorbed waiter exits with its topic's code.
 # After each push the pushed tree's scripts/post-land.ps1 is started detached (Start-PostLand, ADR 0008);
 # it never changes these codes.
+function Reap-LandedBranch {
+  # Reap the SOURCE remote branch once a land PUSHED its content to $Target (2026-11-24). `agentq publish`
+  # mints a `publish/<session>-<ts>` topic and nothing ever deleted it: origin held 466 of them and 201
+  # were provably already merged into main (every commit's patch-id present). Reap ONLY an auto-generated
+  # `publish/*` topic - a human-named branch is never touched, the land target is never touched, and a
+  # branch a working slot is on is left alone. `--no-verify`: husky's CLIENT pre-push runs
+  # scripts/ci/check-rollout-vm-hardening.mjs, a CODE gate that cannot apply to deleting a ref (verified:
+  # the push is refused without it). Any delete failure is journaled and NEVER fails the land.
+  param([string]$Top, [string]$Target, [string]$BranchName, [string]$RepoName, [string[]]$Occupied)
+  if (-not $BranchName) { return }
+  if ($BranchName -notmatch '^publish/') { Write-Output "kept ${BranchName}: not auto-generated"; return }
+  if ($BranchName -eq $Target) { Write-Output "kept ${BranchName}: is the land target"; return }
+  if (@($Occupied) -contains $BranchName) { Write-Output "kept ${BranchName}: a working slot is on it"; return }
+  $out = @(& git -C $Top push --no-verify -q origin --delete $BranchName 2>&1 | ForEach-Object { "$_" })
+  if ($LASTEXITCODE) {
+    Write-Journal @{ event = 'land-reap-failed'; resource = "land:$RepoName"; branch = $BranchName; onto = $Target; reason = ((@($out) | Select-Object -Last 4) -join ' | ').Trim(); repo = $RepoName }
+    Write-Output "kept ${BranchName}: delete failed - $((@($out) | Select-Object -Last 1))"
+    return
+  }
+  Write-Journal @{ event = 'land-reap'; resource = "land:$RepoName"; branch = $BranchName; onto = $Target; repo = $RepoName }
+  Write-Output "reaped $BranchName (landed into $Target)"
+}
 function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -2586,6 +2664,13 @@ function Invoke-Land {
   if (-not $srcLease) { $srcLease = Read-Leases $repo.Name | Where-Object { $_.session -eq $Session -and $_.role -in 'task', 'pinned' } | Sort-Object { "$(P $_ 'created' '')" } | Select-Object -First 1 }
   $script:LandSrcSlot = if ($srcLease) { "$(P $srcLease 'path')" } else { $null }
   $tc = if ($srcLease) { @(P $srcLease 'claims' @()) } else { @() }
+  # Branches a working slot is on - the caller's cwd and its registered source slot - so the reap after a
+  # successful land never deletes the topic out from under a live checkout (2026-11-24).
+  $reapOcc = @()
+  foreach ($wp in @($cwdN, $script:LandSrcSlot) | Where-Object { $_ } | Select-Object -Unique) {
+    $wb = "$(& git -C $wp rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+    if ($wb -and $wb -ne 'HEAD') { $reapOcc += $wb }
+  }
   try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
   $lease = $null; $hb = $null; $set = @(); $peersDone = $false
@@ -2659,13 +2744,21 @@ function Invoke-Land {
     }
     foreach ($tp in @($set | Where-Object { -not $_.own })) {
       $r = $acc.results[$tp.branch]
-      if ($r) { Write-JsonAtomic (Join-Path $bdir "$($tp.ticket.id).json") @{ exit = [int]$r.exit; sha = "$($r.sha)"; by = $Session; holder = $t.id; reason = "$(if ($r.exit) { 'failed on its own after bisection' })" } }
+      if ($r) {
+        Write-JsonAtomic (Join-Path $bdir "$($tp.ticket.id).json") @{ exit = [int]$r.exit; sha = "$($r.sha)"; by = $Session; holder = $t.id; reason = "$(if ($r.exit) { 'failed on its own after bisection' })" }
+        # A batched topic that landed is reaped here: its own waiter returned early on the batch result, so
+        # it never reaches its own success block - same rule, same helper (2026-11-24).
+        if ($r.exit -eq 0 -and -not $r.nothing) { Reap-LandedBranch -Top $main -Target $Onto -BranchName $tp.branch -RepoName $repo.Name -Occupied $reapOcc }
+      }
       else { try { Update-Ticket $tp.ticket @{ batchedBy = '' } } catch {} }
     }
     $peersDone = $true
     $own = $acc.results[$Branch]
     if (-not $own) { throw "land: internal error - no result for $Branch" }
-    if ($own.exit -eq 0 -and -not $own.nothing) { Write-Output "landed $Branch -> origin/$Onto @ $(Short $own.sha 12)$(if ($acts) { " (releases: $($acts -join ', '))" })" }
+    if ($own.exit -eq 0 -and -not $own.nothing) {
+      Write-Output "landed $Branch -> origin/$Onto @ $(Short $own.sha 12)$(if ($acts) { " (releases: $($acts -join ', '))" })"
+      Reap-LandedBranch -Top $main -Target $Onto -BranchName $Branch -RepoName $repo.Name -Occupied $reapOcc
+    }
     $script:LandExit = [int]$own.exit
   } finally {
     $script:WaitAbort = $null
@@ -2818,7 +2911,9 @@ function Invoke-Publish {
   if (-not $DoLand) { Write-Output "publish: land it with: agentq land -Branch $topic -Onto $onto -Purpose `"$Purpose`""; return }
   $script:Branch = $topic; $script:Onto = $onto
   Invoke-Land
-  if ($script:LandExit -eq 0) { & git -C $top push -q --no-verify origin ":refs/heads/$topic" 2>$null | Out-Null }
+  # The source reap lives in Invoke-Land (Reap-LandedBranch) so it applies to `publish -Land` AND to a
+  # topic absorbed into another holder's batch - a branch landed by a batch is deleted by that holder,
+  # never by the waiter that returned early. Nothing to delete here (2026-11-24).
 }
 
 
