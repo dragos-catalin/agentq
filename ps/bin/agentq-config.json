@@ -245,7 +245,14 @@
       "project": "codai-training",
       "zone": "europe-west4-a"
     },
-    "caelia-android": { "project": "codai-training", "zone": "europe-west4-a" },
+    "caelia-android": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
+    "brivio": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
     "vitals-win": {
       "project": "codai-training",
       "zone": "europe-west4-a"
