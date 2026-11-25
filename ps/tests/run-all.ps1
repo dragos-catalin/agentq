@@ -161,6 +161,12 @@ $suites = [ordered]@{
   # counted, not assumed), that the thread reopens when the asker replies, and that an unreadable -To is
   # exit 2 with a fixable message instead of a message nobody will ever read.
   'agent msgs'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-msgs.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-25: the anti-regression ratchet for POOL-delegating land gates. Every landGate.<repo> in
+  # bin/agentq-config.json must name a pool wrapper (ps|scripts|infra/devcloud/, tool/*cloud*) or be in
+  # tests/land-gate-pool.allow.json with a reason - so a new repo cannot quietly land an expensive local
+  # command on this workstation the way agentq's own gate did (2160 s, 26 suites). Paired with the
+  # install.ps1 map entry in this same commit - 'install wiring' pins the two.
+  'land gate pool'  = @('-File', (Join-Path $PSScriptRoot 'test-land-gate-pool.ps1'))
 }
 $names = @($suites.Keys)
 # -RepoSuites: the suites THIS repo's gate runs, from bin/agentq-config.json -> gateSuites.<repo>

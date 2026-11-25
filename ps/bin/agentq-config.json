@@ -150,6 +150,7 @@
       "help",
       "script scope",
       "install wiring",
+      "land gate pool",
       "status readonly",
       "slot budget"
     ]
@@ -214,6 +215,7 @@
     "marcai": "codai",
     "codai": "codai",
     "caelia": "caelia",
+    "agentq": "agentq",
     "vitals": "vitals-win",
     "watch-faces": "watch-faces",
     "frontier-kit": "frontiers",
@@ -246,6 +248,10 @@
       "zone": "europe-west4-a"
     },
     "caelia-android": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
+    "agentq": {
       "project": "codai-training",
       "zone": "europe-west4-a"
     },

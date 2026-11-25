@@ -163,6 +163,11 @@ $map = [ordered]@{
   # land PRE-gate must run at Normal like the queued land gate. Paired with the run-all.ps1 entry in
   # this same commit - 'install wiring' pins the two.
   'tests\test-journal-write-race.ps1' = 'bin\test-journal-write-race.ps1'
+  # 2026-11-25: the anti-regression ratchet for POOL-delegating land gates, plus the allow-list it
+  # reads (the installed suite lives in bin\, so the JSON must too). Paired with the run-all.ps1 entry
+  # in this same commit - 'install wiring' pins the two.
+  'tests\test-land-gate-pool.ps1' = 'bin\test-land-gate-pool.ps1'
+  'tests\land-gate-pool.allow.json' = 'bin\land-gate-pool.allow.json'
 }
 $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.copilot' }
 # Config merge: the installed file keeps every value it has; values only the checkout has are appended.
