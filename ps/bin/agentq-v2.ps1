@@ -2320,6 +2320,31 @@ function Invoke-LandRebaseOnConflict([string]$wt, [string]$ref, [string]$onto, [
   Write-Journal @{ event = 'land-rebase-clean'; resource = $res; ref = $ref; branch = $onto; reason = "rebased onto origin/$onto in the land slot; the pick is retried once"; repo = $repo.Name }
   return 'rebased'
 }
+# 2026-11-25: name the gate the way the repo's .husky/pre-push compares it. codai's hook skips its own
+# `pnpm gate:platform` ONLY when $env:AGENTQ_LAND_GREEN_GATE is that exact literal, but codai's DEFAULT
+# land gate is the cloud wrapper `pwsh -NoProfile -File scripts/ops/cloud-land-gate.ps1` - which runs
+# EXACTLY `pnpm gate:platform` on the very worktree being pushed (scripts/ops/cloud-land-gate.ps1:
+# $tokens = @('pnpm','gate:platform'), and $Repo resolves to this worktree). Exporting the wrapper string
+# made the handshake unmatchable, so EVERY codai land re-ran the whole platform gate LOCALLY on top of the
+# cloud run and could fail on an already-green tree (the real land that died this way had passed the cloud
+# gate seconds earlier). Map ONLY that exact wrapper name -> the equivalent literal; any other gate keeps
+# its real string, and a mismatched tree still gates (the hook compares HEAD^{tree}). Never lie to the hook.
+function Resolve-HookGateName([string]$RepoName, [string]$Gate) {
+  if ($RepoName -eq 'codai' -and $Gate -eq 'pwsh -NoProfile -File scripts/ops/cloud-land-gate.ps1') { return 'pnpm gate:platform' }
+  return $Gate
+}
+# 2026-11-25: a land's push output used to be tailed only on failure, so a rejected land's pre-push hook
+# log was unrecoverable from the job log. Persist the FULL captured push output to the slot and name the
+# file in the land-push-failed message; exit-code semantics are untouched (5/6/7 stay as they were).
+function Write-LandPushLog([string]$Slot, [object[]]$Lines) {
+  try {
+    $dir = Join-Path $Slot '.copilot-tmp\build-logs'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $file = Join-Path $dir ("{0}-land-push.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    @($Lines) | Set-Content -LiteralPath $file -Encoding utf8
+    return $file
+  } catch { return $null }
+}
 function Invoke-LandSet([object[]]$set) {
   $o = @{ results = @{}; failExit = 0; failSet = @(); dropped = @(); sha = '' }
   $script:LandSetOut = $o
@@ -2447,7 +2472,7 @@ function Invoke-LandSet([object[]]$set) {
     # The pre-push hook may re-run the land gate (codai .husky/pre-push runs `pnpm gate:platform`): tell it
     # which tree just passed which gate so it can skip a second run of the same check on the SAME tree. A
     # finalize commit changes the tree, so the hook compares HEAD^{tree} and gates anything else.
-    if ($greenForPush) { $env:AGENTQ_LAND_GREEN_TREE = $greenForPush; $env:AGENTQ_LAND_GREEN_GATE = $Gate }
+    if ($greenForPush) { $env:AGENTQ_LAND_GREEN_TREE = $greenForPush; $env:AGENTQ_LAND_GREEN_GATE = (Resolve-HookGateName $repo.Name $Gate) }
     $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
     if (-not $LASTEXITCODE) { $pushed = $true } else {
       $isRace = [bool]($out -match $LandRaceRe)
@@ -2486,9 +2511,11 @@ function Invoke-LandSet([object[]]$set) {
       return
     }
     if ($isRace) { Write-Output "land: origin/$Onto moved, retry round $($round + 1)"; continue }
+    $pushLog = Write-LandPushLog $wt $out
     $out | Select-Object -Last 20 | ForEach-Object { [Console]::Error.WriteLine($_) }
     $tail = (@($out | Select-Object -Last 6) -join ' | ')
-    Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
+    if ($pushLog) { [Console]::Error.WriteLine("land: full push output (incl. the pre-push hook log): $pushLog") }
+    Write-Journal @{ event = 'land-push-failed'; resource = $res; exit = 7; branch = $Onto; log = $pushLog; reason = $tail.Substring(0, [math]::Min(500, $tail.Length)); repo = $repo.Name }
     $o.failExit = 7; return
   }
   [Console]::Error.WriteLine("land: origin kept moving (3 rounds) - try again ($label)")
