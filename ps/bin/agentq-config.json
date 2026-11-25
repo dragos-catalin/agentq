@@ -121,7 +121,7 @@
     "codai": "pnpm gate:platform",
     "marcai": "pnpm guards",
     "caelia": "pwsh -NoProfile -File tool/verify_cloud.ps1 -Resource verify",
-    "vmui": "pnpm typecheck",
+    "vmui": "pwsh -NoProfile -File infra/devcloud/gate.ps1",
     "agentq": "pwsh -NoProfile -Command \"& (Join-Path (git rev-parse --show-toplevel) 'ps/tests/run-all.ps1') -RepoSuites -Parallel 4\""
   },
   "gateSuites": {
