@@ -86,12 +86,22 @@ $bannerOut = @(& pwsh -NoProfile -Command "& '$wait' -Log '$l2b' -Done 'DONE' -M
 Check '-MaxMin 60 is clamped to 10' ($bannerOut -match 'max 10 min') $bannerOut
 
 # --- pid mode: done when the process exits; nonzero exit -> FAILED ----------------------------------
-$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 700; exit 0' -WindowStyle Hidden -PassThru
-$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '20')
-Check 'wait-job -Pid DONE when the process exits 0' ($r.code -eq 0) "code=$($r.code) $($r.out)"
-$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 700; exit 4' -WindowStyle Hidden -PassThru
-$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '20')
+# A non-child process's exit code is readable only through a handle opened while it is still alive, so
+# wait-job MUST start before the fixture ends. 700 ms was too short: under load wait-job's own startup
+# ate the whole window, the code came back unreadable, and the documented fallback (an unknown code is
+# DONE) turned the nonzero check red on a green tree - that is how the land gate of 2026-11-25 20:22
+# failed (log: 'waiting on pid 102192' and 'DONE: pid 102192 exited' in the same second). The fixture
+# now lives 5 s, and the zero case asserts the code was actually READ ('(exit 0)'), not fallen back to.
+$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 5000; exit 0' -WindowStyle Hidden -PassThru
+$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '30')
+Check 'wait-job -Pid DONE when the process exits 0' ($r.code -eq 0 -and $r.out -match '\(exit 0\)') "code=$($r.code) $($r.out)"
+$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 5000; exit 4' -WindowStyle Hidden -PassThru
+$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '30')
 Check 'wait-job -Pid FAILED when the process exits nonzero' ($r.code -eq 1 -and $r.out -match 'exit code 4') "code=$($r.code) $($r.out)"
+# The fallback above, pinned on purpose: with no readable code wait-job reports DONE, never FAILED (a
+# guess would be worse). An unreachable pid keeps the check free of process-table races.
+$r = Run-Wait @('-Pid', '2147483647', '-EveryS', '0.2', '-MaxSec', '10')
+Check 'wait-job -Pid with an unreadable exit code is DONE, not FAILED (documented fallback)' ($r.code -eq 0 -and $r.out -notmatch '\(exit') "code=$($r.code) $($r.out)"
 
 # --- job-start -> registry -> jobs list -> done ------------------------------------------------------
 $cwd = Join-Path $tmp 'work'; New-Item -ItemType Directory -Force $cwd | Out-Null
