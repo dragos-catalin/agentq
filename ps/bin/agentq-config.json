@@ -122,7 +122,7 @@
     "marcai": "pwsh -NoProfile -File scripts/devcloud/gate.ps1",
     "caelia": "pwsh -NoProfile -File tool/verify_cloud.ps1 -Resource verify",
     "vmui": "pwsh -NoProfile -File infra/devcloud/gate.ps1",
-    "agentq": "pwsh -NoProfile -Command \"& (Join-Path (git rev-parse --show-toplevel) 'ps/tests/run-all.ps1') -RepoSuites -Parallel 4\""
+    "agentq": "pwsh -NoProfile -File ps/devcloud/gate.ps1"
   },
   "gateSuites": {
     "agentq": [
