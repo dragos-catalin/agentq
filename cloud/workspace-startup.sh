@@ -127,31 +127,54 @@ esac
 # bin/cache (flutter rewrites its lockfile and stamps on each run), and chowning the image's own tree
 # would break the GitHub runner still using it.
 case ",$TOOLCHAINS," in *,flutter,*)
-  F=/opt/flutter
-  if [ ! -f /opt/devcloud/.flutter-v1 ]; then
-    SRC="$(find /home /opt /usr/local /srv -maxdepth 4 -type f -path '*/bin/flutter' -printf '%h\n' 2>/dev/null | head -1 || true)"
-    SRC="${SRC%/bin}"
-    if [ -n "$SRC" ] && [ "$SRC" != "$F" ] && [ -x "$SRC/bin/flutter" ]; then
-      echo "::flutter-copy src=$SRC"
+  # The image bakes exactly ONE Flutter - whatever `stable` was at image build time - while a repo pins
+  # its own. caelia pins 3.47.3 and the image has 3.50.1, whose android plugin now demands AGP >= 9.1.1
+  # and refuses the 9.1.0 the repo pins (`Your project's Android Gradle Plugin version 9.1.0 is lower
+  # than Flutter's minimum supported version 9.1.1`). Installing the exact tag keeps the pool build equal
+  # to the workstation build instead of quietly upgrading the toolchain under the repo.
+  FV="$(md devcloud-flutter-version)"
+  if [ -n "$FV" ]; then
+    F="/opt/flutter-$FV"
+    if [ ! -f "/opt/devcloud/.flutter-$FV-v1" ]; then
+      echo "::flutter-install version=$FV into $F"
       rm -rf "$F"
-      cp -a "$SRC" "$F"
-      chown -R dev:dev "$F"
-      if [ -d /opt/android-sdk ]; then chown -R dev:dev /opt/android-sdk; fi
-      touch /opt/devcloud/.flutter-v1
-    elif [ -x "$F/bin/flutter" ]; then
-      touch /opt/devcloud/.flutter-v1
-    else
-      echo "::flutter-no-sdk (nothing under /home /opt /usr/local /srv at depth 4)"
+      if sudo -u dev -H git clone -q --depth 1 -b "$FV" https://github.com/flutter/flutter.git "$F"; then
+        sudo -u dev -H "$F/bin/flutter" precache --android --linux >/dev/null 2>&1 || true
+        touch "/opt/devcloud/.flutter-$FV-v1"
+      else
+        echo "::flutter-install FAILED for $FV"
+      fi
+    fi
+  fi
+  if [ -z "$FV" ] || [ ! -x "$F/bin/flutter" ]; then
+    F=/opt/flutter
+    if [ ! -f /opt/devcloud/.flutter-v1 ]; then
+      SRC="$(find /home /opt /usr/local /srv -maxdepth 4 -type f -path '*/bin/flutter' -printf '%h\n' 2>/dev/null | head -1 || true)"
+      SRC="${SRC%/bin}"
+      if [ -n "$SRC" ] && [ "$SRC" != "$F" ] && [ -x "$SRC/bin/flutter" ]; then
+        echo "::flutter-copy src=$SRC"
+        rm -rf "$F"
+        cp -a "$SRC" "$F"
+        chown -R dev:dev "$F"
+        if [ -d /opt/android-sdk ]; then chown -R dev:dev /opt/android-sdk; fi
+        touch /opt/devcloud/.flutter-v1
+      elif [ -x "$F/bin/flutter" ]; then
+        touch /opt/devcloud/.flutter-v1
+      else
+        echo "::flutter-no-sdk (nothing under /home /opt /usr/local /srv at depth 4)"
+      fi
     fi
   fi
   if [ -x "$F/bin/flutter" ]; then
+    chown -R dev:dev "$F"
     ln -sfn "$F/bin/flutter" /usr/local/bin/flutter
     ln -sfn "$F/bin/dart" /usr/local/bin/dart
     git config --system --add safe.directory "$F" || true
     A=/opt/android-sdk; J=/usr/lib/jvm/temurin-21-jdk-amd64
     if [ -d "$A" ]; then printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$A" "$A" >> /etc/devcloud/env.new; fi
     if [ -d "$J" ]; then printf 'JAVA_HOME=%s\n' "$J" >> /etc/devcloud/env.new; fi
-    echo "::flutter-ready root=$F java=$J android=$A"
+    VERS="$("$F/bin/flutter" --version 2>/dev/null | head -1 || true)"
+    echo "::flutter-ready root=$F version=$VERS java=$J android=$A"
   fi
   ;;
 esac
