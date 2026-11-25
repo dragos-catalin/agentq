@@ -30,7 +30,18 @@ if [ ! -f /opt/devcloud/.installed-$NODE_VERSION-$PNPM_VERSION ]; then
   apt-get install -y --no-install-recommends git curl ca-certificates jq unzip zstd xz-utils build-essential python3 ripgrep pkg-config libssl-dev
   timedatectl set-timezone Europe/Bucharest || true
   curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" | tar -xJ -C /usr/local --strip-components=1
-  npm install -g "pnpm@${PNPM_VERSION}"
+  # The baked image already carries pnpm from its own release tarball (/usr/local/bin/pnpm is a
+  # symlink into /opt/pnpm), and `npm install -g` refuses to overwrite a file it does not own:
+  # `npm error code EEXIST / npm error path /usr/local/bin/pnpm`, which `set -e` turns into a
+  # failed boot - the runner agent never starts and every job queues forever. Measured 2026-11-25
+  # on ws-brivio and ws-caelia-android, 37-58 s into the first boot. Keep the image's pnpm when it
+  # is already usable (repos pin their own version through packageManager); only a workspace
+  # without one installs it with npm.
+  if pnpm --version >/dev/null 2>&1; then
+    echo "startup: pnpm $(pnpm --version) already present (image), keeping it over $PNPM_VERSION"
+  else
+    npm install -g "pnpm@${PNPM_VERSION}"
+  fi
   # Tailscale (joined by DC-055 with an OAuth client; installed now so the image has it)
   curl -fsSL https://tailscale.com/install.sh | sh || true
   mkdir -p /opt/devcloud && touch /opt/devcloud/.installed-$NODE_VERSION-$PNPM_VERSION
