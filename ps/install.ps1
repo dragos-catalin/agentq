@@ -168,6 +168,8 @@ $dst = if ($env:AGENTQ_INSTALL_DIR) { $env:AGENTQ_INSTALL_DIR } else { Join-Path
 # wins, a new one from the checkout is added. A top-level-only merge could never deliver a new per-repo
 # default - 2026-11-21: `landGate.codai` was added to the checkout and silently dropped because the
 # installed copy already had a `landGate` key, so the live config never carried the gate.
+# EXCEPT `landGate` itself: a land gate is a REPO policy, not a machine value, so the CHECKOUT owns it
+# and the installed copy only contributes repos the checkout does not name (2026-11-25).
 # Returns the merged text, or $null when nothing is missing (file left untouched).
 function Merge-ConfigMap([string]$prefix, $to, $from) {
   $o = [ordered]@{}
@@ -183,6 +185,25 @@ function Merge-ConfigMap([string]$prefix, $to, $from) {
       $add = @($fv | Where-Object { $tv -notcontains $_ })
       $o[$k] = @($tv) + $add
       if ($add.Count) { $script:CfgAdded = @($script:CfgAdded) + @("$path += $($add -join ', ')") }
+    } elseif ($path -eq 'landGate' -and $fv -is [Collections.IDictionary] -and $tv -is [Collections.IDictionary]) {
+      # Installed-wins is WRONG for a gate, and the old code had a second defect on top of the value:
+      # it reported only ADDED keys, so a checkout that changed an EXISTING gate rewrote nothing at all.
+      # 2026-11-25: the checkout moved `landGate.vmui` to the devcloud pool gate, the installed copy kept
+      # `pnpm typecheck`, and the live config never carried the change - the same class of silent drop as
+      # the 2026-11-21 incident above, for an existing key instead of a missing one. Measured: an install
+      # into a scratch AGENTQ_INSTALL_DIR left `pnpm typecheck` in place.
+      # Here the checkout is the base (it wins) and the installed copy adds only the repos it alone names.
+      # Build the map here rather than recursing: the recursion reports every installed-only key as an
+      # ADDITION, which made `-Check` report drift on every later run (a repo named only locally can
+      # never be "added" twice) and broke the "a re-install changes nothing" invariant.
+      $g = [ordered]@{}
+      foreach ($rk in $fv.Keys) { $g[$rk] = $fv[$rk] }
+      foreach ($rk in $tv.Keys) { if (-not $g.Contains($rk)) { $g[$rk] = $tv[$rk] } }
+      foreach ($rk in $fv.Keys) {
+        if (-not $tv.ContainsKey($rk)) { $script:CfgAdded = @($script:CfgAdded) + @("$path.$rk = $($fv[$rk])") }
+        elseif ("$($tv[$rk])" -ne "$($fv[$rk])") { $script:CfgChanged = @($script:CfgChanged) + @("$path.$rk = $($fv[$rk])") }
+      }
+      $o[$k] = $g
     } elseif ($fv -is [Collections.IDictionary] -and $tv -is [Collections.IDictionary]) {
       $o[$k] = Merge-ConfigMap $path $tv $fv
     } else { $o[$k] = $tv }
@@ -199,8 +220,11 @@ function Get-MergedConfig([string]$from, [string]$to) {
   $s = Get-Content -LiteralPath $from -Raw | ConvertFrom-Json -AsHashtable
   $d = Get-Content -LiteralPath $to -Raw | ConvertFrom-Json -AsHashtable
   $script:CfgAdded = @()
+  $script:CfgChanged = @()
   $o = Merge-ConfigMap '' $d $s
-  if (-not @($script:CfgAdded).Count) { return $null }
+  # A CHANGED value is as much work as an added key: without this the merged text was discarded and the
+  # live file was left untouched, so a gate change could never be delivered.
+  if (-not (@($script:CfgAdded).Count + @($script:CfgChanged).Count)) { return $null }
   ($o | ConvertTo-Json -Depth 8) + "`n"
 }
 # --- green record freshness (begin) ---------------------------------------------------------------
@@ -298,7 +322,7 @@ foreach ($k in $drift) {
     $merged = Get-MergedConfig $a $b
     if ($null -ne $merged) {
       [IO.File]::WriteAllText("$b.new", $merged, [Text.UTF8Encoding]::new($false)); Move-Item "$b.new" $b -Force
-      "merged $($map[$k]): added $($script:CfgAdded -join ', ') (existing keys keep their local value)"
+      "merged $($map[$k]): $(if (@($script:CfgAdded).Count) { "added $($script:CfgAdded -join ', ')" })$(if (@($script:CfgAdded).Count -and @($script:CfgChanged).Count) { '; ' })$(if (@($script:CfgChanged).Count) { "changed $($script:CfgChanged -join ', ')" }) (other keys keep their local value)"
     }
     continue
   }

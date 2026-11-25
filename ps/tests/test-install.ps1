@@ -87,6 +87,23 @@ try {
   $cg2 = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
   Check '3b a nested key the installed map lacks is added from the checkout' ($code -eq 0 -and $cg2['landGate']['keepme'] -eq 'local' -and $cg2['landGate'].Count -eq ($srcCfg['landGate'].Count + 1) -and $o -match 'added landGate\.') $o
 
+  # 3d. an EXISTING nested key whose VALUE the checkout CHANGED - the landGate case (2026-11-25). A land
+  # gate is a repo policy, not a machine value, so the checkout owns it. Installed-wins made a gate change
+  # undeliverable twice over: the value was kept AND, because the merge reported only ADDED keys, the
+  # merged text was discarded and the live file was not even rewritten. Mutation: put the generic
+  # `$o[$k] = Merge-ConfigMap $path $tv $fv` branch back in front of the landGate one and this Check goes
+  # red (measured: it does).
+  $cl = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  $clRepo = @($srcCfg['landGate'].Keys)[0]
+  $clOld = "$($cl['landGate'][$clRepo])"
+  $cl['landGate'][$clRepo] = 'a stale gate the checkout disagrees with'
+  [IO.File]::WriteAllText($cfgDst, ($cl | ConvertTo-Json -Depth 8))
+  $o = Install $Src @('-SkipTests')
+  $cl2 = Get-Content -LiteralPath $cfgDst -Raw | ConvertFrom-Json -AsHashtable
+  Check "3d a landGate value the checkout changed replaces the installed one (checkout owns the gate)" ($code -eq 0 -and "$($cl2['landGate'][$clRepo])" -eq "$($srcCfg['landGate'][$clRepo])" -and "$($cl2['landGate'][$clRepo])" -ne 'a stale gate the checkout disagrees with' -and $o -match [regex]::Escape("changed landGate.$clRepo = $($srcCfg['landGate'][$clRepo])")) "${clRepo}: was '$clOld' -> '$($cl2['landGate'][$clRepo])' || $o"
+  Check '3d a landGate repo only the installed copy names is still kept' ($cl2['landGate']['keepme'] -eq 'local')
+  Check '3d the gate fix is in sync afterwards (a re-install changes nothing)' ((Install $Src @('-Check')) -match 'in sync')
+
   # 3c. an ARRAY the installed config already has must GROW. Treating a list as a scalar ("the installed
   # copy wins") means a new list item never reaches the live config: 2026-11-23 the checkout's
   # `gateSuites.agentq` went from 17 to 25 names, the merge kept the installed 17, and the gate therefore
