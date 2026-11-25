@@ -60,7 +60,17 @@ function Get-Config {
   $script:Cfg = $c
   $c
 }
-function Get-WtRoot { if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' } }
+# `E:\gh\.wt` is this workstation's layout, and CODAI_WT_ROOT overrides it everywhere else. But a
+# pool/devcloud checkout lives on a volume that does not exist here: `Join-Path 'E:\gh\.wt' <repo>` then
+# THROWS ("Cannot find drive. A drive with the name 'E' does not exist.") and every slot-aware path dies
+# with exit 1 - measured 2026-11-25 on ws-agentq, where `agentq v1`'s two shared-clone checks reported
+# "got 1" instead of the expected 3 and 0. Fall back only when the drive is genuinely absent, so the
+# workstation keeps the exact path it had.
+function Get-WtRoot {
+  if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT }
+  elseif ($IsWindows) { if (Test-Path 'E:\') { 'E:\gh\.wt' } else { Join-Path $env:USERPROFILE '.agentq\wt' } }
+  else { '/work/.wt' }
+}
 function Get-ReleaseSlotCount([string]$repoName) { $r = (Get-Config).releaseSlots; if ($r -and $r.ContainsKey($repoName)) { [int]$r[$repoName] } else { 1 } }
 # Index access, not property access: under StrictMode 3 `(Get-Config).scratchSlots` THROWS when the key is
 # absent (the default map has no scratchSlots), so a scratch lease failed before the default 3 could apply.
