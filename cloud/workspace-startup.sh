@@ -155,6 +155,18 @@ case ",$TOOLCHAINS," in *,flutter,*)
   fi
   ;;
 esac
+# --- docker for job containers. brivio's land gate starts its own pgvector Postgres container, and the
+# brivio workspace (ws-brivio, image devcloud-ci-node24) has the docker binary but neither a running
+# daemon nor the job user in the `docker` group. Added 2026-11-25 after
+# `[gate] docker is not usable on this workspace; the gate's database would not start`.
+# Safe everywhere: it does nothing on an image without /usr/bin/docker.
+if [ -x /usr/bin/docker ]; then
+  getent group docker >/dev/null || groupadd docker
+  usermod -aG docker dev >/dev/null 2>&1 || true
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  echo "::docker service=$(systemctl is-active docker 2>&1 | head -1) group=$(id -nG dev 2>&1)"
+fi
+
 mv /etc/devcloud/env.new /etc/devcloud/env
 sed -e 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/' /etc/devcloud/env > /etc/profile.d/devcloud-env.sh
 
