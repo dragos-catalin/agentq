@@ -187,10 +187,20 @@ try {
   $denyLine = $cl | Where-Object { $_.tool -eq 'run_in_terminal' -and $_.deny } | Select-Object -First 1
   Ok ($cl.Count -ge 10) 'cost log: one line per hook call so far' "lines=$($cl.Count)"
   Ok ($allowLine -and $allowLine.ms -ge 0 -and $allowLine.session -eq 'test-hook-pre' -and $allowLine.ts) 'cost log: an allowed call has ts, ms, tool, session and deny=false' ($allowLine | ConvertTo-Json -Compress)
-  Ok ($allowLine -and $allowLine.startMs -ge 0) 'cost log: startMs (process start to script start) is recorded' ($allowLine | ConvertTo-Json -Compress)
+  Ok ($allowLine -and $allowLine.startMs -ge 0 -and [double]$allowLine.startMs -lt 5000) 'cost log: startMs (call to script start) is a plausible number' ($allowLine | ConvertTo-Json -Compress)
   Ok ([bool]$denyLine) 'cost log: a denied call is logged with deny=true'
+  # 2026-11-25: the resident server runs this script inside its own process (resident-server.ps1), so
+  # GetCurrentProcess().StartTime is SERVER UPTIME - the field reached 12 951 812 ms while ms stayed ~100.
+  # A caller-supplied receipt time must win. One hour back is not a value any process start can produce,
+  # so this case can only pass if the marker really is the origin.
+  $env:CODAI_HOOK_REQUEST_MS = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 3600000).ToString()
+  [void](Invoke-Hook ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }))
+  Remove-Item Env:CODAI_HOOK_REQUEST_MS -ErrorAction SilentlyContinue
+  $marked = @(Cost-Lines) | Where-Object { $null -ne $_.startMs } | Select-Object -Last 1
+  Ok ($marked -and [double]$marked.startMs -ge 3500000 -and [double]$marked.startMs -lt 4000000) 'cost log: CODAI_HOOK_REQUEST_MS is the origin of startMs (not the process start)' ($marked | ConvertTo-Json -Compress)
   Ok (@($cl | Where-Object { $_.tool -eq 'bash' -and $_.deny }).Count -ge 1) 'cost log: the CLI dialect (exit-code deny) is logged too'
-  $n0 = $cl.Count
+  # Re-read: the cases above (the marker case included) write lines AFTER $cl was captured.
+  $n0 = @(Cost-Lines).Count
   $probe = @(
     @{ name = 'allow'; p = ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }) },
     @{ name = 'hard deny'; p = ($vs + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = $forcePush } }) },

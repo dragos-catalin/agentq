@@ -22,15 +22,26 @@
   by ps/install.ps1. Until 2026-11 this file existed only in the installed folder.
 
   Cost log (OQ-012): every call appends one line to <coord>/hooks/cost-yyyyMMdd.jsonl
-  ({ ts, ms, startMs, tool, deny, session }): ms = time spent in this script, startMs = from the
-  creation of this process to the first line of the script (the part a resident daemon would remove).
+  ({ ts, ms, startMs, tool, deny, session }): ms = time spent in this script, startMs = from the call
+  reaching this process to the first line of the script (the part a resident daemon removes). On the
+  resident path the daemon runs this script IN-PROCESS, so the process start is server uptime, not this
+  call (2026-11-25: startMs 12 951 812 ms = 3.6 h while ms stayed ~100); the daemon must pass the request
+  receipt time as CODAI_HOOK_REQUEST_MS (epoch ms), and without a number the field is null, not a lie.
   `agentq slo` sums it. Best effort: it can neither change a decision nor fail the call.
   AGENTQ_NO_HOOK_COST=1 turns it off.
 #>
 $ErrorActionPreference = 'Continue'
 $hookSw = [Diagnostics.Stopwatch]::StartNew()
 $hookStartMs = $null
-try { $hookStartMs = [math]::Round(([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds) } catch { }
+try {
+  $reqMs = $env:CODAI_HOOK_REQUEST_MS
+  if ($reqMs -and $reqMs -match '^\d{10,}$') {
+    $hookStartMs = [math]::Round(([DateTime]::Now - [DateTimeOffset]::FromUnixTimeMilliseconds([long]$reqMs).LocalDateTime).TotalMilliseconds)
+  } elseif ([Environment]::CommandLine -notmatch 'resident-server') {
+    # A fresh process per call: its creation IS the moment the call arrived.
+    $hookStartMs = [math]::Round(([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds)
+  }
+} catch { }
 $raw = ''
 try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' }
 $rawIn = $raw   # the payload exactly as the harness sent it (the AXIOM gate reads its own dialects)
