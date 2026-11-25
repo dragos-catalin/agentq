@@ -118,7 +118,7 @@
   "overridesPerHour": 6,
   "landGate": {
     "brivio": "pnpm land:gate",
-    "codai": "pnpm gate:platform",
+    "codai": "pwsh -NoProfile -File scripts/ops/cloud-land-gate.ps1",
     "marcai": "pnpm guards",
     "caelia": "pwsh -NoProfile -File tool/verify_cloud.ps1 -Resource verify",
     "vmui": "pwsh -NoProfile -File infra/devcloud/gate.ps1",
