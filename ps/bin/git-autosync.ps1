@@ -490,6 +490,41 @@ function Save-Snapshot([string]$r, [string]$name, [string]$remote) {
   [pscustomobject]@{ sha = $sha; ref = $ref; ts = $ts; where = $where }
 }
 
+# Uncommitted state -> a ref of its own, built in a TEMP index, with NO push and NO write to the real
+# index or the worktree. Save-Snapshot above runs only when a path COLLIDES with incoming upstream work,
+# so the case that lost a file - a brand-new untracked file upstream never touches - was captured NOWHERE
+# and `read-tree -u` simply removed it (codai 2026-11-25: a file written and gone ~30 min later, in the
+# window this pass ran). Returns $null when the ref could not be written; the caller then REFUSES to move.
+function Save-LocalSnapshot([string]$r, [string]$name) {
+  $ts = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+  $idx = Join-Path ([IO.Path]::GetTempPath()) "gas-ls-$name-$ts-$PID.idx"
+  $old = $env:GIT_INDEX_FILE; $env:GIT_INDEX_FILE = $idx
+  try {
+    G $r read-tree HEAD | Out-Null
+    # NO pathspec, and never ':(exclude).copilot-tmp': naming an ignored path as a pathspec makes
+    # `git add` exit 1 while producing the SAME tree (measured 2026-11-26 on E:\gh\codai: the exclude
+    # form rc=1, plain `add -A` rc=0, both tree ead4f3eebf2e). .copilot-tmp is gitignored everywhere.
+    G $r add -A 2>&1 | Out-Null
+    $tree = ((G $r write-tree) | Select-Object -First 1).Trim()
+  } finally { if ($old) { $env:GIT_INDEX_FILE = $old } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }; Remove-Item $idx -ErrorAction SilentlyContinue }
+  if (-not $tree) { return $null }
+  # Same tree as the newest snapshot for this repo = already captured: reuse it, write no new ref.
+  $prev = ((G $r for-each-ref --sort=-creatordate --count 1 --format='%(refname)' "refs/backup/snapshot/$name/") | Select-Object -First 1)
+  if ($prev) {
+    $prev = "$prev".Trim()
+    $pt = ((G $r rev-parse "$prev^{tree}") | Select-Object -First 1)
+    if ("$pt".Trim() -eq $tree) { return [pscustomobject]@{ ref = $prev; sha = ((G $r rev-parse $prev) | Select-Object -First 1).Trim(); ts = $ts; reused = $true } }
+  }
+  $ref = "refs/backup/snapshot/$name/$ts"
+  $sha = ((G $r commit-tree $tree -p HEAD -m "backup: uncommitted state of the $name shared clone before git-autosync moves it ($ts); nothing discarded") | Select-Object -First 1).Trim()
+  if (-not $sha) { return $null }
+  G $r update-ref $ref $sha | Out-Null
+  # Read the ref back: a ref that is not really there is the same as no snapshot at all.
+  $back = ((G $r rev-parse --verify --quiet $ref) | Select-Object -First 1)
+  if (-not $back -or "$back".Trim() -ne $sha) { return $null }
+  [pscustomobject]@{ ref = $ref; sha = $sha; ts = $ts; reused = $false }
+}
+
 # Land the replayed commits through agentq (clean land slot, dedupe, hooks on the clean result), DETACHED:
 # a codai land runs the full pre-push (20-40 min) and must not freeze the other repos' sync.
 # Returns the started job record; a later pass reads its rc file.
@@ -838,6 +873,21 @@ function Sync-Repo([string]$r) {
   if ($resolved.Count) {
     $by = $resolved | Group-Object kind | ForEach-Object { "$($_.Count) $($_.Name)" }
     $what += ", collisions resolved: $($by -join ', ') [" + (($resolved | ForEach-Object { "$($_.p)=$($_.kind)" }) -join ', ') + ']'
+  }
+  # No collision -> Save-Snapshot below never runs, yet the clone may still hold uncommitted work that
+  # lives in NO ref and NO bundle: an untracked file upstream does not touch is deleted outright by the
+  # `read-tree -u` of the move (the 2026-11-25 loss). Capture it first, in a temp index, and refuse the
+  # move if that capture cannot be written.
+  if (-not $resolved.Count) {
+    $dirty = @(G $r -c core.quotepath=off status --porcelain 2>$null | ForEach-Object { "$_" } | Where-Object { $_ })
+    if ($dirty.Count) {
+      $onlyHere = @(G $r ls-files --others --exclude-standard 2>$null | ForEach-Object { "$_" } | Where-Object { $_ -and $_ -notmatch '^\.copilot-tmp/' })
+      if ($onlyHere.Count) { $what += ", $($onlyHere.Count) untracked file(s) exist only in this clone (captured before the move)" }
+      if ($WhatIf) { return @{ code = 0; msg = "would move $($head.Substring(0,8)) -> $($target.Substring(0,8)): $what" } }
+      $preSnap = Save-LocalSnapshot $r $name
+      if (-not $preSnap) { return @{ code = 3; msg = "refuse: $($dirty.Count) uncommitted path(s) in this clone are in no ref and the pre-move snapshot could not be written; nothing moved" } }
+      $what += ", uncommitted state captured as $($preSnap.ref)" + $(if ($preSnap.reused) { ' (same tree, ref reused)' } else { " ($($preSnap.sha.Substring(0,10)))" }) + "; restore: git -C `"$r`" show <ref>:<path>"
+    }
   }
   if ($WhatIf) { return @{ code = 0; msg = "would move $($head.Substring(0,8)) -> $($target.Substring(0,8)): $what" } }
 
