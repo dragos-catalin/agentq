@@ -4,6 +4,7 @@ agentq-cloud — run one command on a devcloud warm workspace (DC-037). Job cont
   agentq-cloud.ps1 -Ws codai -Purpose 'why' [-Lane gate] [-TimeoutMin 60] [-Repo <dir>] [-NoPatch] -- pnpm --filter @codai/common typecheck
   agentq-cloud.ps1 -Ws codai -Status          VM state + heartbeat + known shas
   agentq-cloud.ps1 -Ws codai -Suspend         suspend now (the agent also does it after idle-min)
+  agentq-cloud.ps1 -Ws codai -StaleClaimMin 3 [-NoHeal]   recycle a wedged workspace, see HEAL
 
 WHAT TRAVELS (git delta, never the whole tree)
   base  = HEAD of the local repo. The workspace publishes the shas it has (ws/<ws>/repos/<repo>.json);
@@ -13,6 +14,15 @@ WHAT TRAVELS (git delta, never the whole tree)
           shared index is never touched: read-tree HEAD; add -A; diff --cached --binary HEAD.
 FLOW  resume VM if SUSPENDED/TERMINATED -> upload bundle/patch -> queue spec (written LAST) ->
       stream jobs/<id>/log -> result.json -> exit with the remote exit code.
+HEAL  nobody claimed the job and the workspace heartbeat has not moved since the submission: the runner
+  wedged across a suspend (a resume does NOT re-run the startup script, so the VM keeps the frozen
+  process, looks RUNNING and never reads the queue - ws-vitals-win, 2026-11-25, five jobs, an hour).
+  One reset re-runs the boot script and starts a fresh agent; the deadline gets a second window.
+  The heartbeat is the evidence, never the VM state: a running job heartbeats "busy" every 30 s, so a
+  silent agent is conclusive evidence of a wedge and a busy one is never touched. Fires when the
+  heartbeat is older than the submission (precise) or has been silent for the whole wait (robust to a
+  clock skew between this machine and the workspace). The wait is only a floor, 3 min: the heartbeat
+  comparison is what makes the reset safe.
 JOURNAL  cloud-queued / cloud-done / cloud-fail in ~/.codai/coord/journal.jsonl with holdSec,
       waitSec (queue -> claimed, includes resume), lane, kind=cloud, resource cloud:<ws>, so
       `agentq metrics` shows cloud runs beside local ones.
@@ -22,6 +32,7 @@ EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavai
 #>
 $Ws = 'codai'; $Purpose = $null; $Lane = 'gate'; $TimeoutMin = 60; $RepoArg = $null; $NoPatch = $false
 $Status = $false; $Suspend = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
+$StaleClaimMin = 3; $NoHeal = $false
 $argv = @($args); $Rest = @()
 $dd = [array]::IndexOf($argv, '--')
 if ($dd -ge 0) { $Rest = @($argv | Select-Object -Skip ($dd + 1)); $argv = @($argv | Select-Object -First $dd) }
@@ -32,6 +43,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     'ws' { $Ws = & $val } 'purpose' { $Purpose = & $val } 'lane' { $Lane = (& $val).ToLowerInvariant() }
     'timeoutmin' { $TimeoutMin = [int](& $val) } 'repo' { $RepoArg = & $val } 'nopatch' { $NoPatch = $true }
     'noinstall' { $NoInstall = $true } 'status' { $Status = $true } 'suspend' { $Suspend = $true }
+    'staleclaimmin' { $StaleClaimMin = [int](& $val) } 'noheal' { $NoHeal = $true }
     'project' { $Project = & $val } 'zone' { $Zone = & $val } 'ctlproject' { $CtlProject = & $val }
     default { [Console]::Error.WriteLine("agentq-cloud: unknown argument '$a' (put the command after --)"); exit 2 }
   }
@@ -122,7 +134,24 @@ function Read-Gcs([string]$uri) { Read-Obj ($uri -replace "^gs://$BucketName/", 
 
 if ($Status) {
   & gcloud compute instances describe $Vm --project $Project --zone $Zone --format='table(name,status,machineType.basename(),lastStartTimestamp,lastSuspendedTimestamp)' 2>&1 | ForEach-Object { Out-Line "$_" }
-  Out-Line "heartbeat: $((Read-Gcs "$Bucket/ws/$Ws/heartbeat"))".TrimEnd()
+  $hbRaw = Read-Gcs "$Bucket/ws/$Ws/heartbeat"
+  Out-Line "heartbeat: $hbRaw".TrimEnd()
+  # The one-line diagnosis this cost an hour to reach by hand: RUNNING + a heartbeat that stopped moving
+  # means the agent is wedged, not idle, and the queue will never be read.
+  try {
+    $hb = $hbRaw | ConvertFrom-Json
+    $vst = Get-VmStatus
+    if ($hb.PSObject.Properties['at'] -and $vst -eq 'RUNNING') {
+      # ConvertFrom-Json turns an ISO-8601 string into [DateTime] here (PowerShell 7), so cast rather
+      # than re-stringifying: "$($hb.at)" would be formatted for the local culture and fail to parse.
+      $hbAge = [math]::Round(([DateTime]::UtcNow - ([DateTime]$hb.at).ToUniversalTime()).TotalSeconds)
+      # 30 s is the heartbeat cadence and 300 s is ten missed beats: below that the agent may just be
+      # between ticks, so the middle band reports what it sees instead of advising a reset.
+      if ($hbAge -gt 300) { Out-Line "agent: STALE ${hbAge}s (heartbeat state '$($hb.state)') - reset it: gcloud compute instances reset $Vm --zone $Zone --project $Project" }
+      elseif ($hbAge -gt 90) { Out-Line "agent: quiet ${hbAge}s (heartbeat state '$($hb.state)'; it beats every 30 s) - read again in a minute, then: gcloud compute instances reset $Vm --zone $Zone --project $Project" }
+      else { Out-Line "agent: ok (${hbAge}s ago, state '$($hb.state)')" }
+    } elseif ($vst -ne 'RUNNING') { Out-Line "agent: n/a ($Vm is $vst)" }
+  } catch { Out-Line "agent: unknown ($($_.Exception.Message))" }
   & gcloud storage ls "$Bucket/ws/$Ws/queue/" 2>$null | ForEach-Object { Out-Line "queued: $_" }
   exit 0
 }
@@ -216,10 +245,28 @@ try {
 
   # 6. stream the log until result.json exists
   $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin + 15)
-  $printed = 0; $claimedAt = $null; $runningAt = $null; $result = $null
+  $printed = 0; $claimedAt = $null; $runningAt = $null; $result = $null; $healedAt = $null
   while ([DateTime]::UtcNow -lt $deadline) {
     if ($resumeAt -and -not $runningAt) { if ((Get-VmStatus) -eq 'RUNNING') { $runningAt = [DateTime]::UtcNow; Out-Line ("[agentq-cloud] {0} RUNNING after {1:N0}s" -f $Vm, ($runningAt - $resumeAt).TotalSeconds) } }
     if (-not $claimedAt) { if (Read-Gcs "$Bucket/jobs/$id/claimed") { $claimedAt = [DateTime]::UtcNow } }
+    if (-not $NoHeal -and -not $claimedAt -and -not $healedAt -and ([DateTime]::UtcNow - $queuedAt).TotalSeconds -ge $StaleClaimMin * 60) {
+      $hbAt = $null
+      try { $hb = (Read-Gcs "$Bucket/ws/$Ws/heartbeat") | ConvertFrom-Json; if ($hb.PSObject.Properties['at']) { $hbAt = ([DateTime]$hb.at).ToUniversalTime() } } catch { $hbAt = $null }
+      $hbAge = if ($hbAt) { [math]::Round(([DateTime]::UtcNow - $hbAt).TotalSeconds) } else { $null }
+      # Older than the submission is the precise test; silent for the whole wait is the same thing seen
+      # from the workspace's clock, so the OR survives a skew between it and this machine.
+      if ($hbAt -and ($hbAt -lt $queuedAt -or $hbAge -gt $StaleClaimMin * 60)) {
+        $vst = Get-VmStatus
+        $act = if ($vst -eq 'RUNNING') { 'reset' } elseif ($vst -eq 'SUSPENDED') { 'resume' } else { $null }
+        if ($act) {
+          Invoke-VmOp $act
+          Out-Line ("[agentq-cloud] unclaimed after {0} min and the heartbeat is {1}s old ($Vm $vst) - {2} {3}, waiting" -f $StaleClaimMin, $hbAge, $act, $Vm)
+          Write-Journal @{ event = 'cloud-heal'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; vmState = $vst; heartbeatAgeSec = $hbAge; action = $act }
+          $healedAt = [DateTime]::UtcNow
+          $deadline = $deadline.AddMinutes(10)
+        } else { Out-Line ("[agentq-cloud] unclaimed after {0} min but the heartbeat is {1}s old and $Vm is $vst - leaving it alone" -f $StaleClaimMin, $hbAge) }
+      }
+    }
     $logTxt = Read-Gcs "$Bucket/jobs/$id/log"
     if ($logTxt -and $logTxt.Length -gt $printed) { [Console]::Out.Write($logTxt.Substring($printed)); $printed = $logTxt.Length; if (-not $claimedAt) { $claimedAt = [DateTime]::UtcNow } }
     $r = Read-Gcs "$Bucket/jobs/$id/result.json"
