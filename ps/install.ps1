@@ -45,6 +45,13 @@ $map = [ordered]@{
   'tests\test-worktree-v2.ps1' = 'hooks\test-worktree-v2.ps1'; 'tests\test-guard-v2.ps1' = 'hooks\test-guard-v2.ps1'
   # 2026-11-25: a formatter may never run with its own DEFAULT config over a repo that has no config
   'tests\test-guard-format.ps1' = 'hooks\test-guard-format.ps1'
+  # 2026-11-25: the formatter taxonomy BOTH hooks use. Without this entry the guard fell back to its
+  # stub functions (Test-FormatterConfigured -> $false) and the rule was inert in production while its
+  # suite was green in the checkout - "configured" is not "installed".
+  'hooks\lib\FormatterConfig.ps1' = 'hooks\lib\FormatterConfig.ps1'
+  # 2026-11-25: the other half of the rule - a file CREATED into a repo that owns formatter settings is
+  # formatted FOR the agent (PostToolUse), instead of the agent being refused later.
+  'hooks\post-create-format.ps1' = 'hooks\post-create-format.ps1'
   'tests\test-land-changelog.ps1' = 'bin\test-land-changelog.ps1'
   'bin\repo-migrate.ps1' = 'bin\repo-migrate.ps1'; 'tests\test-repo-migrate.ps1' = 'bin\test-repo-migrate.ps1'
   # background jobs: bounded wait + registry (mirrored by agentq-sync)
