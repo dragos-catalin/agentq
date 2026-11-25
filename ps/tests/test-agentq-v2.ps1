@@ -14,7 +14,13 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 # leaseIdleMin 1: ADR 0012 makes a lease with a DEAD owner stale at leaseIdleMin (it no longer reads
 # leaseDeadIdleMin), so the "dead owner + idle > 1 min -> STALE" check below needs this knob set; without
 # it the dead-owner threshold is the default 45 and idle 3 would not be stale.
-'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseIdleMin":1,"leaseDeadIdleMin":1,"leaseDirtyIdleMin":2,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
+#
+# MARGE DE TIMP (2026-11-25): leaseDirtyIdleMin era 2 min, iar testul de mai jos scrie heartbeat-ul la
+# -90 s, deci avea 30 s de marjă ca să ajungă de la `status` la `sweep`. Fiecare `AQ` pornește un pwsh
+# nou: sub încărcare (3 instalatoare concurente × run-all -Parallel 4) un check ajunge la ~16 s
+# (log real: `agentq v2 exit=1 pass=22 fail=1 sec=379`), deci marja se epuiza și sweep expira corect
+# slotul → suita roșie → install.ps1 refuza instalarea. 10 min de marjă în loc de 2.
+'{"taskSlotsPerRepo":2,"taskSlotsMachine":3,"pinned":{"repo":["db-live"]},"leaseIdleMin":1,"leaseDeadIdleMin":1,"leaseDirtyIdleMin":10,"leaseMaxIdleMin":5,"minFreeCommitGB":0}' | Set-Content $cfg
 $env:AGENTQ_CONFIG = $cfg
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
@@ -91,7 +97,8 @@ try {
   Check 'dead owner + dirty slot + idle < dirtyIdle -> kept' ((@($st.leases) | Where-Object slot -eq 'task-2').stale -eq $false)
   $o = AQ sweep
   Check 'sweep keeps a lease with unsaved work' ((Test-Path $lf) -and $o -notmatch 'expired repo/task-2') $o
-  [IO.File]::SetLastWriteTimeUtc("$lf.hb", [DateTime]::UtcNow.AddMinutes(-3))
+  # > dirtyIdle (10 min) cu marjă mare, ca și sub încărcare să fie STALE când ajunge la assert
+  [IO.File]::SetLastWriteTimeUtc("$lf.hb", [DateTime]::UtcNow.AddMinutes(-16))
   $st = AQ status -Json | ConvertFrom-Json
   Check 'dead owner + idle > dirtyIdle -> STALE' ((@($st.leases) | Where-Object slot -eq 'task-2').stale -eq $true)
   $o = AQ sweep
