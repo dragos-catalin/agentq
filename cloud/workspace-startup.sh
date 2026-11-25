@@ -118,6 +118,43 @@ case ",$TOOLCHAINS," in *,python-uv,*)
   printf 'UV_CACHE_DIR=%s\n' /work/.uv-cache >> /etc/devcloud/env.new
   ;;
 esac
+# flutter = the image bakes the SDK at /home/runner/flutter (image-setup.sh `step flutter`) and
+# publishes its bin only into a GitHub-runner `.path` file, while devcloud jobs run as `dev`. Added
+# 2026-11-25 for ws-caelia-android: with no `flutter` branch the case fell through, so the workspace had
+# no flutter/dart on PATH, no JAVA_HOME/ANDROID_HOME, and an EMPTY /etc/devcloud/env - the APK job died
+# with `no flutter SDK on this workspace`.
+# The SDK is COPIED to /opt/flutter and owned by dev, once (stamp): the job user must be able to WRITE
+# bin/cache (flutter rewrites its lockfile and stamps on each run), and chowning the image's own tree
+# would break the GitHub runner still using it.
+case ",$TOOLCHAINS," in *,flutter,*)
+  F=/opt/flutter
+  if [ ! -f /opt/devcloud/.flutter-v1 ]; then
+    SRC="$(find /home /opt /usr/local /srv -maxdepth 4 -type f -path '*/bin/flutter' -printf '%h\n' 2>/dev/null | head -1 || true)"
+    SRC="${SRC%/bin}"
+    if [ -n "$SRC" ] && [ "$SRC" != "$F" ] && [ -x "$SRC/bin/flutter" ]; then
+      echo "::flutter-copy src=$SRC"
+      rm -rf "$F"
+      cp -a "$SRC" "$F"
+      chown -R dev:dev "$F"
+      [ -d /opt/android-sdk ] && chown -R dev:dev /opt/android-sdk
+      touch /opt/devcloud/.flutter-v1
+    elif [ -x "$F/bin/flutter" ]; then
+      touch /opt/devcloud/.flutter-v1
+    else
+      echo "::flutter-no-sdk (nothing under /home /opt /usr/local /srv at depth 4)"
+    fi
+  fi
+  if [ -x "$F/bin/flutter" ]; then
+    ln -sfn "$F/bin/flutter" /usr/local/bin/flutter
+    ln -sfn "$F/bin/dart" /usr/local/bin/dart
+    git config --system --add safe.directory "$F" || true
+    A=/opt/android-sdk; J=/usr/lib/jvm/temurin-21-jdk-amd64
+    if [ -d "$A" ]; then printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$A" "$A" >> /etc/devcloud/env.new; fi
+    if [ -d "$J" ]; then printf 'JAVA_HOME=%s\n' "$J" >> /etc/devcloud/env.new; fi
+    echo "::flutter-ready root=$F java=$J android=$A"
+  fi
+  ;;
+esac
 mv /etc/devcloud/env.new /etc/devcloud/env
 sed -e 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/' /etc/devcloud/env > /etc/profile.d/devcloud-env.sh
 
