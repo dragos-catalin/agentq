@@ -102,6 +102,31 @@ case ",$TOOLCHAINS," in *,android-jdk21,*)
   printf 'JAVA_HOME=%s\nANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$J" "$A" "$A" >> /etc/devcloud/env.new
   ;;
 esac
+# jdk21 = Temurin 21 and nothing else. Added 2026-11-26 for ws-brivio, whose land gate runs
+# `@brivio/tax-ro:test`: that suite shells out to scripts/validate-declaration.mjs, which builds
+# tools/duk/shim/BrivioDuk.java with javac and EXITS 2 when there is no JVM on PATH - on purpose
+# ("a gate that quietly does nothing is indistinguishable from a gate that passed"). So a workspace
+# with no JDK cannot go green on any branch. Measured on ws-brivio 2026-11-26 with an empty
+# devcloud-toolchains: `land-gate: 116/117 green in 136 s`, the only red member
+# `@brivio/tax-ro:test: + harness fault: no JVM on PATH`, and nothing to fix in the branch itself.
+# `android-jdk21` would also satisfy javac but drags the Android SDK (~1.5 GB) onto a runner that
+# builds no APK; keep this one for JDK-only gates (brivio's own CI android job has its own image).
+case ",$TOOLCHAINS," in *,jdk21,*)
+  J=/usr/lib/jvm/temurin-21-jdk-amd64
+  if [ ! -f /opt/devcloud/.jdk21-v1 ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor --yes -o /usr/share/keyrings/adoptium.gpg
+    echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb noble main" > /etc/apt/sources.list.d/adoptium.list
+    apt-get update
+    apt-get install -y --no-install-recommends temurin-21-jdk
+    # javac, not just java: the DUK shim compiles. Ubuntu's alternatives put it on /usr/bin, which
+    # is already on the job user's PATH; JAVA_HOME is for Gradle/AGP-style consumers.
+    "$J/bin/javac" -version
+    touch /opt/devcloud/.jdk21-v1
+  fi
+  printf 'JAVA_HOME=%s\n' "$J" >> /etc/devcloud/env.new
+  ;;
+esac
 # python-uv = uv (Astral) in /usr/local/bin + a managed CPython, for every Python repo on the VM. Added
 # 2026-11-25: the image had no uv, so each frontier gate bootstrapped it into $HOME/.local/bin on every
 # fresh job (~20 s + a network dependency on astral.sh inside a run that should be measuring math).
