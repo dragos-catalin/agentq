@@ -163,6 +163,17 @@ describe("argument vectors", () => {
         ]);
     });
 
+    it("asks for the registry document when json is set, and for one workspace otherwise", () => {
+        // Two shapes of the same read-only verb. The document is registry-wide, so `-Ws` is not sent
+        // with it, and the one-workspace table stays exactly what it was.
+        expect(mcpArgv.cloudStatus({ json: true })).toEqual(["-Status", "-Json"]);
+        expect(mcpArgv.cloudStatus({ ws: "codai" })).toEqual(["-Ws", "codai", "-Status"]);
+    });
+
+    it("refuses a status read that names neither a workspace nor the document", () => {
+        expect(() => mcpArgv.cloudStatus({})).toThrow(/json: true/);
+    });
+
     it("passes job-start named parameters, never one joined string", () => {
         expect(mcpArgv.jobStart({ label: "web gate", command: "pnpm build", expectedMin: 12 })).toEqual([
             "-Label",

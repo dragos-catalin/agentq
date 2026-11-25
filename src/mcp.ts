@@ -204,7 +204,20 @@ export const mcpArgv = {
         "--",
         ...a.command,
     ],
-    cloudStatus: (a: { ws: string }): string[] => ["-Ws", a.ws, "-Status"],
+    // One read-only verb, two shapes: the table for one workspace, or the whole registry as one
+    // document. `-Status -Json` ignores `-Ws` by design - the document lists every workspace - so the
+    // flag is never sent with it, and a call that names neither is refused rather than guessed at.
+    cloudStatus: (a: { ws?: string | undefined; json?: boolean | undefined }): string[] => {
+        if (a.json === true) {
+            return ["-Status", "-Json"];
+        }
+        if (a.ws === undefined) {
+            throw new Error(
+                "cloud_status needs `ws` for the workspace table, or `json: true` for the registry document",
+            );
+        }
+        return ["-Ws", a.ws, "-Status"];
+    },
     cloudSuspend: (a: { ws: string }): string[] => ["-Ws", a.ws, "-Suspend"],
     cloudInstance: (verb: "resume" | "reset", a: { ws: string; project: string; zone: string }): string[] => [
         "compute",
@@ -695,8 +708,16 @@ export function buildMcpServer(ep: Endpoint, session: string): McpServer {
         "cloud_status",
         {
             description:
-                "A devcloud workspace's VM state, heartbeat and queued jobs, with a one-line verdict on whether its agent is wedged. Read-only.",
-            inputSchema: { ws: z.string() },
+                "A devcloud workspace's VM state, heartbeat and queued jobs, with a one-line verdict on whether its agent is wedged - or, with json, the whole cloud registry as one JSON document: state, heartbeat age, idle seconds and queue depth per workspace, plus the names of any it could not reach and why. A value that could not be measured is null, never 0. Read-only.",
+            inputSchema: {
+                ws: z.string().optional().describe("The workspace to report on. Required unless json is true."),
+                json: z
+                    .boolean()
+                    .default(false)
+                    .describe(
+                        "Return every workspace in the cloud registry as one JSON document instead of one workspace's table.",
+                    ),
+            },
             annotations: { readOnlyHint: true },
         },
         (a) => scripted(CLOUD_EXIT, () => runPwsh("agentq-cloud.ps1", mcpArgv.cloudStatus(a), { timeoutMs: FAST_MS })),
