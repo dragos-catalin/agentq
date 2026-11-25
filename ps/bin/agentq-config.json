@@ -6,10 +6,81 @@
     "codai": 2
   },
   "pinned": {
-    "codai": ["db-live"],
-    "brivio": ["qa-prod"]
+    "codai": [
+      "db-live"
+    ],
+    "brivio": [
+      "qa-prod"
+    ]
   },
-  "autosync": { "daemons": ["git-autosync"] },
+  "autosync": {
+    "daemons": [
+      "git-autosync"
+    ],
+    "repos": [
+      "E:\\gh\\codai",
+      "E:\\gh\\brivio",
+      "E:\\gh\\money",
+      "E:\\gh\\metu",
+      "E:\\gh\\mmo",
+      "E:\\gh\\vitals",
+      "E:\\gh\\titi",
+      "E:\\gh\\HIDE",
+      "E:\\gh\\axiom",
+      "E:\\gh\\afti",
+      "E:\\gh\\dashy",
+      "E:\\gh\\caelia",
+      "E:\\gh\\dragoscatalin",
+      "E:\\gh\\vmui",
+      "E:\\gh\\agentq",
+      "E:\\gh\\marcai",
+      "E:\\gh\\cursuri-studiai",
+      "E:\\gh\\notai",
+      "E:\\gh\\selfie-screen",
+      "E:\\gh\\swami",
+      "E:\\gh\\watch-faces",
+      "E:\\gh\\scrin",
+      "E:\\gh\\notalone",
+      "E:\\gh\\unscroll-rules",
+      "E:\\gh\\frontiers\\arc-prize-2027",
+      "E:\\gh\\frontiers\\bb6-holdouts",
+      "E:\\gh\\frontiers\\erdos-computational",
+      "E:\\gh\\frontiers\\fluid-singularities",
+      "E:\\gh\\frontiers\\frontier-kit",
+      "E:\\gh\\frontiers\\frontiers-index",
+      "E:\\gh\\frontiers\\graph-existence",
+      "E:\\gh\\frontiers\\hadamard-next",
+      "E:\\gh\\frontiers\\hutter-enwik9",
+      "E:\\gh\\frontiers\\linear-a",
+      "E:\\gh\\frontiers\\matmul-tensor-rank",
+      "E:\\gh\\frontiers\\ramsey-sat",
+      "E:\\gh\\frontiers\\sphere-codes",
+      "E:\\gh\\frontiers\\vesuvius",
+      "E:\\gh\\wdw-cosmology"
+    ],
+    "replay": [
+      "codai",
+      "brivio",
+      "money",
+      "metu",
+      "mmo",
+      "arc-prize-2027",
+      "bb6-holdouts",
+      "erdos-computational",
+      "fluid-singularities",
+      "frontier-kit",
+      "frontiers-index",
+      "graph-existence",
+      "hadamard-next",
+      "hutter-enwik9",
+      "linear-a",
+      "matmul-tensor-rank",
+      "ramsey-sat",
+      "sphere-codes",
+      "vesuvius",
+      "wdw-cosmology"
+    ]
+  },
   "leaseDeadIdleMin": 120,
   "leaseMaxIdleMin": 360,
   "leaseOwnerGoneIdleMin": 120,
@@ -86,7 +157,22 @@
   "sharedCloneMode": "warn",
   "sharedCloneModeRepos": {
     "codai": "refuse",
-    "brivio": "refuse"
+    "brivio": "refuse",
+    "arc-prize-2027": "refuse",
+    "bb6-holdouts": "refuse",
+    "erdos-computational": "refuse",
+    "fluid-singularities": "refuse",
+    "frontier-kit": "refuse",
+    "frontiers-index": "refuse",
+    "graph-existence": "refuse",
+    "hadamard-next": "refuse",
+    "hutter-enwik9": "refuse",
+    "linear-a": "refuse",
+    "matmul-tensor-rank": "refuse",
+    "ramsey-sat": "refuse",
+    "sphere-codes": "refuse",
+    "vesuvius": "refuse",
+    "wdw-cosmology": "refuse"
   },
   "runBuildTimeoutMin": 240,
   "journalRotateMB": 64,
@@ -147,13 +233,31 @@
     "wdw-cosmology": "frontiers"
   },
   "cloudRegistry": {
-    "devbox": { "project": "codai-training", "zone": "europe-west4-b" },
-    "codai": { "project": "codai-training", "zone": "europe-west4-a" },
-    "caelia": { "project": "codai-training", "zone": "europe-west4-a" },
+    "devbox": {
+      "project": "codai-training",
+      "zone": "europe-west4-b"
+    },
+    "codai": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
+    "caelia": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
     "caelia-android": { "project": "codai-training", "zone": "europe-west4-a" },
-    "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" },
-    "watch-faces": { "project": "codai-training", "zone": "europe-west4-a" },
-    "frontiers": { "project": "codai-training", "zone": "europe-west4-a" }
+    "vitals-win": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
+    "watch-faces": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    },
+    "frontiers": {
+      "project": "codai-training",
+      "zone": "europe-west4-a"
+    }
   },
   "cloudAutoMinSec": 240
 }

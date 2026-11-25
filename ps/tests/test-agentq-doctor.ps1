@@ -1,6 +1,9 @@
 # ADR 0009 stage 0 (OQ-011): `agentq doctor` - a READ-ONLY health report (stale index locks, empty
 # package-store folders, install/config drift, dead lease owners, dead jobs and keepers, old marks,
-# state size). Every case asserts the row AND the exit code. Isolated in %TEMP%; the installed copy and
+# state size). Section 18 covers the two pre-flight flags added 2026-11-25 (-Only <check[,check]> runs a
+# subset and REFUSES an unknown name with exit 2; -Quiet prints the findings only), with a mutation
+# proving the refusal is what produces that exit code. Every case asserts the row AND the exit code. 
+# Isolated in %TEMP%; the installed copy and
 # the source checkout are fakes (AGENTQ_INSTALL_DIR, -Src), scheduled tasks are skipped.
 param([string]$Aq = (Join-Path $PSScriptRoot '..\bin\agentq.ps1'))
 $ErrorActionPreference = 'Stop'
@@ -525,6 +528,53 @@ try {
   $r = DJ -All
   Check '17g no profile found -> an ok summary saying where it looked, no finding row' (@(Rows $r 'cloud-lanes' 'warn').Count -eq 0 -and @($r.rows | Where-Object { $_.check -eq 'cloud-lanes' -and $_.kind -eq 'summary' -and $_.detail -match 'no repo under' }).Count -eq 1) $raw
   [IO.File]::WriteAllText($cfg, $cfgText)
+
+  # ---- 18 -Only / -Quiet (2026-11-25): the two questions asked before starting work ("is this install
+  # in sync?" / "would this run LOCAL?") must not pay for the whole report, and a typo in a check name
+  # must never read as a green report. ONE fixture (a stale index lock) gives exactly one finding, so
+  # every assertion below is about the flags and not about the state.
+  Reset-State
+  $env:AGENTQ_INSTALL_DIR = $inst
+  $gdq = New-FakeSlot 'repo' 'task-1'; $null = New-Lock $gdq 10
+  $loud = AQ doctor
+  $loudLines = @($loud -split "`n")
+  $loudFindings = @($loudLines | Where-Object { $_ -match '^(FAIL|warn)\s' }).Count
+  Check '18a the fixture is one FAIL and exit 1' ($code -eq 1 -and $loud -match '(?m)^FAIL\s+stale-index-lock' -and $loudFindings -eq 1) "exit=$code findings=$loudFindings"
+  Check '18b the full report also prints ok/info rows and the header' (@($loudLines | Where-Object { $_ -match '^(ok|info)\s' }).Count -gt 3 -and $loud -match '(?m)^agentq doctor  ') "ok/info=$(@($loudLines | Where-Object { $_ -match '^(ok|info)\s' }).Count)"
+  $quiet = AQ doctor -Quiet
+  $quietLines = @($quiet -split "`n")
+  Check '18c -Quiet keeps the finding, its hint, the count line and the exit code' ($code -eq 1 -and $quiet -match '(?m)^FAIL\s+stale-index-lock' -and $quiet -match 'hint:' -and @($quietLines)[-1] -match '^doctor: 1 problem\(s\), ') "exit=$code last=$(@($quietLines)[-1])"
+  Check '18d -Quiet drops every ok/info row and the header' (@($quietLines | Where-Object { $_ -match '^(ok|info)\s' }).Count -eq 0 -and $quiet -notmatch 'agentq doctor  ') $quiet
+  Check '18e -Quiet hides no finding and is strictly shorter' (@($quietLines | Where-Object { $_ -match '^(FAIL|warn)\s' }).Count -eq $loudFindings -and $quietLines.Count -lt $loudLines.Count) "quiet=$($quietLines.Count) loud=$($loudLines.Count)"
+  # -Only: the same fixture, one check at a time
+  $r = DJ -All -Only stale-index-lock
+  Check '18f -Only stale-index-lock: its rows only, same verdict as the whole report' ($code -eq 1 -and -not @(Compare-Object @($r.rows | ForEach-Object check | Select-Object -Unique) @('stale-index-lock'))) $raw
+  $r = DJ -All -Only marks
+  Check '18g -Only marks never looks at the lock: no stale-index-lock row, exit 0' ($code -eq 0 -and @($r.rows | Where-Object { $_.check -eq 'stale-index-lock' }).Count -eq 0 -and @($r.rows | Where-Object { $_.check -eq 'marks' }).Count -ge 1) "exit=$code raw=$raw"
+  $r = DJ -All -Only stale-index-lock,install-proof
+  Check '18h -Only accepts a list: both checks ran, nothing else' ($code -eq 1 -and -not @(Compare-Object @($r.rows | ForEach-Object check | Select-Object -Unique) @('install-proof', 'stale-index-lock'))) $raw
+  $r = DJ -All -Only nosuch
+  Check '18i an unknown check is a usage error (exit 2) naming it AND listing the valid ones' ($code -eq 2 -and $raw -match 'unknown check\(s\): nosuch' -and $raw -match 'cloud-lanes, daemons|daemons, cloud-lanes|cloud-lanes') $raw
+  # MUTATION: with the refusal removed, the same call must come back GREEN (that is what the flag exists
+  # to prevent), so 18i is not vacuous. The whole bin is copied: agentq.ps1 dot-sources its siblings.
+  $mutPs = Join-Path $tmp 'mutbin'
+  Copy-Item (Split-Path -Parent $Aq) $mutPs -Recurse -Force
+  $mutDoc = Join-Path $mutPs 'agentq-doctor.ps1'
+  $mutAq = Join-Path $mutPs 'agentq.ps1'
+  $txt = Get-Content -LiteralPath $mutDoc -Raw
+  # `$$` in a -replace REPLACEMENT is one literal dollar: without it .NET reads `$unknown` as a group
+  # reference and the mutant line lands as ` = @()`, a syntax error that would prove nothing.
+  $txt2 = $txt -replace '\$unknown = @\(\$DoctorOnly \| Where-Object \{ -not \$checks\.Contains\("\$_"\) \}\)', '$$unknown = @()   # MUTANT: the refusal is gone'
+  [IO.File]::WriteAllText($mutDoc, $txt2)
+  # the parse runs on the WRITTEN mutant: parsing before the write would validate the original (vacuous)
+  $mutErrs = $null
+  [System.Management.Automation.Language.Parser]::ParseFile($mutDoc, [ref]$null, [ref]$mutErrs) | Out-Null
+  Check '18j MUTATION injection happened, the mutant is still valid PowerShell' ($txt2 -ne $txt -and $txt2.Contains('$unknown = @()   # MUTANT') -and @($mutErrs).Count -eq 0) "len $($txt.Length) -> $($txt2.Length) errs=$(@($mutErrs).Count)"
+  $mo = @(& pwsh -NoProfile -File $mutAq doctor -Only nosuch -Json 2>&1 | ForEach-Object { "$_" })
+  $mcode = $LASTEXITCODE
+  $mline = @($mo | Where-Object { $_ -match '^\{.*"rows"' }) | Select-Object -Last 1
+  $mrep = if ($mline) { $mline | ConvertFrom-Json } else { $null }
+  Check '18k MUTATION without the refusal an unknown check reads as a green report (exit 0, 0 problems)' ($mcode -eq 0 -and $mrep -and [int]$mrep.problems -eq 0 -and @($mrep.rows).Count -le 2) "exit=$mcode out=$($mo -join ' | ')"
 
   # restore the global switches and the shared install dir for the cleanup path
   $env:AGENTQ_INSTALL_DIR = $inst

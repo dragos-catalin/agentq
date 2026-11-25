@@ -1,5 +1,9 @@
 # agentq doctor (ADR 0009 stage 0, OQ-011): a READ-ONLY health report.
-#   agentq doctor [-Json] [-All] [-Repo <path>] [-Src <checkout>\ps]
+#   agentq doctor [-Json] [-All] [-Repo <path>] [-Src <checkout>\ps] [-Only <check[,check]>] [-Quiet]
+# -Only <check[,check]> runs just those checks (the keys of $checks in Invoke-Doctor); an unknown name is
+# a usage error (exit 2, the valid list on stderr) rather than an empty green report. -Quiet prints the
+# findings only: the human report loses its `ok`/`info` rows and its header, the hints and the final
+# count stay. The -Json shape is frozen for callers and -Quiet does not touch it.
 # Dot-sourced by agentq.ps1 inside its script scope: shares $Root, $QDir, $MDir, $LDir, $RDir, $Journal,
 # $Json, $All, $RepoArg, $Src and the helpers of agentq.ps1 / agentq-v2.ps1. It only READS: no repair, no
 # delete, no journal line. Nothing here may call a helper that writes (Get-Live, Get-Capacity,
@@ -817,7 +821,27 @@ function Test-DoctorDaemons {
 
 # ---- report -----------------------------------------------------------------------------------
 function Format-DoctorText($row) { if ($row.subject) { "$($row.subject): $($row.detail)" } else { "$($row.detail)" } }
-function Write-DoctorReport([object[]]$rows, [string[]]$order, [string]$header, [int]$fails, [int]$warns) {
+function Write-DoctorReport([object[]]$rows, [string[]]$order, [string]$header, [int]$fails, [int]$warns, [bool]$quiet = $false) {
+  # -Quiet: the findings ARE the report. Whoever asks "is this install in sync?" / "would this run
+  # LOCALLY?" usually reads the answer in a turn budget, and ~16 `ok` lines are noise it must skip to
+  # reach the one row that matters. Hints stay (they are the actionable part); the header goes (its
+  # numbers are repeated by the last line), so a clean run is exactly one line.
+  if ($quiet) {
+    foreach ($c in $order) {
+      $finds = @($rows | Where-Object { $_.check -eq $c -and $_.status -ne 'ok' })
+      if (-not $finds.Count) { continue }
+      $shown = 0
+      foreach ($r in $finds) {
+        if ($shown -ge $script:DoctorHumanMaxRows) { break }
+        $shown++
+        '{0,-4} {1,-20} {2}' -f $(if ($r.status -eq 'fail') { 'FAIL' } else { 'warn' }), $c, (Format-DoctorText $r)
+      }
+      if ($finds.Count -gt $shown) { '{0,-25} ... +{1} more (-Json lists all)' -f '', ($finds.Count - $shown) }
+      foreach ($ht in @($finds | ForEach-Object { $_.hint } | Where-Object { $_ } | Select-Object -Unique)) { '{0,-25} hint: {1}' -f '', $ht }
+    }
+    "doctor: $fails problem(s), $warns warning(s)"
+    return
+  }
   $header
   foreach ($c in $order) {
     $mine = @($rows | Where-Object { $_.check -eq $c })
@@ -871,6 +895,20 @@ function Invoke-Doctor {
     'daemons'             = { Test-DoctorDaemons }
     'cloud-lanes'         = { Test-DoctorCloudLanes $scope }
   }
+  # -Only <check[,check]>: run just those checks. An unknown name is a USAGE error, never an empty
+  # report - a caller that typo'd `cloud-lane` and was answered "0 problem(s)" would read a green gate
+  # forever, which is the exact failure this flag could otherwise introduce.
+  if (@($DoctorOnly).Count) {
+    $unknown = @($DoctorOnly | Where-Object { -not $checks.Contains("$_") })
+    if ($unknown.Count) {
+      [Console]::Error.WriteLine("agentq doctor: unknown check(s): $($unknown -join ', ')")
+      [Console]::Error.WriteLine("  checks: $(@($checks.Keys) -join ', ')")
+      exit 2
+    }
+    $keep = [ordered]@{}
+    foreach ($k in @($checks.Keys)) { if ($DoctorOnly -contains $k) { $keep[$k] = $checks[$k] } }
+    $checks = $keep
+  }
   $timings = [ordered]@{}
   foreach ($cn in @($checks.Keys)) {
     $t0 = $sw.ElapsedMilliseconds
@@ -900,5 +938,5 @@ function Invoke-Doctor {
     return
   }
   $header = "agentq doctor  $(Iso (Now))  scope: $scopeText, $($scope.slots.Count) slot(s) under $($scope.wtRoot)  state: $Root  $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
-  Write-DoctorReport $rows (@('scope') + @($checks.Keys)) $header $fails $warns
+  Write-DoctorReport $rows (@('scope') + @($checks.Keys)) $header $fails $warns $Quiet
 }

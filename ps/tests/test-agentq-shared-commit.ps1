@@ -4,6 +4,8 @@
 # `agentq commit` / `agentq land` run (2026-11-19: every commit in a slot was refused as
 # "E:\gh\codai is the SHARED clone" because the decision keyed on path arithmetic over
 # `--git-common-dir`, whose parent is the main clone for EVERY worktree of the repo).
+# 2026-11-25: the slot root is the MANAGED one (Get-WtRoot), so the refusal also arms for a clone that
+# is not directly under the fleet root (E:\gh\frontiers\<repo>) - case 6.
 #
 # Throwaway repo + LINKED worktrees under %TEMP%, isolated AGENTQ_HOME / AGENTQ_CONFIG. No network,
 # no real repo touched. Run: pwsh -NoProfile -File ps\tests\test-agentq-shared-commit.ps1 [-Aq <agentq.ps1>]
@@ -18,11 +20,15 @@ $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:AGENTQ_NO_SIGNAL = '1'
 $env:AGENTQ_NO_ADMISSION = '1'
 $env:AGENTQ_CONFIG = Join-Path $tmp 'cfg.json'
+# The guard asks the MANAGED slot root (agentq-v2.ps1 Get-WtRoot: CODAI_WT_ROOT, else E:\gh\.wt) whether
+# this machine has slot infrastructure. Without pinning it here the verdict silently depended on whether
+# E:\gh\.wt happens to exist on the machine running the suite (2026-11-25).
+$env:CODAI_WT_ROOT = Join-Path $tmp '.wt'
 Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK -ErrorAction SilentlyContinue
 @{
   machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10; minFreeCommitGB = 0
   sharedCloneMode = 'warn'
-  sharedCloneModeRepos = @{ repo = 'refuse'; repo2 = 'refuse' }
+  sharedCloneModeRepos = @{ repo = 'refuse'; repo2 = 'refuse'; repo3 = 'refuse' }
 } | ConvertTo-Json | Set-Content $env:AGENTQ_CONFIG
 
 $fail = 0
@@ -89,15 +95,35 @@ Remove-Item Env:AGENTQ_SHARED_CLONE_COMMIT_OK, Env:AGENTQ_SHARED_CLONE_REASON
 Check '4 AGENTQ_SHARED_CLONE_COMMIT_OK=1 allows the main worktree (exit 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
 Check '4 one-off landed the file' ((@(git -C $repo show --name-only --format= HEAD)) -contains 'once.txt')
 
-# 5. a repo marked refuse but with NO slots root is not protected (nothing to protect) - and the SAME
-#    config entry DOES refuse once the slots root exists, proving case 1 is the slots rule, not the mode
+# 5. a repo marked refuse on a machine with NO slot infrastructure is not protected (nothing to protect:
+#    refusing would leave the agent nowhere to work) - and the SAME config entry DOES refuse as soon as
+#    slot infrastructure exists, proving case 1 is the slots rule, not the mode
 $repo2 = Join-Path $tmp 'repo2'
 New-Repo $repo2
-$r = Invoke-Commit $repo2 'noslots.txt' 'test: no slots root'
-Check '5 main tree with no .wt root allowed (exit 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
+$env:CODAI_WT_ROOT = Join-Path $tmp 'nowt'          # managed root absent, no sibling either
+$r = Invoke-Commit $repo2 'noslots.txt' 'test: no slot infrastructure'
+Check '5 main tree with no slot infrastructure allowed (exit 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
+$env:CODAI_WT_ROOT = Join-Path $tmp '.wt'
 New-Item -ItemType Directory -Force (Join-Path $tmp '.wt\repo2') | Out-Null
 $r = Invoke-Commit $repo2 'withslots.txt' 'test: slots root present'
 Check '5 same repo refused once the .wt root exists (exit 3)' ($r.code -eq 3) "exit $($r.code): $($r.out)"
+
+# 6. THE NESTED-CLONE SHAPE (E:\gh\frontiers\<repo>, 2026-11-25): the repo's slots live under the MANAGED
+#    root (CODAI_WT_ROOT\<repo>), not under the legacy sibling `<clone>\.wt\<repo>`. The refusal must fire
+#    - before the fix only the sibling was consulted, so for every clone not directly under the fleet root
+#    the policy was armed and inert. 6b keeps ADR 0009 stage 0: a repo with NO slot directory anywhere
+#    keeps the advisory (its agent is never left with nowhere to work).
+$repo3 = Join-Path (Join-Path $tmp 'frontiers') 'repo3'
+New-Repo $repo3
+$env:CODAI_WT_ROOT = Join-Path $tmp 'wt-managed'
+Check '6 setup: the managed slot root exists but has no directory for repo3' (
+  (-not (Test-Path (Join-Path $env:CODAI_WT_ROOT 'repo3'))) -and (-not (Test-Path (Join-Path (Split-Path $repo3 -Parent) '.wt\repo3'))))
+$r = Invoke-Commit $repo3 'unprovisioned.txt' 'test: no slots anywhere'
+Check '6b an unprovisioned repo keeps the advisory (exit 0, ADR 0009 stage 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
+New-Item -ItemType Directory -Force (Join-Path $env:CODAI_WT_ROOT 'repo3') | Out-Null   # the shape `agentq lease` leaves
+$r = Invoke-Commit $repo3 'managedroot.txt' 'test: managed root arms the refusal'
+Check '6 nested clone refused via the MANAGED slot dir (exit 3)' ($r.code -eq 3) "exit $($r.code): $($r.out)"
+Check '6 refusal names the shared clone' ($r.out -match 'is the SHARED clone') $r.out
 
 foreach ($w in @($slot, $away)) { git -C $repo worktree remove --force $w 2>$null }
 cmd /c rmdir /s /q "`"$tmp`"" 2>$null

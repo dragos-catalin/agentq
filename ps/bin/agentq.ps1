@@ -131,7 +131,9 @@ STAGE 0 OF THE ORCHESTRATOR PLAN (ADR 0009, tracker OQ-001..012, 2026-11)
   again (green ledger, greenTtlHours). Config `landPregate`, `landPregateFromMain`, `landPregateScratchWaitMin`;
   AGENTQ_LAND_NO_PREGATE=1 off.
   agentq prune [-WhatIf] [-Days n] [-All] [-Json]   remove state nobody needs (also run by sweep).
-  agentq doctor [-All] [-Src <checkout>/ps] [-Json] health report; exit 1 when a check fails.
+  agentq doctor [-All] [-Src <checkout>/ps] [-Json] [-Only <check[,check]>] [-Quiet]
+                 health report; exit 1 when a check fails. -Only runs just those checks (unknown name =
+                 exit 2 listing the valid ones), -Quiet prints the findings only.
   agentq slo [-Hours 168] [-Json]  adds queue time, waits over 10 min, hook cost per day, start-probe buckets
                   and slots lost with a live chat.
 
@@ -183,6 +185,12 @@ $Claims = @()
 $WsName = $null; $Sub = $null
 # ADR 0009 stage 0: prune (-WhatIf, -Days), doctor (-Src <checkout>/ps).
 $WhatIf = $false; $Src = $null; $Days = 0
+# doctor -Only <check[,check]> -Quiet (2026-11-25): the two questions asked most often before starting
+# work ("is this install in sync?" / "would heavy work run LOCAL on this box?") must not pay for the
+# whole report, and a caller that only wants the findings should not have to filter a table of `info`
+# lines. -Only filters which CHECKS run (unknown name = usage error, never a silent empty report);
+# -Quiet keeps the human report's findings and drops its `ok`/`info` lines. Neither touches -Json.
+$DoctorOnly = @(); $Quiet = $false
 # ADR 0003 W2-5: set by Invoke-Land while an absorbed land waiter waits for its batch result.
 $script:WaitAbort = $null; $script:WaitAborted = $false
 $script:PreemptNote = ''; $script:WaitSec = 0; $script:CommitDone = $false
@@ -288,6 +296,18 @@ while ($i -lt $argv.Count) {
     'whatif' { $WhatIf = $true }
     'src' { $Src = & $next }
     'days' { $Days = [double](& $next) }
+    # doctor: -Only <check[,check]> (the check keys of Invoke-Doctor), -Quiet = findings only.
+    # `-Only a,b` arrives as ONE token in-process but as TWO from a native `pwsh -File` call (PowerShell
+    # turns `a,b` into an array before binding) - the same trap `-Paths` documents, so it consumes the
+    # following non-flag tokens exactly the same way. Without this, `-Only x,y` is a usage error, which
+    # is the one outcome a filter flag must never produce by accident.
+    'only' {
+      $vals = @($argv[$i + 1]); if ($i + 1 -ge $argv.Count) { throw "agentq: $a needs a value" }
+      $script:i++
+      while ($i + 1 -lt $argv.Count -and "$($argv[$i + 1])" -notlike '-*') { $script:i++; $vals += "$($argv[$i])" }
+      $DoctorOnly = @($vals | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    }
+    'quiet' { $Quiet = $true }
     default {
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
         [Console]::Error.WriteLine("agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'.")
@@ -455,15 +475,26 @@ function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
   $map = if ($cfg.ContainsKey('sharedCloneModeRepos')) { $cfg['sharedCloneModeRepos'] } else { $null }
   if ($map -and $map.ContainsKey($repo.Name)) { $mode = "$($map[$repo.Name])" }
   if ($mode -ne 'refuse') { return }
-  $slotsDir = Join-Path (Split-Path $repo.Top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $repo.Name)
-  if (-not (Test-Path -LiteralPath $slotsDir)) { return }        # repo without slots: nothing to protect
+  # Where this repo's slots live. The MANAGED root is Get-WtRoot (agentq-v2.ps1: CODAI_WT_ROOT, else
+  # E:\gh\.wt) and does not depend on where the clone sits; the legacy sibling `<clone>\.wt\<repo>` is
+  # only right for a clone directly under the fleet root. 2026-11-25: checking the sibling alone made
+  # the policy armed and inert for every NESTED clone (E:\gh\frontiers\<repo>), because a directory that
+  # never exists reads as "this repo has no slots" - ADR 0009 stage 0 (OQ-008: protect only the repos
+  # that HAVE slots, so an unprovisioned repo keeps the advisory and its agent is never left with
+  # nowhere to work). Both roots are honoured, per repo, in the same shape the editor guard uses.
+  $wtRoot = if (Get-Command Get-WtRoot -ErrorAction SilentlyContinue) { Get-WtRoot }
+    elseif ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT }
+    elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' }
+  $siblingSlots = Join-Path (Split-Path $repo.Top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $repo.Name)
+  $managedSlots = Join-Path $wtRoot $repo.Name
+  if (-not (Test-Path -LiteralPath $siblingSlots) -and -not (Test-Path -LiteralPath $managedSlots)) { return }   # repo without slots: nothing to protect
   # Owner-only override, journaled and with a reason (2026-11-22: agents copied the bypass from the
   # refusal text itself and left unpushed commits on shared main again, so it is no longer advertised).
   if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1' -and $env:AGENTQ_SHARED_CLONE_REASON) {
     Write-Journal @{ event = 'shared-clone-override'; repo = $repo.Name; verb = $verb; reason = "$env:AGENTQ_SHARED_CLONE_REASON" }
     return
   }
-  [Console]::Error.WriteLine("agentq: REFUSED - $($repo.Top) is the SHARED clone of $($repo.Name) (sharedCloneMode=refuse). Agents never $verb here: it leaves the clone dirty, blocks git-autosync and collides with other agents. Lease a slot: agentq lease -Purpose <why> [-Branch <topic>], copy your changes there, commit + land, then unlease. Do NOT look for a bypass.")
+  [Console]::Error.WriteLine("agentq: REFUSED - $($repo.Top) is the SHARED clone of $($repo.Name) (sharedCloneMode=refuse). Agents never $verb here: it leaves the clone dirty, blocks git-autosync and collides with other agents. Lease a slot: agentq lease -Purpose <why> [-Branch <topic>] (the slot directory is created on demand, there is nothing to set up), work there, commit + land, then unlease. Do NOT look for a bypass.")
   Write-Journal @{ event = 'shared-clone-refused'; repo = $repo.Name; verb = $verb; note = 'shared clone of a repo marked read-only' }
   exit 3
 }
@@ -2249,7 +2280,7 @@ $script:AqHelp = [ordered]@{
   'notify-landing' = @{ g = 'Land & release (ADR 0001)'; u = 'notify-landing -Repo <r> -Branch <b> [-Sha <sha>] [-Target <t>]'; d = 'tell running releases that a commit landed (called by commit/land)' }
   'workspace' = @{ g = 'Cloud workspaces (devcloud F2)'; u = 'workspace take|release|list -Name <ws>'; d = 'register or look up a warm cloud workspace used by run -Where cloud' }
   'prune' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'prune [-WhatIf] [-Days n] [-All] [-Json]'; d = 'remove state nobody needs any more (sweep runs it too)' }
-  'doctor' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'doctor [-All] [-Src <checkout>/ps] [-Json]'; d = 'health report of the whole install; exit 1 when a check fails' }
+  'doctor' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'doctor [-All] [-Src <checkout>/ps] [-Json] [-Only <check[,check]>] [-Quiet]'; d = 'health report read-only; exit 1 when a check fails. -Only runs just those checks (an unknown name exits 2 and prints the valid list), -Quiet prints the findings only. checks: stale-index-lock, empty-package-store, install-drift, config-drift, install-proof, stale-install, dead-owner, lease-hygiene, dead-keeper, marks, machine-memory, state-size, scheduled-tasks, git-autosync, daemons, cloud-lanes'; e = 'agentq doctor -Only cloud-lanes,install-drift -Quiet' }
   'slo' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'slo [-Hours 168] [-Json] [-Track]'; d = 'queue time, waits over 10 min, hook cost per day, slots lost with a live chat' }
   'flakes' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'flakes [-Id <test key or substring> -Reason "why"]'; d = 'quarantine report; -Id lifts a quarantine' }
   'store' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]'; d = 'SQLite index of the journal + job registry (the JSONL stays the source of truth)' }
