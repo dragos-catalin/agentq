@@ -117,7 +117,7 @@
   "burstMaxMin": 60,
   "overridesPerHour": 6,
   "landGate": {
-    "brivio": "pnpm land:gate",
+    "brivio": "pwsh -NoProfile -File scripts/devcloud/gate.ps1",
     "codai": "pwsh -NoProfile -File scripts/ops/cloud-land-gate.ps1",
     "marcai": "pnpm guards",
     "caelia": "pwsh -NoProfile -File tool/verify_cloud.ps1 -Resource verify",
