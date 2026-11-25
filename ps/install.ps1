@@ -113,6 +113,9 @@ $map = [ordered]@{
   # the repo's RUNS.md). Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins
   # the two, and the suite's in-flight exception in test-install-wiring.ps1 is dropped by this line.
   'tests\test-cloud-evidence.ps1' = 'bin\test-cloud-evidence.ps1'
+  # 2026-11-25: `-Status -Json` (vitals ADR 0050). Paired with the run-all.ps1 entry in this same
+  # commit - 'install wiring' pins the two, so a suite the installed gate cannot run is impossible.
+  'tests\test-agentq-cloud-status.ps1' = 'bin\test-agentq-cloud-status.ps1'
   'tests\test-slo.mjs' = 'bin\test-slo.mjs'
   # 2026-11-23: `bump -Id|-Session` (a waiter can target its OWN ticket) + the `== MINE session ...` line
   # in `status`. Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.

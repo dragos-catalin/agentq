@@ -47,6 +47,10 @@ $suites = [ordered]@{
     # needs no new file here - only the test itself (install map entry owned by the parent, see the wiring
     # guard's $mapExcept).
     'cloud evidence' = @('-File', (Join-Path $PSScriptRoot 'test-cloud-evidence.ps1'))
+  # 2026-11-25: `-Status -Json`, the read-only document Vitals' Projects tab reads (vitals ADR 0050).
+  # The suite runs offline - a `gcloud` shim on PATH answers the reads - so it pins the shape and the
+  # "a number that cannot be measured is null, never 0" rule without a network or a real workspace.
+  'cloud status'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud-status.ps1'))
   'adaptive+reg'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-adaptive.ps1'))
   'reap terminals' = @('-File', (Join-Path $PSScriptRoot 'test-reap-terminals.ps1'), '-Tool', (Join-Path $bin 'reap-terminals.ps1'))
   'term interrupt' = @('-File', (Join-Path $PSScriptRoot 'test-term-interrupt.ps1'), '-Tool', (Join-Path $bin 'term-interrupt.ps1'))

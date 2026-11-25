@@ -9,6 +9,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - MCP: the whole surface is reachable through the server, not only the daemon. 23 new tools - `agentq_since`/`_status`/`_run`/`_note`/`_break`/`_propose`/`_workspace`, `agentq_lease`/`_unlease`/`_land`/`_publish`/`_sweep`, `job_start`/`job_wait`/`job_list` and `cloud_submit`/`cloud_status`/`cloud_workspaces`/`cloud_suspend`/`cloud_resume`/`cloud_reset`/`cloud_log`/`cloud_result` - each wrapping the script a person would call, with named parameters, the script's own exit codes, and a required reason on the destructive ones. Spawning goes through the new `src/pws.ts` (argv arrays, captured pipes, `pwsh` with a `powershell.exe` fallback, a timeout that reports code 124). 30 tools in total; `buildMcpServer` is exported so a test can register against an in-memory transport.
 
 - `-Lane interactive|quick|gate|heavy|batch` and `-Priority` on `run` / run-build: waiters are ranked by priority with aging instead of strict FIFO.
+- `agentq-cloud.ps1 -Status -Json`: one read-only JSON document describing every workspace in the cloud registry - state, heartbeat age, idle seconds and queue depth per workspace, plus the names of any the registry could not reach and why. A value that could not be measured is `null`, never `0`, so a client cannot mistake "not measured" for "idle". This is the machine-readable half of `status`, and what a client reads instead of parsing the human table (Vitals' Projects tab, vitals ADR 0050). Read-only `gcloud` reads only: nothing is started, stopped, resumed or queued, and the human `status` output is unchanged.
 - Atomic multi-resource grant: a run waiting for `build:machine` no longer holds `build:<repo>`.
 - Soft slots: quick-lane burst slots; non-batch jobs run beside batch holders (batch runs at Idle priority).
 - Idle-yield watchdog: a holder whose process tree is idle stops counting against the machine cap (`idle-yield` / `idle-resume` events).
@@ -47,6 +48,16 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   suite the installer never carries cannot gate anything - the `test-land-default-gate.ps1` gap, generalised),
   and every map **destination** is unique and resolves inside the install root (a duplicate silently loses a
   file, an escaping one writes outside `~/.copilot`). Measured on today's map: 98 destinations, 52 suites.
+- `agentq-cloud.ps1 -Status -Json`: a **read-only** JSON surface for every devcloud workspace in the
+  registry (`{"v":1,"at":<ISO>,"workspaces":[{ws,vm,project,zone,state,heartbeatAt,heartbeatAgeSec,
+  idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - the verb Vitals waits
+  for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md §6.3). `state` folds the VM
+  status (`suspended`/`stopped`/`suspending`) with the heartbeat (`idle`/`busy`); a figure that cannot be
+  measured is `null`, NEVER `0`, and a workspace with no readable heartbeat is `null` there and named in
+  `unavailable` with the reason. Only `gcloud compute instances describe` and `gcloud storage cat|ls` -
+  no suspend/resume/reset/submit and no journal write. `-Status` without `-Json` is the human table of
+  before, unchanged. New suite `tests/test-agentq-cloud-status.ps1` pins the shape, the null rule (a
+  mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
 ### Fixed
 

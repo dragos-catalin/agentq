@@ -36,7 +36,7 @@ EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavai
   expires); 2 = usage.
 #>
 $Ws = 'codai'; $Purpose = $null; $Lane = 'gate'; $TimeoutMin = 60; $RepoArg = $null; $NoPatch = $false
-$Status = $false; $Suspend = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
+$Status = $false; $Suspend = $false; $Json = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
 $StaleClaimMin = 3; $NoHeal = $false
 $argv = @($args); $Rest = @()
 $dd = [array]::IndexOf($argv, '--')
@@ -47,7 +47,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
   switch ($n) {
     'ws' { $Ws = & $val } 'purpose' { $Purpose = & $val } 'lane' { $Lane = (& $val).ToLowerInvariant() }
     'timeoutmin' { $TimeoutMin = [int](& $val) } 'repo' { $RepoArg = & $val } 'nopatch' { $NoPatch = $true }
-    'noinstall' { $NoInstall = $true } 'status' { $Status = $true } 'suspend' { $Suspend = $true }
+    'noinstall' { $NoInstall = $true } 'status' { $Status = $true } 'suspend' { $Suspend = $true } 'json' { $Json = $true }
     'staleclaimmin' { $StaleClaimMin = [int](& $val) } 'noheal' { $NoHeal = $true }
     'project' { $Project = & $val } 'zone' { $Zone = & $val } 'ctlproject' { $CtlProject = & $val }
     default { [Console]::Error.WriteLine("agentq-cloud: unknown argument '$a' (put the command after --)"); exit 2 }
@@ -269,7 +269,79 @@ function Get-VmStatus { $r = Invoke-Api GET "$VmUrl`?fields=status"; if ($r.code
 function Invoke-VmOp([string]$op) { $r = Invoke-Api POST "$VmUrl/$op"; if ($r.code -ne 200) { throw "compute $op $Vm -> $($r.code) $($r.body)" } }
 function Read-Gcs([string]$uri) { Read-Obj ($uri -replace "^gs://$BucketName/", '') }
 
+# ---- read-only devcloud status (ADR 0050): the surface Vitals calls ------------------------------
+# `-Status -Json` prints ONE JSON document on stdout - every workspace in the registry, its VM state,
+# heartbeat age and queue depth, plus the list of workspaces whose live state could not be measured.
+# Read-only by construction: only `gcloud compute instances describe` and `gcloud storage cat|ls`, never
+# a suspend/resume/reset/submit and never a journal write. A figure that cannot be measured is $null,
+# NEVER 0: an absent heartbeat and a heartbeat of 0 s are different facts (agentq/vitals AGENTS.md).
+# The total function order is fixed (v, at, workspaces, unavailable) so a consumer can pin a schema.
+function Get-DevcloudHeartbeat([string]$ws) {
+  # No object -> $null (the caller records it in `unavailable`); a present but unparseable object is
+  # also $null, because a heartbeat nobody can read is a heartbeat nobody has.
+  $raw = ''
+  try { $raw = @(& gcloud storage cat "$Bucket/ws/$ws/heartbeat" 2>$null) -join "`n" } catch { $raw = '' }
+  if (-not "$raw".Trim()) { return $null }
+  try { return ($raw | ConvertFrom-Json) } catch { return $null }
+}
+function Get-DevcloudQueueDepth([string]$ws) {
+  # One object per queued job; the count is a real measurement, so an empty queue is 0. A listing that
+  # fails is $null (not measured), never 0 - the same rule the heartbeat follows.
+  try { return [int]@(& gcloud storage ls "$Bucket/ws/$ws/queue/" 2>$null | Where-Object { $_ -and "$_".Trim() }).Count } catch { return $null }
+}
+function Get-DevcloudWorkspaceRow([string]$ws, [string]$project, [string]$zone) {
+  $vm = "ws-$ws"
+  $why = @()
+  $hb = Get-DevcloudHeartbeat $ws
+  if (-not $hb) { $why += "no heartbeat at ws/$ws/heartbeat (the agent publishes one every 30 s)" }
+
+  # VM state, read-only. A describe that fails (unknown ws, no permission) leaves the state UNKNOWN and
+  # is reported in `unavailable` rather than being guessed from the heartbeat.
+  $vst = ''
+  try {
+    $vj = @(& gcloud compute instances describe $vm --project $project --zone $zone --format=json 2>$null) -join "`n"
+    if ("$vj".Trim()) { $vst = [string](($vj | ConvertFrom-Json).status) } else { $why += "VM $vm was not described in $project/$zone" }
+  } catch { $why += "VM describe failed: $($_.Exception.Message)" }
+
+  $heartbeatAt = $null; $heartbeatAgeSec = $null; $idleSec = $null
+  if ($hb) {
+    if ($hb.PSObject.Properties['at'] -and $hb.at) {
+      # ConvertFrom-Json turns an ISO-8601 string into [DateTime] here (PowerShell 7); ToUniversalTime
+      # makes the age independent of this machine's zone (the same cast the human `-Status` path uses).
+      $hbDt = [DateTime]$hb.at
+      $heartbeatAt = $hbDt.ToUniversalTime().ToString('o')
+      $heartbeatAgeSec = [int][math]::Round(([DateTime]::UtcNow - $hbDt.ToUniversalTime()).TotalSeconds)
+    }
+    if ($hb.PSObject.Properties['idleSec'] -and $null -ne $hb.idleSec) { $idleSec = [int]$hb.idleSec }
+  }
+
+  # The VM tells the coarse truth (suspended/stopped); the heartbeat tells idle vs busy while it runs.
+  # `suspending` may come from either side (the runner writes it before it calls instances.suspend).
+  $hbState = if ($hb -and $hb.PSObject.Properties['state']) { [string]$hb.state } else { '' }
+  $state = 'unknown'
+  if ($vst -eq 'TERMINATED') { $state = 'stopped' }
+  elseif ($vst -eq 'SUSPENDED') { $state = 'suspended' }
+  elseif ($vst -eq 'SUSPENDING') { $state = 'suspending' }
+  elseif ($hbState -in @('idle', 'busy', 'suspending')) { $state = $hbState }
+
+  $row = [ordered]@{ ws = $ws; vm = $vm; project = $project; zone = $zone; state = $state
+    heartbeatAt = $heartbeatAt; heartbeatAgeSec = $heartbeatAgeSec; idleSec = $idleSec; queueDepth = (Get-DevcloudQueueDepth $ws) }
+  [pscustomobject]@{ row = $row; why = @($why) }
+}
+function Get-DevcloudStatusDoc {
+  $doc = [ordered]@{ v = 1; at = [DateTime]::UtcNow.ToString('o'); workspaces = @(); unavailable = @() }
+  foreach ($name in @($Registry.Keys | Sort-Object)) {
+    $r = Get-DevcloudWorkspaceRow -ws $name -project $Registry[$name].project -zone $Registry[$name].zone
+    $doc.workspaces += $r.row
+    if (@($r.why).Count) { $doc.unavailable += [ordered]@{ ws = $name; why = (@($r.why) -join '; ') } }
+  }
+  $doc
+}
+
 if ($Status) {
+  # `-Status -Json` is the read-only machine surface Vitals calls (ADR 0050): stdout is the JSON and
+  # nothing else. The block below it is the human table `-Status` has always printed, unchanged.
+  if ($Json) { Out-Line ((Get-DevcloudStatusDoc) | ConvertTo-Json -Depth 6); exit 0 }
   & gcloud compute instances describe $Vm --project $Project --zone $Zone --format='table(name,status,machineType.basename(),lastStartTimestamp,lastSuspendedTimestamp)' 2>&1 | ForEach-Object { Out-Line "$_" }
   $hbRaw = Read-Gcs "$Bucket/ws/$Ws/heartbeat"
   Out-Line "heartbeat: $hbRaw".TrimEnd()
