@@ -119,7 +119,7 @@
   "landGate": {
     "brivio": "pwsh -NoProfile -File scripts/devcloud/gate.ps1",
     "codai": "pwsh -NoProfile -File scripts/ops/cloud-land-gate.ps1",
-    "marcai": "pnpm guards",
+    "marcai": "pwsh -NoProfile -File scripts/devcloud/gate.ps1",
     "caelia": "pwsh -NoProfile -File tool/verify_cloud.ps1 -Resource verify",
     "vmui": "pwsh -NoProfile -File infra/devcloud/gate.ps1",
     "agentq": "pwsh -NoProfile -Command \"& (Join-Path (git rev-parse --show-toplevel) 'ps/tests/run-all.ps1') -RepoSuites -Parallel 4\""
