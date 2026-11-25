@@ -297,7 +297,8 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
 # and Rule B (a plan/*.csv write) cannot drift apart. True ONLY for the repo's MAIN working tree
 # (a leased slot is a LINKED worktree: git-dir != git-common-dir) that agentq-config.json marks
 # sharedCloneMode=refuse (a per-repo sharedCloneModeRepos entry wins) and that HAS slots
-# (<parent-of-top>\.wt\<repo>). AGENTQ_SHARED_CLONE_COMMIT_OK=1 is agentq's own documented one-off
+# (<parent-of-top>\.wt\<repo> or <CODAI_WT_ROOT|E:\gh\.wt>\<repo>, per repo - see below).
+# AGENTQ_SHARED_CLONE_COMMIT_OK=1 is agentq's own documented one-off
 # escape and disables it. Returns @{ top = <main worktree>; repo = <name> }, or $null. Never blocks.
 # All three paths come from ONE `git rev-parse`: on Windows each spawn is ~50-80 ms and Rule A/B are
 # the only rules that need git, so this is the whole discovery cost of the call.
@@ -323,14 +324,49 @@ function Get-GuardSharedClone([string]$dir) {
     }
   } catch { return $null }
   if ($scMode -ne 'refuse') { return $null }
-  $slotsDir = Join-Path (Split-Path $top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $scRepo)
-  if (-not (Test-Path -LiteralPath $slotsDir)) { return $null }
+  # The repo must HAVE slots (ADR 0009 stage 0 / OQ-008: an unprovisioned repo keeps the advisory, so its
+  # agent is never left with nowhere to work). 2026-11-25: this checked the legacy sibling only
+  # (`<clone>\.wt\<repo>`), which is right only for a clone directly under the fleet root - so for every
+  # NESTED clone (E:\gh\frontiers\<repo>) it read "no slots" and the deny could not fire at all, while
+  # agentq's own guard refused the commit: the two halves disagreed exactly where it mattered.
+  # Both roots, per repo: the managed one (CODAI_WT_ROOT, else E:\gh\.wt - the same fallback Get-WtRoot
+  # uses) and the legacy sibling, so a fleet mid-migration keeps working.
+  $wtRoot = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' }
+  $siblingSlots = Join-Path (Split-Path $top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $scRepo)
+  $managedSlots = Join-Path $wtRoot $scRepo
+  if (-not (Test-Path -LiteralPath $siblingSlots) -and -not (Test-Path -LiteralPath $managedSlots)) { return $null }
   return [pscustomobject]@{ top = $top; repo = $scRepo }
 }
 # The path-based caller (Rule B) already knows the repo root and only needs the verdict.
 function Test-GuardSharedClone([string]$repoTop) {
   $sc = Get-GuardSharedClone $repoTop
   if ($sc) { return $sc.repo }
+  return $null
+}
+
+# Resolve a written path to the repo that encloses it, inside the fleet root.
+# 2026-11-25: this was a single regex pinned to ONE level under the root
+# (`^<root>\<repo>\<rel>`), which recognised E:\gh\<repo>\... and nothing else - so every NESTED clone
+# (E:\gh\frontiers\<repo>\...) was invisible to the edit rule, and the editor half of the shared-clone
+# policy could not fire where the fleet actually lives. Walk UP instead: the nearest ancestor below the
+# fleet root that owns a `.git` DIRECTORY is the repo, whatever its depth. `.git` being a FILE is what a
+# LINKED worktree (a leased slot) looks like, so slots resolve to nothing and stay writable; the slots
+# root itself (`.wt`) is refused explicitly.
+function Resolve-GuardRepoPath([string]$file, [string]$root) {
+  $p = "$file".Replace('/', '\') -replace '^(?i)file:\\+', ''
+  $rootN = "$root".TrimEnd('\')
+  if (-not $p.StartsWith($rootN + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  $dir = Split-Path -Parent $p
+  while ($dir -and $dir.Length -gt $rootN.Length) {
+    $name = Split-Path -Leaf $dir
+    if ($name -eq '.wt') { return $null }
+    if (Test-Path -LiteralPath (Join-Path $dir '.git') -PathType Container) {
+      return [pscustomobject]@{ dir = $dir; repo = $name; rel = $p.Substring($dir.Length).TrimStart('\') }
+    }
+    $parent = Split-Path -Parent $dir
+    if (-not $parent -or $parent -eq $dir) { return $null }
+    $dir = $parent
+  }
   return $null
 }
 
@@ -378,12 +414,11 @@ if ($isEditTool) {
   $ghRoot = if ($env:CODAI_GH_ROOT) { $env:CODAI_GH_ROOT } else { 'E:\gh' }
   $scHard = [System.Collections.Generic.List[string]]::new()
   foreach ($one in $wps) {
-    $wpn = $one.Replace('/', '\') -replace '^(?i)file:\\+', ''
-    $rx = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
-    if ($wpn -match $rx -and $Matches.repo -ne '.wt') {
-      $repoDir = Join-Path $ghRoot $Matches.repo; $rel = $Matches.rel
+    $info = Resolve-GuardRepoPath $one $ghRoot
+    if ($info) {
+      $repoDir = $info.dir; $rel = $info.rel
       $exempt = $rel -match '(?i)^(\.copilot-tmp|\.git|plan|docs|memories)\\' -or $rel -match '(?i)\.(md|mdx|txt|csv)$'
-      if (-not $exempt -and (Test-Path -LiteralPath (Join-Path $repoDir '.git') -PathType Container)) {
+      if (-not $exempt) {
         # ADR 0004 (W4-1): mode from agentq-config.json (sharedCloneModeRepos.<repo> wins over sharedCloneMode).
         $scRepo = Split-Path -Leaf $repoDir
         $scMode = 'warn'
@@ -398,6 +433,10 @@ if ($isEditTool) {
             if ($scRepos -and $scRepos.PSObject.Properties[$scRepo]) { $scMode = "$($scRepos.PSObject.Properties[$scRepo].Value)" }
           }
         } catch { }
+        # ADR 0009 stage 0 (OQ-008): a repo marked refuse that has NO slots of its own keeps the
+        # ADVISORY, so its agent is never left with nowhere to work. Same rule as Get-GuardSharedClone
+        # (one predicate, so the edit rule and Rule A/B cannot disagree).
+        if ($scMode -eq 'refuse' -and -not (Test-GuardSharedClone $repoDir)) { $scMode = 'warn' }
         $scOv = Get-SharedCloneOverride; $scOverride = $scOv.allowed
         if ($scMode -ne 'off') {
           try {
@@ -437,13 +476,11 @@ if ($isEditTool) {
   # Same class of bug as above, and the same fix: a multi-file patch can carry a plan/*.csv hunk
   # beside its source hunks, and only the first header used to be read (2026-11-25).
   foreach ($oneB in $wps) {
-    $wpnB = $oneB.Replace('/', '\') -replace '^(?i)file:\\+', ''
-    $rxB = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
-    if ($wpnB -match $rxB -and $Matches.repo -ne '.wt') {
-      $scRepoWildB = $Matches.repo   # the inner -match below clobbers $Matches
-      $relB = $Matches.rel.Replace('\', '/')
+    $infoB = Resolve-GuardRepoPath $oneB $ghRoot
+    if ($infoB) {
+      $relB = $infoB.rel.Replace('\', '/')
       if ($relB -match '(?i)(^|/)plan/[^/]+\.csv$') {
-        $scRepoB = Test-GuardSharedClone (Join-Path $ghRoot $scRepoWildB)
+        $scRepoB = Test-GuardSharedClone $infoB.dir
         if ($scRepoB) {
           $script:SharedWarn = "WARNING (shared clone): writing $relB directly in the SHARED clone of $scRepoB. Tracker CSVs left uncommitted here block git-autosync - it cannot move main while they exist, and it reverts colliding drafts (2026-11-22: plan/dev-cloud-CANONICAL.csv wedged codai for ~4 h). Write the rows in your leased slot, or publish them: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" publish -Paths $relB -Message `"docs(plan): ...`" -Purpose `"why`" [-Onto main]."
           [Console]::Error.WriteLine($script:SharedWarn)

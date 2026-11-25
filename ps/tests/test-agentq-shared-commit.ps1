@@ -108,17 +108,21 @@ New-Item -ItemType Directory -Force (Join-Path $tmp '.wt\repo2') | Out-Null
 $r = Invoke-Commit $repo2 'withslots.txt' 'test: slots root present'
 Check '5 same repo refused once the .wt root exists (exit 3)' ($r.code -eq 3) "exit $($r.code): $($r.out)"
 
-# 6. THE NESTED-CLONE SHAPE (E:\gh\frontiers\<repo>, 2026-11-25): the managed slot root exists but has no
-#    directory for this repo yet. The refusal must still fire - `agentq lease` creates that directory on
-#    demand - otherwise the policy is armed and inert, which is exactly what it was for every clone not
-#    directly under the fleet root.
+# 6. THE NESTED-CLONE SHAPE (E:\gh\frontiers\<repo>, 2026-11-25): the repo's slots live under the MANAGED
+#    root (CODAI_WT_ROOT\<repo>), not under the legacy sibling `<clone>\.wt\<repo>`. The refusal must fire
+#    - before the fix only the sibling was consulted, so for every clone not directly under the fleet root
+#    the policy was armed and inert. 6b keeps ADR 0009 stage 0: a repo with NO slot directory anywhere
+#    keeps the advisory (its agent is never left with nowhere to work).
 $repo3 = Join-Path (Join-Path $tmp 'frontiers') 'repo3'
 New-Repo $repo3
 $env:CODAI_WT_ROOT = Join-Path $tmp 'wt-managed'
-New-Item -ItemType Directory -Force $env:CODAI_WT_ROOT | Out-Null   # infrastructure, no per-repo dir
-Check '6 setup: the managed slot root has no directory for repo3' (-not (Test-Path (Join-Path $env:CODAI_WT_ROOT 'repo3')))
+Check '6 setup: the managed slot root exists but has no directory for repo3' (
+  (-not (Test-Path (Join-Path $env:CODAI_WT_ROOT 'repo3'))) -and (-not (Test-Path (Join-Path (Split-Path $repo3 -Parent) '.wt\repo3'))))
+$r = Invoke-Commit $repo3 'unprovisioned.txt' 'test: no slots anywhere'
+Check '6b an unprovisioned repo keeps the advisory (exit 0, ADR 0009 stage 0)' ($r.code -eq 0) "exit $($r.code): $($r.out)"
+New-Item -ItemType Directory -Force (Join-Path $env:CODAI_WT_ROOT 'repo3') | Out-Null   # the shape `agentq lease` leaves
 $r = Invoke-Commit $repo3 'managedroot.txt' 'test: managed root arms the refusal'
-Check '6 nested clone refused on the managed root alone (exit 3)' ($r.code -eq 3) "exit $($r.code): $($r.out)"
+Check '6 nested clone refused via the MANAGED slot dir (exit 3)' ($r.code -eq 3) "exit $($r.code): $($r.out)"
 Check '6 refusal names the shared clone' ($r.out -match 'is the SHARED clone') $r.out
 
 foreach ($w in @($slot, $away)) { git -C $repo worktree remove --force $w 2>$null }

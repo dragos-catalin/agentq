@@ -475,21 +475,19 @@ function Assert-SharedCloneWriteAllowed([object]$repo, [string]$verb) {
   $map = if ($cfg.ContainsKey('sharedCloneModeRepos')) { $cfg['sharedCloneModeRepos'] } else { $null }
   if ($map -and $map.ContainsKey($repo.Name)) { $mode = "$($map[$repo.Name])" }
   if ($mode -ne 'refuse') { return }
-  # Where this repo's slots live. The managed root is Get-WtRoot (agentq-v2.ps1: CODAI_WT_ROOT, else
-  # E:\gh\.wt) - it does NOT depend on where the clone sits. The old sibling form `<clone>\.wt\<repo>`
-  # is only right for a clone directly under the fleet root, so for every NESTED clone
-  # (E:\gh\frontiers\<repo>, 2026-11-25) it pointed at a directory that never exists and the refusal
-  # could not fire at all - the policy looked armed and was inert.
+  # Where this repo's slots live. The MANAGED root is Get-WtRoot (agentq-v2.ps1: CODAI_WT_ROOT, else
+  # E:\gh\.wt) and does not depend on where the clone sits; the legacy sibling `<clone>\.wt\<repo>` is
+  # only right for a clone directly under the fleet root. 2026-11-25: checking the sibling alone made
+  # the policy armed and inert for every NESTED clone (E:\gh\frontiers\<repo>), because a directory that
+  # never exists reads as "this repo has no slots" - ADR 0009 stage 0 (OQ-008: protect only the repos
+  # that HAVE slots, so an unprovisioned repo keeps the advisory and its agent is never left with
+  # nowhere to work). Both roots are honoured, per repo, in the same shape the editor guard uses.
   $wtRoot = if (Get-Command Get-WtRoot -ErrorAction SilentlyContinue) { Get-WtRoot }
     elseif ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT }
     elseif ($IsWindows) { 'E:\gh\.wt' } else { '/work/.wt' }
   $siblingSlots = Join-Path (Split-Path $repo.Top -Parent) ('.wt' + [IO.Path]::DirectorySeparatorChar + $repo.Name)
   $managedSlots = Join-Path $wtRoot $repo.Name
-  # `agentq lease` PROVISIONS the slot directory on demand (Initialize-Slot creates
-  # <wt root>\<repo>\task-N), so the question is whether slot infrastructure exists at all, not whether a
-  # directory for this repo happens to be there yet. The escape stays for a machine with no managed root
-  # and no legacy sibling (a foreign checkout): there, refusing would leave the agent nowhere to work.
-  if (-not (Test-Path -LiteralPath $wtRoot) -and -not (Test-Path -LiteralPath $siblingSlots) -and -not (Test-Path -LiteralPath $managedSlots)) { return }
+  if (-not (Test-Path -LiteralPath $siblingSlots) -and -not (Test-Path -LiteralPath $managedSlots)) { return }   # repo without slots: nothing to protect
   # Owner-only override, journaled and with a reason (2026-11-22: agents copied the bypass from the
   # refusal text itself and left unpushed commits on shared main again, so it is no longer advertised).
   if ($env:AGENTQ_SHARED_CLONE_COMMIT_OK -eq '1' -and $env:AGENTQ_SHARED_CLONE_REASON) {

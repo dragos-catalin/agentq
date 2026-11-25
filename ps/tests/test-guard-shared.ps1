@@ -159,6 +159,36 @@ Ok ($r.code -eq 0 -and $r.out -notmatch '"deny"') 'multi-file patch wholly insid
 $bothShared = "*** Begin Patch`n*** Update File: $root\repo\src\a.ts`n@@`n-a`n+b`n*** Update File: $root\repo\src\b.ts`n@@`n-a`n+b`n*** End Patch"
 $r = Call 'apply_patch' @{ input = $bothShared; explanation = 'x' }
 Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'src\\\\a\.ts' -and $r.out -match 'src\\\\b\.ts') 'multi-file patch wholly in the shared clone: denied, both paths named'
+
+# 2026-11-25: a NESTED clone (E:\gh\frontiers\<repo>) has NO sibling `.wt` - the fleet keeps every slot
+# in the ONE managed root (`CODAI_WT_ROOT`, else E:\gh\.wt)\<repo>. The predicate read only the sibling,
+# so on every nested clone it concluded "no slots" and the deny could not fire at all, while agentq's own
+# guard refused the commit: the editor half of the policy was dead exactly where it was needed (the
+# sibling form is right only for a clone directly under the fleet root). Both roots now, per repo.
+foreach ($nr in 'nested', 'nested2') {
+  New-Item -ItemType Directory "$root\frontiers\$nr\src" -Force | Out-Null
+  Push-Location "$root\frontiers\$nr"
+  try {
+    git init -q .
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
+  } finally { Pop-Location }
+}
+Ok (-not (Test-Path -LiteralPath "$root\frontiers\.wt")) 'nested setup: no sibling slots root (the shape of E:\gh\frontiers)'
+'{"sharedCloneModeRepos":{"nested":"refuse","nested2":"refuse"}}' | Set-Content $cfg
+$r = Call 'replace_string_in_file' @{ filePath = "$root\frontiers\nested\src\a.ts"; oldString = 'x'; newString = 'y' }
+# `refuse` in the config, but no slots anywhere for this repo: the ADVISORY, never a deny - otherwise
+# the agent has nowhere to work (and the deny would be the reason it stayed in the shared clone).
+Ok ($r.out -match 'SHARED clone' -and $r.out -notmatch '"deny"') 'nested clone, unprovisioned: advisory only (ADR 0009 stage 0 / OQ-008)'
+New-Item -ItemType Directory "$root\.wt\nested" -Force | Out-Null    # the shape `agentq lease` leaves behind
+$r = Call 'replace_string_in_file' @{ filePath = "$root\frontiers\nested\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'sharedCloneMode=refuse' -and $r.out -match 'ADR 0004') 'nested clone refused via the MANAGED slot dir'
+Ok ((Lines)[-1].repo -eq 'nested') 'nested clone: journaled under the nested repo name'
+$r = Call 'replace_string_in_file' @{ filePath = "$root\frontiers\nested2\src\a.ts"; oldString = 'x'; newString = 'y' }
+Ok ($r.out -notmatch '"deny"') 'nested clone without a slot of its own keeps the advisory'
+if ($ps51) {
+  $r = Call 'replace_string_in_file' @{ filePath = "$root\frontiers\nested\src\a.ts"; oldString = 'x'; newString = 'y' } $ps51
+  Ok ($r.out -match '"permissionDecision":"deny"') 'nested clone refused under Windows PowerShell 5.1 too'
+}
 Remove-Item Env:AGENTQ_CONFIG
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }
