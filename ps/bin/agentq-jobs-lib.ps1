@@ -154,6 +154,19 @@ function Get-JobView([hashtable]$j, [double]$stallMin = 5) {
       $state = if (($exp -gt 0 -and $runMin -gt 2 * $exp) -or $quietMin -gt $stallMin) { 'suspect' } else { 'running' }
     }
   }
+  # A stored state outside this vocabulary - a hand-written 'stopped' in jobs/*.json, an older tool's
+  # name - used to flow out verbatim. agentq-sync pushes jobs[].state into the gateway's
+  # agentqPushSchema, which accepts exactly these six and rejects the WHOLE push with HTTP 400; the
+  # sync offset only advances on success, so those rows re-sent forever and the hub mirror stayed dead
+  # for 24 h on 2026-11-24/25 over five 'stopped' rows (gateway body: jobs[].state "Invalid option:
+  # expected one of running|done|failed|killed|suspect|dead"). Normalise from the evidence already in
+  # the row: 'starting' is a live job (the gateway's name for it is 'running'); a recorded, real exit
+  # code decides done/failed; anything else never produced an outcome, and 'killed' still shows up as
+  # needing attention in the hub, where a wrong 'done' would hide it.
+  if ($state -eq 'starting') { $state = 'running' }
+  elseif ($state -notin 'running', 'suspect', 'done', 'failed', 'killed', 'dead') {
+    $state = if ($null -ne $exit -and [int]$exit -ge 0) { if ([int]$exit -eq 0) { 'done' } else { 'failed' } } else { 'killed' }
+  }
   $endFor = if ($ended) { $ended } elseif ($state -in 'running', 'suspect', 'starting') { $now } elseif ($lastOut) { $lastOut } else { $now }
   [ordered]@{
     id = "$($j['id'])"; label = "$($j['label'])"; state = $state; exitCode = $exit

@@ -251,6 +251,12 @@ Check 'jobs reap treats a recycled pid as dead' ($rrc.state -eq 'dead')
 & pwsh -NoProfile -File $jobs kill $live.id | Out-Null
 
 # --- agentq-sync payload carries jobs[] in the contract shape ---------------------------------------
+# Regression 2026-11-25: a stored state outside the gateway vocabulary ('stopped', hand-written into
+# jobs/*.json by an older tool) used to be pushed verbatim; the gateway rejected the WHOLE push and the
+# hub mirror sat dead for 24 h. These three rows prove Get-JobView normalises into the vocabulary.
+$nol = Join-Path $tmp 'legacy-no-log.txt'
+@{ id = 'legacy-stopped'; label = 'legacy stopped state'; command = 'x'; cwd = $cwd; pid = 999999; pidStart = 1; log = $nol; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-20).ToString('o'); endedAt = [DateTime]::UtcNow.AddMinutes(-19).ToString('o'); exitCode = -1; state = 'stopped'; ownerPid = 999999; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME 'jobs\legacy-stopped.json')
+@{ id = 'legacy-stopped-exit'; label = 'legacy stopped with a recorded exit code'; command = 'x'; cwd = $cwd; pid = 999999; pidStart = 1; log = $nol; expectedMin = 1; startedAt = [DateTime]::UtcNow.AddMinutes(-20).ToString('o'); endedAt = [DateTime]::UtcNow.AddMinutes(-19).ToString('o'); exitCode = 3; state = 'stopped'; ownerPid = 999999; host = 'h' } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME 'jobs\legacy-stopped-exit.json')
 $env:AGENTQ_SYNC_STATE = Join-Path $tmp 'sync-state.json'
 $env:AGENTQ_SYNC_DUMP = Join-Path $tmp 'sync-body.json'
 # daemon health: the default daemon (git-autosync) is pointed at a fake so the dry-run never runs the
@@ -266,6 +272,9 @@ $keys = 'id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,startedAt
 Check 'agentq-sync -DryRun counts jobs' ($d -match 'jobs=\d+') $d
 Check 'sync jobs[] entry has exactly the contract fields' ($sj.Count -eq 1 -and -not (Compare-Object $keys @($sj[0].PSObject.Properties.Name))) (($sj | ConvertTo-Json -Compress))
 Check 'sync jobs[] carries computed state (dead/suspect)' (@($body.jobs | Where-Object { $_.id -eq $deadId -and $_.state -eq 'dead' }).Count -eq 1)
+Check 'sync jobs[] normalises an out-of-vocabulary state to killed' (@($body.jobs | Where-Object { $_.id -eq 'legacy-stopped' -and $_.state -eq 'killed' }).Count -eq 1) (($body.jobs | Where-Object { $_.id -eq 'legacy-stopped' } | ConvertTo-Json -Compress))
+Check 'sync jobs[] uses a real recorded exit code for an out-of-vocabulary state' (@($body.jobs | Where-Object { $_.id -eq 'legacy-stopped-exit' -and $_.state -eq 'failed' }).Count -eq 1)
+Check 'every pushed job state is inside the gateway vocabulary' (@($body.jobs | Where-Object { "$($_.state)" -notin 'running', 'done', 'failed', 'killed', 'suspect', 'dead' }).Count -eq 0) (@($body.jobs | Where-Object { "$($_.state)" -notin 'running', 'done', 'failed', 'killed', 'suspect', 'dead' } | ConvertTo-Json -Compress))
 Check 'agentq-sync -DryRun counts daemons' ($d -match 'daemons=1') $d
 Check 'sync payload carries daemons[] in the frozen shape' (@($body.daemons).Count -eq 1 -and $body.daemons[0].name -eq 'git-autosync' -and $body.daemons[0].verdict -eq 'warn' -and @($body.daemons[0].history).Count -eq 1) (($body.daemons | ConvertTo-Json -Compress))
 Check 'daemon record written under coord/daemons' (Test-Path (Join-Path $env:AGENTQ_HOME 'daemons\git-autosync.json'))
