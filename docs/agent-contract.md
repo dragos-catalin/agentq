@@ -104,6 +104,23 @@ bug?"; check the levels above yours before blaming the code.
 - Long runs go through `job-start.ps1`/`wait-job.ps1` (bounded), not a blocking terminal call, and their
   output goes to a log that is read afterwards.
 
+## Git traps that have cost hours here
+
+- **A pathspec commit refuses an untracked path.** `git commit --only -- <path>` (what `agentq commit`
+  ends up doing) fails with `pathspec did not match` when the file was never staged; stage it first
+  (`git add -- <path>`). `agentq commit` does the add itself, so this only bites a hand-written commit.
+- **A commit that failed leaves the branch where it started — already pushed.** After a refused commit on
+  a throwaway branch, the remote ref still names the base commit, so landing that branch looks like "no
+  work". Delete it (`git push origin --delete <branch>`) before pushing the real branch.
+- **Do not re-commit an old worktree.** A parked worktree at a detached HEAD shows the same edits as
+  again-staged files; `git diff origin/main --numstat -- <path>` per path is the cheap proof. Every path
+  answering `IDENTICAL to main` except yours means only your files are unlanded, and the parked copies
+  must not be committed a second time (measured 2026-11-25: five tracked files were byte-identical to
+  main while appearing as staged changes).
+- **Check your own diff before blaming the gate.** `install.ps1 -Check` names the drifted artefacts; if
+  the ones it lists are not yours, they are another agent's uncommitted work and installing them would
+  publish a half-finished snapshot machine-wide. Report the drift, do not clear it for them.
+
 ## Where the numbers live
 
 `~/.codai/coord/journal.jsonl` is the hash-chained record of every acquire, release, expiry, break, mark
@@ -121,4 +138,8 @@ cannot write them, and the guard says so instead of failing silently. Two legiti
 2. **A ticket** — only the owner can issue one, interactively, and it is bound to their identity:
    `pwsh -NoProfile -File "C:\Users\vladu\.copilot\hooks\rules-ticket.ps1" -Issue -Scope '<glob>' -Hours 2`.
    Write the glob as an absolute path; the matcher has no `{a,b}` alternation and anchors `**/` to the
-   current repo, so a list of paths is safer than a pattern.
+   current repo. **A quoted comma list is the trap**: `-Scope 'a.ps1,b.ps1'` is stored as ONE glob that
+   still contains the commas, so it matches nothing while `-Show` prints `VALID` (measured 2026-11-25,
+   three re-issues wasted). Pass an array of separate entries (`-Scope @('a.ps1','b.ps1')`) or one
+   directory glob (`-Scope 'hooks\*.ps1'`), and prove coverage with
+   `scripts/ops/forensics/ticket-scope.ps1` in the codai checkout before writing anything.

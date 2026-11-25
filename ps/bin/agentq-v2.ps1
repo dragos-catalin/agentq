@@ -2587,6 +2587,22 @@ function Reap-LandedBranch {
   Write-Journal @{ event = 'land-reap'; resource = "land:$RepoName"; branch = $BranchName; onto = $Target; repo = $RepoName }
   Write-Output "reaped $BranchName (landed into $Target)"
 }
+# 2026-11-25: one land held land:codai for 24+ min of which the gate was 67 s - the whole wait was the
+# queue, and the summary said only "landed". An agent cannot tell "my tree is slow" from "the machine is
+# busy" without the split, and the wrong conclusion is a bigger gate timeout or a bypass. Gate seconds and
+# run count come from the accumulator (a bisect pays several), the queue wait from the ticket's own
+# queued->acquired window.
+function Format-LandTiming {
+  param($QueuedAt, $AcquiredAt)
+  if (-not $QueuedAt) { return $null }
+  $gateSec = if ($script:LandAcc) { [int]$script:LandAcc.gateSec } else { 0 }
+  $runs = if ($script:LandAcc) { [int]$script:LandAcc.gateRuns } else { 0 }
+  $queueSec = if ($AcquiredAt) { [int][math]::Round(($AcquiredAt - $QueuedAt).TotalSeconds) } else { 0 }
+  $totalSec = [int][math]::Round(((Now) - $QueuedAt).TotalSeconds)
+  $qm = [math]::Round($queueSec / 60.0, 1)
+  $tm = [math]::Round($totalSec / 60.0, 1)
+  return "land: queue $qm min, gate $gateSec s in $runs run(s), total $tm min"
+}
 function Invoke-Land {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -2687,6 +2703,7 @@ function Invoke-Land {
   }
   try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
+  $landQueuedAt = Now
   $lease = $null; $hb = $null; $set = @(); $peersDone = $false
   $bdir = Join-Path (Join-Path $Root 'batches') $repo.Name
   $myResult = Join-Path $bdir "$($t.id).json"
@@ -2700,6 +2717,7 @@ function Invoke-Land {
     $script:WaitPoll = { Invoke-LandWedgeReap $repo }.GetNewClosure()
     try { Wait-Turn $t (Get-LandWaitMin) $null } finally { $script:WaitPoll = $null }
     $script:WaitAbort = $null
+    $landAcquiredAt = Now
     if ($script:WaitAborted -or (Test-Path -LiteralPath $myResult)) {
       # Absorbed into another holder's batch (W2-5): its result is ours.
       $r = Read-JsonFile $myResult
@@ -2707,6 +2725,7 @@ function Invoke-Land {
       $x = [int](P $r 'exit' 1)
       if ($x -eq 0) { Write-Output "landed $Branch -> origin/$Onto @ $(Short (P $r 'sha' '') 12) (in a batch by $(P $r 'by' '?'))" }
       else { [Console]::Error.WriteLine("land: $Branch failed in a batch by $(P $r 'by' '?') (exit $x$(if (P $r 'reason' '') { ': ' + (P $r 'reason' '') })) - nothing of it was pushed") }
+      $tl = Format-LandTiming $landQueuedAt $landAcquiredAt; if ($tl) { Write-Output $tl }
       $script:LandExit = $x; return
     }
     $lease = New-Lease $repo 'land' 'land' $why '' $PID 10 $false
@@ -2773,6 +2792,7 @@ function Invoke-Land {
       Write-Output "landed $Branch -> origin/$Onto @ $(Short $own.sha 12)$(if ($acts) { " (releases: $($acts -join ', '))" })"
       Reap-LandedBranch -Top $main -Target $Onto -BranchName $Branch -RepoName $repo.Name -Occupied $reapOcc
     }
+    $tl = Format-LandTiming $landQueuedAt $landAcquiredAt; if ($tl) { Write-Output $tl }
     $script:LandExit = [int]$own.exit
   } finally {
     $script:WaitAbort = $null
