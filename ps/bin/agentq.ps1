@@ -1491,12 +1491,47 @@ function Send-Signal([string]$ev, [string]$text) {
 
 # ---------------------------------------------------------------------------------------
 # devcloud F2 (DC-037): decide local vs cloud. Returns @{ where; ws; why }.
+# One repo may name ONE cloud workspace (a string, the original shape) or several (an array).
+# Several exist so two lanes that must not share a machine can run at once: vitals' rust and
+# android lanes are both concurrency:1 dedicated in .devcloud/profile.json, yet they serialised
+# behind the single vitals-win VM (vitals tracker row S26-12). With an array the lane comes from
+# `-Lane <name>` on the command line, then from the optional cloudLaneWorkspaces pin, then
+# round-robin by session, so two concurrent lanes of one session diverge instead of colliding.
+# A workspace with no cloudRegistry entry is never picked: a name nothing can place is a typo,
+# and choosing it would fail the run at submit time instead of here. A STRING value is returned
+# unchanged, so no other repo's placement moves.
+function Resolve-WorkspaceForLane($cfg, [string]$repoName, $value, [string]$cmdLine) {
+  if ($value -is [string] -or $value -isnot [System.Collections.IEnumerable]) { return $value }
+  $list = @($value | Where-Object { $_ })
+  if ($list.Count -eq 0) { return $null }
+  if ($list.Count -eq 1) { return $list[0] }
+  $reg = if ($cfg.ContainsKey('cloudRegistry') -and $cfg['cloudRegistry']) { $cfg['cloudRegistry'] } else { @{} }
+  $known = @($list | Where-Object { $reg.ContainsKey("$_") })
+  if ($known.Count) { $list = $known }
+  if ($list.Count -eq 1) { return $list[0] }
+  $lane = $null
+  if ($cmdLine -and $cmdLine -match '(?:^|\s)-Lane\s+([A-Za-z0-9._-]+)') { $lane = $Matches[1].ToLowerInvariant() }
+  if ($lane -and $cfg.ContainsKey('cloudLaneWorkspaces') -and $cfg['cloudLaneWorkspaces']) {
+    $pins = $cfg['cloudLaneWorkspaces']
+    if ($pins.ContainsKey($repoName)) {
+      $pin = $pins[$repoName]
+      if ($pin -and $pin.ContainsKey($lane) -and $pin[$lane]) { return $pin[$lane] }
+    }
+  }
+  # Round-robin by session + lane. Stated as a hash rather than a counter because the two lanes
+  # are separate processes: a shared counter would need a lock to be correct and a hash costs
+  # nothing. Two lanes of one session differ because the lane name is in the key.
+  $key = if ($lane) { "$Session|$lane" } else { "$Session" }
+  $h = 0
+  foreach ($ch in $key.ToCharArray()) { $h = ($h * 31 + [int]$ch) % 1000003 }
+  $list[$h % $list.Count]
+}
 function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
   $want = if ($Where) { $Where } elseif ($env:AGENTQ_WHERE) { $env:AGENTQ_WHERE.ToLowerInvariant() } else { 'local' }
   if ($want -notin 'local', 'cloud', 'auto') { throw "agentq: -Where must be local|cloud|auto (got '$want')" }
   $cfg = Get-Config
   $map = if ($cfg.ContainsKey('cloudWorkspaces') -and $cfg['cloudWorkspaces']) { $cfg['cloudWorkspaces'] } else { @{} }
-  $ws = if ($Ws) { $Ws } elseif ($repo -and $map.ContainsKey($repo.Name)) { $map[$repo.Name] } else { $null }
+  $ws = if ($Ws) { $Ws } elseif ($repo -and $map.ContainsKey($repo.Name)) { Resolve-WorkspaceForLane $cfg $repo.Name $map[$repo.Name] $cmdLine } else { $null }
   if ($want -eq 'local') { return @{ where = 'local'; ws = $ws; why = $(if ($Where) { '-Where local' } elseif ($env:AGENTQ_WHERE) { 'AGENTQ_WHERE=local' } else { 'default' }) } }
   if (-not $ws) {
     if ($want -eq 'cloud') { throw "agentq: no cloud workspace for repo '$($repo.Name)' (config cloudWorkspaces or -Ws)" }

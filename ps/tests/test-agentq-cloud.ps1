@@ -124,6 +124,69 @@ $o = (& pwsh -NoProfile -File $real -Ws 'unknown-ws' -Purpose regtest -- echo 2>
 Check 'unknown workspace is usage error' ($LASTEXITCODE -eq 2 -and $o -match 'zz-ws' -and $o -match 'vitals-win') $o
 Remove-Item $cfg2 -ErrorAction SilentlyContinue
 
+# 11. AGENTQPARALLELLANES20261125: a repo may map to SEVERAL workspaces, so two lanes that must
+# not share a machine stop serialising behind one VM. The lane comes from the command line, then
+# from the cloudLaneWorkspaces pin, then round-robin by session; a workspace with no
+# cloudRegistry entry is never a candidate, and a STRING mapping keeps behaving exactly as before.
+function RunOut([string]$dir, [string[]]$extra, [string]$cmd) {
+  $a = @('-NoProfile', '-File', $Aq, 'run', '-Resource', 'build', '-Purpose', 'cloudtest', '-MinFreeGB', '0', '-TimeoutMin', '1', '-Repo', $dir) + $extra + @('--') + ($cmd -split ' ')
+  ((& pwsh @a 2>&1) -join "`n")
+}
+# The hash is re-stated here on purpose: the guarantee is "the same session and lane always pick
+# the same workspace, and two lanes of one session diverge when their keys do". A test that only
+# demanded "not always equal" would pass or fail with the parity of whatever names it happened to
+# use, which is how a flaky test gets written.
+function Expected-Ws([string]$session, [string]$lane, [string[]]$pool) {
+  $key = "$session|$lane"; $h = 0
+  foreach ($ch in $key.ToCharArray()) { $h = ($h * 31 + [int]$ch) % 1000003 }
+  $pool[$h % $pool.Count]
+}
+$cfg3 = Join-Path ([IO.Path]::GetTempPath()) "aq-multi-$PID.json"
+@{
+  machineCap = 1; quickBurst = 0; agingMin = 0; idleYieldMin = 0; minFreeCommitGB = 0
+  cloudWorkspaces     = @{ repo = @('pair-a', 'pair-b'); other = 'solo-ws' }
+  cloudLaneWorkspaces = @{ repo = @{ rust = 'pair-a'; android = 'pair-b' } }
+  cloudRegistry       = @{ 'pair-a' = @{ project = 'p'; zone = 'z' }; 'pair-b' = @{ project = 'p'; zone = 'z2' } }
+} | ConvertTo-Json -Depth 6 | Set-Content $cfg3
+$env:AGENTQ_CONFIG = $cfg3
+
+$rc = Run $repo @('-Where', 'cloud') 'pwsh -NoProfile -File scripts/verify.ps1 -Lane rust -Where local'
+Check 'array + a rust pin picks the pinned workspace' ("$((Calls) | Select-Object -Last 1)" -match '-Ws pair-a ') "$((Calls) | Select-Object -Last 1)"
+$rc = Run $repo @('-Where', 'cloud') 'pwsh -NoProfile -File scripts/verify.ps1 -Lane android -Where local'
+Check 'array + an android pin picks the other workspace' ("$((Calls) | Select-Object -Last 1)" -match '-Ws pair-b ') "$((Calls) | Select-Object -Last 1)"
+
+# Two lanes with no pin must still diverge. The lanes are chosen by the test so that their keys do
+# differ, rather than hoping two plausible names happen to land on different workspaces.
+$lanes = 1..8 | ForEach-Object { "probe$_" }
+$probeA = $null; $probeB = $null
+foreach ($l in $lanes) {
+  foreach ($m in $lanes) {
+    if ($m -eq $l) { continue }
+    if ((Expected-Ws 'cloudtest' $m @('pair-a', 'pair-b')) -ne (Expected-Ws 'cloudtest' $l @('pair-a', 'pair-b'))) { $probeA = $l; $probeB = $m; break }
+  }
+  if ($probeA) { break }
+}
+$wantA = Expected-Ws 'cloudtest' $probeA @('pair-a', 'pair-b')
+$gotA = RunOut $repo @('-Where', 'cloud') "pwsh -NoProfile -File scripts/verify.ps1 -Lane $probeA -Where local"
+$gotB = RunOut $repo @('-Where', 'cloud') "pwsh -NoProfile -File scripts/verify.ps1 -Lane $probeB -Where local"
+$wsA = if ($gotA -match 'placement cloud:(pair-[ab])') { $Matches[1] } else { '' }
+$wsB = if ($gotB -match 'placement cloud:(pair-[ab])') { $Matches[1] } else { '' }
+Check 'an unpinned lane uses the workspace the documented hash predicts' ($wsA -eq $wantA) "lane=$probeA got=$wsA want=$wantA"
+# The placement line stringifies, so an array would still read as its first element there. What the
+# tool receives is the contract that matters, and `-Ws X Y` is not a workspace.
+$lastA = "$((Calls) | Select-Object -Last 1)"
+Check 'an unpinned lane passes exactly one workspace to the tool' ($lastA -match '-Ws pair-[ab] -Purpose') $lastA
+Check 'two unpinned lanes of one session diverge' ($wsA -and $wsB -and $wsA -ne $wsB) "a=${probeA}:$wsA b=${probeB}:$wsB"
+
+# A string mapping is untouched by all of this, and an unregistered sibling is not a candidate.
+$rc = Run $other @('-Where', 'cloud') 'pnpm typecheck'
+Check 'a string mapping still picks that one workspace' ("$((Calls) | Select-Object -Last 1)" -match '-Ws solo-ws ') "$((Calls) | Select-Object -Last 1)"
+@{ machineCap = 1; minFreeCommitGB = 0; cloudWorkspaces = @{ repo = @('ghost-ws', 'pair-a') }; cloudRegistry = @{ 'pair-a' = @{ project = 'p'; zone = 'z' } } } | ConvertTo-Json -Depth 6 | Set-Content $cfg3
+$env:AGENTQ_CONFIG = $cfg3
+$rc = Run $repo @('-Where', 'cloud') 'pnpm typecheck'
+Check 'an unregistered workspace is never picked' ("$((Calls) | Select-Object -Last 1)" -match '-Ws pair-a ') "$((Calls) | Select-Object -Last 1)"
+Remove-Item $cfg3 -ErrorAction SilentlyContinue
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Remove-Item Env:AGENTQ_CONFIG, Env:AGENTQ_SESSION, Env:AGENTQ_CLOUD_TOOL -ErrorAction SilentlyContinue
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }
