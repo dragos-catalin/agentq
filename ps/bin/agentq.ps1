@@ -2133,13 +2133,16 @@ function Invoke-Release {
 }
 
 . (Join-Path $PSScriptRoot 'agentq-v2.ps1')
+# Directed agent-to-agent messages (ask/reply/inbox + the inbox notice below). Loaded unconditionally so the
+# notice can run on any working verb, not only on the three message verbs.
+. (Join-Path $PSScriptRoot 'agentq-msgs.ps1')
 if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'renew', 'lease-check', 'prune', 'probe', 'slo', 'eval', 'feedback', 'who') { Renew-ForCwd }
 # Session renewal only for verbs that mean "this agent is working"; maintenance verbs (sweep, break,
 # unlease, metrics, rotate) from the same session must not keep a lease alive they are judging.
 if ($Verb.ToLowerInvariant() -in 'run', 'commit', 'publish', 'land', 'note', 'acquire', 'release', 'bump', 'propose', 'lease', 'backup', 'since') { Renew-ForSession }
 # A notice is consumed when shown, so a read-only verb leaves it for the next working call
 # (`status` lists the losses of the last 24 h from the journal anyway).
-if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'lease-check') { Show-LeaseNotices }
+if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'lease-check', 'inbox') { Show-LeaseNotices; Show-MessageNotices }
 
 # Agent registry (S18-09, 2026-10-17). Every agentq call records WHO called: the session, the AI
 # client (from env + the process ancestry), the app that owns the shell, the repo and the last
@@ -2202,6 +2205,9 @@ $script:AqHelp = [ordered]@{
   'log' = @{ g = 'Queue & run'; u = 'log [-Last 30] [-All] [-Json]'; d = 'recent journal: queued/start/done/fail/break/mark/note/commit' }
   'since' = @{ g = 'Queue & run'; u = 'since [-Hours 12] [-Json]'; d = 'what changed in this repo: journal + git log' }
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
+  'ask' = @{ g = 'Queue & run'; u = 'ask -To <repo:<name>|session:<term-id>|slot:<repo>:<slot>|any|owner> -Message "..." [-Resource <r>] [-Repo <r>]'; d = 'ask another LIVE agent a question; prints how many agents the address reaches, and a negative answer is not silent'; e = 'agentq ask -To repo:agentq -Message "is ps/bin/agentq.ps1 free to edit for 20 min?"' }
+  'reply' = @{ g = 'Queue & run'; u = 'reply -Id <msg id> -Message "..."'; d = 'answer an ask (the asker replying again reopens the thread)' }
+  'inbox' = @{ g = 'Queue & run'; u = 'inbox [-All] [-Id <msg id>] [-Json]'; d = 'the open messages addressed to me (repo/session/slot/any); -Id prints the whole thread' }
   'bump' = @{ g = 'Fairness & overrides (v3)'; u = 'bump [-Id <ticket> | -Session <id>] -By 20 -Reason "..."'; d = 'raise a waiting ticket in the scheduler order (MY ticket by default; -Session/-Id name one explicitly; cap bumpMax)' }
   'burst' = @{ g = 'Fairness & overrides (v3)'; u = 'burst [-Resource build:machine] [-By 1] [-Minutes 30] -Reason "..."'; d = 'temporary extra slot, refused when RAM/commit headroom is under 2x the gate' }
   'propose' = @{ g = 'Fairness & overrides (v3)'; u = 'propose [-Reason "..."]'; d = 'diagnose my wait and APPLY safe remedies (break dead/STALE >2x, bump long waits, short burst)' }
@@ -2279,6 +2285,11 @@ switch ($Verb.ToLowerInvariant()) {
     Write-Journal @{ event = 'note'; resource = $(if ($repo) { "note:$($repo.Name)" } else { 'note' }); message = $Message; repo = $(if ($repo) { $repo.Name } else { '' }) }
     Write-Output 'noted'
   }
+  # A directed channel between agents (agentq-msgs.ps1). Next to `note`, which has no addressee, no answer
+  # and no notification: an agent that needs a decision from the agent next door asks instead of guessing.
+  'ask' { Invoke-Ask }
+  'reply' { Invoke-Reply }
+  'inbox' { Show-Inbox }
   'acquire' { Invoke-Acquire }
   'release' { Invoke-Release }
   'workspace' { Invoke-Workspace }

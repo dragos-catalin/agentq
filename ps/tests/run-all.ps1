@@ -142,6 +142,14 @@ $suites = [ordered]@{
   # + the backup error, lease released, every file kept. The second half of the suite pins the trigger as
   # NOT widened: every OTHER backup failure still fails closed, keeps the lease and stays visible.
   'orphan broken slot' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-orphan-broken-slot.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-25: agentq had NO directed channel between live agents - `note` is a broadcast journal line
+  # under a repo, `feedback` is the tool's own (owner-facing) inbox and `eval` is a read-only preemption
+  # verdict, so "the other agent is editing this file" had no home. ask/reply/inbox add one, addressed by
+  # session / repo / slot / any, with a throttled delivery notice on the next verb, because an unread
+  # question is the same as no question. The suite pins that "asked nobody" is REPORTED (reachability is
+  # counted, not assumed), that the thread reopens when the asker replies, and that an unreadable -To is
+  # exit 2 with a fixable message instead of a message nobody will ever read.
+  'agent msgs'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-msgs.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
 }
 $names = @($suites.Keys)
 # -RepoSuites: the suites THIS repo's gate runs, from bin/agentq-config.json -> gateSuites.<repo>

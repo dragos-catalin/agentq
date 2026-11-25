@@ -127,14 +127,30 @@
     "codai": "codai",
     "caelia": "caelia",
     "vitals": "vitals-win",
-    "watch-faces": "watch-faces"
+    "watch-faces": "watch-faces",
+    "frontier-kit": "frontiers",
+    "frontiers-index": "frontiers",
+    "arc-prize-2027": "frontiers",
+    "bb6-holdouts": "frontiers",
+    "erdos-computational": "frontiers",
+    "fluid-singularities": "frontiers",
+    "graph-existence": "frontiers",
+    "hadamard-next": "frontiers",
+    "hutter-enwik9": "frontiers",
+    "linear-a": "frontiers",
+    "matmul-tensor-rank": "frontiers",
+    "ramsey-sat": "frontiers",
+    "sphere-codes": "frontiers",
+    "vesuvius": "frontiers",
+    "wdw-cosmology": "frontiers"
   },
   "cloudRegistry": {
     "devbox": { "project": "codai-training", "zone": "europe-west4-b" },
     "codai": { "project": "codai-training", "zone": "europe-west4-a" },
     "caelia": { "project": "codai-training", "zone": "europe-west4-a" },
     "vitals-win": { "project": "codai-training", "zone": "europe-west4-a" },
-    "watch-faces": { "project": "codai-training", "zone": "europe-west4-a" }
+    "watch-faces": { "project": "codai-training", "zone": "europe-west4-a" },
+    "frontiers": { "project": "codai-training", "zone": "europe-west4-a" }
   },
   "cloudAutoMinSec": 240
 }

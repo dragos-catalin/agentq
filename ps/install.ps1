@@ -39,6 +39,10 @@ $src = $PSScriptRoot
 $cfgKey = 'bin\agentq-config.json'
 $map = [ordered]@{
   'bin\agentq.ps1' = 'bin\agentq.ps1'; 'bin\agentq-v2.ps1' = 'bin\agentq-v2.ps1'; 'bin\agentq-config.json' = 'bin\agentq-config.json'
+    # 2026-11-25: ask/reply/inbox - the directed agent-to-agent channel (dot-sourced by agentq.ps1, so a
+    # missing copy here makes every `agentq ask` fail in the installed tree while the checkout looks fine).
+    'bin\agentq-msgs.ps1' = 'bin\agentq-msgs.ps1'
+    'tests\test-agentq-msgs.ps1' = 'bin\test-agentq-msgs.ps1'
   'bin\worktree.ps1' = 'bin\worktree.ps1'; 'bin\worktree-prune-task.ps1' = 'bin\worktree-prune-task.ps1'; 'bin\agentq-sync.ps1' = 'bin\agentq-sync.ps1'
   'hooks\deploy-clean.ps1' = 'hooks\deploy-clean.ps1'; 'hooks\run-build.ps1' = 'hooks\run-build.ps1'; 'hooks\guard-tooluse.ps1' = 'hooks\guard-tooluse.ps1'
   'tests\test-agentq.ps1' = 'bin\test-agentq.ps1'; 'tests\test-agentq-v2.ps1' = 'bin\test-agentq-v2.ps1'; 'tests\test-agentq-v3.ps1' = 'bin\test-agentq-v3.ps1'
