@@ -40,6 +40,13 @@ $suites = [ordered]@{
   'guard'          = @('-File', (Join-Path $PSScriptRoot 'test-guard-v2.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'jobs'           = @('-File', (Join-Path $PSScriptRoot 'test-jobs.ps1'), '-Bin', $bin, '-Hooks', $hooks)
   'cloud place'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud.ps1'), '-Aq', (Join-Path $stage 'agentq.ps1'))
+    # 2026-11-25: a cloud run's log lived only in the job bucket and a terminal buffer, so a gate result was
+    # an assertion rather than evidence. Every run now leaves runs/<jobid>.log plus ONE idempotent row in
+    # the repo's own run journal (docs/RUNS.md or RUNS.md, its existing columns). No tool argument: the
+    # helpers live in bin\agentq-cloud.ps1 and the suite extracts them from it by AST, so the installed tree
+    # needs no new file here - only the test itself (install map entry owned by the parent, see the wiring
+    # guard's $mapExcept).
+    'cloud evidence' = @('-File', (Join-Path $PSScriptRoot 'test-cloud-evidence.ps1'))
   'adaptive+reg'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-adaptive.ps1'))
   'reap terminals' = @('-File', (Join-Path $PSScriptRoot 'test-reap-terminals.ps1'), '-Tool', (Join-Path $bin 'reap-terminals.ps1'))
   'term interrupt' = @('-File', (Join-Path $PSScriptRoot 'test-term-interrupt.ps1'), '-Tool', (Join-Path $bin 'term-interrupt.ps1'))

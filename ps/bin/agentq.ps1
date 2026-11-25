@@ -107,6 +107,9 @@ CLOUD PLACEMENT (devcloud F2, DC-037)
   the gate, or the kind's local p50 hold >= cloudAutoMinSec). Otherwise local.
   Default = env AGENTQ_WHERE, else local. AGENTQ_WHERE=local is the opt-out everywhere.
   Journal: cloud-queued / cloud-done / cloud-fail (resource cloud:<ws>) + placement(where, why).
+  Evidence: a run that reached the workspace writes the whole log into the TARGET repo as runs/<jobid>.log
+  and appends ONE row to that repo's own run journal (docs/RUNS.md or RUNS.md, following its columns,
+  idempotent by job id; a repo without one gets the log only, .gitignore is never edited).
 
 STAGE 0 OF THE ORCHESTRATOR PLAN (ADR 0009, tracker OQ-001..012, 2026-11)
   status / log / metrics / doctor only READ the state folder (no reaping, no capacity rewrite, no notice
@@ -2207,7 +2210,7 @@ if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'since', 'help', 
 # parsing both from this file). `agentq help` is the index an agent reads in one step; `agentq help
 # <verb>` is the usage. This is why `run` is the only verb an agent needs to remember.
 $script:AqHelp = [ordered]@{
-  'run' = @{ g = 'Queue & run'; u = 'run -Resource <build|install|commit|deploy:<target>|slot:<repo>:<slot>|any name> -Purpose "why" [-- <cmd>] [-Lane interactive|quick|gate|heavy|batch] [-Priority -50..50] [-MinFreeGB 6] [-TimeoutMin n] [-Where local|cloud|auto] [-Ws <ws>] [-NoWait]'; d = 'queue for a resource, hold it, run the command, release'; e = 'agentq run -Resource build -Purpose "typecheck" -- pnpm typecheck' }
+  'run' = @{ g = 'Queue & run'; u = 'run -Resource <build|install|commit|deploy:<target>|slot:<repo>:<slot>|any name> -Purpose "why" [-- <cmd>] [-Lane interactive|quick|gate|heavy|batch] [-Priority -50..50] [-MinFreeGB 6] [-TimeoutMin n] [-Where local|cloud|auto] [-Ws <ws>] [-NoWait]'; d = 'queue for a resource, hold it, run the command, release; a cloud run also leaves runs/<jobid>.log and one row in the repo run journal (docs/RUNS.md or RUNS.md), idempotent by job id'; e = 'agentq run -Resource build -Purpose "typecheck" -- pnpm typecheck' }
   'acquire' = @{ g = 'Queue & run'; u = 'acquire -Resource R [-Purpose p] [-Capacity n] [-NoWait]'; d = 'low-level: take one ticket and print its id (scripting; `run` does this for you)' }
   'release' = @{ g = 'Queue & run'; u = 'release -Resource R -Id <ticket> [-Reason "..."]'; d = 'low-level: give back a ticket taken with `acquire`' }
   'status' = @{ g = 'Queue & run'; u = 'status [<repo>] [-All] [-Json]'; d = 'who holds what, waiters, stale, marks, leases, releases, load'; e = 'agentq status --json | ConvertFrom-Json' }

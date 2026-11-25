@@ -30,6 +30,9 @@ Pass several names as one comma-separated value. A name that is not in `-List` i
 A new suite must also be added to `install.ps1`'s `$map`: the installed gate runs from `~/.copilot`, where a file
 the map does not carry does not exist. The `install wiring` suite fails when a suite's file or its tool is missing
 from the map, or when the map names a file no checkout has.
+When that map entry has to wait for another agent (`install.ps1` in flight), the wiring suite takes one **named,
+printed exception**: `$mapExcept` in `test-install-wiring.ps1` names the file and the exact map key it needs, and
+reports it on every run, so the hole is never silent. Drop the exception in the same commit that adds the key.
 
 ## Output
 

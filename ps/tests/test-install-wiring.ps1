@@ -139,10 +139,25 @@ function Get-TrackedSet([string]$RepoRoot) {
 $trackExcept = @{ 'tests\test-slot-budget.ps1' = 'in-flight 2026-11-23: new suite for the elastic scratch pool + the machine task-slot budget; the lead commits it with this slice, then drop this exception'
   'tests\test-agentq-bump.ps1' = 'in-flight 2026-11-23: `bump -Id|-Session` + the `== MINE` status line; registered in run-all.ps1 and the install map in this same slice, then drop this exception' }
 
+# A WIRING exception: a file that is registered in run-all.ps1 while its install map key is still missing,
+# so checks 1, 4 and 11 skip it and NAME IT on every run (a deliberate hole must never be silent). The
+# entry names the exact key install.ps1 needs and is dropped in the same commit that adds it. Reason a
+# slice can need one: install.ps1 is owned by a different agent, and leaving the guard RED instead would
+# block every land in this clone.
+# 2026-11-25: the in-flight exception for 'tests\test-cloud-evidence.ps1' was DROPPED together with the
+# install.ps1 map entry it asked for, in the same commit - which is the contract this file documents.
+$mapExcept = @{}
+
 # --- 1: every suite reference is installed -------------------------------------------------------
-$drift = @(Get-MapDrift $runAll $install)
+$drift = @(Get-MapDrift $runAll $install -Except @($mapExcept.Keys))
 Check 'every file the suites reference is in the install map' ($drift.Count -eq 0) "$($drift.Count) missing: $($drift -join '; ')"
 if ($drift.Count) { $drift | ForEach-Object { Note "not installed: $_" } }
+# The exceptions are named on every run and reported STALE once the map carries them, so the only way to
+# make this guard quiet about a file is to install it.
+foreach ($e in $mapExcept.Keys) {
+  Note "EXCEPTED (not in the install map yet): $e - $($mapExcept[$e])"
+  if ($mapKeys -contains $e) { Note "the exception for $e is now STALE (it IS a map key) - drop it from the guard" }
+}
 
 # --- 2: every map key exists here -----------------------------------------------------------------
 # An EXCEPTED path may legitimately be absent: its entry is committed while the file is not. Measured
@@ -182,7 +197,14 @@ foreach ($m in [regex]::Matches($suiteBlock, "(?ms)^\s*'(?<n>[^']+)'\s*=\s*@\('-
 # Anti-vacuity: nothing below can fail if the -File arguments were not extracted.
 Check 'the suite files are readable (not an empty match)' ($suiteFiles.Count -ge 45) "extracted $($suiteFiles.Count) suite files"
 $unmappedSuites = @($suiteFiles | Where-Object { -not $_.Mapped })
-Check 'every suite -File is a map key (the installed gate carries what it runs)' ($unmappedSuites.Count -eq 0) "$($unmappedSuites.Count): $((@($unmappedSuites | ForEach-Object { "$($_.Name) ($($_.Cand -join ' or '))" })) -join '; ')"
+# An excepted suite is PRINTED on every run (same rule as $trackExcept): the hole is deliberate and
+# temporary, so it must never be silent.
+$unmappedBare = @($unmappedSuites | Where-Object { -not @($_.Cand | Where-Object { $mapExcept.ContainsKey($_) }).Count })
+Check 'every suite -File is a map key (the installed gate carries what it runs)' ($unmappedBare.Count -eq 0) "$($unmappedBare.Count): $((@($unmappedBare | ForEach-Object { "$($_.Name) ($($_.Cand -join ' or '))" })) -join '; ')"
+foreach ($u in @($unmappedSuites | Where-Object { @($_.Cand | Where-Object { $mapExcept.ContainsKey($_) }).Count })) {
+  $key = @($u.Cand | Where-Object { $mapExcept.ContainsKey($_) })[0]
+  Note "EXCEPTED (in flight, not an install map key yet): suite '$($u.Name)' -> $key - $($mapExcept[$key])"
+}
 
 # --- 12: the map destinations are unique and inside the install root -------------------------------
 $mapEntries = @(Get-MapEntries $install)
@@ -215,7 +237,7 @@ function Get-GateFindings([string]$CfgPath, [string]$Repo, [string[]]$Names, [st
   foreach ($n in $list) { if (-not $known.ContainsKey("$n".ToLowerInvariant())) { $f += "gateSuites.$Repo names '$n', which is not a suite in run-all.ps1" } }
   if (-not @($list | Where-Object { "$_".Trim().ToLowerInvariant() -eq 'status readonly' }).Count) { $f += "gateSuites.$Repo does not include 'status readonly'" }
   # a gated suite whose tool is not installed cannot run from the installed gate
-  $missingRef = @(Get-MapDrift $RunAllPath (Join-Path (Split-Path -Parent $RunAllPath) '..\install.ps1'))
+  $missingRef = @(Get-MapDrift $RunAllPath (Join-Path (Split-Path -Parent $RunAllPath) '..\install.ps1') -Except @($mapExcept.Keys))
   if ($missingRef.Count) { $f += "the install map is missing $($missingRef -join '; ')" }
   $f
 }

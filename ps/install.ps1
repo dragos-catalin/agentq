@@ -109,6 +109,10 @@ $map = [ordered]@{
   # 2026-11-21: the release `phase` is the last checkpoint, not the failed step - display + schema pinned
   'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'
   'tests\test-agentq-prune.ps1' = 'bin\test-agentq-prune.ps1'; 'tests\test-agentq-doctor.ps1' = 'bin\test-agentq-doctor.ps1'
+  # 2026-11-25: a cloud run leaves versioned evidence in the target repo (runs\<jobid>.log + one row in
+  # the repo's RUNS.md). Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins
+  # the two, and the suite's in-flight exception in test-install-wiring.ps1 is dropped by this line.
+  'tests\test-cloud-evidence.ps1' = 'bin\test-cloud-evidence.ps1'
   'tests\test-slo.mjs' = 'bin\test-slo.mjs'
   # 2026-11-23: `bump -Id|-Session` (a waiter can target its OWN ticket) + the `== MINE session ...` line
   # in `status`. Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
@@ -227,6 +231,25 @@ foreach ($k in $map.Keys) {
 if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; exit 0 }
 if (-not $SkipTests) {
   if ($RepoSuites -and $Suites) { throw 'install: pass either -Suites or -RepoSuites, not both' }
+  # Serialize with other installs (2026-11-25). Three installs ran the FULL suite at once, each with
+  # -Parallel 4: the suites share machine resources and the real .wt / lease state, and two of them went
+  # red only because a sibling run was in flight (`test-agentq-v2.ps1` and `test-land-batch.ps1` both pass
+  # when run alone). A red suite makes install REFUSE to install, so contention means nobody installs --
+  # the installed agentq stayed stale for hours. The gate is held for the whole test phase only.
+  $gate = $null; $gotGate = $false
+  if ($env:AGENTQ_INSTALL_NO_GATE) { 'install gate: disabled by AGENTQ_INSTALL_NO_GATE' }
+  else {
+    try {
+      $gate = New-Object Threading.Mutex($false, 'Global\agentq-install-gate')
+      $gotGate = $gate.WaitOne(45 * 60 * 1000)
+      if ($gotGate) { 'install gate acquired (the test suite runs one install at a time)' }
+      else { 'WARNING: another agentq install has held the gate for 45 min - running the suite ungated (that holder may be stuck)' }
+    } catch {
+      $gate = $null; $gotGate = $true
+      "WARNING: install gate unavailable ($($_.Exception.Message)) - running the suite ungated"
+    }
+  }
+  try {
   $raArgs = @()
   if ($Suites) { $raArgs += @('-Only', (@($Suites | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')) }
   if ($RepoSuites) { $raArgs += '-RepoSuites' }
@@ -255,6 +278,9 @@ if (-not $SkipTests) {
     if ($code -eq 2) { throw 'install: the gate STALLED (its job log went quiet while the process was alive) - not installing; read the job log, then re-run' }
     if ($code -eq 3) { throw 'install: the gate was still running when the wait cap expired - not installing; re-check the job id printed above, then re-run' }
     if ($code) { throw 'install: tests are red - not installing' }
+  }
+  } finally {
+    if ($gate -and $gotGate) { try { $gate.ReleaseMutex() } catch { } }
   }
 }
 $bk = Join-Path $dst ".backup\$((Get-Date).ToString('yyyyMMdd-HHmmss'))"

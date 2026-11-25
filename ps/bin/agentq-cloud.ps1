@@ -26,6 +26,11 @@ HEAL  nobody claimed the job and the workspace heartbeat has not moved since the
 JOURNAL  cloud-queued / cloud-done / cloud-fail in ~/.codai/coord/journal.jsonl with holdSec,
       waitSec (queue -> claimed, includes resume), lane, kind=cloud, resource cloud:<ws>, so
       `agentq metrics` shows cloud runs beside local ones.
+EVIDENCE  a run that reached the workspace also leaves VERSIONED evidence in the TARGET repo, never only
+      in the job bucket and a terminal buffer: the whole log as runs/<id>.log plus ONE row in the repo's
+      own run journal (docs/RUNS.md or RUNS.md - an existing file only, following that table's columns,
+      idempotent by job id; .gitignore is never edited). A repo without that file, or without a markdown
+      table in it, gets the log and a printed notice instead of a file its conventions never asked for.
 EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavailable, NOTHING
   submitted (agentq falls back to local and skips this workspace until cloud-down/<ws>.json
   expires); 2 = usage.
@@ -78,6 +83,138 @@ function Write-Journal([hashtable]$e) {
   $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) }
   finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
+}
+# ---- evidence in the target repo (the run's own log, in the repo, forever) ----------------------
+# A gate result lived only in gs://<ctl>-devcloud-jobs/jobs/<id>/log and in a terminal buffer, so it was
+# an assertion rather than evidence: it could not be cited afterwards and it was not in the tree the run
+# was about. These helpers put it where the repo keeps results - runs/<id>.log plus ONE row in the
+# repo's own run journal - and are deliberately SELF-CONTAINED (no caller's script scope): the suite
+# tests/test-cloud-evidence.ps1 extracts these definitions from THIS file by AST and drives them
+# directly, so a rename or a reference to something outside them fails the suite.
+function Get-RunJournalRowField {
+  # StrictMode-proof field read: a missing field must read as empty, never throw.
+  param($Row, [string]$Name)
+  $p = $Row.PSObject.Properties[$Name]
+  if ($p) { "$($p.Value)" } else { '' }
+}
+function Get-RunJournalTable([string]$Path) {
+  # The FIRST markdown table of the file. Its header cells are the columns the row must follow; the shape
+  # in use here is `| date | job id | region | expected cost | actual | state | purpose |`
+  # (arc-prize-2027, hadamard-next). Last = the file index of that table's last row, because the new row
+  # goes there and never at end-of-file: a repo may keep prose or a second table below the first one.
+  $raw = [IO.File]::ReadAllText($Path)
+  $lines = @($raw -split "`r?`n")
+  for ($i = 0; $i + 1 -lt $lines.Count; $i++) {
+    $h = $lines[$i].Trim()
+    if ($h -notmatch '^\|.*\|$') { continue }
+    if ($lines[$i + 1].Trim() -notmatch '^\|[\s:\-|]+\|$') { continue }
+    $cols = @($h.Trim('|') -split '\|' | ForEach-Object { $_.Trim() })
+    if ($cols.Count -lt 2) { continue }
+    $last = $i + 1
+    while ($last + 1 -lt $lines.Count -and $lines[$last + 1].Trim() -match '^\|') { $last++ }
+    return [pscustomobject]@{ Header = $i; Last = $last; Columns = $cols; Lines = $lines; Raw = $raw }
+  }
+  $null
+}
+function ConvertTo-RunJournalValue([string]$Column, $Row) {
+  # One cell per column NAME, by keyword: the repo's header decides the order and the wording, this
+  # decides only the content. An unmatched column stays empty rather than being filled with an invention;
+  # whatever the columns left out is appended to the last cell by New-RunJournalRow.
+  $n = "$Column".ToLowerInvariant()
+  if ($n -match '\bdate\b|\bwhen\b|\bday\b') { return (Get-RunJournalRowField $Row 'Date') }
+  if ($n -match '\bjob\b|\bid\b') { return (Get-RunJournalRowField $Row 'Job') }
+  if ($n -match '\bregion\b|\bhost\b|\bmachine\b|\bvm\b|\bwhere\b|\btarget\b|\bzone\b|\bproject\b') { return (Get-RunJournalRowField $Row 'Region') }
+  if ($n -match '\bcost\b|\beur\b|\bprice\b|\bspend\b|\bbudget\b|\bbill\b|\bactual\b|\bexpected\b') { return (Get-RunJournalRowField $Row 'Cost') }
+  if ($n -match '\bstate\b|\bstatus\b|\bexit\b|\bresult\b|\boutcome\b|\bverdict\b|\bcode\b') { return (Get-RunJournalRowField $Row 'State') }
+  if ($n -match '\bpurpose\b|\bwhat\b|\bwhy\b|\bdesc\w*\b|\bnote\w*\b|\bcomm\w*\b|\blog\b|\bevid\w*\b|\bartefact\w*\b|\bartifact\w*\b') { return (Get-RunJournalRowField $Row 'Purpose') }
+  ''
+}
+function New-RunJournalRow($Table, $Row) {
+  $cells = @(@($Table.Columns) | ForEach-Object { ConvertTo-RunJournalValue $_ $Row })
+  # The contract, whatever the header says: a row that does not name the job cannot be deduplicated and a
+  # row without the log path is not evidence. Anything the columns left out is appended to the last cell,
+  # so an unfamiliar header still yields a usable row.
+  $facts = @()
+  $fp = $Row.PSObject.Properties['Facts']
+  if ($fp) { $facts = @($fp.Value) }
+  $missing = @($facts | Where-Object { $_ -and -not (($cells -join ' ').Contains("$_")) })
+  if ($missing.Count) {
+    $last = "$($cells[$cells.Count - 1])"
+    $cells[$cells.Count - 1] = $(if ($last) { $last + '; ' } else { '' }) + ($missing -join '; ')
+  }
+  # a pipe or a newline in a value would break the row open, so both are written the way a markdown table
+  # reads them back
+  $cells = @($cells | ForEach-Object { ("$_" -replace '\r?\n', ' ' -replace '\s{2,}', ' ').Trim() -replace '\|', '\|' })
+  '| ' + ($cells -join ' | ') + ' |'
+}
+function Add-RunJournalRow([string]$Path, [string]$JobId, [string]$RowText) {
+  $t = Get-RunJournalTable $Path
+  if (-not $t) { return [pscustomobject]@{ Added = $false; Reason = "no markdown table in $Path" } }
+  $lines = @($t.Lines)
+  for ($i = $t.Header; $i -le $t.Last; $i++) { if ($lines[$i].Contains($JobId)) { return [pscustomobject]@{ Added = $false; Reason = "job $JobId is already rowed in $Path" } } }
+  $tail = @()
+  if ($t.Last + 1 -lt $lines.Count) { $tail = @($lines[($t.Last + 1)..($lines.Count - 1)]) }
+  $out = @($lines[0..$t.Last]) + @($RowText) + $tail
+  # the file's own line endings and BOM are kept: a rewritten journal must not show up as a whole-file
+  # diff next to the one row it gained
+  $eol = if ($t.Raw.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191)
+  [IO.File]::WriteAllText($Path, (@($out) -join $eol), (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $bom))
+  [pscustomobject]@{ Added = $true; Reason = '' }
+}
+function Save-CloudEvidence {
+  # After a run that reached the workspace: the whole log as runs/<id>.log and one row in the repo's run
+  # journal. Never a file the repo did not ask for, never fatal to the run (the caller wraps it), and
+  # idempotent by job id - a re-run of the same gate must not grow the journal.
+  param(
+    [Parameter(Mandatory = $true)][string]$RepoDir,
+    [Parameter(Mandatory = $true)][string]$JobId,
+    [string]$Log = '', [int]$ExitCode = 0, [double]$TotalSec = 0, [string]$Purpose = '',
+    [string]$Lane = '', [string]$Region = '', [string]$Command = '', [string]$Date = ''
+  )
+  if (-not (Test-Path -LiteralPath $RepoDir)) { throw "cloud evidence: $RepoDir does not exist" }
+  if (-not $JobId) { throw 'cloud evidence: a job id is required' }
+  $rel = "runs/$JobId.log"
+  $runsDir = Join-Path $RepoDir 'runs'
+  if (-not (Test-Path -LiteralPath $runsDir)) { New-Item -ItemType Directory -Force -Path $runsDir | Out-Null }
+  $logPath = Join-Path $runsDir "$JobId.log"
+  $text = "$Log"
+  if (-not $text.Trim()) { $text = "# no log object was streamed for job $JobId`n" }
+  [IO.File]::WriteAllText($logPath, $text, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+  $res = [pscustomobject]@{ job = $JobId; logPath = $logPath; logRelative = $rel; logBytes = ([IO.FileInfo]$logPath).Length
+    logWritten = $true; runsIgnored = $false; journalPath = ''; journalRow = ''; journalAdded = $false; journalSkipped = '' }
+  # `runs/` being ignored is REPORTED, never fixed: an agent must not edit a repo's .gitignore, and
+  # evidence nobody commits is evidence nobody can cite.
+  if (Get-Command git -CommandType Application -ErrorAction SilentlyContinue) {
+    $prevEap = $ErrorActionPreference
+    try { $ErrorActionPreference = 'Continue'; & git -C $RepoDir check-ignore -q -- $rel 2>$null; $res.runsIgnored = ($LASTEXITCODE -eq 0) }
+    finally { $ErrorActionPreference = $prevEap }
+  }
+  $journal = ''
+  foreach ($cand in @((Join-Path $RepoDir 'docs\RUNS.md'), (Join-Path $RepoDir 'RUNS.md'))) { if (Test-Path -LiteralPath $cand) { $journal = $cand; break } }
+  if (-not $journal) { $res.journalSkipped = 'no docs\RUNS.md or RUNS.md in this repo - no journal row appended'; return $res }
+  $res.journalPath = $journal
+  $t = Get-RunJournalTable $journal
+  if (-not $t) { $res.journalSkipped = "no markdown table in $journal"; return $res }
+  if (-not $Date) { $Date = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+  $total = ([math]::Round($TotalSec, 1)).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+  $state = if ($ExitCode -lt 0) { 'CLIENT-FAIL' } elseif ($ExitCode -eq 0) { 'DONE' } else { 'FAILED' }
+  $why = "$Purpose"
+  if ($Lane) { $why += " (lane $Lane)" }
+  if ("$Command".Trim()) { $why += '; `' + "$Command".Trim() + '`' }
+  $why += "; log $rel"
+  $row = [pscustomobject]@{ Date = $Date; Job = $JobId
+    Region = $(if ($Region) { $Region } else { 'unknown' })
+    Cost = '0 EUR marginal (fleet workspace VM, already up)'
+    State = '{0}, exit {1}, total {2} s' -f $state, $ExitCode, $total
+    Purpose = $why.Trim()
+    Facts = @($JobId, "log $rel", "exit $ExitCode", "total $total s") }
+  $res.journalRow = New-RunJournalRow $t $row
+  $add = Add-RunJournalRow $journal $JobId $res.journalRow
+  $res.journalAdded = $add.Added
+  $res.journalSkipped = $add.Reason
+  $res
 }
 # Transport: GCS JSON API + Compute REST with ONE gcloud access token. A gcloud process costs
 # 4-5 s on this machine (measured 2026-10-12), and a job made ~15 of them (83 s "upload").
@@ -280,6 +417,12 @@ try {
   $end = [DateTime]::UtcNow
   if (-not $result) {
     Write-Journal @{ event = 'cloud-fail'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; reason = 'no result before deadline'; holdSec = [math]::Round(($end - $t0).TotalSeconds, 1); waitSec = 0 }
+    # A run with no result still owes the repo its evidence: whatever log had been streamed, so a wedged
+    # run is a dated artefact rather than a story (exit 3 = timed out waiting after submit).
+    try {
+      $ev = Save-CloudEvidence -RepoDir $top -JobId $id -Log $logTxt -ExitCode 3 -TotalSec (($end - $t0).TotalSeconds) -Purpose $Purpose -Lane $Lane -Region "$Vm, $Project $Zone" -Command $cmd
+      Out-Line ("[agentq-cloud] evidence {0} ({1} bytes) -> {2}" -f $ev.logRelative, $ev.logBytes, $(if ($ev.journalAdded) { "$($ev.journalPath) (row appended)" } else { $ev.journalSkipped }))
+    } catch { [Console]::Error.WriteLine("agentq-cloud: evidence not written ($($_.Exception.Message))") }
     [Console]::Error.WriteLine("agentq-cloud: no result for $id within $($TimeoutMin + 15) min (log: $Bucket/jobs/$id/log)"); exit 3
   }
   $claimRef = if ($claimedAt) { $claimedAt } else { $end }
@@ -294,12 +437,30 @@ try {
   $ph = $result.PSObject.Properties['phases']; $ph = if ($ph) { $ph.Value } else { $null }
   $P = { param($n) if ($ph -and $ph.PSObject.Properties[$n]) { $ph.$n } else { '-' } }
   Out-Line ("[agentq-cloud] {0} exit={1} total {2:N1}s (upload {3:N1}s, queue->claim {4:N1}s{5}, remote {6:N1}s: sync {7} install {8} run {9})" -f $id, $result.exit, ($end - $t0).TotalSeconds, $submitSec, $waitSec, $(if ($null -ne $resumeSec) { ", resume ${resumeSec}s" } else { '' }), $result.durSec, (& $P 'sync'), (& $P 'install'), (& $P 'run'))
+  # Versioned evidence, in the target repo. Never fatal: a repo that cannot take it must not turn a green
+  # run red, and the journal row is skipped (loudly) rather than the file being invented.
+  try {
+    $ev = Save-CloudEvidence -RepoDir $top -JobId $id -Log $logTxt -ExitCode ([int]$result.exit) -TotalSec (($end - $t0).TotalSeconds) -Purpose $Purpose -Lane $Lane -Region "$Vm, $Project $Zone" -Command $cmd
+    Out-Line ("[agentq-cloud] evidence {0} ({1} bytes) -> {2}" -f $ev.logRelative, $ev.logBytes, $(if ($ev.journalAdded) { "$($ev.journalPath) (row appended)" } else { $ev.journalSkipped }))
+    if ($ev.runsIgnored) { Out-Line "[agentq-cloud] $($ev.logRelative) is gitignored - the log stays local (no .gitignore edit made)" }
+  } catch { [Console]::Error.WriteLine("agentq-cloud: evidence not written ($($_.Exception.Message))") }
   exit ([int]$result.exit)
 } catch {
   $ErrorActionPreference = $prevEap
   $reason = "$($_.Exception.Message)".Substring(0, [math]::Min(300, "$($_.Exception.Message)".Length))
   Write-Journal @{ event = 'cloud-fail'; resource = "cloud:$Ws"; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; reason = $reason; submitted = $submitted }
   [Console]::Error.WriteLine("agentq-cloud: $($_.Exception.Message)")
+  # Submitted, then the client side died (network, a stream that never came back): the run DID happen on
+  # the workspace, so its evidence still belongs in the repo - with what this terminal knew, and a pointer
+  # to the canonical log object. NOT submitted is not a cloud run, and writes no evidence.
+  if ($submitted) {
+    try {
+      $partial = Get-Variable -Name logTxt -ValueOnly -ErrorAction SilentlyContinue
+      if (-not $partial) { $partial = "# no log was streamed for job $id - read gs://$CtlProject-devcloud-jobs/jobs/$id/log`n" }
+      $ev = Save-CloudEvidence -RepoDir $top -JobId $id -Log $partial -ExitCode -1 -TotalSec ([math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)) -Purpose $Purpose -Lane $Lane -Region "$Vm, $Project $Zone" -Command $cmd
+      Out-Line ("[agentq-cloud] evidence {0} ({1} bytes) -> {2}" -f $ev.logRelative, $ev.logBytes, $(if ($ev.journalAdded) { "$($ev.journalPath) (row appended)" } else { $ev.journalSkipped }))
+    } catch { [Console]::Error.WriteLine("agentq-cloud: evidence not written ($($_.Exception.Message))") }
+  }
   if (-not $submitted) {
     try {
       New-Item -ItemType Directory -Force $DownDir | Out-Null
