@@ -1765,7 +1765,16 @@ function Invoke-Commit {
     # own ticket (push:<repo>, capacity 2) because it contends on the remote ref only, and the retry loop
     # below already DEFERS when an incoming change overlaps another agent's uncommitted edits.
     Drop-Ticket $t
-    if (-not $NoPush) {
+    # A repository with no 'origin' (frontiers-index and most of the research repos have none) can only fail
+    # the push, and the failure looked exactly like a refused gate while the commit HAD landed. Detect it
+    # first, say so, and leave the commit local (2026-11-25).
+    $hasOrigin = $false
+    Push-Location $repo.Top
+    try { $hasOrigin = (@(& git remote) -contains 'origin') } finally { Pop-Location }
+    if (-not $NoPush -and -not $hasOrigin) {
+      [Console]::Error.WriteLine("agentq: no 'origin' remote in $($repo.Top) - commit $sha stays LOCAL (nothing pushed)")
+    }
+    if (-not $NoPush -and $hasOrigin) {
       $resPush = "push:$($repo.Name)"
       Assert-NotMarked $resPush
       $tPush = New-Ticket $resPush $Purpose "push $($repo.Name)" $repo.Top

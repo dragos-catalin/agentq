@@ -361,7 +361,7 @@ try {
   # 10 summaries prove every other check ran. Counting them as a constant is what broke this check twice
   # (ADR 0012 added lease-hygiene; 2026-11-21 added the machine-memory skip), so rows that only say
   # "skipped (...)" are excluded: the number of checks that ACTUALLY ran is what this asserts.
-  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' -and $_.detail -notmatch '^skipped \(' }).Count -eq 10 -and $code -eq 0) $raw
+  Check '12 the other checks still ran' (@(Rows $r 'marks' 'warn').Count -eq 1 -and @($r.rows | Where-Object { $_.kind -eq 'summary' -and $_.detail -notmatch '^skipped \(' }).Count -eq 11 -and $code -eq 0) $raw
 
   # ---- 13 git-autosync health folded into the doctor ------------------------------------------------
   # The doctor does NOT re-implement git-autosync's checks: it runs the tool with -Doctor and folds the
@@ -491,6 +491,41 @@ try {
   }
   $r = DJ -All -Src (Join-Path $gitRepo2 'ps')
   Check '16g origin/main absent -> an ok row saying so, no warn' (@($r.rows | Where-Object { $_.check -eq 'stale-install' -and $_.detail -match 'no origin/main known locally' }).Count -eq 1 -and @(Rows $r 'stale-install' 'warn').Count -eq 0 -and $code -eq 0) $raw
+  # ---- 17 cloud-lanes: a repo that declares devcloud lanes must be reachable in the cloud ------------
+  # The promise in .devcloud/profile.json is kept in two places: the repo's lanes and agentq's own
+  # cloudWorkspaces mapping (+ a cloudRegistry entry for the workspace). Without the mapping `-Where
+  # cloud` throws and the work quietly stays on the workstation, which is the exact failure the owner
+  # keeps hitting (2026-11-25: the 15 frontier repos each needed a mapping). Roots come from config
+  # `repoRoots`; without that key the check falls back to the worktree root's parent.
+  Reset-State
+  $env:AGENTQ_INSTALL_DIR = $inst
+  $root = Join-Path $tmp 'repo-root'
+  Put (Join-Path $root 'alpha\.devcloud\profile.json') '{"v":1,"repo":"alpha","lanes":{"gate":{}}}'
+  Put (Join-Path $root 'beta\.devcloud\profile.json') '{"v":1,"repo":"beta","lanes":{"gate":{}}}'
+  Put (Join-Path $root 'gamma\.devcloud\profile.json') '{"v":1,"repo":"gamma","lanes":{"gate":{}}}'
+  # a nested workspace (E:\gh\frontiers\<repo>): the profile sits one level deeper, two git repos mark
+  # the container, and the check must still find it
+  Put (Join-Path $root 'ws\delta\.devcloud\profile.json') '{"v":1,"repo":"delta","lanes":{"gate":{},"image":{}}}'
+  foreach ($n in 'one', 'two') { Put (Join-Path $root "ws\$n\.git") "gitdir: nowhere`n" }
+  $cfgCloud = [ordered]@{ taskSlotsPerRepo = 3; taskSlotsMachine = 5; leaseIdleMin = 120; minFreeCommitGB = 0
+    repoRoots = @($root)
+    cloudWorkspaces = [ordered]@{ alpha = 'wsA'; gamma = 'wsZ' }
+    cloudRegistry = [ordered]@{ wsA = [ordered]@{ project = 'p'; zone = 'z' } } } | ConvertTo-Json
+  [IO.File]::WriteAllText($cfg, $cfgCloud)
+  $r = DJ -All -Src $srcPs
+  Check '17a mapped to a registered workspace -> no warn' (@(Rows $r 'cloud-lanes' 'warn' | Where-Object { $_.subject -eq 'alpha' }).Count -eq 0) $raw
+  Check '17b declares lanes but is unmapped -> warn naming the repo, exit still 0' (@(Rows $r 'cloud-lanes' 'warn' | Where-Object { $_.subject -eq 'beta' -and $_.detail -match 'stays LOCAL' }).Count -eq 1 -and $code -eq 0) $raw
+  Check '17c mapped to a workspace with no cloudRegistry entry -> warn' (@(Rows $r 'cloud-lanes' 'warn' | Where-Object { $_.subject -eq 'gamma' -and $_.detail -match 'no cloudRegistry entry' }).Count -eq 1) $raw
+  Check '17d a profile inside a nested workspace is still found' (@(Rows $r 'cloud-lanes' 'warn' | Where-Object { $_.subject -eq 'delta' }).Count -eq 1) $raw
+  Check '17e the summary counts every repo found, mapped or not' (@($r.rows | Where-Object { $_.check -eq 'cloud-lanes' -and $_.kind -eq 'summary' -and $_.detail -match '^4 repo\(s\) declare devcloud lanes: 1 reachable in the cloud, 2 unmapped, 1 mapped to an unregistered workspace$' }).Count -eq 1) $raw
+  Check '17f with -All the reachable repos are listed with their lanes' (@(Rows $r 'cloud-lanes' 'ok' | Where-Object { $_.subject -eq 'alpha' -and $_.detail -match 'cloud wsA: 1 lane\(s\) \[gate\]' }).Count -eq 1) $raw
+  # an empty scan is said plainly and must not read as "everything is fine"
+  $cfgEmpty = [ordered]@{ taskSlotsPerRepo = 3; taskSlotsMachine = 5; leaseIdleMin = 120; minFreeCommitGB = 0; repoRoots = @((Join-Path $tmp 'nowhere')) } | ConvertTo-Json
+  [IO.File]::WriteAllText($cfg, $cfgEmpty)
+  $r = DJ -All
+  Check '17g no profile found -> an ok summary saying where it looked, no finding row' (@(Rows $r 'cloud-lanes' 'warn').Count -eq 0 -and @($r.rows | Where-Object { $_.check -eq 'cloud-lanes' -and $_.kind -eq 'summary' -and $_.detail -match 'no repo under' }).Count -eq 1) $raw
+  [IO.File]::WriteAllText($cfg, $cfgText)
+
   # restore the global switches and the shared install dir for the cleanup path
   $env:AGENTQ_INSTALL_DIR = $inst
   $env:AGENTQ_DOCTOR_NO_STALE = '1'

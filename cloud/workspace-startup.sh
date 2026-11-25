@@ -91,8 +91,68 @@ case ",$TOOLCHAINS," in *,android-jdk21,*)
   printf 'JAVA_HOME=%s\nANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$J" "$A" "$A" >> /etc/devcloud/env.new
   ;;
 esac
+# python-uv = uv (Astral) in /usr/local/bin + a managed CPython, for every Python repo on the VM. Added
+# 2026-11-25: the image had no uv, so each frontier gate bootstrapped it into $HOME/.local/bin on every
+# fresh job (~20 s + a network dependency on astral.sh inside a run that should be measuring math).
+# uv installs to /usr/local/bin (`sudo`-free for jobs) and its cache lives on the boot disk.
+case ",$TOOLCHAINS," in *,python-uv,*)
+  if [ ! -f /opt/devcloud/.python-uv-v1 ]; then
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    mkdir -p /work/.uv-cache && chown dev:dev /work/.uv-cache
+    sudo -u dev -H env UV_CACHE_DIR=/work/.uv-cache bash -lc '/usr/local/bin/uv python install 3.12 3.13' || true
+    /usr/local/bin/uv --version
+    touch /opt/devcloud/.python-uv-v1
+  fi
+  # UV_CACHE_DIR only: the VM keeps one cache across jobs, and repos still choose their own interpreter.
+  printf 'UV_CACHE_DIR=%s\n' /work/.uv-cache >> /etc/devcloud/env.new
+  ;;
+esac
 mv /etc/devcloud/env.new /etc/devcloud/env
 sed -e 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/' /etc/devcloud/env > /etc/profile.d/devcloud-env.sh
+
+# --- gh, the GitHub CLI (unconditional, like rust: the CI image's base layer has it since DC-040, and a
+# workspace without it cannot read a PR, an issue or a private sibling). Added 2026-11-25.
+if [ ! -f /opt/devcloud/.gh-v1 ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+  chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+  apt-get update
+  # jq is needed by the credential block below and only the (skippable) node block installs it.
+  apt-get install -y --no-install-recommends gh jq ca-certificates >/dev/null
+  gh --version | head -1
+  touch /opt/devcloud/.gh-v1
+fi
+
+# --- optional GitHub credential (secret devcloud-github-token in the control project). The provisioner
+# grants it with -SecretAccess 'dragos-devcloud:devcloud-github-token'; with no grant (or no secret) this
+# is a no-op and jobs simply run unauthenticated - never a failed boot. Read straight from the Secret
+# Manager REST API with the VM's own metadata token, so no gcloud CLI is needed on the image. The token
+# goes to /home/dev/.config/gh/hosts.yml (0600, dev-owned) - the one place `gh` and `git` read it - and
+# is never echoed. Rotating the secret: `rm /opt/devcloud/.gh-token-v1` then re-run -UpdateAgent.
+if [ ! -f /opt/devcloud/.gh-token-v1 ]; then
+  GH_SECRET="$(md devcloud-github-token-secret)"; GH_SECRET="${GH_SECRET:-devcloud-github-token}"
+  GH_SP="$(md devcloud-secret-project)"
+  GH_VAL=''
+  if [ -n "$GH_SP" ] && command -v gh >/dev/null 2>&1; then
+    MT="$(curl -fsS -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' 2>/dev/null | jq -r '.access_token // empty' || true)"
+    if [ -n "$MT" ]; then
+      GH_VAL="$(curl -fsS -H "Authorization: Bearer $MT" "https://secretmanager.googleapis.com/v1/projects/$GH_SP/secrets/$GH_SECRET/versions/latest:access" 2>/dev/null | jq -r '.payload.data // empty' | base64 -d 2>/dev/null || true)"
+      case "$GH_VAL" in ''|null|*'<'*'Error'*) GH_VAL='' ;; esac
+    fi
+  fi
+  if [ -n "$GH_VAL" ]; then
+    install -d -o dev -g dev -m 700 /home/dev/.config/gh
+    printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n    user: devcloud\n' "$GH_VAL" > /home/dev/.config/gh/hosts.yml
+    chown dev:dev /home/dev/.config/gh/hosts.yml; chmod 600 /home/dev/.config/gh/hosts.yml
+    sudo -u dev -H bash -lc 'gh auth setup-git' >/dev/null 2>&1 || true
+    echo "github credential: installed for dev ($GH_SP/$GH_SECRET)"
+    touch /opt/devcloud/.gh-token-v1
+  else
+    echo "github credential: not available ($GH_SP/$GH_SECRET unreadable or absent) - jobs run without gh auth"
+  fi
+  unset GH_VAL MT
+fi
 
 # --- runner-agent from metadata (always the latest pushed by the provisioner)
 mkdir -p /opt/devcloud

@@ -739,6 +739,82 @@ function Test-DoctorDaemons {
   Add-DoctorSummary 'daemons' "$n daemon record(s), $failed failing"
 }
 
+  # ---- 4c. cloud-lanes: a repo that declares devcloud lanes must actually reach the cloud ------------
+  # A lane in .devcloud/profile.json is a promise that the heavy work happens on a devcloud VM. The
+  # promise is kept in TWO places: the repo's lanes, and agentq's own `cloudWorkspaces` mapping (plus a
+  # `cloudRegistry` entry for the workspace) which turns `-Where cloud` and auto into a real VM. A repo
+  # with lanes and no mapping throws "no cloud workspace for repo" and every run silently stays local on
+  # a machine the owner keeps asking us not to use (2026-11-25: each of the 14 frontier repos needed a
+  # mapping). Warn, never fail: the repo itself is fine, the machine's config is incomplete.
+  # Slots are NOT the source here: a repo can declare lanes and never be leased (the frontier repos have
+  # no slot at all), so the scan walks the real directories. Roots: config `repoRoots` when set, else the
+  # worktree root's parent (E:\gh); nested workspaces (E:\gh\frontiers\<repo>, a dir holding >=2 git
+  # repos) are walked one level deeper.
+  function Get-DoctorRepoRoots {
+    $cfg = Get-Config
+    if ($cfg.ContainsKey('repoRoots') -and @($cfg['repoRoots']).Count) { return @($cfg['repoRoots']) }
+    $wt = Get-WtRoot
+    $parent = $null
+    if ($wt) { $parent = Split-Path $wt -Parent }
+    if ($parent -and [IO.Directory]::Exists($parent)) { return @($parent) }
+    @()
+  }
+
+  function Get-DoctorRepoProfilePaths {
+    $out = [System.Collections.Generic.List[object]]::new()
+    $budget = 800
+    foreach ($root in @(Get-DoctorRepoRoots)) {
+      if (-not [IO.Directory]::Exists($root)) { continue }
+      $children = @(); try { $children = @([IO.Directory]::EnumerateDirectories($root)) } catch { }
+      foreach ($c in $children) {
+        if ($budget-- -le 0) { break }
+        $p = Join-Path $c '.devcloud/profile.json'
+        if ([IO.File]::Exists($p)) { $out.Add([pscustomobject]@{ repo = [IO.Path]::GetFileName($c); file = $p }) }
+      }
+      foreach ($c in $children) {
+        $subs = @(); try { $subs = @([IO.Directory]::EnumerateDirectories($c)) } catch { }
+        $repos = @($subs | Where-Object { [IO.File]::Exists((Join-Path $_ '.git')) -or [IO.Directory]::Exists((Join-Path $_ '.git')) })
+        if ($repos.Count -lt 2) { continue }
+        foreach ($c2 in $subs) {
+          if ($budget-- -le 0) { break }
+          $p = Join-Path $c2 '.devcloud/profile.json'
+          if ([IO.File]::Exists($p)) { $out.Add([pscustomobject]@{ repo = [IO.Path]::GetFileName($c2); file = $p }) }
+        }
+      }
+    }
+    $out
+  }
+
+  function Test-DoctorCloudLanes {
+    $cfg = Get-Config
+    $map = if ($cfg.ContainsKey('cloudWorkspaces') -and $cfg['cloudWorkspaces']) { $cfg['cloudWorkspaces'] } else { @{} }
+    $reg = if ($cfg.ContainsKey('cloudRegistry') -and $cfg['cloudRegistry']) { $cfg['cloudRegistry'] } else { @{} }
+    $seen = @{}; $profiles = @()
+    foreach ($f in @(Get-DoctorRepoProfilePaths)) {
+      if ($seen.ContainsKey($f.repo)) { continue }
+      $seen[$f.repo] = $true
+      $lanes = @()
+      try { $lanes = @((Get-Content -LiteralPath $f.file -Raw | ConvertFrom-Json).lanes.PSObject.Properties.Name) } catch { }
+      $profiles += [pscustomobject]@{ repo = $f.repo; lanes = $lanes; file = $f.file }
+    }
+    if (-not $profiles.Count) { Add-DoctorSummary 'cloud-lanes' "no repo under $(@(Get-DoctorRepoRoots) -join ', ') declares .devcloud/profile.json"; return }
+    $unmapped = @($profiles | Where-Object { -not $map.ContainsKey($_.repo) })
+    $orphan = @($profiles | Where-Object { $map.ContainsKey($_.repo) -and -not $reg.ContainsKey("$($map[$_.repo])") })
+    foreach ($p in $unmapped) {
+      Add-DoctorRow 'cloud-lanes' 'warn' $p.repo "declares $($p.lanes.Count) devcloud lane(s) but is absent from cloudWorkspaces: '-Where cloud' throws and the work stays LOCAL" "add `"$($p.repo)`": `"<ws>`" to cloudWorkspaces in ps/bin/agentq-config.json and the ws to cloudRegistry"
+    }
+    foreach ($p in $orphan) {
+      Add-DoctorRow 'cloud-lanes' 'warn' $p.repo "mapped to workspace '$($map[$p.repo])' which has no cloudRegistry entry (project + zone)" 'add the workspace to cloudRegistry, or fix the mapping'
+    }
+    if ($All) {
+      foreach ($p in @($profiles | Where-Object { $map.ContainsKey($_.repo) -and $reg.ContainsKey("$($map[$_.repo])") })) {
+        Add-DoctorRow 'cloud-lanes' 'ok' $p.repo "cloud $($map[$p.repo]): $($p.lanes.Count) lane(s) [$($p.lanes -join ', ')]"
+      }
+    }
+    $ok = $profiles.Count - $unmapped.Count - $orphan.Count
+    Add-DoctorSummary 'cloud-lanes' "$($profiles.Count) repo(s) declare devcloud lanes: $ok reachable in the cloud, $($unmapped.Count) unmapped, $($orphan.Count) mapped to an unregistered workspace"
+  }
+
 # ---- report -----------------------------------------------------------------------------------
 function Format-DoctorText($row) { if ($row.subject) { "$($row.subject): $($row.detail)" } else { "$($row.detail)" } }
 function Write-DoctorReport([object[]]$rows, [string[]]$order, [string]$header, [int]$fails, [int]$warns) {
@@ -793,6 +869,7 @@ function Invoke-Doctor {
     'scheduled-tasks'     = { Test-DoctorTasks }
     'git-autosync'        = { Test-DoctorGitAutosync }
     'daemons'             = { Test-DoctorDaemons }
+    'cloud-lanes'         = { Test-DoctorCloudLanes $scope }
   }
   $timings = [ordered]@{}
   foreach ($cn in @($checks.Keys)) {

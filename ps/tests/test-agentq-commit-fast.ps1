@@ -83,6 +83,21 @@ try {
   Check '5 pushes are journalled' ($pushEv.Count -ge 2) ($pushEv | ConvertTo-Json -Depth 3)
   $capf = Join-Path $qp 'capacity'
   Check '5 push capacity is 2' ((Test-Path $capf) -and ([int](Get-Content $capf -Raw) -eq 2)) "capacity file: $(if (Test-Path $capf) { Get-Content $capf -Raw } else { 'missing' })"
+  # 6. A repo with NO 'origin' (frontiers-index and most research repos) must not report a broken push: the
+  # commit lands locally and the command says so. Before 2026-11-25 it exited 1 with "push failed (not a
+  # race...)", which made a landed commit look like a refused gate.
+  $lonely = Join-Path $tmp 'no-origin'
+  git init -q -b main $lonely
+  [IO.File]::WriteAllText("$lonely\x.txt", "x`n")
+  $env:AGENTQ_SESSION = 'agent-4'
+  Push-Location $lonely
+  try {
+    $o4 = @(& pwsh -NoProfile -File $Aq commit -Purpose 'no-origin' -Message 'test:local-only' -Paths 'x.txt' 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $c4 = $LASTEXITCODE
+  } finally { Pop-Location }
+  Check '6 a repo without origin commits locally and exits 0' ($c4 -eq 0 -and $o4 -match 'stays LOCAL') "exit=$c4`n$o4"
+  $l4 = @(& git -C $lonely log --oneline -2 2>$null | ForEach-Object { "$_" }) -join ' | '
+  Check '6 the commit is in that repo' ($l4 -match 'test:local-only') $l4
 } finally {
   Pop-Location
   foreach ($p in @($p1, $p3)) { if ($p -and -not $p.HasExited) { $p.Kill() } }
