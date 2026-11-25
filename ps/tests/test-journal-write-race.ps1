@@ -13,6 +13,12 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 }
 $pwsh = (Get-Process -Id $PID).Path
 
+# Liveness guard, NOT a load allowance. On an idle machine one `agentq run` of `exit 0` costs ~18 s
+# (55 s through Start-Process); with several agents building/landing the same call exceeded 90 s and
+# ALL SIX cases reported rc=99 - a red suite blaming agentq for the machine being busy (2026-11-25).
+$runTimeoutS = 300
+if ($env:AGENTQ_TEST_RUN_TIMEOUT_S) { $runTimeoutS = [int]$env:AGENTQ_TEST_RUN_TIMEOUT_S }
+
 # Everything this suite writes lands in a throwaway store, never the machine's own journal/queues.
 $store = Join-Path ([IO.Path]::GetTempPath()) ('aq-journal-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $store | Out-Null
@@ -38,7 +44,14 @@ function Invoke-AqRun([string]$purpose, [int]$holdMs) {
       -RedirectStandardOutput $outFile -RedirectStandardError $errFile -ArgumentList $argLine
     if ($holdMs -gt 0) { Start-Sleep -Milliseconds $holdMs; $lock.Dispose(); $lock = $null }
   } finally { if ($lock) { $lock.Dispose() } }
-  if (-not $psi.WaitForExit(90000)) { try { $psi.Kill() } catch {} ; return 99 }
+  if (-not $psi.WaitForExit($runTimeoutS * 1000)) {
+    try { $psi.Kill() } catch {}
+    # A timeout must SAY what it saw, for the same reason a non-zero rc must above.
+    [Console]::Error.WriteLine("--- agentq run '$purpose' TIMED OUT after ${runTimeoutS}s (rc=99) ---")
+    @(Get-Content -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue) |
+      Select-Object -Last 12 | ForEach-Object { [Console]::Error.WriteLine('  | ' + $_) }
+    return 99
+  }
   if ($psi.ExitCode -ne 0) {
     # stderr, never the pipeline: this function's return value must stay the exit code alone.
     [Console]::Error.WriteLine("--- agentq run '$purpose' rc=$($psi.ExitCode) ---")
