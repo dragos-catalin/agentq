@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "_why": "landGate.<repo> entries that are NOT recognisably pool-delegating and are NOT a regression, each with a one-line reason. Read by ps/tests/test-land-gate-pool.ps1. Add a line only when the gate genuinely cannot name a wrapper under ps/devcloud/, scripts/devcloud/, infra/devcloud/ or tool/*cloud*, and say why - an allow-listed local gate is a local gate that runs on this workstation.",
+  "allow": {
+    "codai": "pool-delegating, but the wrapper is scripts/ops/cloud-land-gate.ps1 - outside the four recognised directories",
+    "agentq": "LOCAL until ws-agentq exists; the pool gate is staged at ps/devcloud/gate.ps1 and run-all took 2160 s here on 2026-11-25",
+    "frontiers-index": "one shared registry gate for the fifteen frontiers repos (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1); it is not under a devcloud directory",
+    "frontier-kit": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "arc-prize-2027": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "bb6-holdouts": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "erdos-computational": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "fluid-singularities": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "graph-existence": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "hadamard-next": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "hutter-enwik9": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "linear-a": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "matmul-tensor-rank": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "ramsey-sat": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "sphere-codes": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "vesuvius": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)",
+    "wdw-cosmology": "shares the frontiers registry gate (E:\\gh\\frontiers\\frontiers-index\\scripts\\land-gate.ps1)"
+  }
+}
