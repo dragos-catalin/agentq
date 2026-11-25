@@ -138,11 +138,16 @@ case ",$TOOLCHAINS," in *,flutter,*)
     if [ ! -f "/opt/devcloud/.flutter-$FV-v1" ]; then
       echo "::flutter-install version=$FV into $F"
       rm -rf "$F"
-      if sudo -u dev -H git clone -q --depth 1 -b "$FV" https://github.com/flutter/flutter.git "$F"; then
-        sudo -u dev -H "$F/bin/flutter" precache --android --linux >/dev/null 2>&1 || true
+      # `/opt` is root-owned and `git clone` creates its target directory itself - as `dev` that is an
+      # instant EACCES. Measured: the whole install died 1.4 s in and fell back to the image's Flutter.
+      install -d -o dev -g dev "$F"
+      if sudo -u dev -H git clone -q --depth 1 -b "$FV" https://github.com/flutter/flutter.git "$F" \
+          >/var/log/devcloud-flutter-clone.log 2>&1 && [ -x "$F/bin/flutter" ]; then
+        sudo -u dev -H "$F/bin/flutter" precache --android --linux >>/var/log/devcloud-flutter-clone.log 2>&1 || true
         touch "/opt/devcloud/.flutter-$FV-v1"
       else
         echo "::flutter-install FAILED for $FV"
+        tail -6 /var/log/devcloud-flutter-clone.log 2>/dev/null | sed -e 's/^/::flutter-clone: /' || true
       fi
     fi
   fi
