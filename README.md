@@ -44,7 +44,21 @@ Agents without a shell can coordinate through MCP:
 { "servers": { "agentq": { "command": "npx", "args": ["-y", "@codai/agentq@0.2.0", "mcp"] } } }
 ```
 
-Tools: `acp_acquire`, `acp_wait`, `acp_release`, `acp_status`, `acp_mark`, `acp_note`, `acp_journal`. Tickets taken through MCP belong to the MCP server process and are released when the session ends.
+Run it from a checkout instead, so the tools match the working tree rather than the
+published version:
+
+```json
+{ "servers": { "agentq": { "command": "node", "args": ["<repo>\\dist\\cli.mjs", "mcp"] } } }
+```
+
+Thirty tools. The daemon-facing seven - `acp_acquire`, `acp_wait`, `acp_release`, `acp_status`, `acp_mark`, `acp_note`, `acp_journal` - take tickets owned by the MCP server process and released when the session ends. The rest wrap the script a person would call in a terminal, with named parameters and the script's own exit codes reported back:
+
+- coordination: `agentq_since`, `agentq_status`, `agentq_run`, `agentq_note`, `agentq_break`, `agentq_propose`, `agentq_workspace`
+- slots and landing: `agentq_lease`, `agentq_unlease`, `agentq_land`, `agentq_publish`, `agentq_sweep`
+- background jobs: `job_start`, `job_wait`, `job_list`
+- devcloud: `cloud_submit`, `cloud_status`, `cloud_workspaces`, `cloud_suspend`, `cloud_resume`, `cloud_reset`, `cloud_log`, `cloud_result`
+
+The destructive ones (`agentq_break`, `agentq_land`, `agentq_sweep`, `cloud_reset`, `cloud_suspend`) require the resource and a reason, and act on nothing by default.
 
 ### Hooks
 
