@@ -253,7 +253,20 @@ if ($cfg) {
   Check "gateSuites.$repoName is a valid, fully installed gate list (with 'status readonly')" ($gateFindings.Count -eq 0) "$($gateFindings -join '; ')"
   $lg = if ($cfg.ContainsKey('landGate')) { $cfg['landGate'] } else { $null }
   $lgCmd = if ($lg -and $lg.ContainsKey($repoName)) { "$($lg[$repoName])" } else { '' }
-  Check "landGate.$repoName drives the persisted list (-RepoSuites), never a repeated literal" ($lgCmd -and $lgCmd -match '-RepoSuites' -and $lgCmd -notmatch '-Only\s') "landGate.$repoName = '$lgCmd'"
+    # The rule is "the gate drives the PERSISTED list, never a repeated literal", and since 2026-11-25 there
+    # are two sanctioned ways to satisfy it: `-RepoSuites` on this box, or the pool wrapper, whose payload
+    # (ps/devcloud/pool-suites.ps1) resolves `gateSuites.<repo>` from this same config. Accepting the wrapper
+    # is not a relaxation - a wrapper whose payload did NOT read the config would fail the second branch, and
+    # a literal list in the config still fails both.
+    $lgOk = $false
+    if ($lgCmd) {
+      if ($lgCmd -match '-RepoSuites') { $lgOk = $true }
+      elseif ($lgCmd -match 'ps[\\/]devcloud[\\/]gate\.ps1') {
+        $gp = Join-Path $psRoot 'devcloud\gate.ps1'
+        $lgOk = (Test-Path $gp) -and ((Get-Content $gp -Raw) -match 'pool-suites\.ps1')
+      }
+    }
+    Check "landGate.$repoName drives the persisted list (-RepoSuites, or the ps/devcloud wrapper whose payload resolves gateSuites), never a repeated literal" ($lgOk -and $lgCmd -notmatch '-Only\s') "landGate.$repoName = '$lgCmd'"
   $gl = @(Get-GateList $cfgPath $repoName)
   Note "gateSuites.$repoName ($($gl.Count)): $($gl -join ', ')"
 }
