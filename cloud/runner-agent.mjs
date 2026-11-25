@@ -236,13 +236,32 @@ async function runJob(spec) {
                 append(d.toString());
                 void flush();
             });
-            p.on("error", (e) => {
-                append(`[devcloud] spawn ${cmd}: ${e.message}\n`);
-            });
-            p.on("close", (code) => {
+            // The step ends when the process ends, not when its streams close. A tool that
+            // starts a daemon hands that daemon the handles it inherited from us: Gradle's
+            // daemon outlives its client by hours, so `close` - process exit AND both streams
+            // closed - never fires, and the job never publishes an exit code. Measured
+            // 2026-11-25: the log ended with `assemble exit=0`, every process we started had
+            // exited, and result.json was still absent ten minutes later; three android jobs
+            // were abandoned and the instance was reset twice. The daemon holding a pipe to a
+            // reader that has stopped caring is the toolchain's business, and killing the
+            // daemon to make a bookkeeping event fire would trade a hang for a rebuilt JVM.
+            let settled = false;
+            const settle = (code) => {
+                if (settled) return;
+                settled = true;
                 if (timer) clearTimeout(timer);
                 res(killed ? 124 : (code ?? 1));
+            };
+            p.on("error", (e) => {
+                append(`[devcloud] spawn ${cmd}: ${e.message}\n`);
+                settle(1);
             });
+            // `close` normally arrives first and stays the fast path; the exit handler is what
+            // makes a step whose pipes are still held by a daemon (or by a grandchild that
+            // outlives its parent) finish at all. Half a second after exit covers the output
+            // still sitting in the pipe, which `close` would otherwise have delivered.
+            p.on("close", (code) => settle(code));
+            p.on("exit", (code) => setTimeout(() => settle(code), 500));
         });
     await gs
         .put(
@@ -523,7 +542,10 @@ async function main() {
             lastSelfCheck = Date.now();
             const fresh = await attr("runner-agent", "");
             const self = process.argv[1];
-            if (fresh.length > 1000 && fresh !== fs.readFileSync(self, "utf8").trim()) {
+            // Compared trimmed on both sides: the metadata value is what gcloud read from a
+            // file, so whether it carries the file's final newline is gcloud's business, and a
+            // mismatch that is only a newline restarts the agent every minute forever.
+            if (fresh.length > 1000 && fresh.trim() !== fs.readFileSync(self, "utf8").trim()) {
                 fs.writeFileSync(self, fresh);
                 log("agent updated from metadata, restarting");
                 process.exit(0);
