@@ -136,7 +136,7 @@ case ",$TOOLCHAINS," in *,flutter,*)
       rm -rf "$F"
       cp -a "$SRC" "$F"
       chown -R dev:dev "$F"
-      [ -d /opt/android-sdk ] && chown -R dev:dev /opt/android-sdk
+      if [ -d /opt/android-sdk ]; then chown -R dev:dev /opt/android-sdk; fi
       touch /opt/devcloud/.flutter-v1
     elif [ -x "$F/bin/flutter" ]; then
       touch /opt/devcloud/.flutter-v1
