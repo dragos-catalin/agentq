@@ -1603,6 +1603,17 @@ function Invoke-Run {
         try { $raw = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json -AsHashtable; $raw['yielded'] = $v; $raw['yieldAt'] = [DateTime]::UtcNow.ToString('o')
           [IO.File]::WriteAllText("$f.tmp", ($raw | ConvertTo-Json -Depth 4)); [IO.File]::Move("$f.tmp", $f, $true) } catch {}
       }
+        # A thread job runs in a FRESH session state: the parent's Append-JournalLine is not visible
+        # here (CommandNotFoundException, swallowed by the catch below), so the watchdog flipped the
+        # flag but journaled nothing. Same retry contract, defined locally (2026-11-25: suite check
+        # 'idle-yield journaled' failed while 'idle watchdog marks sleeping holder yielded' passed).
+        function Append-Line([string]$path, [string]$line) {
+          $enc = [Text.UTF8Encoding]::new($false)
+          for ($i = 1; $i -le 25; $i++) {
+            try { [IO.File]::AppendAllText($path, $line, $enc); return $true } catch { Start-Sleep -Milliseconds ([Math]::Min(25 * $i, 200)) }
+          }
+          $false
+        }
       while ($true) {
         foreach ($f in $files) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }
         if ($mfile -and $yieldMin -gt 0 -and ($tick % 3) -eq 0) {
@@ -1615,9 +1626,9 @@ function Invoke-Run {
             $idle = ($span -ge ($yieldMin - 0.5)) -and ($burn -lt $cpuSec)
             $busyAgain = $yielded -and $samples.Count -ge 2 -and (($samples[$samples.Count - 1].cpu - $samples[$samples.Count - 2].cpu) -ge $cpuSec)
             if ($idle -and -not $yielded) { $yielded = $true; SetFlag $mfile $true
-              [void](Append-JournalLine $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-yield'; resource = 'build:machine'; session = $session; reason = "cpu $([math]::Round($burn,1))s in $([math]::Round($span,1)) min" } | ConvertTo-Json -Compress) + "`n")) }
+              [void](Append-Line $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-yield'; resource = 'build:machine'; session = $session; reason = "cpu $([math]::Round($burn,1))s in $([math]::Round($span,1)) min" } | ConvertTo-Json -Compress) + "`n")) }
             elseif ($busyAgain) { $yielded = $false; SetFlag $mfile $false
-              [void](Append-JournalLine $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-resume'; resource = 'build:machine'; session = $session } | ConvertTo-Json -Compress) + "`n")) }
+              [void](Append-Line $journal ((@{ ts = [DateTime]::UtcNow.ToString('o'); event = 'idle-resume'; resource = 'build:machine'; session = $session } | ConvertTo-Json -Compress) + "`n")) }
           } catch {}
         }
         $tick++; Start-Sleep -Seconds 20
