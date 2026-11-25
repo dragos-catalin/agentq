@@ -139,6 +139,26 @@ $r = Call 'replace_string_in_file' @{ filePath = "$root\repo\plan\notes.md"; old
 Ok ($r.out -notmatch 'SHARED clone') 'a non-CSV under plan/: silent'
 $r = Call 'replace_string_in_file' @{ filePath = "$root\other\plan\a.csv"; oldString = 'x'; newString = 'y' }
 Ok ($r.out -notmatch 'SHARED clone') 'plan CSV outside a shared clone: silent'
+
+# 2026-11-25 (owner-ticked I1): a MULTI-FILE call is judged as a WHOLE. Only the FIRST `*** File:`
+# header of a patch used to be read, so a patch whose first hunk was legitimate got source INTO the
+# read-only shared clone through its later hunks (measured live: hunks 1-2 in a leased slot, hunk 3
+# in E:\gh\codai, verdict = allowed). One refused path now refuses the whole call, and the reason
+# names every path, so the reader can see which hunk was the refused one and that the others were
+# not written either. The `repo` fixture here is refuse-mode and does have a slot.
+$mix = "*** Begin Patch`n*** Update File: $root\.wt\repo\task-1\src\ok.ts`n@@`n-a`n+b`n*** Update File: $root\repo\src\bad.ts`n@@`n-a`n+b`n*** End Patch"
+$r = Call 'apply_patch' @{ input = $mix; explanation = 'x' }
+# The verdict is read as JSON, so a Windows separator arrives as `\\` in the text: match the ESCAPED
+# form (4 backslashes in a single-quoted pattern = 2 literal ones). The first version of these
+# assertions looked for `src\bad.ts` and failed against a guard that was behaving correctly.
+Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'src\\\\bad\.ts') 'multi-file patch: a shared-clone hunk refuses the WHOLE call'
+Ok ($r.out -match 'task-1\\\\src\\\\ok\.ts') 'multi-file patch: the refusal names every path, the slot hunk included'
+$bothSlot = "*** Begin Patch`n*** Update File: $root\.wt\repo\task-1\src\a.ts`n@@`n-a`n+b`n*** Update File: $root\.wt\repo\task-1\src\b.ts`n@@`n-a`n+b`n*** End Patch"
+$r = Call 'apply_patch' @{ input = $bothSlot; explanation = 'x' }
+Ok ($r.code -eq 0 -and $r.out -notmatch '"deny"') 'multi-file patch wholly inside the slot: allowed'
+$bothShared = "*** Begin Patch`n*** Update File: $root\repo\src\a.ts`n@@`n-a`n+b`n*** Update File: $root\repo\src\b.ts`n@@`n-a`n+b`n*** End Patch"
+$r = Call 'apply_patch' @{ input = $bothShared; explanation = 'x' }
+Ok ($r.out -match '"permissionDecision":"deny"' -and $r.out -match 'src\\\\a\.ts' -and $r.out -match 'src\\\\b\.ts') 'multi-file patch wholly in the shared clone: denied, both paths named'
 Remove-Item Env:AGENTQ_CONFIG
 Remove-Item -Recurse -Force $root
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

@@ -358,15 +358,27 @@ function Get-SharedCloneOverride {
 }
 $script:SharedWarn = $null
 if ($isEditTool) {
-  $wp = $null
+  # EVERY path the call writes, not just the first. A multi-file patch carries one
+  # `*** Update File:` / `*** Add File:` / `*** Delete File:` header per file, and reading only the
+  # first one let ONE tool call write source into the READ-ONLY shared clone while its other hunks
+  # were legitimate (measured 2026-11-25: hunks 1-2 in a leased slot, hunk 3 in E:\gh\codai -- the
+  # guard inspected the slot, allowed the call, and the shared clone was edited by an agent that
+  # believed it was writing in a slot). The verdict further down is therefore WHOLE-CALL: one refused
+  # path refuses the call, because the caller asked for all of them at once.
+  $wps = [System.Collections.Generic.List[string]]::new()
   foreach ($container in $payload.tool_input, $payload.toolInput) {
     if (-not $container -or $container -is [string]) { continue }
-    foreach ($k in 'filePath', 'path', 'file') { if (-not $wp -and $container.PSObject.Properties.Name -contains $k -and $container.$k) { $wp = "$($container.$k)" } }
-    if (-not $wp -and $container.PSObject.Properties.Name -contains 'input' -and "$($container.input)" -match '\*\*\* (?:Update|Add|Delete) File: ([^\r\n]+)') { $wp = $Matches[1].Trim() }
+    foreach ($k in 'filePath', 'path', 'file') { if ($container.PSObject.Properties.Name -contains $k -and $container.$k) { $wps.Add("$($container.$k)") } }
+    if ($container.PSObject.Properties.Name -contains 'input' -and "$($container.input)") {
+      foreach ($m in [regex]::Matches("$($container.input)", '\*\*\* (?:Update|Add|Delete) File: ([^\r\n]+)')) { $wps.Add($m.Groups[1].Value.Trim()) }
+    }
   }
+  # $wp stays the FIRST path: Rule B below and the older single-path readers use it.
+  $wp = if ($wps.Count) { "$($wps[0])" } else { $null }
   $ghRoot = if ($env:CODAI_GH_ROOT) { $env:CODAI_GH_ROOT } else { 'E:\gh' }
-  if ($wp) {
-    $wpn = $wp.Replace('/', '\') -replace '^(?i)file:\\+', ''
+  $scHard = [System.Collections.Generic.List[string]]::new()
+  foreach ($one in $wps) {
+    $wpn = $one.Replace('/', '\') -replace '^(?i)file:\\+', ''
     $rx = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
     if ($wpn -match $rx -and $Matches.repo -ne '.wt') {
       $repoDir = Join-Path $ghRoot $Matches.repo; $rel = $Matches.rel
@@ -396,8 +408,11 @@ if ($isEditTool) {
           } catch { }
         }
         if ($scMode -eq 'refuse' -and -not $scOverride) {
-          [Console]::Error.WriteLine("BLOCKED by guard (HARD, ADR 0004, sharedCloneMode=refuse): $rel is source in the SHARED clone $repoDir, which is read-only for agents. Lease a slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], edit + commit + push there, then unlease. Docs, plans, markdown and .copilot-tmp stay writable here. A deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1 (journaled).")
-          Deny-Exit -HardBlock -HardBlockNote 'source edit in a shared clone that has slots; lease one, or set CODAI_SHARED_CLONE_WRITE_OK=1 for a journaled one-off'
+          # Recorded, not denied here: the verdict belongs to the WHOLE call (flushed after the
+          # loop), so one refused path must not end the scan before the others are classified, and
+          # the message must name every path so the reader sees which hunk was the refused one.
+          $scHard.Add("$rel (in $repoDir)")
+          continue
         }
         if ($scMode -eq 'off' -or $scOverride) { $script:SharedWarn = $null } else {
         $script:SharedWarn = "WARNING (shared clone): editing $rel directly in the SHARED clone $repoDir. Other agents work here too, and a draft left behind after the same work lands from a worktree blocks git-autosync (2026-10-17). Do source work in a leased slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], commit + push from there, then unlease. A deliberate small fix committed right away via agentq commit is fine."
@@ -406,6 +421,12 @@ if ($isEditTool) {
       }
     }
   }
+  if ($scHard.Count) {
+    [Console]::Error.WriteLine("BLOCKED by guard (HARD, ADR 0004, sharedCloneMode=refuse): " + ($scHard -join ' ; ') + " is SOURCE in a SHARED clone, which is read-only for agents.")
+    [Console]::Error.WriteLine("This call names: " + ($wps -join ' , ') + ". A tool call is applied as ONE unit, so a single refused path refuses all of them - the other paths were NOT written either. Put every source path in your leased slot and re-issue the whole call.")
+    [Console]::Error.WriteLine("Lease a slot: pwsh -NoProfile -File `"$env:USERPROFILE\.copilot\bin\agentq.ps1`" lease -Purpose <why> [-Branch <topic>], edit + commit + push there, then unlease. Docs, plans, markdown and .copilot-tmp stay writable here. A deliberate one-off: set CODAI_SHARED_CLONE_WRITE_OK=1 (journaled).")
+    Deny-Exit -HardBlock -HardBlockNote 'at least one path in this call writes source in a shared clone; a call is applied as a unit, so it is refused whole - lease a slot, or set CODAI_SHARED_CLONE_WRITE_OK=1 for a journaled one-off'
+  }
 
   # ---- Rule B: a plan/*.csv written in the shared clone (2026-11-22) -------------------------
   # Plan CSVs are DELIBERATELY exempt from the source-write rule above (they are tracker data an
@@ -413,8 +434,10 @@ if ($isEditTool) {
   # files (plan/dev-cloud-CANONICAL.csv|.md) left uncommitted made git-autosync refuse ("local
   # edit(s) collide with incoming and are still being edited"), and it reverts colliding drafts.
   # WARN, never deny: write the rows in your leased slot, or publish them.
-  if ($wp) {
-    $wpnB = $wp.Replace('/', '\') -replace '^(?i)file:\\+', ''
+  # Same class of bug as above, and the same fix: a multi-file patch can carry a plan/*.csv hunk
+  # beside its source hunks, and only the first header used to be read (2026-11-25).
+  foreach ($oneB in $wps) {
+    $wpnB = $oneB.Replace('/', '\') -replace '^(?i)file:\\+', ''
     $rxB = '(?i)^' + [regex]::Escape($ghRoot.TrimEnd('\')) + '\\(?<repo>[^\\]+)\\(?<rel>.+)$'
     if ($wpnB -match $rxB -and $Matches.repo -ne '.wt') {
       $scRepoWildB = $Matches.repo   # the inner -match below clobbers $Matches
