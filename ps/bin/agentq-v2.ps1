@@ -24,6 +24,8 @@ $script:SlotWorkCache = $null
 # verb (status/log/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
 # comment in agentq.ps1 says was fixed. Verified by ps/tests/test-status-readonly.ps1 (2026-11-22).
 $script:GateExit = $null
+$script:GateFailedMembers = @()
+$script:GateLog = $null
 $script:PregateResult = $null
 
 # ---- policy -------------------------------------------------------------------------------
@@ -1960,7 +1962,7 @@ function Get-LandPregateOn([string]$repoName) {
   [bool]$v
 }
 # Runs the land gate through run-build in $dir. Sets $script:GateExit / $script:GateSec; output flows on.
-function Invoke-GateRun([string]$dir, [string]$purpose) {
+function Invoke-GateRun([string]$dir, [string]$purpose, [string]$repoName) {
   $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
   $sw = [Diagnostics.Stopwatch]::StartNew()
   # Placement of the gate WRAPPER (see Get-GateRunWhere for why `auto` was reverted). A gate whose work
@@ -1973,10 +1975,54 @@ function Invoke-GateRun([string]$dir, [string]$purpose) {
   # (agentq.ps1: explicit -Where beats AGENTQ_WHERE), so pool work still lands on the pool.
   $prevWhere = $env:AGENTQ_WHERE
   if (-not $prevWhere) { $env:AGENTQ_WHERE = Get-GateRunWhere $Gate }
-  try { & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate }
-  finally { if ($prevWhere) { $env:AGENTQ_WHERE = $prevWhere } else { Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue } }
+  # The gate WRAPPER queues on `verify:<repo>`, NOT `build:<repo>` (owner decision 2026-11-26). A land's
+  # gate and that repo's ordinary builds are different kinds of work and must not serialise against each
+  # other: measured 2026-11-26, a codai pre-gate sat on `build:codai [gate] cap 1` behind ordinary builds
+  # (one pre-gate measured 7242 s of which seconds were the gate itself). `verify:<repo>` is a first-class
+  # resource - Resolve-Resource returns a one-colon string literally and Get-Capacity falls back to 1 - and
+  # it is what the fifteen frontiers repositories already use for their land gate ("submitted on the
+  # 'verify' resource because a land already holds build:<repo>", agentq-config.json landGate comment).
+  # run-build still does the execution, the per-repo lock, the log and the wedge watch: AGENTQ_HELD is
+  # pre-seeded with `build:<repo>` so its own re-entry sees that resource already held and runs the command
+  # DIRECTLY instead of taking a second ticket in the build queue (run-build.ps1: `AGENTQ_HELD -notmatch
+  # '(^|,)build:'`). Without a repo name (or without agentq) the old path is used unchanged.
+  $agentqExe = Join-Path $PSScriptRoot 'agentq.ps1'
+  $prevHeld = $env:AGENTQ_HELD
+  $viaVerify = [bool]($repoName -and (Test-Path $agentqExe))
+  if ($viaVerify) { $env:AGENTQ_HELD = (@($prevHeld, "build:$repoName") | Where-Object { $_ }) -join ',' }
+  try {
+    if ($viaVerify) {
+      # `-Purpose` goes to BOTH: agentq uses it for the queue ticket, run-build for the log file name
+      # (and the test double for its own record). Dropping it from the inner call renamed/blanked the
+      # gate's own log and broke ps/tests/test-land-pregate.ps1 case 1 (measured 2026-11-26).
+      & pwsh -NoProfile -File $agentqExe run -Resource "verify:$repoName" -Purpose $purpose -TimeoutMin 120 -Repo $dir -Lane gate -Where $env:AGENTQ_WHERE '--' pwsh -NoProfile -File $rb -Root $dir -Purpose $purpose -Command $Gate
+    } else {
+      & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate
+    }
+  } finally {
+    if ($prevHeld) { $env:AGENTQ_HELD = $prevHeld } else { Remove-Item Env:AGENTQ_HELD -ErrorAction SilentlyContinue }
+    if ($prevWhere) { $env:AGENTQ_WHERE = $prevWhere } else { Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue }
+  }
   $script:GateExit = [int]$LASTEXITCODE
   $script:GateSec = [int][math]::Round($sw.Elapsed.TotalSeconds)
+  # WHICH member failed (2026-11-26). The verdict used to be only the exit code, and the journal line
+  # carried the COMMAND as its reason, so a red pre-gate took four slot scans and two 300 KB logs to
+  # attribute (gate:tracker-k2; bench:evidence-suites + bench:tokenizer-suites). run-build writes the
+  # gate's own log under <dir>/.copilot-tmp/build-logs; read the newest one and name the members that
+  # reported `fail`, so the journal answers "why" without a dig.
+  $script:GateFailedMembers = @()
+  $script:GateLog = $null
+  if ($script:GateExit -ne 0) {
+    try {
+      $ld = Join-Path $dir '.copilot-tmp\build-logs'
+      $last = @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+      if ($last) {
+        $script:GateLog = $last[0].FullName
+        $txt = Get-Content -LiteralPath $last[0].FullName -Raw -ErrorAction SilentlyContinue
+        if ($txt) { $script:GateFailedMembers = @([regex]::Matches($txt, 'gate-run:\s+[\d.]+s\s+(\S+)\s+fail\b') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique) }
+      }
+    } catch {}
+  }
 }
 # Placement for a GATE wrapper (2026-11-26). `auto` lets Resolve-Placement escalate to a cloud workspace
 # when `build:machine` is saturated - right for a command the pool can run, fatal for the gate wrappers
@@ -2233,7 +2279,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     }
     Write-Output "land: pre-gate round $round - '$Gate' on $Branch rebased onto origin/$Onto @ $(Short $tip) (tree $(Short $tree 12)) in $sp, before the land ticket"
     $script:GateExit = 1; $script:GateSec = 0
-    try { Invoke-GateRun $sp "land pregate $Branch" }
+    try { Invoke-GateRun $sp "land pregate $Branch" $repo.Name }
     finally {
       if ($moved) {
         if ($branchNow) { & git -C $sp checkout -q $branchNow 2>$null } else { & git -C $sp checkout -q --detach $head 2>$null }
@@ -2243,8 +2289,22 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
         }
       }
     }
+    # A gate that EXPLODED in under 5 s never judged the tree: 2026-11-26 four DIFFERENT topics were
+    # quarantined in one morning by `exit 64` in 0.1 s (a PowerShell wrapper handed to a Linux pool).
+    # The exit code describes the RUNNER, not the content, so it must not quarantine the topic nor fail
+    # the land: retry ONCE, forced local, and judge only the second verdict. Pre-setting AGENTQ_WHERE is
+    # what forces it - Invoke-GateRun only fills that variable when the caller left it empty.
+    if ($script:GateExit -eq 64 -and $script:GateSec -le 5) {
+      Write-Journal @{ event = 'land-pregate-infra-64'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = "the gate died with 64 in $($script:GateSec)s (a runner/platform failure - nothing of the gate executed); retried once forced local; the topic is not quarantined on this verdict"; repo = $repo.Name }
+      [Console]::Error.WriteLine("land: the pre-gate answered 64 in $($script:GateSec)s - that is the runner, not the tree, so the topic is NOT quarantined on it. Retrying once with the wrapper forced LOCAL.")
+      $prevWhere64 = $env:AGENTQ_WHERE
+      $env:AGENTQ_WHERE = 'local'
+      try { Invoke-GateRun $sp "land pregate $Branch (retry after exit 64)" $repo.Name }
+      finally { if ($prevWhere64) { $env:AGENTQ_WHERE = $prevWhere64 } else { Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue } }
+    }
     if ($script:GateExit) {
-      Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; reason = $Gate; repo = $repo.Name }
+      Write-Journal @{ event = 'land-pregate-failed'; resource = $res; exit = $script:GateExit; branch = $Branch; tree = $tree; durSec = $script:GateSec; members = @($script:GateFailedMembers); log = $script:GateLog; reason = $Gate; repo = $repo.Name }
+      if ($script:GateFailedMembers.Count) { [Console]::Error.WriteLine("land: the pre-gate failed ($($script:GateExit)) in: $($script:GateFailedMembers -join ', ') - log $(if ($script:GateLog) { $script:GateLog } else { '(not found)' })") }
       # The gate ran in the caller's own tree, which carried untracked paths that are not the topic's, so
       # the failure may not be the topic's either. Quarantining on it would block a green topic for 6 h and
       # failing the land would make the agent chase a defect it does not have: hand the verdict to the
@@ -2258,7 +2318,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
       # B) Quarantine the topic so no later land re-absorbs it into the cap-1 mutex batch (see the block
       # above Get-LandQuarantineFile). A fresh, passing pre-gate clears it (Invoke-Land).
       Set-LandQuarantine $repo.Name $Branch $tree "$Gate (exit $($script:GateExit))"
-      Write-Journal @{ event = 'land-pregate-quarantined'; resource = $res; branch = $Branch; tree = $tree; reason = "$Gate failed (exit $($script:GateExit)); the topic is quarantined so a batch will not absorb it"; repo = $repo.Name }
+      Write-Journal @{ event = 'land-pregate-quarantined'; resource = $res; branch = $Branch; tree = $tree; members = @($script:GateFailedMembers); log = $script:GateLog; reason = "$Gate failed (exit $($script:GateExit))$(if ($script:GateFailedMembers.Count) { " in $($script:GateFailedMembers -join ', ')" }); the topic is quarantined so a batch will not absorb it"; repo = $repo.Name }
       [Console]::Error.WriteLine("land: gate failed ($($script:GateExit)) for $Branch rebased onto origin/$Onto running '$Gate', BEFORE the queue - nothing queued, nothing pushed. Fix it in the slot and land again. (AGENTQ_LAND_NO_PREGATE=1 runs the gate in the queue instead.)")
       $script:PregateResult = 'failed'; return
     }
@@ -2546,11 +2606,12 @@ function Invoke-LandSet([object[]]$set) {
         Write-Output "land: gate skipped for $names - tree $(Short $gateTree 12) already passed '$Gate' ($($green['where']), $($green['at']))"
       } else {
         $script:GateExit = 1; $script:GateSec = 0
-        Invoke-GateRun $wt "land gate $names"
+        Invoke-GateRun $wt "land gate $names" $repo.Name
         $gx = $script:GateExit
         if ($script:LandAcc) { $script:LandAcc.gateRuns = [int]$script:LandAcc.gateRuns + 1; $script:LandAcc.gateSec = [int]$script:LandAcc.gateSec + [int]$script:GateSec }
         if ($gx) {
-          Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
+          Write-Journal @{ event = 'land-gate-failed'; resource = $res; exit = $gx; members = @($script:GateFailedMembers); log = $script:GateLog; reason = $Gate; paths = @($picked | ForEach-Object { $_.branch }); repo = $repo.Name }
+          if ($script:GateFailedMembers.Count) { [Console]::Error.WriteLine("land: the gate failed ($gx) in: $($script:GateFailedMembers -join ', ') - log $(if ($script:GateLog) { $script:GateLog } else { '(not found)' })") }
           [Console]::Error.WriteLine("land: gate failed ($gx) for $names - '$Gate' exited non-zero; nothing pushed")
           $o.failExit = 6; return
         }

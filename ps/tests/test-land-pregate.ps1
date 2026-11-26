@@ -13,7 +13,10 @@ $env:AGENTQ_SESSION = 'test-pg'
 $env:AGENTQ_RUN_BUILD = Join-Path $PSScriptRoot 'fake-gate.ps1'
 $env:FAKE_GATE_LOG = Join-Path $tmp 'gates.log'
 $env:FAKE_GATE_TREE_LOG = Join-Path $tmp 'gate-trees.log'
-foreach ($v in 'FAKE_GATE_HOLD', 'AGENTQ_LAND_NO_PREGATE', 'AGENTQ_NO_GREEN') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+$env:FAKE_GATE_WHERE_LOG = Join-Path $tmp 'gate-where.log'
+# A parent AGENTQ_WHERE would win over the placement rule under test (case D), so it is cleared here and
+# every case judges the decision agentq makes on its own.
+foreach ($v in 'FAKE_GATE_HOLD', 'AGENTQ_LAND_NO_PREGATE', 'AGENTQ_NO_GREEN', 'AGENTQ_WHERE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NAME = 't'; $env:GIT_COMMITTER_EMAIL = 't@t'
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $fail = 0
@@ -433,6 +436,9 @@ exit 0
   Check 'A a dirty scratch slot is reset to the target ref before the gate judges it' ($reset1.Count -eq 1 -and "$($reset1[0].reason)" -match 'dirty when leased; reset' -and $trees1.Count -eq 1 -and "$($trees1[0].root)" -match 'scratch-\d+$') ("$o || reset=" + (($reset1 | ConvertTo-Json -Compress)))
   Check 'A ... no generic skip, the gate runs, the topic lands' ($code -eq 0 -and (Remote 'pA1.txt') -eq 'pA1' -and @(Ev 'land-pregate-skipped' 'pA1').Count -eq 0 -and @(Gates '^land gate pA1').Count -eq 0) $o
   Check 'A ... and the slot it reset is clean when the gate sees it' ($trees1.Count -eq 1 -and -not @(git -C "$($trees1[0].root)" status --porcelain 2>$null | Where-Object { $_ })) ((git -C "$($trees1[0].root)" status --porcelain 2>$null) -join ' / ')
+  # the other half of case D: a gate that is NOT a PowerShell wrapper still lets Resolve-Placement decide
+  $wA = @(if (Test-Path -LiteralPath $env:FAKE_GATE_WHERE_LOG) { Get-Content -LiteralPath $env:FAKE_GATE_WHERE_LOG | Where-Object { $_ -match '^land pregate pA1\|' } })
+  Check 'A ... and a non-PowerShell gate still places as auto (not always local)' (@($wA | Where-Object { $_ -match '\|auto$' }).Count -eq 1) ("where=" + ($wA -join ' / '))
   git -C $repo checkout -q -B pA2 origin/dev
   Set-Content (Join-Path $repo 'pA2.txt') 'pA2'; git -C $repo add pA2.txt; git -C $repo commit -qm 'topic pA2'; git -C $repo push -q origin pA2 2>$null
   git -C $repo checkout -q dev
@@ -446,6 +452,22 @@ exit 0
     if ($lk -and $lk.path -and $lk.leaseId) { $null = AQ unlease -Repo "$($lk.path)" -LeaseId "$($lk.leaseId)" -Force -Reason 'test A cleanup' }
   }
   Remove-Item Env:FAKE_PREP_DIRT -ErrorAction SilentlyContinue; $env:AGENTQ_NO_PREP = '1'
+
+  # D. PLACEMENT (2026-11-26). Every `landGate.<repo>` we declare is `pwsh -NoProfile -File <script>`, and
+  #    run-build ships THAT STRING to the workspace run it placed: with `auto` it escalated to the pool
+  #    whenever build:machine was saturated, the Linux pool answered 64 in 0.1 s having executed nothing,
+  #    and agentq read the 64 as a pre-gate failure - the land failed BEFORE the queue and the topic was
+  #    QUARANTINED, so no later batch absorbed it either (a lane that looked held for a runner's exit
+  #    code). A PowerShell host command is Windows-only, so its wrapper must never leave this machine.
+  "{`"taskSlotsPerRepo`":15,`"taskSlotsMachine`":17,`"scratchSlotsMax`":3,`"minFreeCommitGB`":0,`"landGate`":{`"$repoName`":`"pwsh -NoProfile -File scripts/devcloud/gate.ps1`"}}" | Set-Content $cfg
+  git -C $repo fetch -q origin; git -C $repo checkout -q -B pW origin/dev
+  Set-Content (Join-Path $repo 'pW.txt') 'pW'; git -C $repo add pW.txt; git -C $repo commit -qm 'topic pW'; git -C $repo push -q origin pW 2>$null
+  git -C $repo checkout -q dev
+  $o = AsSession 'pgW' { LandFrom $repo @('-Branch', 'pW', '-Purpose', 'land pW') }
+  $wD = @(if (Test-Path -LiteralPath $env:FAKE_GATE_WHERE_LOG) { Get-Content -LiteralPath $env:FAKE_GATE_WHERE_LOG | Where-Object { $_ -match '^land pregate pW\|' } })
+  Check 'D a PowerShell gate wrapper is never cloud-placed (where=local)' ($wD.Count -eq 1 -and @($wD | Where-Object { $_ -match '\|local$' }).Count -eq 1) ("$o || where=" + ($wD -join ' / '))
+  Check 'D ... and that land still gates and lands' ($code -eq 0 -and (Remote 'pW.txt') -eq 'pW') $o
+  Cfg   # the fixture's own gate back for anything after
 
   # C. a land started from a DIFFERENT clone of the same repo (the `land` slot is one per repo NAME, owned
   #    by whichever clone created it) is refused EARLY, naming both clones, instead of dying inside
@@ -463,7 +485,7 @@ exit 0
   Check 'C ... journal land-wrong-clone names the resolved clone, the owner clone and the slot' ($wcev.Count -eq 1 -and "$($wcev[0].clone)" -match [regex]::Escape($other) -and "$($wcev[0].owner)" -match [regex]::Escape($repo)) (Ev 'land-wrong-clone' | ConvertTo-Json -Compress)
   Check 'C ... nothing was queued and no gate ran' (@(Journal | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -eq "land:$repoName" }).Count -eq $nQ -and @(Gates '.').Count -eq $nG) ("queued now=$(@(Journal | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -eq "land:$repoName" }).Count) was=$nQ ; gates now=$(@(Gates '.').Count) was=$nG")
 } finally {
-  foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'FAKE_GATE_TREE_LOG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_FLAKES', 'AGENTQ_NO_POSTLAND', 'AGENTQ_LAND_BATCH', 'AGENTQ_LAND_NO_PREGATE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_RUN_BUILD', 'FAKE_GATE_LOG', 'FAKE_GATE_TREE_LOG', 'FAKE_GATE_WHERE_LOG', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_FLAKES', 'AGENTQ_NO_POSTLAND', 'AGENTQ_LAND_BATCH', 'AGENTQ_LAND_NO_PREGATE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$tmp`"" 2>$null
 }
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

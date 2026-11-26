@@ -20,7 +20,8 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Ps = (Join-Path $PSScriptRoot '..'),
-    [string]$Allow = (Join-Path $PSScriptRoot 'land-gate-pool.allow.json')
+    [string]$Allow = (Join-Path $PSScriptRoot 'land-gate-pool.allow.json'),
+    [string]$V2 = (Join-Path $PSScriptRoot '..\bin\agentq-v2.ps1')
 )
 $ErrorActionPreference = 'Continue'
 $pass = 0; $fail = 0
@@ -124,6 +125,151 @@ try {
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- WHERE THE WRAPPER RUNS, not just where the work runs (class #3, 2026-11-26) -------------------
+# The rule above answers "does this gate delegate its WORK to the pool". This one answers a second,
+# independent question: does the WRAPPER itself run on a host that can execute it. Getting the first
+# right and the second wrong is what held land:codai for hours on 2026-11-26: agentq forced
+# AGENTQ_WHERE=auto, run-build.ps1 (which carries no platform knowledge of the workspace) shipped the
+# PowerShell wrapper to ws-codai, Linux answered `exit 64` in 0.1 s, and agentq - reading 64 as a
+# PRE-gate failure - quarantined every topic before a land ticket existed. Invoke-GateRun now asks
+# Get-GateRunWhere; this ratchet keeps that honest for a repo that acquires a PowerShell gate later.
+# The host set is written HERE as an independent literal, so removing a host from the helper (or
+# classifying it as `auto`) turns this suite red instead of silently reopening the hole.
+$winHosts = @('pwsh', 'powershell', 'powershell_ise', 'cmd')
+Check 'the Windows-only host set is non-trivial (4 hosts)' ($winHosts.Count -ge 4) "count=$($winHosts.Count)"
+
+# One finding per landGate whose classification disagrees with its first token. `$Classify` is injected
+# so the rule can be mutated in-process (a checker that cannot fail is not a check).
+function Get-GatePlacementFindings($LandGate, $Classify) {
+    $f = @()
+    if (-not ($LandGate -is [Collections.IDictionary])) { return @('landGate is not a map') }
+    foreach ($k in @($LandGate.Keys | Sort-Object)) {
+        if ("$k".StartsWith('_')) { continue }
+        $cmd = "$($LandGate[$k])".Trim()
+        if (-not $cmd) { continue }   # an empty entry is the other rule's finding, not this one's
+        $first = @($cmd -split '\s+' | Where-Object { $_ })[0]
+        $leaf = @(($first -replace '(?i)\.(exe|cmd|bat|ps1)$', '').ToLowerInvariant() -split '[\\/]' | Where-Object { $_ })[-1]
+        $want = if ($winHosts -contains $leaf) { 'local' } else { 'auto' }
+        $got = "$(& $Classify $cmd)"
+        if ($got -ne $want) { $f += "$k : first token '$leaf' is placed '$got' but must be '$want'" }
+    }
+    @($f)
+}
+
+# The rule is taken as TEXT out of the real file and evaluated in a sandbox scriptblock. Dot-sourcing
+# agentq-v2.ps1 is not an option in an offline suite: the file runs top-level statements that need the
+# CLI's own state and die with "Cannot bind argument to parameter 'Path' because it is null" (measured
+# 2026-11-26). Extracting the function keeps this suite read-only and still tests the REAL text - if the
+# function is renamed or deleted the extraction below fails closed.
+$helperLoaded = $false
+$probe = $null
+Check "the placement helper is readable ($V2)" (Test-Path -LiteralPath $V2)
+if (Test-Path -LiteralPath $V2) {
+    $v2Text = Get-Content -LiteralPath $V2 -Raw
+    $m = [regex]::Match($v2Text, '(?ms)^function\s+Get-GateRunWhere\b.*?^}')
+    if ($m.Success) {
+        try {
+            # `$args[0]` is the scriptblock's own argument list, so the call needs no quoting of the
+            # gate command (tokens contain spaces and backslashes).
+            $probe = [ScriptBlock]::Create($m.Value + "`nGet-GateRunWhere `$args[0]")
+            $helperLoaded = "$(& $probe 'pwsh -File x.ps1')" -eq 'local'
+        } catch {
+            Note "evaluating the extracted rule failed: $($_.Exception.Message)"
+        }
+    }
+    else { Note "no 'function Get-GateRunWhere' in $V2 - the rule was renamed or removed" }
+}
+Check 'the placement rule extracted from agentq-v2.ps1 works (a pwsh gate is local)' $helperLoaded
+
+if ($helperLoaded) {
+    function Invoke-GateRunWhere([string]$Command) { "$(& $probe $Command)" }
+    # The table: both sides of the rule, in the forms a gate is actually written in.
+    foreach ($h in @('pwsh', 'powershell', 'PWSh.EXE', 'cmd', 'cmd.exe', 'C:\Windows\System32\cmd.exe')) {
+        $dec = Invoke-GateRunWhere "$h -NoProfile -File scripts/devcloud/gate.ps1"
+        Check "Get-GateRunWhere places '$h' as local" ($dec -eq 'local') "got '$dec'"
+    }
+    foreach ($p in @('bash', 'sh', 'pnpm', 'node')) {
+        $dec = Invoke-GateRunWhere "$p scripts/devcloud/gate.sh"
+        Check "Get-GateRunWhere leaves '$p' as auto (the pool may take it)" ($dec -eq 'auto') "got '$dec'"
+    }
+    Check "Get-GateRunWhere leaves an empty gate as auto" ((Invoke-GateRunWhere '') -eq 'auto')
+
+    # ...and the real config must AGREE. A new repo with a `cmd /c` or a fully-qualified pwsh gate lands here.
+    $place = @(Get-GatePlacementFindings $landGate { param($c) Invoke-GateRunWhere $c })
+    Check "every landGate wrapper is placed for its own host ($($repos.Count) repos)" ($place.Count -eq 0) ($place -join '; ')
+    foreach ($p in $place) { Note "misplaced land gate: $p" }
+
+    # MUTATION: the checker itself must reject a wrapper placed for the wrong host, both ways round.
+    $synthWin = @{ 'poolrepo' = 'pwsh -NoProfile -File scripts/devcloud/gate.ps1' }
+    $m1 = @(Get-GatePlacementFindings $synthWin { param($c) 'auto' })
+    Check 'MUTATION a pwsh wrapper placed auto is DETECTED (red)' (@($m1 | Where-Object { $_ -match '^poolrepo ' }).Count -eq 1) "findings=$($m1 -join '; ')"
+    $m2 = @(Get-GatePlacementFindings $synthWin { param($c) 'local' })
+    Check 'MUTATION the same wrapper PASSES once placed local' (@($m2 | Where-Object { $_ -match '^poolrepo ' }).Count -eq 0) "findings=$($m2 -join '; ')"
+    $synthPosix = @{ 'poolrepo2' = 'bash scripts/devcloud/gate.sh' }
+    $m3 = @(Get-GatePlacementFindings $synthPosix { param($c) 'local' })
+    Check 'MUTATION a POSIX gate forced local is DETECTED (the rule is two-sided)' (@($m3 | Where-Object { $_ -match '^poolrepo2 ' }).Count -eq 1) "findings=$($m3 -join '; ')"
+}
+else {
+    # Fail closed: without the helper loaded, the checks above are the ones that matter and they did not run.
+    Check 'the placement rule could be evaluated (helper loaded)' $false 'agentq-v2.ps1 did not define Get-GateRunWhere'
+}
+
+# --- WHERE THE GATE QUEUES, and what a runner crash may NOT do (2026-11-26, owner) -----------------
+# Two independent regressions, both measured on 2026-11-26:
+#  (A) the gate queued on `build:<repo>` (cap 1) - the land lane and that repo's ordinary build lane
+#      serialised against each other (one pre-gate measured 7242 s in the queue). It must queue on
+#      `verify:<repo>` while STILL executing through run-build.ps1 (lock, log, wedge watch): the
+#      AGENTQ_HELD pre-seed is what stops run-build from taking a second ticket.
+#  (B) `exit 64` in 0.1 s - a PowerShell wrapper shipped to a Linux pool - quarantined four different
+#      topics in one morning, because the exit code of the RUNNER was read as a verdict on the TREE.
+#      It must journal land-pregate-infra-64, retry once with the wrapper forced LOCAL, and only the
+#      second verdict may reach Set-LandQuarantine.
+# Both are checked as TEXT of the real file and both carry a mutation, so flipping either back turns
+# this suite red instead of silently reopening the hole.
+if (-not $v2Text) { $v2Text = '' }
+
+function Get-GateQueueFindings([string]$Text) {
+    $f = @()
+    $m = [regex]::Match($Text, '(?ms)^function\s+Invoke-GateRun\b.*?^}')
+    if (-not $m.Success) { return @('Invoke-GateRun is gone from agentq-v2.ps1') }
+    $g = $m.Value
+    if ($g -notmatch '-Resource\s+"verify:\$repoName"') { $f += 'the gate does not queue on verify:<repo> (a land gate serialises against that repo''s builds again)' }
+    if ($g -notmatch '"-File",|pwsh -NoProfile -File \$rb -Root \$dir') { $f += 'the gate no longer executes through run-build.ps1 (the lock, the log and the wedge watch are lost)' }
+    if ($g -notmatch '"build:\$repoName"') { $f += 'AGENTQ_HELD is not pre-seeded with build:<repo>, so run-build takes a SECOND ticket in the build queue' }
+    if ($g -notmatch '(?s)\$prevWhere = \$env:AGENTQ_WHERE.*?if \(-not \$prevWhere\)') { $f += 'AGENTQ_WHERE is filled unconditionally - the forced-local retry would stop working' }
+    @($f)
+}
+
+$qFind = @(Get-GateQueueFindings $v2Text)
+Check 'the land gate queues on verify:<repo> and still runs through run-build (no build-lane serialisation)' ($qFind.Count -eq 0) ($qFind -join '; ')
+foreach ($p in $qFind) { Note "gate placement regression: $p" }
+
+# MUTATION: put it back on build:<repo> and the same checker must go red.
+$qMut = $v2Text -replace [regex]::Escape('-Resource "verify:$repoName"'), '-Resource "build:$repoName"'
+$qMutFind = @(Get-GateQueueFindings $qMut)
+Check 'MUTATION a build:<repo> placement is DETECTED (red)' ($qMutFind.Count -ge 1) "findings=$($qMutFind -join '; ')"
+# MUTATION: a run-build invocation that no longer pre-seeds AGENTQ_HELD must also be caught.
+$qMut2 = $v2Text -replace [regex]::Escape('$env:AGENTQ_HELD = (@($prevHeld, "build:$repoName")'), '$env:AGENTQ_HELD = (@($prevHeld, "x:$repoName")'
+Check 'MUTATION dropping the AGENTQ_HELD pre-seed is DETECTED (red)' (@(Get-GateQueueFindings $qMut2).Count -ge 1) ''
+
+# The exit-64 escape hatch: the retry must sit BETWEEN the 64 verdict and the quarantine block, and the
+# quarantine call itself must still exist after it (otherwise `-notmatch` would pass vacuously).
+$i64 = $v2Text.IndexOf('land-pregate-infra-64')
+$iQ = $v2Text.IndexOf('land-pregate-quarantined')
+Check 'the exit-64 escape hatch exists in the pre-gate' ($i64 -gt 0) 'no land-pregate-infra-64 journal event'
+Check 'the escape hatch sits BEFORE the quarantine event (the order is what makes it an escape)' ($i64 -gt 0 -and $iQ -gt $i64) "i64=$i64 iQ=$iQ"
+$win64 = if ($i64 -gt 0 -and $iQ -gt $i64) { $v2Text.Substring($i64, $iQ - $i64) } else { '' }
+Check 'exit 64 in <=5 s forces AGENTQ_WHERE=local for the retry' ($win64 -match "AGENTQ_WHERE = 'local'")
+# NOTE: these patterns must stay SINGLE-quoted. In a double-quoted string `\$sp` does NOT escape the
+# dollar - PowerShell interpolates `$sp`/`$repo` (empty here) and the regex silently matches nothing.
+Check 'exit 64 retries the pre-gate once, with the repo name' ($win64 -match 'Invoke-GateRun \$sp .*\$repo\.Name')
+$iRetry = $win64.IndexOf("(retry after exit 64)")
+$iSetQ = $win64.IndexOf('Set-LandQuarantine $repo.Name $Branch')
+Check 'exit 64 does not fail the topic before the retry (no PregateResult = failed in the 64 block)' ($iRetry -gt 0 -and ($win64.Substring(0, $iRetry) -notmatch "PregateResult = 'failed'"))
+Check 'MUTATION guard: the quarantine call exists AFTER the retry in the same window (the check above is not vacuous)' ($iSetQ -gt $iRetry -and $iRetry -gt 0) "retry@$iRetry setQ@$iSetQ"
+# ...and the failure journal must NAME the member, not just the command.
+Check 'a failed pre-gate journals the failing member(s) and the log path' ($v2Text -match '(?s)land-pregate-failed.{0,400}members = @\(\$script:GateFailedMembers\)')
 
 Write-Output "land gate pool: pass=$pass fail=$fail"
 if ($fail) { exit 1 } else { Write-Output 'ALL PASS'; exit 0 }
