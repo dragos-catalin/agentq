@@ -71,6 +71,18 @@ Tests: `ps/tests/test-land-pregate.ps1` case 6 + new case 6b — `69 pass / 0 fa
    `powershell.exe` (433 ms p50). Ranked fixes (min/day at 41,776 calls): gate AXIOM to write-tools only 78–210;
    short-circuit the signal DELETE 143; slim `guard-tooluse` 173; a resident daemon/node entry removes the
    5.65 h spawn share; fewer+bigger reads halve the rest. F1–F3 are local edits ≈ 6.5 h/day.
+   **2026-11-26 follow-up - the metric above was partly a lie.** From 2026-11-25 the resident hook host ran
+   `hook-pre.ps1` in its own process and that script derived `startMs` from `GetCurrentProcess().StartTime`,
+   i.e. the HOST'S UPTIME: `agentq slo` printed `hook cost 318 162 h/day`, 7 874 of today's 21 489 lines
+   carried a `startMs` over 1 h, max 29.2 h. The 5.65 h/day "process spawn" share above is therefore partly
+   the server's age, not a spawn cost. Fixed at the source: the server passes `CODAI_HOOK_REQUEST_MS` per
+   request (plus `CODAI_HOOK_RESIDENT=1`), `hook-pre.ps1` writes `startMs` **null** when a host gives no
+   receipt time, `agentq-slo.mjs` FLAGS lines over 1 h (never clamps them) and names this fix, the resident
+   tooling is now version-controlled in `ps/hooks/resident`, and `install.ps1` restarts the server after a
+   guard change (the host parsed `hook-pre.ps1` once at startup - that staleness is why the first fix
+   attempt did not take). Measured 08:15Z->08:20Z after the restart: 75 calls, `startMs` max 1 719 ms,
+   avg 496 ms, total `ms + startMs` 166 s = ~2.2 s/call. At ~70 k calls/day the PHYSICAL hook cost is
+   still tens of h/day: the ranked fixes below stand, and `< 2 h/day` is genuinely unmet, not unmeasurable.
 8. **brivio staging builder — root-caused 2026-11-23: genuinely slow, NOT stuck.** The local `cpuSec` ~1050 only
    counts the node process streaming the remote VM log; the work runs on a spot n2d-standard-32 VM. ~90 min =
    ~4 min bundle/VM + **~60 min deploy phase** (~24 min Next.js web image build, turbo `@brivio/web:build` ~1454 s,

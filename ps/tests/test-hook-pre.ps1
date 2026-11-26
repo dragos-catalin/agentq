@@ -198,6 +198,14 @@ try {
   Remove-Item Env:CODAI_HOOK_REQUEST_MS -ErrorAction SilentlyContinue
   $marked = @(Cost-Lines) | Where-Object { $null -ne $_.startMs } | Select-Object -Last 1
   Ok ($marked -and [double]$marked.startMs -ge 3500000 -and [double]$marked.startMs -lt 4000000) 'cost log: CODAI_HOOK_REQUEST_MS is the origin of startMs (not the process start)' ($marked | ConvertTo-Json -Compress)
+  # 2026-11-26: a HOST runs this script in its own process, where GetCurrentProcess().StartTime is the
+  # HOST's uptime - the field reached 318 162 h/day in `agentq slo` that way (>1420x). With the resident
+  # marker set and NO receipt time the field must be null (the header's contract), never the host uptime.
+  $env:CODAI_HOOK_RESIDENT = '1'
+  [void](Invoke-Hook ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }))
+  Remove-Item Env:CODAI_HOOK_RESIDENT -ErrorAction SilentlyContinue
+  $residentLine = @(Cost-Lines) | Select-Object -Last 1
+  Ok ($residentLine -and $null -eq $residentLine.startMs -and $residentLine.tool -eq 'read_file') 'cost log: resident marker with no receipt time writes startMs null (never the host uptime)' ($residentLine | ConvertTo-Json -Compress)
   Ok (@($cl | Where-Object { $_.tool -eq 'bash' -and $_.deny }).Count -ge 1) 'cost log: the CLI dialect (exit-code deny) is logged too'
   # Re-read: the cases above (the marker case included) write lines AFTER $cl was captured.
   $n0 = @(Cost-Lines).Count

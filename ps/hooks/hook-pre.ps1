@@ -24,9 +24,13 @@
   Cost log (OQ-012): every call appends one line to <coord>/hooks/cost-yyyyMMdd.jsonl
   ({ ts, ms, startMs, tool, deny, session }): ms = time spent in this script, startMs = from the call
   reaching this process to the first line of the script (the part a resident daemon removes). On the
-  resident path the daemon runs this script IN-PROCESS, so the process start is server uptime, not this
-  call (2026-11-25: startMs 12 951 812 ms = 3.6 h while ms stayed ~100); the daemon must pass the request
-  receipt time as CODAI_HOOK_REQUEST_MS (epoch ms), and without a number the field is null, not a lie.
+  resident path the daemon runs this script IN-PROCESS, so the process start is server UPTIME, not this
+  call (2026-11-25: startMs 82 425 070 ms == the server's uptime while ms stayed ~800, and `agentq slo`
+  read it as 318 162 h/day). A host must therefore (a) set CODAI_HOOK_RESIDENT=1 so the in-process case
+  is detectable and (b) pass the request receipt time as CODAI_HOOK_REQUEST_MS (epoch ms); without a
+  number the field is null, not a lie - NEVER the host's uptime. A host parses this file ONCE at
+  startup, so a change here reaches the resident path only after the host is replaced (install.ps1 now
+  restarts it; that staleness is why the defect outlived the first fix attempt).
   `agentq slo` sums it. Best effort: it can neither change a decision nor fail the call.
   AGENTQ_NO_HOOK_COST=1 turns it off.
 #>
@@ -34,13 +38,22 @@ $ErrorActionPreference = 'Continue'
 $hookSw = [Diagnostics.Stopwatch]::StartNew()
 $hookStartMs = $null
 try {
+  # Hosted (the resident server runs this script in ITS process) or fresh? Two independent signals,
+  # because one alone has been wrong before: the host sets CODAI_HOOK_RESIDENT=1, and its command line
+  # names the script that hosts the guard. Under the classic path (a fresh `powershell.exe -File
+  # hook-pre.ps1` per call) both are false and the process start IS the call's arrival; under a host
+  # both are true, so a process-start value would be the HOST'S UPTIME, not this call.
+  $resident = ($env:CODAI_HOOK_RESIDENT -eq '1') -or ([Environment]::CommandLine -match 'resident-server')
   $reqMs = $env:CODAI_HOOK_REQUEST_MS
   if ($reqMs -and $reqMs -match '^\d{10,}$') {
+    # The host passes the request's receipt time; that, not the process, is the call's arrival.
     $hookStartMs = [math]::Round(([DateTime]::Now - [DateTimeOffset]::FromUnixTimeMilliseconds([long]$reqMs).LocalDateTime).TotalMilliseconds)
-  } elseif ([Environment]::CommandLine -notmatch 'resident-server') {
+  } elseif (-not $resident) {
     # A fresh process per call: its creation IS the moment the call arrived.
     $hookStartMs = [math]::Round(([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds)
   }
+  # else: hosted with no receipt time -> leave $null. The contract is explicit above: without a number
+  # the field is null, not a lie. Never fall back to the host's uptime.
 } catch { }
 $raw = ''
 try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' }

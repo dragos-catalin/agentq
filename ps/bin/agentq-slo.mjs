@@ -51,6 +51,11 @@ export const TARGETS = {
     liveChatIdleMin: 30,
 };
 const INTEGRATION = new Set(["main", "master", "dev"]);
+// A hook call arrives at most a few seconds before its script's first line runs; a process-start value
+// an hour old can only be a LONG-LIVED HOST's uptime leaking into the field (2026-11-26: the resident
+// server recorded its own uptime, and `hook cost` read 318 162 h/day). Flagged, never clamped - a bound
+// that silently corrected the sum would hide the defect instead of showing it.
+const IMPLAUSIBLE_START_MS = 3_600_000;
 const LAND_FAIL = {
     "land-conflict": "conflict",
     "land-push-failed": "pushRefused",
@@ -437,7 +442,7 @@ function parseDayLine(line) {
 }
 
 export async function computeHookCost(lines, { start, end }) {
-    const byDay = new Map(); // YYYY-MM-DD (UTC) -> { cost: [], startMs: [], denies }
+    const byDay = new Map(); // YYYY-MM-DD (UTC) -> { cost: [], startMs: [], denies, implausible }
     let badLines = 0;
     for await (const line of lines) {
         const p = parseDayLine(line);
@@ -448,28 +453,33 @@ export async function computeHookCost(lines, { start, end }) {
         }
         if (p.t < start || p.t > end) continue;
         const day = new Date(p.t).toISOString().slice(0, 10);
-        if (!byDay.has(day)) byDay.set(day, { cost: [], startMs: [], denies: 0 });
+        if (!byDay.has(day)) byDay.set(day, { cost: [], startMs: [], denies: 0, implausible: 0 });
         const d = byDay.get(day);
         const hasStart = Number.isFinite(p.o.startMs) && p.o.startMs >= 0;
         d.cost.push(p.o.ms + (hasStart ? p.o.startMs : 0));
-        if (hasStart) d.startMs.push(p.o.startMs);
+        if (hasStart) {
+            d.startMs.push(p.o.startMs);
+            if (p.o.startMs > IMPLAUSIBLE_START_MS) d.implausible++;
+        }
         if (p.o.deny === true) d.denies++;
     }
-    const row = (cost, startMs, denies) => ({
+    const row = (cost, startMs, denies, implausible) => ({
         calls: cost.length,
         totalHours: sum(cost) / 3.6e6,
         p50Ms: pct(cost, 50),
         p90Ms: pct(cost, 90),
         startP50Ms: pct(startMs, 50),
         denies,
+        implausible,
     });
     const days = [...byDay]
         .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-        .map(([day, d]) => ({ day, ...row(d.cost, d.startMs, d.denies) }));
+        .map(([day, d]) => ({ day, ...row(d.cost, d.startMs, d.denies, d.implausible) }));
     const all = row(
         [...byDay.values()].flatMap((d) => d.cost),
         [...byDay.values()].flatMap((d) => d.startMs),
         sum([...byDay.values()].map((d) => d.denies)),
+        sum([...byDay.values()].map((d) => d.implausible)),
     );
     return {
         days,
@@ -480,6 +490,7 @@ export async function computeHookCost(lines, { start, end }) {
         p90Ms: all.p90Ms,
         startP50Ms: all.startP50Ms,
         denies: all.denies,
+        implausible: all.implausible,
         badLines,
     };
 }
@@ -1001,6 +1012,10 @@ export function render(rep) {
             ),
         );
         out.push(`${fh(hc.hoursPerDay, 2)} h/day over ${hc.days.length} day(s) with data; ${hc.badLines} bad lines`);
+        if (hc.implausible)
+            out.push(
+                `  ! ${hc.implausible} of ${hc.calls} lines carry a startMs over ${IMPLAUSIBLE_START_MS / 3600000} h: a long-lived host is recording its own UPTIME as the call's start, so this number is not measurable. Fix the host (ps/hooks/hook-pre.ps1 / resident/resident-server.ps1), do not clamp it here.`,
+            );
     }
     out.push(
         `\nSTART PROBE (5-minute buckets, bucket = median start latency, good < ${TARGETS.startProbeBucketMs} ms)`,
