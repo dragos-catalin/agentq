@@ -6,17 +6,11 @@
     "codai": 2
   },
   "pinned": {
-    "codai": [
-      "db-live"
-    ],
-    "brivio": [
-      "qa-prod"
-    ]
+    "codai": ["db-live"],
+    "brivio": ["qa-prod"]
   },
   "autosync": {
-    "daemons": [
-      "git-autosync"
-    ],
+    "daemons": ["git-autosync"],
     "repos": [
       "E:\\gh\\codai",
       "E:\\gh\\brivio",
@@ -152,7 +146,9 @@
       "install wiring",
       "land gate pool",
       "status readonly",
-      "slot budget"
+      "slot budget",
+      "prewarm verb",
+      "prewarm cloud"
     ]
   },
   "sharedCloneMode": "warn",

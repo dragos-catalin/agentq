@@ -180,6 +180,27 @@ Check 'an unmeasurable workspace is left alone' (($r.Exit -eq 0) -and (Contains 
 Check 'a tick that fails to measure still leaves a heartbeat' ((Test-Path -LiteralPath $tickLog2) -and ((Get-Content -LiteralPath $tickLog2 -Raw) -match 'tick ws='))
 $env:FAKE_VM_STATE = 'SUSPENDED'
 
+# 12. The scheduled task has to run the copy that is installed. A task's action records a path, and a
+# path recorded by hand points wherever it was typed: the registered task on this machine named the
+# SOURCE checkout E:\gh\agentq\ps\bin\prewarm-cloud.ps1 (measured 2026-11-26), so every unattended tick
+# ran whatever was uncommitted in the tree under edit - and a tick that runs the wrong file still writes
+# a healthy-looking log, so nothing else reports it. -TaskFile is the seam that proves the guard with no
+# scheduled task involved, and a task that is not registered is not a failure: nothing points at any
+# copy, so there is nothing to refuse.
+$elsewhere = Join-Path $tmp 'someone-elses\prewarm-cloud.ps1'
+$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $elsewhere)
+'# not the tool' | Set-Content -LiteralPath $elsewhere -Encoding utf8
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $target)
+Check 'the task guard accepts the copy it was told about' (($r.Exit -eq 0) -and (Contains $r.Out 'runs this copy'))
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $elsewhere)
+Check 'the task guard refuses a foreign copy' (($r.Exit -eq 1) -and (Contains $r.Out 'runs a DIFFERENT copy'))
+Check 'the refusal names the copy that would run' (Contains $r.Out $elsewhere)
+Check 'the refusal names the one-line fix' (Contains $r.Out '-RepairTask')
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskName', 'aq-no-such-task-xyz')
+Check 'an unregistered task is not a failure' (($r.Exit -eq 0) -and (Contains $r.Out 'not registered'))
+$r = Invoke-Prewarm @('-RepairTask', '-TaskFile', $elsewhere)
+Check 'a repair refuses to run from the test seam' (($r.Exit -eq 2) -and (Contains $r.Out 'cannot run from -TaskFile'))
+
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "prewarm: $script:Pass passed, $script:Fail failed" -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

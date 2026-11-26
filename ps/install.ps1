@@ -384,4 +384,25 @@ if ($wipTask -and "$($wipTask.Actions[0].Arguments)" -notmatch 'git-wip-snapshot
   Set-ScheduledTask -TaskName 'codai-git-wip-snapshot' -Action $a | Out-Null
   'task codai-git-wip-snapshot -> bin\git-wip-snapshot.ps1 -All'
 }
+# The prewarm task runs the agentq copy too (registered 2026-11-25). It has to be re-pointed by PATH,
+# not by file name: a task naming E:\gh\agentq\ps\bin\prewarm-cloud.ps1 passes a name check while running
+# the SOURCE checkout - measured live 2026-11-26, that is exactly what the registered task did, so every
+# unattended tick ran uncommitted code. Read back after the write, because Set-ScheduledTask returning
+# without an error says nothing about what the task now names.
+$pwTask = Get-ScheduledTask -TaskName 'codai-workspace-prewarm' -ErrorAction SilentlyContinue
+$pwWant = Join-Path $dst 'bin\prewarm-cloud.ps1'
+if ($pwTask) {
+  $pwArgs = "$($pwTask.Actions[0].Arguments)"
+  $pwNamed = [regex]::Match($pwArgs, '-File\s+"?([^"]+?)"?(\s|$)')
+  if (-not ($pwNamed.Success -and ($pwNamed.Groups[1].Value.Trim().TrimEnd('\') -ieq "$pwWant".TrimEnd('\')))) {
+    $pwExe = if ("$($pwTask.Actions[0].Execute)") { "$($pwTask.Actions[0].Execute)" } else { 'pwsh.exe' }
+    $pwFixed = if ($pwNamed.Success) { $pwArgs.Remove($pwNamed.Groups[1].Index, $pwNamed.Groups[1].Length).Insert($pwNamed.Groups[1].Index, $pwWant) } else { '' }
+    if ($pwFixed) {
+      Set-ScheduledTask -TaskName 'codai-workspace-prewarm' -Action (New-ScheduledTaskAction -Execute $pwExe -Argument $pwFixed) | Out-Null
+      $pwNow = [regex]::Match("$(@((Get-ScheduledTask -TaskName 'codai-workspace-prewarm').Actions)[0].Arguments)", '-File\s+"?([^"]+?)"?(\s|$)')
+      if ($pwNow.Success -and ($pwNow.Groups[1].Value.Trim().TrimEnd('\') -ieq "$pwWant".TrimEnd('\'))) { 'task codai-workspace-prewarm -> bin\prewarm-cloud.ps1' }
+      else { "WARNING: task codai-workspace-prewarm still names '$($pwNow.Groups[1].Value)' - re-point it by hand (bin\prewarm-cloud.ps1 -RepairTask from the installed copy)" }
+    } else { "WARNING: task codai-workspace-prewarm names no -File, so it could not be re-pointed: $pwArgs" }
+  }
+}
 "install: $($drift.Count) file(s); backup in $bk"

@@ -36,7 +36,8 @@
 .PARAMETER All
   One tick per workspace in cloudRegistry, so every heavy workspace on the machine is covered rather
   than the one repo that happened to be configured first. Each workspace is ticked by the same body
-  below (re-invoked with -Ws), so the bounds are identical per workspace and the day cap is shared.
+  below (re-invoked with -Ws), so the bounds are identical per workspace. The day cap is per workspace
+  too (it was one shared counter until 2026-11-25, which let one busy repo starve the rest).
   Exit: 0 all clear, 3 some workspace resumed but did not come up inside -WaitSec, 1 a tick failed.
 
 .PARAMETER MaxTickSec
@@ -60,6 +61,28 @@
   saying why. Trimmed to its last 300 lines once it passes 256 KB. (Not `-Log`: PowerShell ignores
   case, so `-Log` and this file's own record of resumes were one variable, and the first run wrote
   every narration line into the counter it was supposed to keep clean - measured 2026-11-25.)
+
+.PARAMETER VerifyTask
+  Check that the scheduled task runs THIS copy, without measuring or resuming anything. Exit 0 when it
+  does, or when no such task is registered (then nothing points at any copy); exit 1 when it runs a
+  different file, naming the one-line fix. Run it after an install, and from the task's own command
+  line when a tick behaves like code nobody committed.
+
+.PARAMETER RepairTask
+  Re-register the task's action against this file. The host's Execute is preserved (this machine wraps
+  the command in wscript + hidden-run.vbs so no console flashes) and every argument except the -File
+  value is kept verbatim, so -All and the knob values survive. The task is read back afterwards and the
+  exit code is its verdict, not the repair's. Refused from -TaskFile: a fake reading must not rewrite a
+  real task.
+
+.PARAMETER TaskName
+  Scheduled task to check or repair. Default codai-workspace-prewarm, the name this tool is registered
+  under by default.
+
+.PARAMETER TaskFile
+  Path to compare the task's -File against, instead of this script's own. For tests: it lets the guard
+  be proven against a known wrong value with no scheduled task involved, and -RepairTask refuses to run
+  with it.
 
 .EXAMPLE
   pwsh -NoProfile -File prewarm-cloud.ps1 -Repo vitals
@@ -92,13 +115,67 @@ param(
     [switch]$All,
     [switch]$Report,
     [switch]$Off,
-    [switch]$Quiet
+    [switch]$Quiet,
+    # The scheduled-task guard (see -VerifyTask). It lives on this script rather than only on the agentq
+    # verb because the verb forwards a whitelist of flags: an operator debugging a broken task has to be
+    # able to run the task's OWN recorded command line against the copy it names.
+    [string]$TaskName = 'codai-workspace-prewarm',
+    [string]$TaskFile,
+    [switch]$VerifyTask,
+    [switch]$RepairTask
 )
 $ErrorActionPreference = 'Stop'
 
 if (-not $Root) { $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' } }
 if (-not $ConfigPath) { $ConfigPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' } }
 if (-not $Gcloud) { $Gcloud = if ($env:AGENTQ_GCLOUD) { $env:AGENTQ_GCLOUD } else { 'gcloud' } }
+
+# ---- the scheduled task must run the INSTALLED copy ----------------------------------------------
+# A task's action records a path, and a path recorded by hand points wherever it was typed: on
+# 2026-11-25 this machine's task named E:\gh\agentq\ps\bin\prewarm-cloud.ps1 - the source checkout - so
+# every unattended tick ran whatever was uncommitted in the tree that was being edited. A checkout-named
+# task also survives an install as a silent second copy, and a tick that runs the wrong file still
+# leaves a healthy-looking log, so nothing else reports it. install.ps1 re-points the task on install;
+# this is the check that makes the state visible in between, and after any hand edit of the task.
+# It runs before the kill switch and before anything is written: a verdict must be readable even when
+# the tool is switched off.
+$self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+if ($VerifyTask -or $RepairTask) {
+    $tn = if ($TaskName) { $TaskName } else { 'codai-workspace-prewarm' }
+    $action = $null
+    if ($TaskFile) {
+        # A test seam: no scheduled task is read, and -RepairTask is refused below, because a value a
+        # test supplied must never rewrite a real task.
+        $action = [pscustomobject]@{ Execute = 'pwsh.exe'; Arguments = ('-NoProfile -File "' + $TaskFile + '"') }
+    } else {
+        $task = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+        if (-not $task) { Write-Output ("task '{0}' is not registered on this host - nothing points at any copy" -f $tn); exit 0 }
+        $action = @($task.Actions)[0]
+    }
+    $argLine = "$($action.Arguments)"
+    $found = [regex]::Match($argLine, '-File\s+"?([^"]+?)"?(\s|$)')
+    $runs = if ($found.Success) { $found.Groups[1].Value.Trim() } else { '' }
+    $same = $runs -and ($runs.TrimEnd('\') -ieq "$self".TrimEnd('\'))
+    if ($RepairTask) {
+        if ($TaskFile) { Write-Output 'refused: -RepairTask cannot run from -TaskFile (a test seam must not rewrite a real scheduled task)'; exit 2 }
+        if (-not $found.Success) { Write-Output ("refused: the action of '{0}' names no -File to re-point: {1}" -f $tn, $argLine); exit 2 }
+        $fixed = $argLine.Remove($found.Groups[1].Index, $found.Groups[1].Length).Insert($found.Groups[1].Index, $self)
+        $exe = if ("$($action.Execute)") { "$($action.Execute)" } else { 'pwsh.exe' }
+        try { Set-ScheduledTask -TaskName $tn -Action (New-ScheduledTaskAction -Execute $exe -Argument $fixed) | Out-Null }
+        catch { Write-Output ("could not re-point '{0}': {1}" -f $tn, $_.Exception.Message); exit 1 }
+        # Read the task back: the repair is a state change, so the state is the proof, not the Set call.
+        $after = [regex]::Match("$(@((Get-ScheduledTask -TaskName $tn).Actions)[0].Arguments)", '-File\s+"?([^"]+?)"?(\s|$)')
+        $now = if ($after.Success) { $after.Groups[1].Value.Trim() } else { '' }
+        if ($now.TrimEnd('\') -ieq "$self".TrimEnd('\')) { Write-Output ("task '{0}' -> {1} (via {2})" -f $tn, $self, $exe); exit 0 }
+        Write-Output ("re-pointed '{0}' but it now names '{1}' - read it back by hand" -f $tn, $now)
+        exit 1
+    }
+    if ($same) { Write-Output ("task '{0}' runs this copy ({1})" -f $tn, $self); exit 0 }
+    Write-Output ("task '{0}' runs a DIFFERENT copy: '{1}'" -f $tn, $runs)
+    Write-Output ('fix: pwsh -NoProfile -File "' + $self + '" -RepairTask')
+    exit 1
+}
+
 $dir = Join-Path $Root 'prewarm'
 if (-not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Force -Path $dir }
 $records = Join-Path $dir 'resumes.jsonl'
