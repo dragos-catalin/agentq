@@ -71,9 +71,10 @@ $suites = [ordered]@{
   'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   # 2026-11-26: three guard suites were runnable by hand and by NOTHING else - no gate ever executed them,
   # so a hole in the LIVE guard could ship green. Each is registered here and in install.ps1 in the same
-  # slice. 'guard forms' is the expensive one (~105 s measured idle, ~100 pwsh spawns) because it tests the
-  # forms people actually TYPE against the registered hook (61 stopped / 41 allowed cases); it has caught
-  # three real holes, so its cost is paid deliberately rather than by omission.
+  # slice. 'guard forms' tests the forms people actually TYPE against the registered hook; it has caught
+  # three real holes, so its cost is paid deliberately rather than by omission. 2026-11-26: it was sharded
+  # into six worker processes (54 cases preserved, both mutation checks still load-bearing, the PowerShell
+  # 5.1 leg kept) - 141 s serial -> 18 s measured, so it is no longer the critical path of this gate.
   'guard format'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-format.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'guard forms'    = @('-File', (Join-Path $PSScriptRoot 'test-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'deploy guard'   = @('-File', (Join-Path $PSScriptRoot 'test-deploy-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-DeployClean', (Join-Path $hooks 'deploy-clean.ps1'))
@@ -152,6 +153,23 @@ $suites = [ordered]@{
   # symptom it fixes: ONE VS Code window is ONE session, so every terminal and subagent shared one id and
   # that session held 4 slots while other windows starved. Without this line the suite existed and never ran.
   'agentq slot share' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-slotshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-26 (owner-ticked wave 20): three suites existed and ran nowhere. Registered here AND in
+  # install.ps1 in the same slice - 'install wiring' pins the two lists together.
+  #  - gate input selection: the gate runs only the suites whose declared inputs changed. The danger of any
+  #    input-based selection is skipping a suite that SHOULD have run, so the suite pins both directions and
+  #    every uncertainty (missing base, git error, unmodellable glob) as RUN. A wrong map costs time, never
+  #    coverage. Measured on the real range HEAD~2..HEAD~1: run=27 skip=8.
+  #  - agentq timings: reads the gate logs back into an ordered per-suite wall-time table, so 'which suite is
+  #    the critical path' is a measurement. It found the numbers were never read by anything.
+  #  - agentq reclaim: the proof-based slot reclaim verb. DEFAULT IS REPORT-ONLY, a live/dirty/unpushed slot
+  #    is never released, and a release goes through `unlease` (backup-first, fail-closed).
+  'gate input selection' = @('-File', (Join-Path $PSScriptRoot 'test-gate-input-selection.ps1'))
+  'agentq timings'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-timings.ps1'))
+  'agentq reclaim'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-reclaim.ps1'))
+  #  - agentq approve: the edit-ticket approval path. Hermetic: AGENTQ_HOME in a temp dir, the human
+  #    replaced by a stub window script and the mint by a stub ticket script, plus a mutation check on the
+  #    verdict comparison - so an undetected regression there cannot pass as green.
+  'agentq approve' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-approve.ps1'))
   # 2026-11-21: Invoke-Run runs the child at the resolved repo root when the caller is OUTSIDE it (the
   # "a brand-new slot starts hollow" install trap, commit 37fdf67) and keeps the caller's nested cwd
   # when INSIDE. Without this line the suite existed and never ran.

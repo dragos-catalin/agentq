@@ -154,7 +154,11 @@
       "deploy guard",
       "agentq slot share",
       "land pregate stale ref",
-      "autosync wip snapshot"
+      "autosync wip snapshot",
+      "gate input selection",
+      "agentq timings",
+      "agentq reclaim",
+      "agentq approve"
     ]
   },
   "sharedCloneMode": "warn",

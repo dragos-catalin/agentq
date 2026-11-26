@@ -148,6 +148,21 @@ $map = [ordered]@{
   # copy never carried it - the install gate could not run what it never installed.
   'tests\test-agentq-recover.ps1' = 'bin\test-agentq-recover.ps1'; 'tests\test-agentq-commit-fast.ps1' = 'bin\test-agentq-commit-fast.ps1'
   'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-agentq-slotshare.ps1' = 'bin\test-agentq-slotshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
+  # 2026-11-26 (owner-ticked wave 20): the gate input-selection MODULE (a suite resolves it as ..\bin\<x>,
+  # so an installed suite without it cannot run), the timings reader, and the proof-based reclaim verb -
+  # each with its suite. Paired with the run-all.ps1 entries in this same slice; 'install wiring' pins the
+  # two lists, so a suite the installed gate cannot run is impossible by construction.
+  'bin\agentq-suite-inputs.ps1' = 'bin\agentq-suite-inputs.ps1'
+  'tests\test-gate-input-selection.ps1' = 'bin\test-gate-input-selection.ps1'
+  'bin\agentq-timings.ps1' = 'bin\agentq-timings.ps1'
+  'tests\test-agentq-timings.ps1' = 'bin\test-agentq-timings.ps1'
+  'bin\agentq-reclaim.ps1' = 'bin\agentq-reclaim.ps1'
+  'tests\test-agentq-reclaim.ps1' = 'bin\test-agentq-reclaim.ps1'
+  # The edit-ticket approval path: the CLI half waits for the owner's verdict, the window half mints the
+  # ticket (it owns a real console, which is exactly what `rules-ticket.ps1 -Issue` requires).
+  'bin\agentq-approve.ps1' = 'bin\agentq-approve.ps1'
+  'bin\agentq-approve-gui.ps1' = 'bin\agentq-approve-gui.ps1'
+  'tests\test-agentq-approve.ps1' = 'bin\test-agentq-approve.ps1'
   # 2026-11-21: `agentq run` runs its child at the resolved repo root when the caller is OUTSIDE the
   # repo, and keeps the caller's nested directory when INSIDE (commit 37fdf67, "a brand-new slot
   # starts hollow").

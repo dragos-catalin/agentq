@@ -2,6 +2,22 @@
 # must not silently apply the tool's DEFAULTS. Denies when the target repo declares no config for
 # that formatter; warns about the cross-checkout "mixture tell". Then MUTATION tests: the no-config
 # branch is disabled in a copy of the guard and the deny cases must start to pass through.
+# PostToolUse auto-format (2026-11-25): the other half - a file CREATED into a repo that owns
+# formatter settings is formatted FOR the agent, instead of the agent being refused later.
+#
+# 2026-11-26 - PARALLEL. As ONE serial process this suite spent ~141 s on a loaded machine, almost
+# all of it waiting on ~52 short-lived child PowerShell processes (every case spawns the guard). The
+# cases now run as separate WORKER PROCESSES of this same file (`-Group <name>`), each with its own
+# temp dir, and the orchestrator aggregates their PASS/FAIL lines. Why workers of THIS file and not
+# sibling files: install.ps1 maps exactly ONE file into the installed tree
+# (tests\test-guard-format.ps1 -> hooks\test-guard-format.ps1) and the install-wiring gate pins that
+# map, so a new sibling file would break the INSTALLED gate while the checkout looked green. Why the
+# orchestrator re-enters itself with `-Group`: the case table then lives in exactly ONE place, so a
+# shard can never drift from the list it was split from.
+# Nothing is weakened: the same cases, the same ids, the same mutation checks - plus a ratchet that
+# FAILS if any of the 54 ids a passing run must exercise stops being exercised (a lost case is now a
+# RED suite instead of a quieter one).
+[CmdletBinding()]
 param(
   # '..\hooks\' resolves in BOTH layouts: the repo runs it as ps\tests\..\hooks\guard-tooluse.ps1, the
   # install maps it to hooks\test-guard-format.ps1 next to the guard itself. The bare default (PSScriptRoot)
@@ -9,35 +25,70 @@ param(
   [string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'),
   # The hooks run under powershell.exe 5.1 (that is what VS Code spawns), so the suite must be
   # runnable with it too: pwsh 7 accepting a script says nothing about the shell that runs it.
-  [string]$Exe = 'pwsh'
+  [string]$Exe = 'pwsh',
+  # 'auto' = ORCHESTRATOR: spawn one worker per group and aggregate. A group name = run ONLY that group
+  # in THIS process, which is how the orchestrator re-enters itself (see the header).
+  [ValidateSet('auto', 'block-1', 'block-2', 'block-3', 'guard-mutation', 'allow-list', 'post')]
+  [string]$Group = 'auto',
+  # The orchestrator hands every worker its OWN temp dir, so no two workers can share a fixture.
+  [string]$WorkDir = '',
+  # 0 = one worker per group, all at once; 1 = serial (identical results, for a saturated machine).
+  # AGENTQ_GUARD_FORMAT_WORKERS overrides when -Workers is not given.
+  [int]$Workers = 0,
+  # Print the check ids this suite will exercise, then exit 0. The before/after evidence for a split.
+  [switch]$List,
+  [switch]$KeepWork
 )
 $ErrorActionPreference = 'Stop'
 $Guard = (Resolve-Path $Guard).Path
-$fx = Join-Path $env:TEMP ('gf-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-$fails = 0
-function Check([string]$n, [bool]$ok, [string]$d = '') { if ($ok) { Write-Host "PASS $n" } else { Write-Host "FAIL $n $d" -ForegroundColor Red; $script:fails++ } }
+$script:Exe = $Exe
+$script:fails = 0
+$script:pass = 0
+$script:ids = New-Object System.Collections.Generic.List[string]
+$script:idFile = ''
+# PASS/FAIL is the contract run-all.ps1 counts ('^\s*(PASS|ok)\b' vs '^\s*FAIL\b') - never change it.
+function Check([string]$n, [bool]$ok, [string]$d = '') {
+  if ($ok) { Write-Host "PASS $n"; $script:pass++ } else { Write-Host "FAIL $n $d" -ForegroundColor Red; $script:fails++ }
+  $script:ids.Add($n)
+}
+# The two ids of the block loop. The spacing (2 and 13 spaces) is the ORIGINAL spacing, kept so the id
+# set stays byte-identical to the pre-parallel suite - the before/after evidence depends on it.
+function BlockId([bool]$b, [string]$k) { "block=$b  $k" }
+function WarnId([string]$k) { "warn             $k" }
 
-function New-Repo([string]$name) {
-  $d = Join-Path $fx $name
+function New-Repo([string]$root, [string]$name) {
+  $d = Join-Path $root $name
   New-Item -ItemType Directory -Force -Path "$d\src" | Out-Null
   & git -C $d init -q 2>$null | Out-Null
   Set-Content -LiteralPath "$d\src\a.ts" -Value 'export const a = 1;'
   Set-Content -LiteralPath "$d\package.json" -Value '{"name":"fx","devDependencies":{"prettier":"3.6.2","eslint":"9.0.0"},"scripts":{"format":"prettier --write \"**/*.{ts,tsx,md,json}\"","lint:fix":"eslint --fix .","typecheck":"tsc --noEmit"}}'
   return $d
 }
+# The fixtures, built by the WORKER into its own temp dir (one dir per worker, so nothing is shared):
 # cfgless: prettier+eslint declared, NO config anywhere (brivio's shape, measured 40/40 dirty).
-$cfgless = New-Repo 'cfgless'
-# withcfg: same repo, with a root prettier config + an eslint config.
-$withcfg = New-Repo 'withcfg'
-Set-Content -LiteralPath "$withcfg\.prettierrc.json" -Value '{}'
-Set-Content -LiteralPath "$withcfg\eslint.config.mjs" -Value 'export default [];'
+# withcfg: same repo, with a root prettier config + an eslint config + a rustfmt config (SOFT class).
 # deepcfg: the config lives in the app package, not the repo root (monorepo shape).
-$deepcfg = New-Repo 'deepcfg'
-New-Item -ItemType Directory -Force -Path "$deepcfg\apps\web\src" | Out-Null
-Set-Content -LiteralPath "$deepcfg\apps\web\.prettierrc.json" -Value '{}'
-Set-Content -LiteralPath "$deepcfg\apps\web\src\b.ts" -Value 'export const b = 1;'
-# withcfg also owns a rustfmt config, so the SOFT class is covered in both states.
-Set-Content -LiteralPath "$withcfg\rustfmt.toml" -Value 'max_width = 100'
+function New-Fixtures([string]$root, [string[]]$names) {
+  $fx = @{}
+  foreach ($n in $names) {
+    if ($n -eq 'cfgless') { $fx.cfgless = New-Repo $root 'cfgless' }
+    elseif ($n -eq 'withcfg') {
+      $d = New-Repo $root 'withcfg'
+      Set-Content -LiteralPath "$d\.prettierrc.json" -Value '{}'
+      Set-Content -LiteralPath "$d\eslint.config.mjs" -Value 'export default [];'
+      Set-Content -LiteralPath "$d\rustfmt.toml" -Value 'max_width = 100'
+      $fx.withcfg = $d
+    }
+    elseif ($n -eq 'deepcfg') {
+      $d = New-Repo $root 'deepcfg'
+      New-Item -ItemType Directory -Force -Path "$d\apps\web\src" | Out-Null
+      Set-Content -LiteralPath "$d\apps\web\.prettierrc.json" -Value '{}'
+      Set-Content -LiteralPath "$d\apps\web\src\b.ts" -Value 'export const b = 1;'
+      $fx.deepcfg = $d
+    }
+  }
+  return $fx
+}
 
 # Returns $true when the guard BLOCKS (VS Code dialect: JSON deny on stdout, exit 0).
 function Hook([string]$g, [string]$cwd, [string]$command, [string]$tool = 'run_in_terminal') {
@@ -53,10 +104,15 @@ function Hook([string]$g, [string]$cwd, [string]$command, [string]$tool = 'run_i
   finally { $ErrorActionPreference = $prev }
   return $out
 }
-function Blocks([string]$g, [string]$cwd, [string]$command) { (Hook $g $cwd $command) -match '"permissionDecision":"deny"' }
+function HookDenies([string]$out) { $out -match '"permissionDecision":"deny"' }
+function Blocks([string]$g, [string]$cwd, [string]$command) { HookDenies (Hook $g $cwd $command) }
 function Warns([string]$g, [string]$cwd, [string]$command) { (Hook $g $cwd $command) -match 'WARNING \(guard-command\)' }
 
-$cases = [ordered]@{
+# The case table lives in ONE place; the worker shards are DERIVED from it (Get-BlockShards), so a new
+# case can never be dropped by the split. The cwd values are the fixture variables the WORKER assigns
+# at script scope before this function is called.
+function Get-Cases {
+  return [ordered]@{
   # --- the destructive class: formatter WITHOUT the repo's config (defaults) -> deny
   'npx prettier --write (no cfg)'      = @{ cwd = $cfgless; cmd = 'npx prettier --write src/a.ts'; block = $true }
   'pnpm exec prettier --write (no cfg)' = @{ cwd = $cfgless; cmd = 'pnpm exec prettier --write src/a.ts'; block = $true }
@@ -103,26 +159,58 @@ $cases = [ordered]@{
   'black --check'                      = @{ cwd = $cfgless; cmd = 'black --check src/a.py'; block = $false }
   # --- the COMMAND states the style itself -> the rule does not apply (item 4 of the refusal text)
   'prettier --write --config (no cfg)' = @{ cwd = $cfgless; cmd = 'npx prettier --write --config .prettierrc.custom.json src/a.ts'; block = $false }
+  }
 }
-foreach ($k in $cases.Keys) {
-  $c = $cases[$k]
-  $b = Blocks $Guard $c.cwd $c.cmd
-  Check "block=$($c.block)  $k" ($b -eq $c.block) "(got block=$b)"
-  if ($c.warn) { Check "warn             $k" (Warns $Guard $c.cwd $c.cmd) }
+
+# Split the block cases in SOURCE ORDER across 3 shards, derived from the table itself so a new case
+# can never fall between the shards (the id ratchet catches it if one ever does).
+function Get-BlockShards {
+  $keys = @((Get-Cases).Keys)
+  $per = [int][math]::Ceiling($keys.Count / 3.0)
+  $out = [ordered]@{}
+  for ($i = 0; $i -lt 3; $i++) {
+    $slice = @($keys | Select-Object -Skip ($i * $per) -First $per)
+    if ($slice.Count) { $out["block-$($i + 1)"] = $slice }
+  }
+  return $out
+}
+function Get-GroupCases([string]$g) {
+  $s = Get-BlockShards
+  if ($s.Contains($g)) { return $s[$g] }
+  return @()
+}
+function Invoke-BlockGroup([string]$g, [string]$fx) {
+  $fxr = New-Fixtures $fx @('cfgless', 'withcfg', 'deepcfg')
+  $script:cfgless = $fxr.cfgless; $script:withcfg = $fxr.withcfg; $script:deepcfg = $fxr.deepcfg
+  $cases = Get-Cases
+  foreach ($k in (Get-GroupCases $g)) {
+    $c = $cases[$k]
+    # ONE spawn per case: the block verdict and the advisory are read off the SAME output (the
+    # pre-parallel suite spawned twice per warn case - same verdict, twice the wait).
+    $out = Hook $Guard $c.cwd $c.cmd
+    $b = HookDenies $out
+    Check (BlockId $c.block $k) ($b -eq $c.block) "(got block=$b)"
+    if ($c.warn) { Check (WarnId $k) ($out -match 'WARNING \(guard-command\)') }
+  }
 }
 
 # ---- mutation: disable the no-config branch; the deny cases must stop blocking ----
-$mut = Join-Path $fx 'guard-mut.ps1'
-$text = [IO.File]::ReadAllText($Guard)
-$needle = 'if (-not $fmtCfg) {'
-if (([regex]::Matches($text, [regex]::Escape($needle))).Count -ne 1) { Check 'mutation anchor found once' $false }
-else {
-  [IO.File]::WriteAllText($mut, $text.Replace($needle, 'if ($false) {'), (New-Object Text.UTF8Encoding $false))
-  $worse = 0
-  foreach ($k in @('npx prettier --write (no cfg)', 'pnpm format (no cfg)', 'eslint --fix (no cfg)', 'prettier --write glob (no cfg)')) {
-    if (Blocks $mut $cfgless $cases[$k].cmd) { $worse++ }
+function Invoke-GuardMutation([string]$fx) {
+  $fxr = New-Fixtures $fx @('cfgless')
+  $script:cfgless = $fxr.cfgless
+  $cases = Get-Cases
+  $mut = Join-Path $fx 'guard-mut.ps1'
+  $text = [IO.File]::ReadAllText($Guard)
+  $needle = 'if (-not $fmtCfg) {'
+  if (([regex]::Matches($text, [regex]::Escape($needle))).Count -ne 1) { Check 'mutation anchor found once' $false }
+  else {
+    [IO.File]::WriteAllText($mut, $text.Replace($needle, 'if ($false) {'), (New-Object Text.UTF8Encoding $false))
+    $worse = 0
+    foreach ($k in @('npx prettier --write (no cfg)', 'pnpm format (no cfg)', 'eslint --fix (no cfg)', 'prettier --write glob (no cfg)')) {
+      if (Blocks $mut $cfgless $cases[$k].cmd) { $worse++ }
+    }
+    Check 'mutation: all 4 deny cases pass through with the branch disabled' ($worse -eq 0) "($worse still blocked)"
   }
-  Check 'mutation: all 4 deny cases pass through with the branch disabled' ($worse -eq 0) "($worse still blocked)"
 }
 
 # ---- owner allow-list (2026-11-25) ---------------------------------------------------------------
@@ -144,22 +232,29 @@ function HookHome([string]$g, [string]$cwd, [string]$command, [string]$fakeHome)
     $ErrorActionPreference = $prev
   }
 }
-$th = Join-Path $fx 'home'
-New-Item -ItemType Directory -Force -Path (Join-Path $th '.codai\guard') | Out-Null
-$o0 = HookHome $Guard $cfgless 'npx prettier --write src/a.ts' $th
-Check 'allow-list: still blocks with no entry' ($o0 -match '"permissionDecision":"deny"') $o0
-Set-Content -LiteralPath (Join-Path $th '.codai\guard\formatter-allow.json') -Value (@{ repos = @($cfgless) } | ConvertTo-Json)
-$o1 = HookHome $Guard $cfgless 'npx prettier --write src/a.ts' $th
-Check 'allow-list: the deny is suppressed' (-not ($o1 -match '"permissionDecision":"deny"')) $o1
-Check 'allow-list: a NOTE explains why' ($o1 -match 'formatter-allow\.json') $o1
-Check 'allow-list: the decision is audited' (Test-Path -LiteralPath (Join-Path $th '.codai\guard\formatter.jsonl'))
+function Invoke-AllowList([string]$fx) {
+  $fxr = New-Fixtures $fx @('cfgless')
+  $script:cfgless = $fxr.cfgless
+  $th = Join-Path $fx 'home'
+  New-Item -ItemType Directory -Force -Path (Join-Path $th '.codai\guard') | Out-Null
+  $o0 = HookHome $Guard $cfgless 'npx prettier --write src/a.ts' $th
+  Check 'allow-list: still blocks with no entry' ($o0 -match '"permissionDecision":"deny"') $o0
+  Set-Content -LiteralPath (Join-Path $th '.codai\guard\formatter-allow.json') -Value (@{ repos = @($cfgless) } | ConvertTo-Json)
+  $o1 = HookHome $Guard $cfgless 'npx prettier --write src/a.ts' $th
+  Check 'allow-list: the deny is suppressed' (-not ($o1 -match '"permissionDecision":"deny"')) $o1
+  Check 'allow-list: a NOTE explains why' ($o1 -match 'formatter-allow\.json') $o1
+  Check 'allow-list: the decision is audited' (Test-Path -LiteralPath (Join-Path $th '.codai\guard\formatter.jsonl'))
+}
 
 # ---- PostToolUse auto-format (2026-11-25) --------------------------------------------------------
 # The other half of the rule, and the owner's question: when the repo OWNS the settings, a created
 # file is formatted FOR the agent instead of the agent being told off later. Same lib as the guard,
 # so the two cannot disagree. A fake formatter (a .cmd shim that appends a marker to its LAST
 # argument) proves which file was written without needing the real tool installed.
-$postHook = Join-Path (Split-Path $Guard -Parent) 'post-create-format.ps1'
+function Invoke-Post([string]$fx) {
+  $fxr = New-Fixtures $fx @('cfgless', 'withcfg')
+  $script:cfgless = $fxr.cfgless; $script:withcfg = $fxr.withcfg
+  $postHook = Join-Path (Split-Path $Guard -Parent) 'post-create-format.ps1'
 if (-not (Test-Path -LiteralPath $postHook)) {
   Check 'post-create-format.ps1 exists next to the guard' $false
 } else {
@@ -226,9 +321,203 @@ if (-not (Test-Path -LiteralPath $postHook)) {
     Check 'post mutation: without the ownership test a config-less repo WOULD be rewritten' ((Get-Content -LiteralPath $p4 -Raw) -match 'FORMATTED')
   }
 }
+}
 
-Remove-Item -Recurse -Force $fx -ErrorAction SilentlyContinue
+# ---- the coverage ratchet --------------------------------------------------------------------------
+# The ids a PASSING run must exercise: 31 case names + 9 advisories + the 14 fixed ids = 54. FROZEN on
+# purpose - deriving them from the case table would make DELETING a case invisible, because the expected
+# set would shrink with it. A lost case is worse than a slow suite, so this list only ever grows: update
+# it when you ADD or RENAME a case, and the suite goes red if a case stops being exercised.
+$script:baselineCases = @(
+  'npx prettier --write (no cfg)'
+  'pnpm exec prettier --write (no cfg)'
+  'prettier --write glob (no cfg)'
+  'pnpm format (no cfg)'
+  'eslint --fix (no cfg)'
+  'cli prettier.cmd --write (no cfg)'
+  'npx prettier --write (cfg)'
+  'eslint --fix (cfg)'
+  'pnpm format (cfg)'
+  'prettier --write, cfg in app pkg'
+  'prettier --check (no cfg)'
+  'pnpm typecheck'
+  'git diff --stat'
+  'non-formatter codegen'
+  'clang-format -i (no cfg)'
+  'clang-format --dry-run'
+  'gofmt -w (no cfg)'
+  'cargo fmt (no rustfmt.toml)'
+  'ktfmt (no cfg)'
+  'rustfmt --check'
+  'cargo fmt --check'
+  'cargo fmt (rustfmt.toml)'
+  'missing path under cfg repo'
+  'ruff format (no cfg)'
+  'black (no cfg)'
+  'gdformat (no cfg)'
+  'swiftformat (no cfg)'
+  'zig fmt (no cfg)'
+  'node black.mjs is not black'
+  'black --check'
+  'prettier --write --config (no cfg)'
+)
+$script:baselineWarn = @(
+  'gofmt -w (no cfg)'
+  'cargo fmt (no rustfmt.toml)'
+  'ktfmt (no cfg)'
+  'missing path under cfg repo'
+  'ruff format (no cfg)'
+  'black (no cfg)'
+  'gdformat (no cfg)'
+  'swiftformat (no cfg)'
+  'zig fmt (no cfg)'
+)
+# The 14 ids that do not come from the case table.
+$script:fixedIds = @(
+  'mutation: all 4 deny cases pass through with the branch disabled'
+  'allow-list: still blocks with no entry'
+  'allow-list: the deny is suppressed'
+  'allow-list: a NOTE explains why'
+  'allow-list: the decision is audited'
+  'post: a config-owning repo formats the created file'
+  'post: the agent is told, as PostToolUse JSON'
+  'post: the file is still formatted on the next create'
+  'post: but the text is throttled per session'
+  'post: a config-less repo is left alone'
+  'post: and says nothing'
+  'post: apply_patch is a targeted edit, never touched'
+  'post: a garbage payload is silent (fail-open)'
+  'post mutation: without the ownership test a config-less repo WOULD be rewritten'
+)
+function Get-RequiredIds {
+  $o = New-Object System.Collections.Generic.List[string]
+  foreach ($k in $script:baselineCases) { $o.Add("case $k") }
+  foreach ($k in $script:baselineWarn) { $o.Add("warn $k") }
+  foreach ($f in $script:fixedIds) { $o.Add($f) }
+  return $o
+}
+# An EMITTED id -> its REQUIRED form. block=... carries the expectation and warn... the alignment, so both
+# are compared by CASE NAME: flipping an expectation is deliberate and must not trip the ratchet.
+function Get-NormalizedId([string]$id) {
+  if ($id -match '^block=\S+\s\s(.+)$') { return "case $($Matches[1])" }
+  if ($id -match '^warn\s+(.+)$') { return "warn $($Matches[1])" }
+  return $id
+}
+
+if ($List) {
+  $cases = Get-Cases
+  $ids = New-Object System.Collections.Generic.List[string]
+  foreach ($k in $cases.Keys) { $ids.Add((BlockId $cases[$k].block $k)) }
+  foreach ($k in $cases.Keys) { if ($cases[$k].warn) { $ids.Add((WarnId $k)) } }
+  foreach ($f in $script:fixedIds) { $ids.Add($f) }
+  foreach ($id in $ids) { Write-Host $id }
+  Write-Host ("guard-format: " + $ids.Count + " emitted check ids")
+  exit 0
+}
+
+# ---------------------------------------------------------------- worker: run ONE group in this process
+if ($Group -ne 'auto') {
+  $fx = if ($WorkDir) { $WorkDir } else { Join-Path ([IO.Path]::GetTempPath()) ('gf-' + [guid]::NewGuid().ToString('N').Substring(0, 6)) }
+  $ownDir = -not $WorkDir
+  New-Item -ItemType Directory -Force -Path $fx | Out-Null
+  $script:idFile = Join-Path $fx 'ids.txt'
+  try {
+    switch ($Group) {
+      'block-1' { Invoke-BlockGroup $Group $fx }
+      'block-2' { Invoke-BlockGroup $Group $fx }
+      'block-3' { Invoke-BlockGroup $Group $fx }
+      'guard-mutation' { Invoke-GuardMutation $fx }
+      'allow-list' { Invoke-AllowList $fx }
+      'post' { Invoke-Post $fx }
+    }
+  } finally {
+    # Always leave the emitted ids behind: the orchestrator reads them for the coverage ratchet.
+    try { [IO.File]::WriteAllLines($script:idFile, $script:ids) } catch { }
+    if ($ownDir -and -not $KeepWork) { Remove-Item -Recurse -Force $fx -ErrorAction SilentlyContinue }
+  }
+  if ($script:fails) { Write-Host "$($script:fails) failure(s)" -ForegroundColor Red; exit 1 }
+  exit 0
+}
+
+# -------------------------------------------------------------------------------------------- orchestrator
+function Get-HostExe {
+  $p = $null
+  try { $p = (Get-Process -Id $PID).Path } catch { }
+  if (-not $p) { try { $p = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { } }
+  if (-not $p) { $p = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' } }
+  return $p
+}
+function Quote-Arg([string]$a) { if ($a -match '\s') { return '"' + $a + '"' } return $a }
+
+$order = @((Get-BlockShards).Keys) + @('guard-mutation', 'allow-list', 'post')
+$w = $Workers
+if ($w -le 0 -and $env:AGENTQ_GUARD_FORMAT_WORKERS) { $w = [int]$env:AGENTQ_GUARD_FORMAT_WORKERS }
+if ($w -le 0) { $w = $order.Count }
+if ($w -gt $order.Count) { $w = $order.Count }
+if ($w -lt 1) { $w = 1 }
+$root = Join-Path ([IO.Path]::GetTempPath()) ('gf-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$hostExe = Get-HostExe
+$self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+Write-Host ("guard-format: running $($order.Count) group(s) with $w worker(s) via $hostExe")
+$groups = @()
+for ($i = 0; $i -lt $order.Count; $i += $w) {
+  $running = @()
+  foreach ($g in @($order | Select-Object -Skip $i -First $w)) {
+    $wd = Join-Path $root $g
+    New-Item -ItemType Directory -Force -Path $wd | Out-Null
+    $out = Join-Path $root ("$g.out.txt"); $err = Join-Path $root ("$g.err.txt")
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self, '-Group', $g, '-Guard', $Guard, '-Exe', $Exe, '-WorkDir', $wd)
+    try {
+      $proc = Start-Process -FilePath $hostExe -ArgumentList (($argv | ForEach-Object { Quote-Arg $_ }) -join ' ') -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+    } catch {
+      Write-Host ("FAIL group $g could not start: $($_.Exception.Message)") -ForegroundColor Red; $script:fails++
+      continue
+    }
+    $running += [pscustomobject]@{ Group = $g; Proc = $proc; Out = $out; Err = $err; Wd = $wd }
+  }
+  foreach ($j in $running) { $j.Proc.WaitForExit() }
+  $groups += $running
+}
+# Re-emit every worker line verbatim (run-all.ps1 counts the PASS/FAIL lines) and collect its ids.
+foreach ($j in $groups) {
+  Write-Host ("# group {0} exit={1}" -f $j.Group, $j.Proc.ExitCode)
+  $lines = @()
+  if (Test-Path -LiteralPath $j.Out) { $lines += @(Get-Content -LiteralPath $j.Out -Encoding utf8) }
+  if ((Test-Path -LiteralPath $j.Err) -and (Get-Item -LiteralPath $j.Err).Length) {
+    $lines += @(Get-Content -LiteralPath $j.Err -Encoding utf8 | ForEach-Object { "stderr: $_" })
+  }
+  foreach ($l in $lines) {
+    if ($l -match '^\s*PASS\b') { $script:pass++; Write-Host $l }
+    elseif ($l -match '^\s*FAIL\b') { $script:fails++; Write-Host $l -ForegroundColor Red }
+    else { Write-Host $l }
+  }
+  foreach ($id in @(Get-Content -LiteralPath (Join-Path $j.Wd 'ids.txt') -Encoding utf8 -ErrorAction SilentlyContinue)) {
+    if ($id) { $script:ids.Add($id) }
+  }
+  if ($j.Proc.ExitCode -ne 0) { Check ("group {0} exited non-zero" -f $j.Group) $false ("exit=" + $j.Proc.ExitCode) }
+}
+# The ratchet: every required id has to have been EXERCISED somewhere.
+$seen = @{}
+foreach ($id in $script:ids) { $seen[(Get-NormalizedId $id)] = $true }
+foreach ($id in (Get-RequiredIds)) {
+  if (-not $seen.ContainsKey($id)) { Check ("required check not exercised: " + $id) $false }
+}
+# ...and the case table must still CONTAIN every frozen id. The check above cannot see a case deleted
+# from the table if its frozen line was deleted in the same edit; this pair closes that half.
+$casesNow = Get-Cases
+$tableKeys = @($casesNow.Keys)
+foreach ($k in $script:baselineCases) {
+  if ($tableKeys -cnotcontains $k) { Check ("baseline case missing from the case table: " + $k) $false }
+}
+foreach ($k in $script:baselineWarn) {
+  if ($tableKeys -cnotcontains $k) { Check ("baseline advisory missing from the case table: " + $k) $false }
+  elseif (-not $casesNow[$k].warn) { Check ("case lost its advisory flag: " + $k) $false }
+}
+$checks = $script:pass + $script:fails
 Write-Host ''
-if ($fails) { Write-Host "$fails failure(s)" -ForegroundColor Red; exit 1 }
+if (-not $KeepWork) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+if ($script:fails) { Write-Host "$($script:fails) failure(s)" -ForegroundColor Red; exit 1 }
+Write-Host ("guard-format: checks=$checks pass=$($script:pass) fail=0 groups=$($order.Count) workers=$w exe=$Exe")
 Write-Host "all guard-format cases pass (exe: $Exe)"
 exit 0

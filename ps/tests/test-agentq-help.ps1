@@ -44,7 +44,13 @@ try {
   Check '1b index lists every verb' ($missing.Count -eq 0) ("missing from index: " + ($missing -join ','))
   Check '1c index names the one verb to remember' ($r.out -match 'One verb to remember: run')
   Check '1d index says how to get detail' ($r.out -match 'agentq help <verb>')
-  Check '1e index stays compact' (($r.out -split "`n").Count -le 72) "lines=$(($r.out -split "`n").Count) (one line per verb + group headers; the old header dump was 148)"
+  # The budget is DERIVED from the verb count. The regression this guards is the 148-line header dump,
+  # not an absolute number that every new verb trips: it was a hard 72 while HEAD already rendered 76
+  # lines (the scaffolding - title, group headers, blanks - is ~28 lines on its own), so adding any verb
+  # failed the check for the wrong reason. entries + scaffolding + slack, so a new verb is free and a
+  # reversion to the dump is still caught.
+  $indexBudget = $caseKeys.Count + 30
+  Check '1e index stays compact' (($r.out -split "`n").Count -le $indexBudget) "lines=$(($r.out -split "`n").Count) budget=$indexBudget (one line per verb + group headers; the old header dump was 148)"
   Check '1f index documents exit codes' ($r.out -match 'EXIT: 0 ok')
 
   # ---- 2: one verb's usage --------------------------------------------------------------------
@@ -65,7 +71,7 @@ try {
   Check '4 bogus verb exits 2' ($r.code -eq 2) "exit=$($r.code)"
   Check '4a bogus verb names itself' ($r.out -match "unknown verb 'bogusverb'")
   Check '4b bogus verb points at help' ($r.out -match 'agentq help <verb>')
-  Check '4c bogus verb prints the index, not the header' (($r.out -match 'One verb to remember: run') -and ($r.out -notmatch 'STAGE 0 OF THE ORCHESTRATOR') -and (($r.out -split "`n").Count -le 80)) "lines=$(($r.out -split "`n").Count)"
+  Check '4c bogus verb prints the index, not the header' (($r.out -match 'One verb to remember: run') -and ($r.out -notmatch 'STAGE 0 OF THE ORCHESTRATOR') -and (($r.out -split "`n").Count -le ($indexBudget + 6))) "lines=$(($r.out -split "`n").Count) budget=$($indexBudget + 6)"
 
   # ---- 5: the flag spellings an agent will try ------------------------------------------------
   foreach ($f in '-h', '--help', '-?') {

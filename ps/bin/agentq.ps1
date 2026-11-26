@@ -360,7 +360,7 @@ $script:DoctorExit = $null
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
 # consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
 # happens where work happens (run/commit/lease/land) and in `sweep`.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'lessons', 'metrics', 'doctor', 'help'
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'lessons', 'metrics', 'doctor', 'help', 'timings'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -2617,6 +2617,8 @@ $script:AqHelp = [ordered]@{
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
   'lesson' = @{ g = 'Queue & run'; u = 'lesson -Message "..." [-Repo <r>] [-Kind <class>]'; d = 'record a durable, reusable lesson (symptom -> what you believed -> what proved it -> the fix) so future agents in this repo do not relearn it'; e = 'agentq lesson -Message "vertex 400s on lone surrogates after JSON.stringify: strip them post-stringify"' }
   'lessons' = @{ g = 'Queue & run'; u = 'lessons [-Repo <r>] [-Limit 30] [-Json]'; d = 'list recorded lessons, newest first (read-only)' }
+  'timings' = @{ g = 'Queue & run'; u = 'timings [-Limit 5] [-Json]'; d = 'per-suite gate wall times, slowest LAST run first (read-only; it reads the gate build logs, so it costs ~18 s on codai)'; e = 'agentq timings -Limit 3' }
+  'approve' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'approve -Paths a,b -Purpose "why" [-Hours 2] [-MaxMin 10] [-Json]'; d = 'ask the OWNER to approve an edit ticket: a window states exactly which paths it unlocks, and Approve mints it here (exit 0 approved, 3 denied, 4 recorded for the hub/phone with -MaxMin 0, 5 the mint failed, 7 no answer)'; e = 'agentq approve -Paths "packages/x/**" -Purpose "fix the guard"' }
   'ask' = @{ g = 'Queue & run'; u = 'ask -To <repo:<name>|session:<term-id>|slot:<repo>:<slot>|any|owner> -Message "..." [-Resource <r>] [-Repo <r>]'; d = 'ask another LIVE agent a question; prints how many agents the address reaches, and a negative answer is not silent'; e = 'agentq ask -To repo:agentq -Message "is ps/bin/agentq.ps1 free to edit for 20 min?"' }
   'reply' = @{ g = 'Queue & run'; u = 'reply -Id <msg id> -Message "..."'; d = 'answer an ask (the asker replying again reopens the thread)' }
   'inbox' = @{ g = 'Queue & run'; u = 'inbox [-All] [-Id <msg id>] [-Json]'; d = 'the open messages addressed to me (repo/session/slot/any); -Id prints the whole thread' }
@@ -2723,6 +2725,38 @@ switch ($Verb.ToLowerInvariant()) {
     if ($Json) { $items | ConvertTo-Json -Depth 5 }
     elseif (-not $items) { Write-Output '(no lessons)' }
     else { $items | ForEach-Object { Format-Entry $_ } }
+  }
+  # The per-suite gate wall times, read back from the gate build logs (bin\agentq-timings.ps1). NOT called
+  # from `status`: reading codai's ~2400 logs costs 18 s, and `status` is on the hot path of every agent
+  # turn. Read-only - it only reads logs, which is why 'timings' is in $script:ReadOnly above.
+  'timings' {
+    $t = Join-Path $PSScriptRoot 'agentq-timings.ps1'
+    if (-not (Test-Path -LiteralPath $t)) { throw "agentq timings: missing module $t" }
+    $n = if ($Last -is [int] -and $Last -gt 0) { $Last } else { 5 }
+    $argv = @('-NoProfile', '-File', $t, '-Last', "$n")
+    if ($Json) { $argv += '-Json' }
+    $out = @(& pwsh @argv 2>&1)
+    $code = $LASTEXITCODE
+    $out | ForEach-Object { Write-Output "$_" }
+    if ($code -eq 3) { Write-Output 'agentq timings: nothing recorded yet (no gate log has been read back)' }
+    elseif ($code -ne 0) { throw "agentq timings: exit $code" }
+  }
+  # Trust-surface work. An agent CANNOT mint an edit ticket itself: `rules-ticket.ps1 -Issue` refuses a
+  # redirected console, which is the point. So this asks the OWNER in a window, and the WINDOW mints it -
+  # it is the only process in the chain that owns a real console (bin\agentq-approve.ps1).
+  'approve' {
+    $a = Join-Path $PSScriptRoot 'agentq-approve.ps1'
+    if (-not (Test-Path -LiteralPath $a)) { throw "agentq approve: missing module $a" }
+    if (-not @($Paths).Count) { [Console]::Error.WriteLine('agentq approve: -Paths a,b is required (the exact paths the ticket must authorise)'); exit 2 }
+    $argv = @('-NoProfile', '-File', $a, '-Paths', ($Paths -join ','))
+    if ($Purpose) { $argv += @('-Purpose', "$Purpose") }
+    if ($MaxMinGiven) { $argv += @('-MaxMin', "$MaxMin") }
+    # $Hours defaults to 12 in THIS file (the `since -Hours 12` default) while a ticket lives at most
+    # 2 h, so only an explicitly LOWER value is forwarded - otherwise the clamp would warn on every call.
+    if ($Hours -lt 12) { $argv += @('-Hours', "$Hours") }
+    if ($Json) { $argv += '-Json' }
+    & pwsh @argv
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
   }
   # A directed channel between agents (agentq-msgs.ps1). Next to `note`, which has no addressee, no answer
   # and no notification: an agent that needs a decision from the agent next door asks instead of guessing.

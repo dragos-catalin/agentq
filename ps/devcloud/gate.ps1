@@ -148,6 +148,32 @@ if (-not $gateList.Count) {
     "AGENTQ-CLOUD-GATE: no gateSuites.$RepoKey in $cfgPath - refusing to submit a gate the pool would run with NO suites."
     exit 1
 }
+
+# --- the suite SELECTION: which of the $gateList suites did THIS change actually touch? -------------
+# Computed HERE, where the git range (origin/main...HEAD) exists - a pool checkout has no origin refs,
+# so it can only be TOLD the result. Every uncertainty falls back to the FULL list (see
+# ps/bin/agentq-suite-inputs.ps1: fail-open toward running). `Proved` is false unless at least one suite
+# still runs AND at least one skips AND the global inputs (the runner, the suite list, this module) did
+# not change, so a narrowing can never leave the gate with nothing to run.
+$selection = $null
+try {
+    . (Join-Path $repoRoot 'ps\bin\agentq-suite-inputs.ps1')
+    $base = ''
+    $u = "$(& git -C $repoRoot rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $u) { $base = $u }
+    elseif (& git -C $repoRoot rev-parse --verify --quiet origin/main 2>$null) { $base = 'origin/main' }
+    if ($base) {
+        $mb = "$(& git -C $repoRoot merge-base $base HEAD 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $mb) { $base = $mb }
+    }
+    $selection = Select-AqSuites -Suites $gateList -Base $base -Head 'HEAD' -RepoRoot $repoRoot
+} catch {
+    "AGENTQ-CLOUD-GATE: suite selection failed ('$($_.Exception.Message)') - running the full list."
+    $selection = $null
+}
+$narrow = [bool]($selection -and $selection.Proved)
+$selectionReason = if ($selection) { "$($selection.Reason)" } else { 'selection unavailable (running the full list)' }
+
 if (-not $Purpose) { $Purpose = "devcloud pool land gate (gateSuites.$RepoKey - $($gateList.Count) suites)" }
 
 # --- -LocalOnly: today's command, verbatim (escape hatch, never a land shortcut) --------------------
@@ -155,6 +181,9 @@ if ($LocalOnly) {
     $runAll = Join-Path $repoRoot 'ps\tests\run-all.ps1'
     "AGENTQ-CLOUD-GATE: -LocalOnly - running TODAY's local command on this workstation; nothing is submitted to the pool."
     "AGENTQ-CLOUD-GATE: & pwsh -NoProfile -File $runAll -RepoSuites -Parallel 4"
+    # run-all.ps1 reads AGENTQ_TEST_SKIP (its documented -Skip override), so the same narrowing applies here.
+    if ($narrow) { $env:AGENTQ_TEST_SKIP = ($selection.Skip -join ',') } else { Remove-Item Env:AGENTQ_TEST_SKIP -ErrorAction SilentlyContinue }
+    if ($narrow) { "AGENTQ-CLOUD-GATE: $selectionReason (AGENTQ_TEST_SKIP=$env:AGENTQ_TEST_SKIP)" } else { "AGENTQ-CLOUD-GATE: full list - $selectionReason" }
     & pwsh -NoProfile -File $runAll -RepoSuites -Parallel 4
     $localCode = $LASTEXITCODE
     if ($localCode -eq 0) { "AGENTQ-CLOUD-GATE: PASS (local exit 0; the pool was not used)" }
@@ -165,7 +194,15 @@ if ($LocalOnly) {
 # --- (ii) the remote command: separate argv tokens, each a word (the caelia / vitals-win shape) ----
 # The lane runs `pwsh -NoProfile -File <script>`; the script resolves gateSuites.<RepoKey> on the
 # CHECKOUT under test (not this tree) and fails loudly when the key is missing.
-$inner = @('pwsh', '-NoProfile', '-File', 'ps/devcloud/pool-suites.ps1', '-RepoKey', $RepoKey, '-Parallel', '4')
+# A PROVEN narrowing travels in argv (a devcloud job carries NO environment): ps/bin/agentq-suite-inputs.ps1
+# exports AGENTQ_TEST_SKIP and then runs the SAME pool half, so the suite list is still resolved on the
+# checkout and a missing key still fails loudly there. With no proven narrowing the command is
+# byte-for-byte today's, so the fallback path carries no new risk.
+if ($narrow) {
+    $inner = @('pwsh', '-NoProfile', '-File', 'ps/bin/agentq-suite-inputs.ps1', '-RunPool', '-SuiteRepoKey', $RepoKey, '-PoolParallel', '4', '-Skip', ($selection.Skip -join ','))
+} else {
+    $inner = @('pwsh', '-NoProfile', '-File', 'ps/devcloud/pool-suites.ps1', '-RepoKey', $RepoKey, '-Parallel', '4')
+}
 
 $agentq = Join-Path $HOME '.copilot/bin/agentq.ps1'
 $argv = @(
@@ -179,6 +216,7 @@ if ($DryRun) {
     'agentq ' + ($argv[3..($argv.Count - 1)] -join ' ')
     "  workspace: $Workspace   resource: $Resource"
     "  repo key:  $RepoKey ($($gateList.Count) suites: $($gateList -join ', '))"
+    "  selection: $selectionReason"
     "  remote:    $($inner -join ' ')"
     "  repo:      $Repo"
     '  (dry run: nothing queued)'
@@ -188,7 +226,7 @@ if ($DryRun) {
 $logDir = Join-Path $repoRoot '.copilot-tmp/agentq-cloud-gate'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir ("{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-"=== land gate on the pool: gateSuites.$RepoKey ($($gateList.Count) suites) on ws-$Workspace"
+"=== land gate on the pool: gateSuites.$RepoKey ($($gateList.Count) resolved; $selectionReason) on ws-$Workspace"
 "=== log: $log"
 
 & pwsh @argv 2>&1 | Tee-Object -FilePath $log
