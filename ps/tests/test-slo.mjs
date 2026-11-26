@@ -503,9 +503,13 @@ try {
 
     // hook cost: cost per call = ms + startMs, day = UTC date of ts (not of the file name)
     const hc = rep2.hookCost;
+    // `implausible` was added to computeHookCost (a startMs over IMPLAUSIBLE_START_MS is a host
+    // reporting its own UPTIME, not a call start) WITHOUT updating this expectation, so `slo` was red
+    // on main from that commit until here. The fixture carries no such line, so the count is 0 - the
+    // shape is what this pins; the increment itself is covered by the emitter's own badLines path.
     assert.deepEqual(hc.days, [
-        { day: "2026-10-17", calls: 5, totalHours: 7400 / 3.6e6, p50Ms: 1000, p90Ms: 3600, startP50Ms: 800, denies: 2 },
-        { day: "2026-10-18", calls: 2, totalHours: 300 / 3.6e6, p50Ms: 100, p90Ms: 200, startP50Ms: 150, denies: 0 },
+        { day: "2026-10-17", calls: 5, totalHours: 7400 / 3.6e6, p50Ms: 1000, p90Ms: 3600, startP50Ms: 800, denies: 2, implausible: 0 },
+        { day: "2026-10-18", calls: 2, totalHours: 300 / 3.6e6, p50Ms: 100, p90Ms: 200, startP50Ms: 150, denies: 0, implausible: 0 },
     ]);
     assert.equal(hc.calls, 7);
     assert.equal(hc.totalHours, 7700 / 3.6e6);
@@ -514,6 +518,7 @@ try {
     assert.equal(hc.p90Ms, 3600);
     assert.equal(hc.startP50Ms, 400);
     assert.equal(hc.denies, 2);
+    assert.equal(hc.implausible, 0);
     assert.equal(hc.badLines, 2);
 
     // start probe: 4 buckets, 2 with a median under 500 ms -> 50 % -> FAIL
