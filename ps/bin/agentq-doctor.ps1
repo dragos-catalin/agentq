@@ -38,7 +38,7 @@ $script:DoctorCoreFiles = @(
   'bin\agentq-store.mjs', 'bin\agentq-sync.ps1', 'bin\worktree.ps1', 'bin\job-start.ps1', 'bin\wait-job.ps1',
   'bin\jobs.ps1', 'hooks\run-build.ps1', 'hooks\deploy-clean.ps1', 'hooks\guard-tooluse.ps1', 'hooks\hook-pre.ps1'
 )
-$script:DoctorTasks = @('agentq-sync', 'copilot-worktree-prune', 'agentq-reap-terminals', 'git-autosync')
+$script:DoctorTasks = @('agentq-sync', 'copilot-worktree-prune', 'agentq-reap-terminals', 'git-autosync', 'codai-workspace-prewarm')
 
 # ---- rows ---------------------------------------------------------------------------------
 function Add-DoctorRow([string]$check, [string]$status, [string]$subject, [string]$detail, [string]$hint = '') {
@@ -642,6 +642,31 @@ function Test-DoctorTasks {
   }
 }
 
+# ---- 7b. prewarm (the unattended warmer's liveness) ---------------------------------------------
+# The unattended prewarm has no observable failure mode: LastTaskResult can read 267009 ("still
+# running") while the tick is dead, and the task stays registered and enabled either way, so nothing
+# in Task Scheduler says the warming stopped. The freshness of the tick log is therefore the only
+# honest signal: age it against a bound and fail when it is stale.
+function Test-DoctorPrewarm {
+  if ($env:AGENTQ_DOCTOR_NO_PREWARM -eq '1') { Add-DoctorSummary 'prewarm' 'skipped (AGENTQ_DOCTOR_NO_PREWARM=1)'; return }
+  $tick = if ($env:AGENTQ_PREWARM_TICKLOG) { "$($env:AGENTQ_PREWARM_TICKLOG)" } else { Join-Path $Root 'prewarm\ticks.log' }
+  # Nothing installed yet is a SKIP, not a finding, and the word matters: the doctor suite counts the
+  # checks that actually ran and excludes any summary that begins with "skipped (" (the same reason the
+  # scheduled-tasks check says it). A check with nothing to look at must not inflate that count.
+  if (-not [IO.File]::Exists($tick)) { Add-DoctorSummary 'prewarm' 'skipped (no tick log yet: prewarm not installed here)'; return }
+  try {
+    $age = ([DateTime]::UtcNow - [IO.FileInfo]::new($tick).LastWriteTimeUtc).TotalMinutes
+  } catch {
+    Add-DoctorRow 'prewarm' 'warn' '' "the tick log could not be read: $($_.Exception.Message)"
+    Add-DoctorSummary 'prewarm' 'not checked'
+    return
+  }
+  $bound = if ($env:AGENTQ_PREWARM_MAX_AGE_MIN) { [double]$env:AGENTQ_PREWARM_MAX_AGE_MIN } else { 30 }
+  $ageR = [math]::Round($age, 1)
+  if ($age -le $bound) { Add-DoctorRow 'prewarm' 'ok' '' ("tick {0} min ago ({1})" -f $ageR, $tick) }
+  else { Add-DoctorRow 'prewarm' 'fail' '' ("prewarm tick is {0} min old (bound {1} min): unattended warming has stopped ({2})" -f $ageR, $bound, $tick) 'run it by hand: schtasks /run /tn codai-workspace-prewarm (or bin\prewarm-cloud.ps1 -RepairTask from the installed copy)' }
+}
+
 # ---- 8. git-autosync (the daemon health), via its own -Doctor -----------------------------------
 # One command covers everything: instead of re-implementing its checks (scheduled task, snapshot
 # freshness, ghost keys, long-lived loops), call `git-autosync -Doctor` and fold its verdict into this
@@ -894,6 +919,7 @@ function Invoke-Doctor {
     'git-autosync'        = { Test-DoctorGitAutosync }
     'daemons'             = { Test-DoctorDaemons }
     'cloud-lanes'         = { Test-DoctorCloudLanes $scope }
+    'prewarm'             = { Test-DoctorPrewarm }
   }
   # -Only <check[,check]>: run just those checks. An unknown name is a USAGE error, never an empty
   # report - a caller that typo'd `cloud-lane` and was answered "0 problem(s)" would read a green gate

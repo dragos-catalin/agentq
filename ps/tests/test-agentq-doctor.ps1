@@ -2,7 +2,7 @@
 # package-store folders, install/config drift, dead lease owners, dead jobs and keepers, old marks,
 # state size). Section 18 covers the two pre-flight flags added 2026-11-25 (-Only <check[,check]> runs a
 # subset and REFUSES an unknown name with exit 2; -Quiet prints the findings only), with a mutation
-# proving the refusal is what produces that exit code. Every case asserts the row AND the exit code. 
+# proving the refusal is what produces that exit code. Every case asserts the row AND the exit code.
 # Isolated in %TEMP%; the installed copy and
 # the source checkout are fakes (AGENTQ_INSTALL_DIR, -Src), scheduled tasks are skipped.
 param([string]$Aq = (Join-Path $PSScriptRoot '..\bin\agentq.ps1'))
@@ -156,6 +156,10 @@ try {
   $rows = Rows $r 'stale-index-lock' 'fail'
   Check '2 old lock + git process on the slot: not reported' (-not $gitProc.HasExited -and $rows.Count -eq 1 -and $rows[0].subject -eq 'repo/task-1') $raw
   try { $gitProc.Kill($true) } catch {}; $gitProc.WaitForExit(5000) | Out-Null; $gitProc = $null
+  # task-2's lock is the fixture's "a live git command minted this moments ago" case, and the doctor's
+  # bound is 60 s (DoctorLockAgeSec). On a loaded box the two doctor runs above can take longer than
+  # that, task-2 ages into a THIRD row and this check fails for a reason it does not assert. Refresh it.
+  $null = New-Lock $gd2 0
   $r = DJ -All
   Check '2 same lock once the git process is gone: reported' (@(Rows $r 'stale-index-lock' 'fail').Count -eq 2 -and $code -eq 1) $raw
 

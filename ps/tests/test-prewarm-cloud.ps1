@@ -201,6 +201,69 @@ Check 'an unregistered task is not a failure' (($r.Exit -eq 0) -and (Contains $r
 $r = Invoke-Prewarm @('-RepairTask', '-TaskFile', $elsewhere)
 Check 'a repair refuses to run from the test seam' (($r.Exit -eq 2) -and (Contains $r.Out 'cannot run from -TaskFile'))
 
+# 13. The doctor's own prewarm check. Everything above proves the tick is bounded; this proves the
+# report a person reads agrees with the exit code a scheduler reads, in all four states. It is driven
+# with -Only prewarm so it stays fast and isolated, and with AGENTQ_PREWARM_TICKLOG pointed at a
+# fixture under $tmp so it never reads the machine's real coord root (a check that reads green while
+# the tick is stale would be worse than no check at all). -Json is one object on stdout; the report
+# lives in its `rows` array, whose `check` field names the check.
+$aq = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\bin\agentq.ps1')).Path
+function Invoke-DoctorPrewarm {
+    $out = & pwsh -NoProfile -File $aq doctor -Only prewarm -Json 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $rows = $null
+    $match = @("$out" -split "`r?`n" | Where-Object { $_ -match '^\{.*"rows"' })
+    if ($match.Count) { try { $rows = @((ConvertFrom-Json $match[-1]).rows) } catch { $rows = $null } }
+    return [pscustomobject]@{ Out = $out; Exit = $code; Rows = $rows }
+}
+function PrewarmRows($rows) {
+    if ($null -eq $rows) { return @() }
+    return @($rows | Where-Object { $_.check -eq 'prewarm' })
+}
+$savedTick = $env:AGENTQ_PREWARM_TICKLOG
+$savedNo = $env:AGENTQ_DOCTOR_NO_PREWARM
+$savedMax = $env:AGENTQ_PREWARM_MAX_AGE_MIN
+try {
+    # 13a. No tick log at all: there is nothing to measure, so the check must be silent and green.
+    $tickMissing = Join-Path $tmp 'doctor-ticks-missing.log'
+    Remove-Item -LiteralPath $tickMissing -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTQ_DOCTOR_NO_PREWARM -ErrorAction SilentlyContinue
+    $env:AGENTQ_PREWARM_TICKLOG = $tickMissing
+    $d = Invoke-DoctorPrewarm
+    $real = @(PrewarmRows $d.Rows | Where-Object { $_.kind -ne 'summary' })
+    Check 'doctor prewarm: no tick log -> no row, exit 0' (($d.Exit -eq 0) -and ($real.Count -eq 0)) "exit=$($d.Exit) prewarmRows=$($real.Count)"
+
+    # 13b. A fresh tick log: one row saying so, and the process agrees.
+    $tickFresh = Join-Path $tmp 'doctor-ticks-fresh.log'
+    Set-Content -LiteralPath $tickFresh -Value 'tick ok' -Encoding utf8
+    [IO.File]::SetLastWriteTimeUtc($tickFresh, [DateTime]::UtcNow)
+    $env:AGENTQ_PREWARM_TICKLOG = $tickFresh
+    $d = Invoke-DoctorPrewarm
+    $pw = @(PrewarmRows $d.Rows)
+    Check 'doctor prewarm: fresh tick log -> ok row, exit 0' (($d.Exit -eq 0) -and ($pw.Count -ge 1) -and (@($pw | Where-Object { $_.status -ne 'ok' }).Count -eq 0)) "exit=$($d.Exit) statuses=$(@($pw | ForEach-Object { $_.status }) -join ',')"
+
+    # 13c. A stale tick log: the row and the exit code both have to say so.
+    $tickStale = Join-Path $tmp 'doctor-ticks-stale.log'
+    Set-Content -LiteralPath $tickStale -Value 'tick ok' -Encoding utf8
+    [IO.File]::SetLastWriteTimeUtc($tickStale, [DateTime]::UtcNow.AddHours(-2))
+    $env:AGENTQ_PREWARM_TICKLOG = $tickStale
+    $d = Invoke-DoctorPrewarm
+    $pw = @(PrewarmRows $d.Rows)
+    Check 'doctor prewarm: stale tick log -> fail row, exit 1' (($d.Exit -eq 1) -and ($pw.Count -ge 1) -and (@($pw | Where-Object { $_.status -ne 'fail' }).Count -eq 0)) "exit=$($d.Exit) statuses=$(@($pw | ForEach-Object { $_.status }) -join ',')"
+
+    # 13d. The opt-out, with a fresh file present so only the switch can explain the silence.
+    $env:AGENTQ_PREWARM_TICKLOG = $tickFresh
+    $env:AGENTQ_DOCTOR_NO_PREWARM = '1'
+    $d = Invoke-DoctorPrewarm
+    $real = @(PrewarmRows $d.Rows | Where-Object { $_.kind -ne 'summary' })
+    Check 'doctor prewarm: AGENTQ_DOCTOR_NO_PREWARM -> no row, exit 0' (($d.Exit -eq 0) -and ($real.Count -eq 0)) "exit=$($d.Exit) prewarmRows=$($real.Count)"
+}
+finally {
+    if ($null -ne $savedTick) { $env:AGENTQ_PREWARM_TICKLOG = $savedTick } else { Remove-Item Env:AGENTQ_PREWARM_TICKLOG -ErrorAction SilentlyContinue }
+    if ($null -ne $savedNo) { $env:AGENTQ_DOCTOR_NO_PREWARM = $savedNo } else { Remove-Item Env:AGENTQ_DOCTOR_NO_PREWARM -ErrorAction SilentlyContinue }
+    if ($null -ne $savedMax) { $env:AGENTQ_PREWARM_MAX_AGE_MIN = $savedMax } else { Remove-Item Env:AGENTQ_PREWARM_MAX_AGE_MIN -ErrorAction SilentlyContinue }
+}
+
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "prewarm: $script:Pass passed, $script:Fail failed" -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
