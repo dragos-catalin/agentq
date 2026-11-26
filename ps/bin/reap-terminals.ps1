@@ -37,12 +37,13 @@ with code 0 - no "terminated with exit code -1" alert, and an agent that was sti
 normal interrupt. Only shells still alive after -GraceSec are force-killed (journal how=forced).
 
   reap-terminals.ps1 [-WhatIf] [-MinAgeHours 3] [-KeepNewest 4] [-SoftCap 80] [-PressureMinAgeMin 20]
-                     [-CriticalCap 150] [-CriticalLow 120] [-CriticalMinAgeMin 30] [-GraceSec 20] [-Json]
+                     [-CriticalCap 150] [-CriticalLow 120] [-CriticalMinAgeMin 30] [-GraceSec 20]
+                     [-SignalTimeoutSec 25] [-Json]
 EXIT 0 ok, 2 usage.
 #>
 param([switch]$WhatIf, [double]$MinAgeHours = 3, [int]$KeepNewest = 4, [double]$MaxCpuSec = 1, [int]$SampleSec = 20,
   [int]$SoftCap = 80, [double]$PressureMinAgeMin = 20, [int]$CriticalCap = 150, [int]$CriticalLow = 120, [double]$CriticalMinAgeMin = 30,
-  [int]$GraceSec = 20, [string]$AssocTool = (Join-Path $PSScriptRoot 'vscode-chat-terminals.mjs'),
+  [int]$GraceSec = 20, [int]$SignalTimeoutSec = 25, [string]$AssocTool = (Join-Path $PSScriptRoot 'vscode-chat-terminals.mjs'),
   [string]$SignalTool = (Join-Path $PSScriptRoot 'console-signal.ps1'), [switch]$Json)
 $ErrorActionPreference = 'Stop'
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
@@ -138,8 +139,22 @@ function Write-Reap($r, [string]$how) {
 function Test-Same($r) { try { $g = Get-Process -Id $r.pid -ErrorAction Stop; [math]::Abs(($g.StartTime - $r.created).TotalSeconds) -le 2 } catch { $false } }
 $killed = 0; $freedMB = 0; $graceful = 0; $forced = 0
 if (-not $WhatIf -and $reap.Count) {
-  # 1. interrupt: Ctrl+C + `exit` on each console, in a separate process (it re-attaches consoles)
-  $sigOut = @(try { & pwsh -NoProfile -File $SignalTool -Pids (($reap | ForEach-Object pid) -join ',') 2>&1 } catch { @() })
+  # 1. interrupt: Ctrl+C + `exit` on each console, in a separate process (it re-attaches consoles).
+  #    BOUNDED (2026-11-26): this call had no timeout. When console-signal.ps1 wedged (it AttachConsole's the
+  #    target's console), the reaper blocked here forever, so the grace and force steps below never ran and no
+  #    terminal was ever reaped - while every 30-min run leaked two processes (11 stuck pairs observed).
+  $sigLog = Join-Path $env:TEMP ("agentq-signal-{0}.out" -f $PID)
+  $sigArgs = @('-NoProfile', '-File', $SignalTool, '-Pids', (($reap | ForEach-Object pid) -join ','))
+  $sig = Start-Process -FilePath 'pwsh' -ArgumentList $sigArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $sigLog
+  try {
+    if (-not $sig.WaitForExit($SignalTimeoutSec * 1000)) {
+      & taskkill.exe /PID $sig.Id /T /F 2>&1 | Out-Null
+      if ($Json) { } else { Write-Output ("console-signal exceeded {0}s (pid {1}) - killed it, continuing to grace/force" -f $SignalTimeoutSec, $sig.Id) }
+    }
+  } finally {
+    try { $sig.Dispose() } catch {}
+    Remove-Item -LiteralPath $sigLog -Force -ErrorAction SilentlyContinue
+  }
   # 2. grace: wait for the shells to close themselves
   $deadline = (Get-Date).AddSeconds($GraceSec)
   do { $alive = @($reap | Where-Object { Test-Same $_ }); if ($alive.Count) { Start-Sleep -Milliseconds 500 } } while ($alive.Count -and (Get-Date) -lt $deadline)
