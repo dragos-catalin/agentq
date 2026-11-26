@@ -110,6 +110,21 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   (`scratch-alloc-denied`, `slot-admission-denied`) only when the allocation is really refused.
   Measured live 2026-11-26: 26/26 reported slots were in fact 20 scratch + 15 task + 1 land against a
   measured room of 30, i.e. the machine was over-subscribed rather than leaking slots.
+- **The lease chat grace is read from config instead of being hardcoded.** `agentq-slo.mjs` fixes
+  `TARGETS.liveChatIdleMin` at 30, `agentq-v2.ps1` says in a comment that 30 must match it, and the code
+  default had already been raised to 30 - but BOTH config copies still pinned `leaseChatGraceMin: 20`, and a
+  key present in the config beats the default, so that raise had never taken effect. A lease whose chat had
+  been idle 20-30 min was therefore expired by the reaper and then counted by the SLO as an avoidable loss
+  (`slotsLostLiveChat`, target 0, 34 in OQ-001). Both copies are now 30, and the two `status` display sites
+  read the same knob (`$chatWin`) instead of a hardcoded 30, so the table can no longer call a lease `chat`
+  one moment before the reaper takes it. Suites: `test-agentq-lease-liveness.ps1` (13 checks) ALL PASS,
+  `test-lease-chat.ps1` (40 checks) ALL OK.
+- **`agentq scale` - one step to see why `N/N` is not a small pool.** The slot budget is derived from the
+  machine and re-measured on every call; an agent that reads `26/26` takes it for a fixed, too-small setting
+  and asks for more slots. The new READ-ONLY verb prints the formula with the live numbers (disk and commit
+  room, the task cap, the scratch offer, what is held) and states the part that is easy to misread: a
+  per-repo `N/N` is the LANES, not the machine, because `build:<repo>` tickets are independent and only
+  `build:machine` (max 2) is shared. `-Json` returns the same as an object; `agentq help scale` documents it.
 
 ### Security
 

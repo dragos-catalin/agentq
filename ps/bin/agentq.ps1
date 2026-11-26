@@ -2456,6 +2456,7 @@ $script:AqHelp = [ordered]@{
   'prune' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'prune [-WhatIf] [-Days n] [-All] [-Json]'; d = 'remove state nobody needs any more (sweep runs it too)' }
   'doctor' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'doctor [-All] [-Src <checkout>/ps] [-Json] [-Only <check[,check]>] [-Quiet]'; d = 'health report read-only; exit 1 when a check fails. -Only runs just those checks (an unknown name exits 2 and prints the valid list), -Quiet prints the findings only. checks: stale-index-lock, empty-package-store, install-drift, config-drift, install-proof, stale-install, dead-owner, lease-hygiene, dead-keeper, marks, machine-memory, state-size, scheduled-tasks, git-autosync, daemons, cloud-lanes'; e = 'agentq doctor -Only cloud-lanes,install-drift -Quiet' }
   'slo' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'slo [-Hours 168] [-Json] [-Track]'; d = 'queue time, waits over 10 min, hook cost per day, slots lost with a live chat' }
+  'scale' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'scale [-Json]'; d = 'why N/N is not a small pool: the machine-wide slot room, its formula and the live numbers'; e = 'agentq scale' }
   'flakes' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'flakes [-Id <test key or substring> -Reason "why"]'; d = 'quarantine report; -Id lifts a quarantine' }
   'store' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]'; d = 'SQLite index of the journal + job registry (the JSONL stays the source of truth)' }
   'help' = @{ g = 'Help'; u = 'help [<verb>]'; d = 'this index, or one verb''s usage and an example'; e = 'agentq help land' }
@@ -2481,7 +2482,7 @@ function Show-AgentqHelp([string]$For) {
     Write-Output ("  {0,-15} {1}" -f $k, $h.d)
   }
   Write-Output ''
-  Write-Output 'READ-ONLY (never queue, never reap): status log since who metrics slo flakes doctor probe eval'
+  Write-Output 'READ-ONLY (never queue, never reap): status log since who metrics slo scale flakes doctor probe eval'
   Write-Output 'EXIT: 0 ok | 2 usage | 3 frozen/blocked/timeout | 4 release superseded | 5 land conflict | 6 land pre-gate | 7 lease -Wait bound expired'
   Write-Output 'DESIGN: 4 ADRs in docs/adr (0001 slots/leases/land, 0002 v3 scheduler, 0007 system store, 0009 orchestrator)'
 }
@@ -2597,6 +2598,9 @@ switch ($Verb.ToLowerInvariant()) {
     $slOut | ForEach-Object { Write-Output $_ }
     exit $slCode
   }
+  # Item #10 (2026-11-26): the pool an agent reads as "N/N, too small" is DERIVED from the machine and
+  # measured live. One step to see the formula and the numbers, instead of asking for more slots.
+  'scale' { Show-Scale; exit 0 }
   # ADR 0006: SQLite index of the journal + job registry (rebuildable; JSONL stays the source of truth).
     # agentq store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]
     'store' { $sub = if ($State) { "$State" } else { 'status' }; $sa = @((Join-Path $PSScriptRoot 'agentq-store.mjs'), $sub, '--home', $Root); if ($Id) { $sa += @('--event', $Id) }; if ($Repo) { $sa += @('--repo', (Split-Path -Leaf $Repo)) }; if ($sub -eq 'query') { $sa += @('--hours', "$Hours") }; & node @sa; exit $LASTEXITCODE }

@@ -155,6 +155,38 @@ function Get-TaskSlotBudget {
   $cap = [math]::Min($ceiling, [math]::Max($floor + 1, $derived))
   [pscustomobject]@{ cap = [int]$cap; floor = $floor; ceiling = $ceiling; derived = [int]$derived; scratchHeld = $scratchHeld; freeGB = $r.freeGB; freeCommitGB = $r.freeCommitGB }
 }
+# HOW BIG THE SLOT POOL REALLY IS (item #10, 2026-11-26). An agent that reads `26/26` takes it for a fixed,
+# too-small pool and asks for more slots. It is not a setting: the number is DERIVED from the machine and
+# re-measured on every call, and the two pools (task + scratch) each spend the same room on one volume.
+# READ-ONLY: no queue, no lease, no reap - safe to call at any time.
+function Show-Scale {
+  $room = Get-SlotRoom
+  $tb = Get-TaskSlotBudget
+  $commitKeep = [double](P (Get-Config) 'minFreeCommitGB' 12)
+  $scratchFloor = Get-ScratchSlotCount
+  $scratchHard = Get-ScratchSlotCeiling
+  $scratchHeld = Get-ScratchLeaseCount
+  $taskHeld = Get-TaskLeaseCount
+  $sc = Get-ScratchOfferCeiling $taskHeld
+  if ($Json) {
+    [pscustomobject]@{ room = $room; task = $tb; scratchOffer = $sc; taskHeld = $taskHeld; scratchHeld = $scratchHeld } | ConvertTo-Json -Depth 5
+    return
+  }
+  Write-Output 'agentq scale - the slot pool is DERIVED from this machine, not a number to raise'
+  Write-Output ''
+  Write-Output '  room    = min( floor((freeDisk - 20 GB) / 8 GB), floor((freeCommit - keep) / 2 GB) )'
+  Write-Output ("          = min( floor(({0} - 20) / 8) = {1}, floor(({2} - {3}) / 2) = {4} ) = {5}" -f $room.freeGB, $room.byDisk, $room.freeCommitGB, $commitKeep, $room.byCommit, $room.total)
+  Write-Output ("  task    = clamp(room - scratchHeld, floor + 1 .. ceiling) = clamp({0} - {1}, {2} .. {3}) = {4}" -f $room.total, $tb.scratchHeld, ($tb.floor + 1), $tb.ceiling, $tb.cap)
+  Write-Output ("  scratch = clamp(room - taskHeld, {0} .. {1}), never above {0} while disk < scratchMinFreeGB" -f $scratchFloor, $scratchHard)
+  Write-Output ("          = clamp({0} - {1}, {2} .. {3}) = {4} offered now" -f $room.total, $taskHeld, $scratchFloor, $scratchHard, $sc.offer)
+  Write-Output ''
+  Write-Output ("  held now: {0} task + {1} scratch, against a room of {2} worktrees" -f $taskHeld, $scratchHeld, $room.total)
+  Write-Output ''
+  Write-Output '  A per-repo N/N is the LANES, not the machine: build:<repo> tickets are per repo and'
+  Write-Output '  independent, so a busy repo never blocks another. Only build:machine (max 2) is shared.'
+  Write-Output '  Elastic by design - a scratch slot rides on free room; a refused slot now reports the'
+  Write-Output '  measured offer and room instead of a bare "it is still held".'
+}
 function Get-PinnedSlots([string]$repoName) { $p = (Get-Config)['pinned']; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
 # The ONLY slot names that exist. Anything else is legacy and gets migrated away.
 function Get-SlotRole([string]$repoName, [string]$slot) {
