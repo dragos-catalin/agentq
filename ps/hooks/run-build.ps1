@@ -489,7 +489,13 @@ try {
   $lastCpu = Get-TreeCpu -Tree $tree                         # baseline BEFORE the loop
   if ($treeSw.ElapsedMilliseconds -ge $DiscoveryNoteMs) { "=== tree discovery took $($treeSw.ElapsedMilliseconds) ms ($($tree.Count) pids)" | Add-Content $logPath -Encoding UTF8 }
   # The clock starts here: silence is only silence we actually watched for.
+  # The sweep above is not watched time and is not counted. `$blindMs` keeps the same rule inside the
+  # loop: a discovery is time the loop cannot see output, so it is SUBTRACTED from the silence instead
+  # of resetting it. Resetting was the 2026-11-26 bug -- with a slow box the sweep outlasts the 5 s
+  # spacing, discovery ran on EVERY flat probe, `lastGrowth` jumped on every one and the silence could
+  # never reach `$WedgeMin`: no marker was ever written for an idle child (suite run 1: w5 Seen=False).
   $lastGrowth = [DateTime]::UtcNow
+  $blindMs = 0L                                              # discovery time, excluded from the silence
   $lastCpuAt = [DateTime]::UtcNow                            # window 1 starts with the loop
   $nextDiscoveryAt = [DateTime]::UtcNow                      # first flat probe may discover
   while (-not $proc.WaitForExit(500)) {
@@ -517,26 +523,33 @@ try {
           # grandchild is still caught (one window later), and a silent one is not excused.
           $nowDt = [DateTime]::UtcNow
           if ($nowDt -ge $nextDiscoveryAt) {
-            $nextDiscoveryAt = $nowDt.AddSeconds(5)
             $before = $tree.Count
             $discSw = [Diagnostics.Stopwatch]::StartNew()
             Update-TreePids -Root ([int]$proc.Id) -Tree $tree
             $discSw.Stop()
+            # Spaced from the END of the sweep: a sweep that outlasts the spacing (measured 380-13 000 ms
+            # under load) otherwise re-fires on the very next flat probe, back to back.
+            $nextDiscoveryAt = [DateTime]::UtcNow.AddSeconds(5)
             if ($tree.Count -ne $before) { $cpuSum = Get-TreeCpu -Tree $tree }
             # A discovery is WORK, not silence: it takes 380-968 ms under load (measured), the loop is
             # blind to output while it runs, and on a fixture threshold (3 s) the sweep alone could push
-            # quietAge past the limit and write '=== WEDGED' for a child that never stopped. Reset the
-            # clock after it; the NEXT window measures the new pids' real CPU, so a burning grandchild
-            # is still caught (one window later) and a silent one is not excused.
-            $lastGrowth = [DateTime]::UtcNow
+            # quietAge past the limit and write '=== WEDGED' for a child that never stopped. So SUBTRACT
+            # the blind time from the silence. Never reset the clock: resetting lets a slow box postpone
+            # the verdict forever. The NEXT window still measures the new pids' real CPU, so a burning
+            # grandchild is caught (one window later) and a silent one is not excused.
+            $blindMs += $discSw.ElapsedMilliseconds
             if ($discSw.ElapsedMilliseconds -ge $DiscoveryNoteMs) { "=== tree discovery took $($discSw.ElapsedMilliseconds) ms ($($tree.Count) pids)" | Add-Content $logPath -Encoding UTF8 }
           }
         }
       } else { $cpuPrimed = $true }
       $lastCpu = $cpuSum; $lastCpuAt = [DateTime]::UtcNow
     }
+    # Watched silence: wall time since the last growth, minus the time the loop spent blind in a
+    # discovery. Computed before every verdict so the branch below reads exactly one number.
+    $silentSec = ([DateTime]::UtcNow - $lastGrowth).TotalSeconds - ($blindMs / 1000.0)
     if ($outGrew -or $cpuGrew) {
       $lastGrowth = [DateTime]::UtcNow
+      $blindMs = 0L
       if ($wedged) { $wedged = $false; foreach ($tf in $ticketFiles) { Remove-Item -LiteralPath "$tf.wedged" -Force -ErrorAction SilentlyContinue }; Write-Host 'build output resumed (WEDGED cleared)' -ForegroundColor DarkGray }
       elseif ($cpuGrew -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $quietNotedAt).TotalMinutes -ge 2) {
         $quietNotedAt = [DateTime]::UtcNow
@@ -546,9 +559,9 @@ try {
         Add-Content -LiteralPath $logPath -Value "$msg $(Get-Date -Format o)" -Encoding UTF8
         Write-Host $msg -ForegroundColor DarkGray
       }
-    } elseif (-not $cloudBound -and -not $wedged -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $lastGrowth).TotalMinutes -ge $WedgeMin) {
+    } elseif (-not $cloudBound -and -not $wedged -and $WedgeMin -gt 0 -and $silentSec -ge ($WedgeMin * 60.0)) {
       $wedged = $true
-      $quiet = [math]::Round(([DateTime]::UtcNow - $lastGrowth).TotalMinutes, 1)
+      $quiet = [math]::Round($silentSec / 60.0, 1)
       $w = @{ since = [DateTime]::UtcNow.ToString('o'); quietMin = $quiet; log = $logPath; pid = $proc.Id } | ConvertTo-Json -Compress
       foreach ($tf in $ticketFiles) { try { [IO.File]::WriteAllText("$tf.wedged", $w) } catch { } }
       "=== WEDGED: no output AND no child CPU for $quiet min (pid $($proc.Id)) $(Get-Date -Format o)" | Add-Content $logPath -Encoding UTF8
