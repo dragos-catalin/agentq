@@ -1,10 +1,14 @@
-# Two measured fixes (2026-11-23). (A) ELASTIC SCRATCH SLOTS: scratch-N is valid up to scratchSlotsMax; an
-# index beyond the scratchSlots floor is only allocated when the machine has room (scratchMinFreeGB free on
-# the slot volume + the minFreeCommitGB commit guard), else ONE `scratch-alloc-denied` event. A hard cap of 3
-# starved the `agentq land` pre-gate, which rents a scratch slot for the length of the gate. (B) RESOURCE-
-# DERIVED MACHINE TASK-SLOT BUDGET: the machine-wide cap is measured (free disk + commit charge), ceiling
-# taskSlotsMachine, floor taskSlotsMachineFloor (the first `floor` slots are never refused); above the derived
-# budget a task lease is refused with a `slot-admission-denied` event.
+# Three measured fixes. (A) ELASTIC SCRATCH SLOTS (2026-11-23): scratch-N is valid up to scratchSlotsMax; an
+# index beyond the scratchSlots floor is only allocated when the machine has room, else ONE
+# `scratch-alloc-denied` event. A hard cap of 3 starved the `agentq land` pre-gate, which rents a scratch slot
+# for the length of the gate. (B) RESOURCE-DERIVED MACHINE TASK-SLOT BUDGET: the machine-wide cap is measured
+# (free disk + commit charge), ceiling taskSlotsMachine, floor taskSlotsMachineFloor (the first `floor` slots
+# are never refused); above the derived budget a task lease is refused with a `slot-admission-denied` event.
+# (C) ONE SHARED BUDGET (2026-11-26): task and scratch are both real worktrees on the same volume, so
+# Get-SlotRoom measures ONE room and both pools spend from it - the scratch offer is capped by the room MINUS
+# the task slots held, and the task budget subtracts the scratch leases held. Without that, raising either
+# ceiling promised the same gigabytes twice (measured: 26 of 26 "slots" while the refusals named a budget of
+# 11-17, and ONE window leased all 8 scratch slots).
 # The measurement is injectable (AGENTQ_TEST_SLOT_BUDGET "<freeGB>,<freeCommitGB>"), so the suite pins the
 # allowed AND the refused side without touching the real machine. Isolated in %TEMP% (AGENTQ_HOME /
 # CODAI_WT_ROOT / AGENTQ_CONFIG), the same pattern as test-agentq-lease-liveness.ps1.
@@ -109,6 +113,36 @@ try {
     $ev = @(Ev 'scratch-alloc-denied')[-1]
     Check 'A3 real probe refused: the event carries real numbers' ($null -ne $ev.freeGB -and [double]$ev.freeGB -ge 0 -and [double]$ev.needGB -eq 25) ($ev | ConvertTo-Json -Compress)
   }
+
+  # =============================== C1: the scratch offer is DERIVED from the shared room, not the ceiling
+  # Inject 60 GB free -> byDisk = (60-20)/8 = 5, so the machine offers 5 scratch slots even though
+  # scratchSlotsMax is 8. The 6th never becomes a candidate (no -Slot: the offer path sizes the pool), and the
+  # journal says where the number came from.
+  Clear-Leases
+  $env:AGENTQ_TEST_SLOT_BUDGET = '60,100'
+  foreach ($s in 1..5) { $null = AQ lease -Role scratch -Purpose "o$s" -Json }
+  Check 'C1 scratch-1..5 granted (room 5 of a ceiling of 8)' ((Test-Path (LFile 'scratch-1')) -and (Test-Path (LFile 'scratch-5')))
+  $o = AQ lease -Role scratch -Purpose 'o6' -Wait -MaxMin 0 -Json
+  Check 'C1 the 6th scratch lease is refused by the measured room' ($script:code -ne 0 -and -not (Test-Path (LFile 'scratch-6'))) $o
+  $ev = @(Ev 'scratch-alloc-denied')
+  Check 'C1 the refusal reports offer 5 / room 5 / first refused index 6' ($ev.Count -ge 1 -and $ev[-1].offer -eq 5 -and $ev[-1].room -eq 5 -and $ev[-1].index -eq 6) ($ev[-1] | ConvertTo-Json -Compress)
+
+  # =============================== C2: the task budget shrinks by the scratch leases already held
+  # Both pools are real worktrees on ONE volume, so the same room cannot be promised twice. Inject 100 GB free
+  # -> room 10. With 4 scratch slots held the task cap becomes 6 instead of 10.
+  Clear-Leases
+  $env:AGENTQ_TEST_SLOT_BUDGET = '100,100'
+  $before = @(Ev 'scratch-alloc-denied').Count   # A2 and C1 each journalled one: measure the DELTA, not the file
+  foreach ($s in 1..4) { $null = AQ lease -Role scratch -Purpose "k$s" -Json }
+  Check 'C2 4 scratch slots held' ((Test-Path (LFile 'scratch-1')) -and (Test-Path (LFile 'scratch-4')))
+  Check 'C2 no new scratch-alloc-denied while the offer equals the ceiling' (@(Ev 'scratch-alloc-denied').Count -eq $before)
+  $env:AGENTQ_SESSION = 'tc'
+  foreach ($n in 1..6) { $null = AQ lease -Purpose "u$n" -Slot "task-$n" -Json }
+  Check 'C2 task-1..6 granted (room 10 - 4 scratch held = 6)' ((Test-Path (LFile 'task-1')) -and (Test-Path (LFile 'task-6')))
+  $o = AQ lease -Purpose 'u7' -Slot task-7 -Wait -MaxMin 0 -Json
+  Check 'C2 task-7 refused at the shared budget' ($script:code -ne 0 -and -not (Test-Path (LFile 'task-7'))) $o
+  $ev = @(Ev 'slot-admission-denied')[-1]
+  Check 'C2 the refusal reports budget 6 and the 4 scratch leases held' ($ev.budget -eq 6 -and $ev.scratchHeld -eq 4 -and $ev.held -eq 6) ($ev | ConvertTo-Json -Compress)
 } finally {
   Pop-Location
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

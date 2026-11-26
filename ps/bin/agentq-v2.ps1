@@ -75,11 +75,15 @@ function Get-ReleaseSlotCount([string]$repoName) { $r = (Get-Config).releaseSlot
 # Index access, not property access: under StrictMode 3 `(Get-Config).scratchSlots` THROWS when the key is
 # absent (the default map has no scratchSlots), so a scratch lease failed before the default 3 could apply.
 # scratchSlots    = the GUARANTEED floor (always allocatable, reclaimed after leaseScratchIdleMin);
-# scratchSlotsMax = the hard CEILING. Between the two, a higher index is allocated ONLY when the machine has
-#   room: scratchMinFreeGB free on the slot volume AND the minFreeCommitGB commit guard. 2026-11-23: a HARD
-#   cap of 3 starved the `agentq land` pre-gate (it rents a scratch slot for the length of the gate), so three
-#   permanently-leased scratches pushed the ~14-21 min repo gate inside the cap-1 land mutex - one holder held
-#   it 157 min with 4-5 waiters, each land paying ~830 s under the mutex.
+# scratchSlotsMax = the hard CEILING a scratch slot NAME may reach. How many are actually OFFERED is measured,
+#   not merely gated (Get-ScratchOfferCeiling): task and scratch slots draw on ONE machine budget, so raising
+#   either ceiling can never promise more worktrees than the machine holds. 2026-11-23: a HARD cap of 3 starved
+#   the `agentq land` pre-gate (it rents a scratch slot for the length of the gate), so three permanently-leased
+#   scratches pushed the ~14-21 min repo gate inside the cap-1 land mutex - one holder held it 157 min with 4-5
+#   waiters, each land paying ~830 s under the mutex.
+#   2026-11-26, the opposite failure: a hard ceiling of 8 plus an all-or-nothing gate let ONE window lease all
+#   eight, and 81 of 94 slot timeouts in 24 h were `slot:codai:scratch ... it is still held`. The old gate also
+#   mis-sized the pool: it asked only for scratchMinFreeGB free, never "is there room for one more worktree".
 function Get-ScratchSlotCount { $c = Get-Config; if ($c -and $c.ContainsKey('scratchSlots') -and $c['scratchSlots']) { [int]$c['scratchSlots'] } else { 3 } }
 function Get-ScratchSlotCeiling { $c = Get-Config; if ($c -and $c.ContainsKey('scratchSlotsMax') -and $c['scratchSlotsMax']) { [int]$c['scratchSlotsMax'] } else { 8 } }
 function Get-ScratchMinFreeGB { $c = Get-Config; if ($c -and $c.ContainsKey('scratchMinFreeGB') -and $null -ne $c['scratchMinFreeGB']) { [double]$c['scratchMinFreeGB'] } else { 25 } }
@@ -102,6 +106,31 @@ function Get-MachineBudget {
   try { $freeCommitGB = [math]::Round((Get-MemInfo).FreeVirtualMemory / 1MB, 1) } catch {}
   [pscustomobject]@{ freeGB = $freeGB; freeCommitGB = $freeCommitGB; source = 'machine' }
 }
+# Total worktree slots the machine has room for RIGHT NOW, in ONE formula both pools share: disk free on the
+# slot volume (keep 20 GB) and commit charge (keep minFreeCommitGB), each divided by the measured cost of one
+# real worktree + node_modules. Sharing it is what makes raising the ceilings safe - task + scratch can no
+# longer promise more worktrees than the machine has.
+function Get-SlotRoom {
+  $b = Get-MachineBudget
+  $keepFreeGB = 20.0; $perSlotGB = 8.0; $perSlotCommitGB = 2.0
+  $commitKeepGB = [double](P (Get-Config) 'minFreeCommitGB' 12)
+  $byDisk = [int][math]::Floor([math]::Max(0.0, $b.freeGB - $keepFreeGB) / $perSlotGB)
+  $byCommit = [int][math]::Floor([math]::Max(0.0, $b.freeCommitGB - $commitKeepGB) / $perSlotCommitGB)
+  [pscustomobject]@{ total = [int][math]::Min($byDisk, $byCommit); byDisk = $byDisk; byCommit = $byCommit; freeGB = $b.freeGB; freeCommitGB = $b.freeCommitGB }
+}
+# How many scratch slots may be OFFERED right now: the machine's room (Get-SlotRoom) minus the TASK slots it
+# already holds, clamped to [scratchSlots, scratchSlotsMax], and never above the floor unless the machine still
+# has scratchMinFreeGB free (the inherited coarse guard, kept because owners set that knob).
+# Pure apart from the measured budget (injectable with AGENTQ_TEST_SLOT_BUDGET, like Get-MachineBudget).
+function Get-ScratchOfferCeiling([int]$taskHeld = 0) {
+  $floor = Get-ScratchSlotCount
+  $hard = Get-ScratchSlotCeiling
+  $held = [math]::Max(0, $taskHeld)
+  $r = Get-SlotRoom
+  if ($r.freeGB -lt (Get-ScratchMinFreeGB)) { return [pscustomobject]@{ offer = $floor; floor = $floor; hard = $hard; room = 0; tasksHeld = $held; freeGB = $r.freeGB; freeCommitGB = $r.freeCommitGB } }
+  $room = [math]::Max(0, $r.total - $held)
+  [pscustomobject]@{ offer = [int][math]::Min($hard, [math]::Max($floor, $room)); floor = $floor; hard = $hard; room = [int]$room; tasksHeld = $held; freeGB = $r.freeGB; freeCommitGB = $r.freeCommitGB }
+}
 # WHY this budget is measured, not a hand-raised number: session identity = the DIRECT parent process (the
 # VS Code window), so every terminal and subagent of one window shares one session; the measured pressure that
 # motivated the elastic scratch pool was ONE window holding 3 task + 2 scratch slots, and the 3-slot scratch
@@ -112,20 +141,19 @@ function Get-MachineBudget {
 #   per slot: a real worktree + node_modules (~8 GB disk here) + a little commit charge (keep 20 GB disk and
 #   minFreeCommitGB commit free). cap = clamp(derived, floor+1, ceiling): held < cap is admitted, so the first
 #   `floor` are never refused (a lease is only refused once the machine already holds > floor task slots).
+#   2026-11-26: the scratch leases the machine already holds are claimed against this budget too, because both
+#   pools are real worktrees on the same volume - that shared budget is what makes raising either ceiling safe.
 function Get-TaskSlotBudget {
   $cfg = Get-Config
   $ceiling = [int](P $cfg 'taskSlotsMachine' 26)
   $floor = [int](P $cfg 'taskSlotsMachineFloor' 10)
   if ($ceiling -lt 1) { $ceiling = 1 }
   if ($floor -lt 0) { $floor = 0 }
-  $b = Get-MachineBudget
-  $keepFreeGB = 20.0; $perSlotGB = 8.0; $perSlotCommitGB = 2.0
-  $commitKeepGB = [double](P $cfg 'minFreeCommitGB' 12)
-  $byDisk = [int][math]::Floor([math]::Max(0.0, $b.freeGB - $keepFreeGB) / $perSlotGB)
-  $byCommit = [int][math]::Floor([math]::Max(0.0, $b.freeCommitGB - $commitKeepGB) / $perSlotCommitGB)
-  $derived = [math]::Min($byDisk, $byCommit)
+  $r = Get-SlotRoom
+  $scratchHeld = Get-ScratchLeaseCount
+  $derived = [math]::Max(0, $r.total - $scratchHeld)
   $cap = [math]::Min($ceiling, [math]::Max($floor + 1, $derived))
-  [pscustomobject]@{ cap = [int]$cap; floor = $floor; ceiling = $ceiling; derived = [int]$derived; freeGB = $b.freeGB; freeCommitGB = $b.freeCommitGB }
+  [pscustomobject]@{ cap = [int]$cap; floor = $floor; ceiling = $ceiling; derived = [int]$derived; scratchHeld = $scratchHeld; freeGB = $r.freeGB; freeCommitGB = $r.freeCommitGB }
 }
 function Get-PinnedSlots([string]$repoName) { $p = (Get-Config)['pinned']; if ($p -and $p.ContainsKey($repoName)) { @($p[$repoName]) } else { @() } }
 # The ONLY slot names that exist. Anything else is legacy and gets migrated away.
@@ -800,6 +828,10 @@ function Expire-Lease($l, [string]$why) {
   $true
 }
 function Get-TaskLeaseCount { @(Read-Leases $null | Where-Object { (P $_ 'role') -eq 'task' }).Count }
+# Machine-wide scratch leases, the mirror of the line above: scratch slots are worktrees too, so they are
+# claimed against the task budget (Get-TaskSlotBudget) while the task leases are claimed against the scratch
+# offer (Get-ScratchOfferCeiling) - one resource budget for both pools.
+function Get-ScratchLeaseCount { @(Read-Leases $null | Where-Object { (P $_ 'role') -eq 'scratch' }).Count }
 
 # Take a slot lease (exclusive). Task role picks the first free task-N. Returns the lease object.
 function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [string]$branch, [int]$owner, [int]$timeoutMin, [bool]$noWait, [bool]$wait, $maxMin, [bool]$maxMinGiven) {
@@ -890,32 +922,27 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
     # number: Get-TaskSlotBudget clamps the measurement to [floor+1, taskSlotsMachine]. $tb is $null for
     # non-task roles (release/land/pinned/scratch are never gated by it).
     $tb = if ($role -eq 'task') { Get-TaskSlotBudget } else { $null }
+    # (C) the scratch pool is sized the same way, from the same measured budget minus the task slots already
+    # held. Computed before the mutex, like $tb; $so is $null for every other role.
+    $so = if ($role -eq 'scratch') { Get-ScratchOfferCeiling (Get-TaskLeaseCount) } else { $null }
     $got = With-Mutex "lease-$repoName" {
       $leases = @(Read-Leases $repoName)
       $cands = if (-not $slotValid) { @() }
       elseif ($slot) { @($slot) }
       elseif ($role -eq 'task') { @(1..$cfg.taskSlotsPerRepo | ForEach-Object { "task-$_" }) }
       elseif ($role -eq 'scratch') {
-        # Lowest free index from 1 upward. Indices 1..scratchSlots (the guaranteed floor) are always
-        # candidates; beyond the floor an index needs room on the machine (scratchMinFreeGB free on the
-        # slot volume AND the minFreeCommitGB commit guard). When the gate fails, trim to the floor and
-        # journal ONE `scratch-alloc-denied`, so a caller (and the SLO) can see WHY land starved.
-        $floor = Get-ScratchSlotCount; $ceil = Get-ScratchSlotCeiling
-        if ($ceil -le $floor) { @(1..$ceil | ForEach-Object { "scratch-$_" }) }
-        else {
-          $b = Get-MachineBudget
-          $needGB = Get-ScratchMinFreeGB
-          $needCommitGB = [double](P $cfg 'minFreeCommitGB' 12)
-          if (($b.freeGB -ge $needGB) -and ($b.freeCommitGB -ge $needCommitGB)) { @(1..$ceil | ForEach-Object { "scratch-$_" }) }
-          else {
-            $script:ScratchDenied = $true
-            if (-not $script:ScratchDeniedSaid) {
-              $script:ScratchDeniedSaid = $true
-              Write-Journal @{ event = 'scratch-alloc-denied'; reason = "the machine has no room beyond the scratchSlots floor (need $needGB GB free on the slot volume + $needCommitGB GB commit headroom)"; index = ($floor + 1); freeGB = $b.freeGB; needGB = $needGB; repo = $repoName }
-            }
-            @(1..$floor | ForEach-Object { "scratch-$_" })
+        # Lowest free index from 1 upward. Indices 1..scratchSlots (the guaranteed floor) are always candidates;
+        # above the floor the pool is sized by $so.offer = the machine's measured room minus the task slots it
+        # already holds. When the offer stops at the floor, journal ONE `scratch-alloc-denied` with the numbers
+        # so a caller (and the SLO) can see WHY land starved.
+        if ($so.offer -lt $so.hard) {
+          $script:ScratchDenied = $true
+          if (-not $script:ScratchDeniedSaid) {
+            $script:ScratchDeniedSaid = $true
+            Write-Journal @{ event = 'scratch-alloc-denied'; reason = "the machine only offers $($so.offer) scratch slots (floor $($so.floor), ceiling $($so.hard)): room for $($so.room) more worktrees, $($so.tasksHeld) task slots held (freeGB $($so.freeGB), freeCommitGB $($so.freeCommitGB), need $(Get-ScratchMinFreeGB) GB free)"; index = ($so.offer + 1); freeGB = $so.freeGB; needGB = (Get-ScratchMinFreeGB); offer = $so.offer; room = $so.room; tasksHeld = $so.tasksHeld; repo = $repoName }
           }
         }
+        @(1..[math]::Max($so.floor, $so.offer) | ForEach-Object { "scratch-$_" })
       }
       elseif ($role -eq 'release') { @('release') + @(2..([math]::Max(2, (Get-ReleaseSlotCount $repoName))) | Where-Object { $_ -le (Get-ReleaseSlotCount $repoName) } | ForEach-Object { "release-$_" }) }
       else { @($role) }
@@ -966,15 +993,18 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       $slotBudgetSaid = $true
       $heldN = Get-TaskLeaseCount
       [Console]::Error.WriteLine("agentq: no new task slot - the derived machine budget ($($tb.cap)) is reached (held $heldN; freeGB $($tb.freeGB), freeCommitGB $($tb.freeCommitGB); floor $($tb.floor), ceiling $($tb.ceiling))")
-      Write-Journal @{ event = 'slot-admission-denied'; repo = $repoName; slot = 'task'; freeGB = $tb.freeGB; freeCommitGB = $tb.freeCommitGB; budget = [int]$tb.cap; held = $heldN }
+      Write-Journal @{ event = 'slot-admission-denied'; repo = $repoName; slot = 'task'; freeGB = $tb.freeGB; freeCommitGB = $tb.freeCommitGB; budget = [int]$tb.cap; held = $heldN; scratchHeld = [int]$tb.scratchHeld }
     }
     if ($noWait -or (Now) -gt $deadline) {
       $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" }
         elseif ($got -eq 'SLOT-BUDGET') { "the derived machine task-slot budget ($($tb.cap)) is reached (freeGB $($tb.freeGB), freeCommitGB $($tb.freeCommitGB))" }
-        elseif ($role -eq 'scratch' -and $script:ScratchDenied) { "no free scratch slot in $repoName and the machine has no room for another beyond the scratchSlots floor (need $(Get-ScratchMinFreeGB) GB free on the slot volume + minFreeCommitGB commit headroom)" }
+        elseif ($role -eq 'scratch' -and $script:ScratchDenied) { "no free scratch slot in $repoName and the machine offers only $($so.offer) (floor $($so.floor), ceiling $($so.hard)): room for $($so.room) more worktrees, $($so.tasksHeld) task slots held (freeGB $($so.freeGB), freeCommitGB $($so.freeCommitGB); need $(Get-ScratchMinFreeGB) GB free)" }
         else { "no free $role slot in $repoName" }
       $whyWait = if ($got -eq 'MACHINE-CAP') { "the machine-wide task slot cap ($($agl.limit)) is reached" }
         elseif ($got -eq 'SLOT-BUDGET') { "the derived machine task-slot budget ($($tb.cap)) is reached (freeGB $($tb.freeGB))" }
+        # 2026-11-26: 'it is still held' blamed the holder while the cause was often the shared room decided
+        # BEFORE the mutex - and it is the string agents paste into complaints, so name the measured reason.
+        elseif ($role -eq 'scratch' -and $script:ScratchDenied -and $so) { "the machine offers only $($so.offer) scratch slot(s) right now (room $($so.room), ceiling $($so.hard), $($so.tasksHeld) task slots held)" }
         else { 'it is still held' }
       & $expire $whyWait $why
     }
@@ -1901,7 +1931,17 @@ function Get-LandPregateOn([string]$repoName) {
 function Invoke-GateRun([string]$dir, [string]$purpose) {
   $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate
+  # The gate must not wait for a LOCAL build slot when its work runs in the cloud. run-build re-enters
+  # `agentq run -Resource build` and forwards no placement flag, so the decision came from the `local`
+  # default: measured 2026-11-25, a codai land pre-gate sat in `build:machine [gate] machine saturated`
+  # while the gate script was submitting to ws-codai. `auto` lets Resolve-Placement decide (cloud only
+  # when build:machine is full, RAM is below the gate, or admission is saturated) and degrades to local
+  # when the repo has no cloudWorkspaces entry or the workspace is down. An explicit -Where or
+  # AGENTQ_WHERE from the caller is left alone.
+  $prevWhere = $env:AGENTQ_WHERE
+  if (-not $prevWhere) { $env:AGENTQ_WHERE = 'auto' }
+  try { & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate }
+  finally { if ($prevWhere) { $env:AGENTQ_WHERE = $prevWhere } else { Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue } }
   $script:GateExit = [int]$LASTEXITCODE
   $script:GateSec = [int][math]::Round($sw.Elapsed.TotalSeconds)
 }
