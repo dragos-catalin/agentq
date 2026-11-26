@@ -907,6 +907,7 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
   $script:ScratchDenied = $false
   $script:ScratchDeniedSaid = $false
   $slotBudgetSaid = $false
+  $shareWaitSaid = $false
   # One exit for both expiry sites: -Wait prints ONE line to stdout and exits 7; otherwise the legacy
   # stderr message + exit 3 (byte-identical to what callers parsed before).
   $expire = {
@@ -961,6 +962,15 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
     $so = if ($role -eq 'scratch') { Get-ScratchOfferCeiling (Get-TaskLeaseCount) } else { $null }
     $got = With-Mutex "lease-$repoName" {
       $leases = @(Read-Leases $repoName)
+      # D5 (ADR 0014) PER-SESSION SHARE - the owner ticket of 2026-11-26: ONE VS Code window is ONE session,
+      # so a wide fan-out of subagents shared one id and took 12 of the pool's 12 slots; the land PRE-GATE
+      # then found no scratch slot, was SKIPPED, and ran a 5-40 min repo gate inside the cap-1 land mutex.
+      # A session may hold at most `fairShare.slotsPerSession` slots when > 0, else ceil(machine task cap /
+      # competing sessions) floored at 1 - and only while ANOTHER live session holds a slot, so a lone
+      # session keeps every slot (no regression). This runs BEFORE the candidate loop because the loop WRITES
+      # the lease record: refusing afterwards would leave the slot taken, which is exactly the leak.
+      $sw = Test-SlotShareRefusal $repoName $role
+      if ($sw) { $script:SlotShareWhy = $sw; return 'SHARE' }
       $cands = if (-not $slotValid) { @() }
       elseif ($slot) { @($slot) }
       elseif ($role -eq 'task') { @(1..$cfg.taskSlotsPerRepo | ForEach-Object { "task-$_" }) }
@@ -1018,6 +1028,11 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       if ($capHit) { 'MACHINE-CAP' } elseif ($budgetHit) { 'SLOT-BUDGET' } else { $null }
     }
     if ($got -and $got -isnot [string]) { return $got }
+    # D5: over my session's share. This is NOT a slot shortage, so say what it is rather than blaming a holder.
+    if ($got -eq 'SHARE' -and -not $shareWaitSaid) {
+      [Console]::Error.WriteLine('agentq: my session is at its slot share - waiting for one of its slots to free or for the bound to expire')
+      $shareWaitSaid = $true
+    }
     if ($got -eq 'MACHINE-CAP' -and $agl.limit -lt $agl.base -and -not $limitSaid) {
       $limitSaid = $true
       Write-Journal @{ event = 'agent-limit-hold'; resource = "slot:$repoName"; purpose = $purpose; limit = [int]$agl.limit; base = [int]$agl.base; reason = $agl.why; repo = $repoName }
@@ -1030,6 +1045,12 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       Write-Journal @{ event = 'slot-admission-denied'; repo = $repoName; slot = 'task'; freeGB = $tb.freeGB; freeCommitGB = $tb.freeCommitGB; budget = [int]$tb.cap; held = $heldN; scratchHeld = [int]$tb.scratchHeld }
     }
     if ($noWait -or (Now) -gt $deadline) {
+      if ($got -eq 'SHARE' -and $script:SlotShareWhy) {
+        # Deliberately exit 3, not the -Wait lease-timeout exit 7: another session's slot freeing does not
+        # help MY session, only giving one of MY OWN slots back does, so this is a refusal and not a retry.
+        [Console]::Error.WriteLine("agentq: $($script:SlotShareWhy)")
+        exit 3
+      }
       $why = if ($got -eq 'MACHINE-CAP') { "machine-wide task slot cap ($($agl.limit)) reached$(if ($agl.limit -ne $agl.base) { " - agent limit: $($agl.why); $($agl.base) otherwise" })" }
         elseif ($got -eq 'SLOT-BUDGET') { "the derived machine task-slot budget ($($tb.cap)) is reached (freeGB $($tb.freeGB), freeCommitGB $($tb.freeCommitGB))" }
         elseif ($role -eq 'scratch' -and $script:ScratchDenied) { "no free scratch slot in $repoName and the machine offers only $($so.offer) (floor $($so.floor), ceiling $($so.hard)): room for $($so.room) more worktrees, $($so.tasksHeld) task slots held (freeGB $($so.freeGB), freeCommitGB $($so.freeCommitGB); need $(Get-ScratchMinFreeGB) GB free)" }
@@ -1140,6 +1161,25 @@ function Invoke-Lease {
       $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
       [Console]::Error.WriteLine("agentq: this session already holds a task slot in $($repo.Name): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path instead of leasing. For isolated one-off work use a scratch slot: agentq lease -Role scratch -Purpose '<why>' (not counted against the caps, reclaimed after 15 min without work). To take a second task slot on purpose, name it: -Slot task-N.")
       exit 3
+    }
+  }
+  # D5 (ADR 0014) REUSE BEFORE RENTING - the slot-side twin of the queue's fair share. A session that
+  # already holds a CLEAN slot of the requested role in this repo gets that slot back instead of renting a
+  # second one, so a fan-out of subagents stops multiplying leases. Measured 2026-11-26: ONE session held
+  # 12 of a pool of 8 scratch + 4 task slots, so the land PRE-GATE found no scratch slot, was SKIPPED, and
+  # ran a 5-40 min repo gate inside the cap-1 land mutex. Only an UNNAMED, non-`-Wait` request reuses:
+  # `-Slot scratch-N` asks for THAT slot, and `-Wait` is the probe/pre-gate path - the pre-gate RESETS the
+  # slot it rents to origin/<onto>, so handing it a slot this session is still writing in would lose that tree.
+  if (-not $Slot -and -not $Wait) {
+    $reuse = Get-SlotReuse $repo.Name $Role
+    if ($reuse) {
+      $rp = "$(P $reuse 'path')"
+      $res = [pscustomobject]@{ leaseId = "$(P $reuse 'leaseId')"; repo = $repo.Name; slot = "$($reuse.slot)"; role = "$(P $reuse 'role')"; path = $rp; branch = "$(P $reuse 'branch')"; head = "$(& git -C $rp rev-parse --short HEAD 2>$null)".Trim(); reused = $true }
+      if ($Json) { $res | ConvertTo-Json -Compress } else {
+        Write-Output "reusing $($res.repo)/$($res.slot) ($($res.leaseId)) -> $rp @ $($res.head) - this session already holds a clean $(if ($Role) { $Role } else { 'slot' }) slot in this repo, so no second one is rented (D5, ADR 0014)"
+        Write-Output "release when done: pwsh -NoProfile -File `"$(Join-Path $PSScriptRoot 'agentq.ps1')`" unlease -Repo `"$rp`" -LeaseId $($res.leaseId)"
+      }
+      return
     }
   }
   $main = Get-MainTop $repo
@@ -2205,6 +2245,17 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     Write-Output "land: pre-gate from the shared clone - took $($repo.Name)/$(P $slot 'slot') for the gate, released when it is done"
   }
   $sp = "$(P $slot 'path')"
+  # 2026-11-25: resolve the topic the way the LAND does. `Invoke-Land` refreshes EVERY ref immediately before
+  # it resolves the topic (`& git -C $main fetch -q origin`, ~L2762). This pre-gate fetched only
+  # `origin/$Onto`, so on any path that does NOT lease a slot it resolved the topic from whatever this clone
+  # had fetched last - and `Invoke-Lease` does its own full fetch (~L1085), which is why the RENTED-scratch
+  # path was always current and hid the defect. Round 7 landed from a slot the session already held:
+  # `Resolve-LandRef` answered with a remote-tracking topic ref 1737 commits behind origin/main, the gate
+  # judged THAT tree, `gate:knip` (a ratchet against the baselines IN the tree) failed on it, and the
+  # diagnosis chased a defect the slice did not have - while the same slice passed in the land slot, which
+  # had fetched everything and merged the real tip. A pre-gate verdict about a tree the land will not merge
+  # is worse than no pre-gate, so mirror the land: refresh every ref before resolving the topic.
+  & git -C $main fetch -q origin 2>$null
   $topicSha = "$(& git -C $main rev-parse --verify -q "$topicRef^{commit}" 2>$null)".Trim()
   if (-not $topicSha) { & $skip 'the topic does not resolve to a commit'; return }
   # 2026-11-23: a dirty tree was the TOP cause of the gate running INSIDE the cap-1 land mutex - measured

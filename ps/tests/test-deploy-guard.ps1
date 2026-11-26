@@ -8,9 +8,17 @@
     test-deploy-guard.ps1            # exit 1 on any hole
 #>
 [CmdletBinding()]
-param()
+param(
+  # 2026-11-26: both paths were hardcoded to the INSTALLED tree ($env:USERPROFILE\.copilot\hooks), so this
+  # suite could not run at all in a repo-only checkout and, when it did run, it proved the INSTALLED hook
+  # rather than the one in the tree being edited - the exact "configured != registered != fires" trap this
+  # file exists to close. The defaults keep today's behaviour byte-identical; the registered gate passes the
+  # repo-relative paths explicitly (same fix as test-guard-v2/-shared/-cloud/-format).
+  [string]$Guard = "$env:USERPROFILE\.copilot\hooks\guard-tooluse.ps1",
+  [string]$DeployClean = "$env:USERPROFILE\.copilot\hooks\deploy-clean.ps1"
+)
 $ErrorActionPreference = 'Stop'
-$hook = "$env:USERPROFILE\.copilot\hooks\guard-tooluse.ps1"
+$hook = $Guard
 
 function Invoke-Hook([hashtable]$payload) {
   $json = $payload | ConvertTo-Json -Compress -Depth 4
@@ -22,7 +30,7 @@ function Invoke-Hook([hashtable]$payload) {
 }
 $deploy = 'gcloud run services replace deploy/cloud-run/gateway.service.yaml --region europe-west1'
 $read   = 'gcloud run services describe codai-gateway --region europe-west1'
-$wrap   = "pwsh -NoProfile -File $env:USERPROFILE\.copilot\hooks\deploy-clean.ps1 -Command 'gcloud run services replace x.yaml'"
+$wrap   = "pwsh -NoProfile -File $DeployClean -Command 'gcloud run services replace x.yaml'"
 
 $fx = Join-Path $env:TEMP ("deploy-guard-fx-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $fx | Out-Null

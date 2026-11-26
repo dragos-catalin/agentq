@@ -783,17 +783,88 @@ function Get-EffPrio($t) {
 # Config `fairShare`: true|false | { enabled, maxPerSession } (default enabled, maxPerSession 0 =
 # derived). AGENTQ_NO_FAIRSHARE=1 turns it off for one call.
 function Get-FairShare {
-  $d = @{ enabled = $true; maxPerSession = 0 }
+  $d = @{ enabled = $true; maxPerSession = 0; slotsPerSession = 0 }
   $c = Get-Config
   if ($c.ContainsKey('fairShare')) {
     $v = $c['fairShare']
     if ($v -is [Collections.IDictionary]) {
       if ($v.ContainsKey('enabled')) { $d.enabled = [bool]$v['enabled'] }
       if ($v.ContainsKey('maxPerSession') -and $null -ne $v['maxPerSession']) { $d.maxPerSession = [int]$v['maxPerSession'] }
+      # D5: the SLOT-side twin of maxPerSession. 0 = derive it from the machine task cap (ceil(cap / sessions)).
+      if ($v.ContainsKey('slotsPerSession') -and $null -ne $v['slotsPerSession']) { $d.slotsPerSession = [int]$v['slotsPerSession'] }
     } elseif ($null -ne $v -and "$v" -ne '') { $d.enabled = [bool]$v }
   }
   if ($env:AGENTQ_NO_FAIRSHARE -eq '1') { $d.enabled = $false }
   $d
+}
+# D5 (owner 2026-11-23, ADR 0014) - the slot-side twin of the queue's fair share. ONE VS Code window is ONE
+# agentq session, so every terminal AND every subagent of that window shares one session id; measured
+# 2026-11-26: ONE live process held 12 slot leases while other windows starved. The scratch pool offers far
+# fewer than one session held, so the land PRE-GATE found no scratch slot, was SKIPPED, and ran a 5-40 min
+# repo gate inside the cap-1 land mutex. Two behaviours, both inert for a lone session (no regression):
+#   (1) REUSE BEFORE RENTING - a session that already holds a CLEAN slot of the requested role in this repo
+#       gets that slot back instead of renting a second one ("subagents work in the lead's slot", ADR 0012).
+#   (2) PER-SESSION SHARE - at most `fairShare.slotsPerSession` slots when > 0, else ceil(machine task cap /
+#       competing sessions) floored at 1. Over it: a bounded wait, then a refusal naming the held slots and
+#       both recipes.
+# $leases is a lease array (Read-Leases), $sess a session id, $taskCap the machine task-slot cap.
+function Get-SlotShare($leases, [string]$sess, [int]$taskCap) {
+  $fs = Get-FairShare
+  $live = @($leases | Where-Object { $_ -and -not [bool](P $_ 'stale' $false) })
+  $sessions = @($live | ForEach-Object { "$(P $_ 'session' '')" } | Where-Object { $_ } | Sort-Object -Unique)
+  $held = @($live | Where-Object { "$(P $_ 'session' '')" -eq "$sess" }).Count
+  $pin = [int](P $fs 'slotsPerSession' 0)
+  $derived = [int][math]::Ceiling([double][math]::Max(0, [int]$taskCap) / [double][math]::Max(1, $sessions.Count))
+  $share = if ($pin -gt 0) { $pin } else { [math]::Max(1, $derived) }
+  [pscustomobject]@{
+    enabled = [bool]$fs.enabled; competing = ($sessions.Count -gt 1); sessions = $sessions.Count
+    held = [int]$held; share = [int]$share; slotsPerSession = $pin; taskCap = [int]$taskCap
+  }
+}
+# (1) REUSE BEFORE RENTING: the CLEAN slot of $role this session already holds in $repoName, else $null.
+# The dirty test is the SAME one the pre-gate uses (tracked OR non-ignored untracked changes disqualify):
+# handing a slot back while the caller is still writing in it would silently lose that work.
+function Get-SlotReuse([string]$repoName, [string]$role) {
+  if (-not (Get-FairShare).enabled) { return $null }
+  foreach ($l in @(Read-Leases $repoName)) {
+    if (-not $l -or $l.stale) { continue }
+    if ("$(P $l 'role' '')" -ne "$role") { continue }
+    if ("$(P $l 'session' '')" -ne "$Session") { continue }
+    $p = Norm-Dir "$(P $l 'path' '')"
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+    if (-not (Test-GitClean $p)) { continue }
+    Write-Journal @{ event = 'slot-reuse'; resource = "slot:${repoName}:$($l.slot)"; ticket = "$(P $l 'leaseId' '')"; session = $Session; role = $role; slot = "$($l.slot)"; repo = $repoName; purpose = "$(P $l 'purpose' '')" }
+    return $l
+  }
+  $null
+}
+# (2) PER-SESSION SHARE: $null while this session may still rent, else the refusal text (journaled ONCE).
+function Test-SlotShareRefusal([string]$repoName, [string]$role) {
+  $fs = Get-FairShare
+  if (-not $fs.enabled) { return $null }
+  if (-not (Get-Variable -Name SlotShareSaid -Scope Script -ErrorAction SilentlyContinue)) { $script:SlotShareSaid = $false }
+  # NOTE the $cap local: the literal call below is pinned by test-agentq-slotshare.ps1 (A9), that IS the shape.
+  $cap = [int](Get-TaskSlotBudget).cap
+  $sh = Get-SlotShare (Read-Leases $null) $Session $cap
+  if (-not $sh.competing -or $sh.held -lt $sh.share) { return $null }
+  $mine = @(Read-Leases $null | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
+  $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+  if (-not $script:SlotShareSaid) {
+    $script:SlotShareSaid = $true
+    Write-Journal @{ event = 'slot-fair-share'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; slots = @($mine | ForEach-Object { "$($_.slot)" }); repo = $repoName; reason = "this session already holds $($sh.held) slot(s); its share of the machine task cap $($sh.taskCap) is $($sh.share) while $($sh.sessions) sessions compete" }
+  }
+  "this session ($Session) already holds $($sh.held) of the $($sh.sessions) competing sessions' share of $($sh.share) slot(s) (machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession)): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path. You may reuse a slot this session already holds; or give one back first: agentq unlease -Repo <path> -LeaseId <id>; or wait for another session to finish."
+}
+# The `SLOT SHARE` line of `status` (both halves of D5 in one line: the share and what it is derived from).
+function Show-SlotShare {
+  $fs = Get-FairShare
+  if (-not $fs.enabled) { Write-Output 'SLOT SHARE off (fairShare.enabled = false)'; return }
+  $leases = @(Read-Leases $null)
+  $cap = [int](Get-TaskSlotBudget).cap
+  $sh = Get-SlotShare $leases $Session $cap
+  $mine = @($leases | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
+  $held = ($mine | ForEach-Object { " [$($_.slot) $(P $_ 'role' '')]" }) -join ''
+  Write-Output ("SLOT SHARE {0}{1} held by my session {2}{3}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) sessions compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (no other session competes)' }), $Session, $held)
 }
 # Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one
 # session's block of five waiters cannot sit in front of another session's single waiter. Grouping
@@ -2055,6 +2126,9 @@ function Show-Status {
   }
   $nightTxt = if ($agl.nightWindow) { "; night $($agl.nightWindow): $(if ($agl.night) { 'now' } else { 'not now' })" } else { '' }
   Write-Output ("== AGENTS limit {0} of {1} task slots ({2}{3}); {4} leased" -f $agl.limit, $agl.base, $agl.why, $(if ($agl.state -eq 'off') { '' } else { $nightTxt }), $leasedTasks)
+  # D5 (ADR 0014): my session's slot share, so an agent that only reads `status` sees why its next lease
+  # would be refused and what it already holds. One line, never in -Json (that path returned above).
+  Show-SlotShare
   Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'

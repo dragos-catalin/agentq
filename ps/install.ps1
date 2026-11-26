@@ -49,6 +49,11 @@ $map = [ordered]@{
   'tests\test-worktree-v2.ps1' = 'hooks\test-worktree-v2.ps1'; 'tests\test-guard-v2.ps1' = 'hooks\test-guard-v2.ps1'
   # 2026-11-25: a formatter may never run with its own DEFAULT config over a repo that has no config
   'tests\test-guard-format.ps1' = 'hooks\test-guard-format.ps1'
+  # 2026-11-26: registered in run-all.ps1 in the same slice - a suite that is mapped but unregistered (or the
+  # reverse) is 'runnable by hand and by nothing else', which is how three guard holes and the stale-ref
+  # pre-gate bug shipped green. 'install wiring' pins the two lists together.
+  'tests\test-guard.ps1' = 'hooks\test-guard.ps1'
+  'tests\test-deploy-guard.ps1' = 'hooks\test-deploy-guard.ps1'
   # 2026-11-25: the formatter taxonomy BOTH hooks use. Without this entry the guard fell back to its
   # stub functions (Test-FormatterConfigured -> $false) and the rule was inert in production while its
   # suite was green in the checkout - "configured" is not "installed".
@@ -63,7 +68,7 @@ $map = [ordered]@{
   'bin\job-run.ps1' = 'bin\job-run.ps1'; 'bin\jobs.ps1' = 'bin\jobs.ps1'; 'tests\test-jobs.ps1' = 'bin\test-jobs.ps1'
   # devcloud F2: cloud placement client + its tests
   # shared-clone fast-forward + park (scheduled task git-autosync)
-  'bin\git-autosync.ps1' = 'bin\git-autosync.ps1'; 'tests\test-git-autosync.ps1' = 'bin\test-git-autosync.ps1'; 'tests\test-guard-shared.ps1' = 'hooks\test-guard-shared.ps1'
+  'bin\git-autosync.ps1' = 'bin\git-autosync.ps1'; 'tests\test-git-autosync.ps1' = 'bin\test-git-autosync.ps1'; 'tests\test-guard-shared.ps1' = 'hooks\test-guard-shared.ps1'; 'tests\test-autosync-wip-snapshot.ps1' = 'bin\test-autosync-wip-snapshot.ps1'
   'bin\agentq-cloud.ps1' = 'bin\agentq-cloud.ps1'; 'tests\test-agentq-cloud.ps1' = 'bin\test-agentq-cloud.ps1'; 'tests\test-guard-cloud.ps1' = 'hooks\test-guard-cloud.ps1'
   # Bounded prewarm of a suspended workspace before an agent needs it (see prewarm-cloud.ps1).
   'bin\prewarm-cloud.ps1' = 'bin\prewarm-cloud.ps1'; 'tests\test-prewarm-cloud.ps1' = 'bin\test-prewarm-cloud.ps1'
@@ -109,7 +114,7 @@ $map = [ordered]@{
   'hooks\resident\build-client.ps1' = 'hooks\resident\build-client.ps1'
   'hooks\resident\verify-resident.ps1' = 'hooks\resident\verify-resident.ps1'
   'hooks\resident\README.md' = 'hooks\resident\README.md'
-  'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'; 'tests\test-land-wait.ps1' = 'bin\test-land-wait.ps1'
+  'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'; 'tests\test-land-wait.ps1' = 'bin\test-land-wait.ps1'; 'tests\test-land-pregate-stale-ref.ps1' = 'bin\test-land-pregate-stale-ref.ps1'
   # 2026-11-23: land-autoreap (a wedged holder whose gate is green) + land-requeue (put the ticket back at
   # the HEAD on window expiry, bounded by landRequeueMax). Paired with the run-all.ps1 entry.
   'tests\test-land-reap.ps1' = 'bin\test-land-reap.ps1'
@@ -142,7 +147,7 @@ $map = [ordered]@{
   # fair share (D4). `test-land-default-gate.ps1` was in run-all but not in this map, so the installed
   # copy never carried it - the install gate could not run what it never installed.
   'tests\test-agentq-recover.ps1' = 'bin\test-agentq-recover.ps1'; 'tests\test-agentq-commit-fast.ps1' = 'bin\test-agentq-commit-fast.ps1'
-  'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
+  'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-agentq-slotshare.ps1' = 'bin\test-agentq-slotshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
   # 2026-11-21: `agentq run` runs its child at the resolved repo root when the caller is OUTSIDE the
   # repo, and keeps the caller's nested directory when INSIDE (commit 37fdf67, "a brand-new slot
   # starts hollow").

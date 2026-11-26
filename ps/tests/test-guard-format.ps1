@@ -3,7 +3,10 @@
 # that formatter; warns about the cross-checkout "mixture tell". Then MUTATION tests: the no-config
 # branch is disabled in a copy of the guard and the deny cases must start to pass through.
 param(
-  [string]$Guard = (Join-Path $PSScriptRoot 'guard-tooluse.ps1'),
+  # '..\hooks\' resolves in BOTH layouts: the repo runs it as ps\tests\..\hooks\guard-tooluse.ps1, the
+  # install maps it to hooks\test-guard-format.ps1 next to the guard itself. The bare default (PSScriptRoot)
+  # only worked once installed, so a hand-run in the repo died with "Cannot find path ...ps\tests\guard-tooluse.ps1".
+  [string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'),
   # The hooks run under powershell.exe 5.1 (that is what VS Code spawns), so the suite must be
   # runnable with it too: pwsh 7 accepting a script says nothing about the shell that runs it.
   [string]$Exe = 'pwsh'

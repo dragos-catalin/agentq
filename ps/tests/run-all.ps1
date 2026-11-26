@@ -60,9 +60,23 @@ $suites = [ordered]@{
   'reap terminals' = @('-File', (Join-Path $PSScriptRoot 'test-reap-terminals.ps1'), '-Tool', (Join-Path $bin 'reap-terminals.ps1'))
   'term interrupt' = @('-File', (Join-Path $PSScriptRoot 'test-term-interrupt.ps1'), '-Tool', (Join-Path $bin 'term-interrupt.ps1'))
   'git-autosync'   = @('-File', (Join-Path $PSScriptRoot 'test-git-autosync.ps1'), '-Tool', (Join-Path $bin 'git-autosync.ps1'))
+    # 2026-11-26: untracked-only work in a clone was silently neither captured nor refused before a
+    # fast-forward, so nothing recorded it anywhere. The suite builds that incident shape, runs the REAL
+    # git-autosync.ps1 and carries a MUTATION control against the pre-fix copy - remove the fix and it goes
+    # red. It was runnable by hand and by NOTHING else. Registered here and in install.ps1 in the same
+    # slice; 'install wiring' pins the two together.
+    'autosync wip snapshot' = @('-File', (Join-Path $PSScriptRoot 'test-autosync-wip-snapshot.ps1'))
   'guard shared'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-shared.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'shared commit'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-shared-commit.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'guard cloud'    = @('-File', (Join-Path $PSScriptRoot 'test-guard-cloud.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
+  # 2026-11-26: three guard suites were runnable by hand and by NOTHING else - no gate ever executed them,
+  # so a hole in the LIVE guard could ship green. Each is registered here and in install.ps1 in the same
+  # slice. 'guard forms' is the expensive one (~105 s measured idle, ~100 pwsh spawns) because it tests the
+  # forms people actually TYPE against the registered hook (61 stopped / 41 allowed cases); it has caught
+  # three real holes, so its cost is paid deliberately rather than by omission.
+  'guard format'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-format.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
+  'guard forms'    = @('-File', (Join-Path $PSScriptRoot 'test-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
+  'deploy guard'   = @('-File', (Join-Path $PSScriptRoot 'test-deploy-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-DeployClean', (Join-Path $hooks 'deploy-clean.ps1'))
   # ADR 0003 wave 1
   'publish'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-publish.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
@@ -100,6 +114,12 @@ $suites = [ordered]@{
   'lease chat'      = @('-File', (Join-Path $PSScriptRoot 'test-lease-chat.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'lease liveness' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease-liveness.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land pregate'    = @('-File', (Join-Path $PSScriptRoot 'test-land-pregate.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-26: the pre-gate fetched only `origin/$Onto`, so on any path that did NOT rent a slot it
+  # resolved the topic from whatever the clone had fetched last. Round 7 landed from a slot the session
+  # already held, the gate judged a tree 1737 commits behind origin/main and quarantined a healthy topic.
+  # The rented-scratch path hid it because Invoke-Lease fetches everything. This suite asserts the only
+  # property that cannot be faked: the GATED tree is the tree that LANDED.
+  'land pregate stale ref' = @('-File', (Join-Path $PSScriptRoot 'test-land-pregate-stale-ref.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'pregate lease reap' = @('-File', (Join-Path $PSScriptRoot 'test-pregate-lease-reap.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land wait'      = @('-File', (Join-Path $PSScriptRoot 'test-land-wait.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-23: the waiter reaps a wedged land holder whose gate is green (land-autoreap) and puts its own
@@ -127,6 +147,11 @@ $suites = [ordered]@{
   'recover'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-recover.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'commit fast'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-commit-fast.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'fair share'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-fairshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-26 (D5, ADR 0014): the slot-side twin of the queue's fair share - REUSE BEFORE RENTING a clean
+  # same-role slot of this session, plus a per-session cap while another live session holds a slot. The
+  # symptom it fixes: ONE VS Code window is ONE session, so every terminal and subagent shared one id and
+  # that session held 4 slots while other windows starved. Without this line the suite existed and never ran.
+  'agentq slot share' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-slotshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-21: Invoke-Run runs the child at the resolved repo root when the caller is OUTSIDE it (the
   # "a brand-new slot starts hollow" install trap, commit 37fdf67) and keeps the caller's nested cwd
   # when INSIDE. Without this line the suite existed and never ran.

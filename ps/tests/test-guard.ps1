@@ -23,12 +23,18 @@
   it fail, then fix the pattern. A case added after the fix proves nothing.
 #>
 [CmdletBinding()]
-param()
+param(
+  # 2026-11-26: this suite used to read ONLY the installed guard ($env:USERPROFILE\.copilot\hooks),
+  # so it proved nothing about the guard in the tree being edited and could not run at all in a
+  # repo-only checkout ("guard not found"). Same fix as test-guard-v2/-shared/-cloud/-format: the
+  # repo-relative path is the default, an installed tree still resolves it (hooks\ sits beside tests\).
+  [string]$Guard = (Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1')
+)
 
 $ErrorActionPreference = 'Stop'
 # guard-command.ps1 is the pre-2026-09-06 file; the REGISTERED hook is guard-tooluse.ps1
 # (codai-hooks.json). Testing the old file proved nothing about the live guard.
-$guard = "$env:USERPROFILE\.copilot\hooks\guard-tooluse.ps1"
+$guard = $Guard
 if (-not (Test-Path $guard)) { Write-Host "guard not found: $guard" -ForegroundColor Red; exit 1 }
 
 function Invoke-Guard([string]$cmd) {

@@ -148,7 +148,13 @@
       "status readonly",
       "slot budget",
       "prewarm verb",
-      "prewarm cloud"
+      "prewarm cloud",
+      "guard format",
+      "guard forms",
+      "deploy guard",
+      "agentq slot share",
+      "land pregate stale ref",
+      "autosync wip snapshot"
     ]
   },
   "sharedCloneMode": "warn",
