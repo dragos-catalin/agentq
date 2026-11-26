@@ -15,7 +15,7 @@
     from a process that owns a real console. Two clicks, no command to type.
 
   THE FLOW
-    agentq approve -Paths 'a','b' -Purpose "why" [-Hours 2] [-MaxMin 10]
+    agentq approve -Paths 'a','b' -Purpose "why" [-Hours 2] [-RequestTtlMin 60] [-MaxMin 10]
       1. writes <home>\approvals\<id>.json      - the request: scope, purpose, session, host, expiry
       2. starts agentq-approve-gui.ps1 -STA in its own process (the window; nothing else is shown)
       3. polls <id>.verdict.json for up to -MaxMin minutes
@@ -56,6 +56,11 @@ param(
     [string]$Purpose = '',
     # Ticket lifetime in hours (the mint caps at 2; a larger value is clamped and reported).
     [double]$Hours = 2,
+    # How long the REQUEST stays decidable on the remote surfaces (hub `/ops/agentq`, phone) - the window
+    # in which the owner can still answer. This is the SECOND clock and it is not -Hours: -Hours is how long
+    # the minted TICKET lives AFTER approval, this is how long the question itself is worth answering. A
+    # magic 15 min here made a request silently stale sooner than most owners would see it.
+    [double]$RequestTtlMin = 60,
     # How long to wait for the owner's answer. 0 = record only, never start a window (exit 4).
     [double]$MaxMin = 10,
     [switch]$Json,
@@ -154,11 +159,11 @@ $rec = [ordered]@{
     session    = $session
     host       = $env:COMPUTERNAME
     repo       = $repoLeaf
-    expires_at = (Get-Date).ToUniversalTime().AddMinutes(15).ToString('o')
+    expires_at = (Get-Date).ToUniversalTime().AddMinutes($RequestTtlMin).ToString('o')
 }
 Write-AqAtomic $reqPath ($rec | ConvertTo-Json -Depth 4)
 if (Get-Command Write-Journal -ErrorAction SilentlyContinue) {
-    Write-Journal @{ event = 'approval-request'; resource = "approval:$id"; id = $id; scope = @($globs); purpose = $Purpose; hours = $Hours; session = $session }
+    Write-Journal @{ event = 'approval-request'; resource = "approval:$id"; id = $id; scope = @($globs); purpose = $Purpose; hours = $Hours; ttlMin = $RequestTtlMin; session = $session }
 }
 
 if ($MaxMin -le 0) {
@@ -168,6 +173,7 @@ if ($MaxMin -le 0) {
         Write-Output "  scope   : $($globs -join ', ')"
         Write-Output "  purpose : $(if ($Purpose) { $Purpose } else { '(not stated)' })"
         Write-Output "  valid   : up to $Hours h once approved"
+        Write-Output "  decidable: $(if ($RequestTtlMin -ge 60) { "$([math]::Round($RequestTtlMin / 60, 1)) h" } else { "$RequestTtlMin min" }) from now (answer before then; after that the hub row is stale)"
         Write-Output "  answer  : hub /ops/agentq, or the Codwen phone app (no window was started)"
         Write-Output "  request : $reqPath"
     }

@@ -83,12 +83,30 @@ try {
             $rec = Get-Content -LiteralPath $reqFile.FullName -Raw | ConvertFrom-Json -DateKind String
             $scopeOk = (@($rec.scope).Count -eq 2 -and $rec.scope[0] -eq 'packages/x/**' -and $rec.scope[1] -eq 'packages/y/**')
             $secretFields = @($rec.PSObject.Properties.Name | Where-Object { $_ -match 'token|secret|key$|password' })
-            $recOk = $scopeOk -and $rec.purpose -eq 'record only' -and $secretFields.Count -eq 0 -and -not $rec.ticket_exit
-            if (-not $recOk) { $why = "scope=$($rec.scope -join ',') secretFields=$($secretFields -join ',')" }
+            # The two clocks must both be real and separately named: -Hours is the TICKET's life after
+            # approval, the REQUEST must stay decidable for -RequestTtlMin. A missing parameter made
+            # expires_at == at (instantly stale) and a magic 15 min made a remote answer impossible;
+            # both are caught here.
+            $ttlMin = $null
+            if ($rec.at -and $rec.expires_at) { $ttlMin = ([datetime]$rec.expires_at - [datetime]$rec.at).TotalMinutes }
+            $clockOk = ($null -ne $ttlMin -and $ttlMin -ge 59 -and $ttlMin -le 61 -and $rec.hours -eq 2)
+            $recOk = $scopeOk -and $rec.purpose -eq 'record only' -and $secretFields.Count -eq 0 -and -not $rec.ticket_exit -and $clockOk
+            if (-not $recOk) { $why = "scope=$($rec.scope -join ',') secretFields=$($secretFields -join ',') ttlMin=$ttlMin hours=$($rec.hours)" }
         } catch { $why = "unparseable request: $($_.Exception.Message)" }
     }
     if ($r.code -eq 4 -and $recOk) { Ok '-MaxMin 0 records the request (scope + purpose, no secret) and exits 4' }
     else { Bad '-MaxMin 0 records the request and exits 4' ("exit $($r.code); $why; out=" + ((@($r.out -split "`n") | Where-Object { $_ } | Select-Object -First 2) -join ' ~ ')) }
+
+    # --- 2a. the request window is the OVERRIDE, not a hardcoded number --------------------------
+    $rTtl = Run @('-File', $cli, '-Paths', 'a', '-MaxMin', '0', '-RequestTtlMin', '5')
+    $reqTtl = NewestRequest
+    $ttl2 = $null
+    if ($reqTtl) {
+        $rec2 = Get-Content -LiteralPath $reqTtl.FullName -Raw | ConvertFrom-Json -DateKind String
+        $ttl2 = ([datetime]$rec2.expires_at - [datetime]$rec2.at).TotalMinutes
+    }
+    if ($rTtl.code -eq 4 -and $null -ne $ttl2 -and $ttl2 -ge 4.9 -and $ttl2 -le 5.1) { Ok '-RequestTtlMin is honoured (the window is not hardcoded)' }
+    else { Bad '-RequestTtlMin is honoured' "exit $($rTtl.code) ttlMin=$ttl2" }
 
     # --- 2b. a typo can never record a request ----------------------------------------------------
     # Two shapes PowerShell's own binder refuses: a stray flag, and the space-separated form
