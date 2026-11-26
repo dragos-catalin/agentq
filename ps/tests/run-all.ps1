@@ -52,6 +52,11 @@ $suites = [ordered]@{
     # needs no new file here - only the test itself (install map entry owned by the parent, see the wiring
     # guard's $mapExcept).
     'cloud evidence' = @('-File', (Join-Path $PSScriptRoot 'test-cloud-evidence.ps1'))
+  # 2026-11-26: the heal POLICY when a queued job is never claimed - repeated bounded backoff (the old
+  # one-shot guard never healed a SECOND failure) and the peer-in-flight guard that stops a reset from
+  # rebooting a workspace out from under another agent's run (ws-codai, 2026-11-26: a peer build killed
+  # mid-run). Pure helpers, extracted from bin\agentq-cloud.ps1 by AST, so no new file travels to install.
+  'cloud heal'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud-heal.ps1'))
   # 2026-11-25: `-Status -Json`, the read-only document Vitals' Projects tab reads (vitals ADR 0050).
   # The suite runs offline - a `gcloud` shim on PATH answers the reads - so it pins the shape and the
   # "a number that cannot be measured is null, never 0" rule without a network or a real workspace.

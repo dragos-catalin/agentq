@@ -17,12 +17,19 @@ FLOW  resume VM if SUSPENDED/TERMINATED -> upload bundle/patch -> queue spec (wr
 HEAL  nobody claimed the job and the workspace heartbeat has not moved since the submission: the runner
   wedged across a suspend (a resume does NOT re-run the startup script, so the VM keeps the frozen
   process, looks RUNNING and never reads the queue - ws-vitals-win, 2026-11-25, five jobs, an hour).
-  One reset re-runs the boot script and starts a fresh agent; the deadline gets a second window.
-  The heartbeat is the evidence, never the VM state: a running job heartbeats "busy" every 30 s, so a
-  silent agent is conclusive evidence of a wedge and a busy one is never touched. Fires when the
-  heartbeat is older than the submission (precise) or has been silent for the whole wait (robust to a
-  clock skew between this machine and the workspace). The wait is only a floor, 3 min: the heartbeat
-  comparison is what makes the reset safe.
+  A reset re-runs the boot script and starts a fresh agent. The heartbeat is the evidence, never the VM
+  state: it fires when the heartbeat is older than the submission (precise) or has been silent for the
+  whole wait (robust to a clock skew between this machine and the workspace), and the 3 min wait is only
+  a floor - the heartbeat comparison is what makes the reset safe.
+  The heal is REPEATED and BOUNDED (3 attempts) with a doubling backoff (StaleClaimMin, 2x, 4x), and the
+  deadline is extended to reach each attempt: a one-shot guard let a SECOND failure die at the deadline
+  with "no result before deadline" (38 in the journal). -NoHeal runs exactly as before, with no heals.
+  It is PAUSED while any OTHER job is in flight on the workspace. The runner writes ws/<ws>/busy for the
+  whole duration of every job (job, host, at, timeoutSec, until) and clears it when the job ends; a
+  client honours that before it ever touches the VM. The old heal only asked whether the CALLER's own job
+  had been claimed, so a reset rebooted the whole VM out from under a peer's build (ws-codai,
+  2026-11-26: a peer build killed mid-run). A marker whose own deadline (until) has already passed is a
+  wedge, not a live peer, and only then may a reset proceed - the marker cannot protect a dead run.
 JOURNAL  cloud-queued / cloud-done / cloud-fail in ~/.codai/coord/journal.jsonl with holdSec,
       waitSec (queue -> claimed, includes resume), lane, kind=cloud, resource cloud:<ws>, so
       `agentq metrics` shows cloud runs beside local ones.
@@ -215,6 +222,72 @@ function Save-CloudEvidence {
   $res.journalAdded = $add.Added
   $res.journalSkipped = $add.Reason
   $res
+}
+# ---- heal policy (pure: ps/tests/test-agentq-cloud-heal.ps1 drives these directly) ----------------
+function Get-HealBackoffMin {
+  # The wait, in minutes, before the (HealsDone+1)th heal: the first interval, then double (3, 6, 12 with
+  # the default -StaleClaimMin 3). A heal is not a retry loop - the doubling is what keeps a genuinely
+  # slow workspace from being reset every three minutes while still eventually healing a wedged one.
+  param([int]$HealsDone = 0, [double]$FirstMin = 3)
+  if ($FirstMin -le 0) { return 0 }
+  [double]($FirstMin * [math]::Pow(2, [math]::Max(0, $HealsDone)))
+}
+function Test-CloudPeerBusy {
+  # True when ANOTHER job is in flight on this workspace. The runner publishes ws/<ws>/busy while it runs
+  # a job ({job, host, at, timeoutSec, until}); a marker that names THIS job is not a peer, and a marker
+  # whose own deadline (until, or at+timeoutSec) has passed is not a live peer either - a run that outlived
+  # the timeout it was given is a wedge, and only then may a reset proceed. THIS is the guard that stops
+  # one client from rebooting the VM out from under a peer's run: the old heal only ever asked whether the
+  # CALLER's own job had been claimed, so a reset killed a peer's build (ws-codai, 2026-11-26).
+  param([object]$Marker = $null, [string]$SelfJobId = '', [object]$Now = $null, [double]$GraceMin = 5)
+  if ($null -eq $Marker) { return $false }
+  if ($Marker -is [string]) { if (-not "$Marker".Trim()) { return $false }; try { $Marker = ($Marker | ConvertFrom-Json) } catch { return $false } }
+  if ($null -eq $Marker) { return $false }
+  if ($Marker -is [System.Collections.IDictionary]) { $Marker = [pscustomobject]$Marker }   # a dictionary/hashtable marker reads like the JSON one
+  $job = ''
+  if ($Marker.PSObject.Properties['job']) { $job = "$($Marker.job)" }
+  if ($SelfJobId -and $job -eq $SelfJobId) { return $false }
+  $until = $null
+  if ($Marker.PSObject.Properties['until'] -and $Marker.until) { try { $until = ([DateTime]$Marker.until).ToUniversalTime() } catch { $until = $null } }
+  if (-not $until) {
+    $at = $null
+    if ($Marker.PSObject.Properties['at'] -and $Marker.at) { try { $at = ([DateTime]$Marker.at).ToUniversalTime() } catch { $at = $null } }
+    $ts = 0
+    if ($Marker.PSObject.Properties['timeoutSec'] -and $Marker.timeoutSec) { $ts = [int]$Marker.timeoutSec }
+    if ($at -and $ts -gt 0) { $until = $at.AddSeconds($ts) }
+    elseif ($at) { $until = $at.AddMinutes([math]::Max($GraceMin, 1)) }
+  }
+  if (-not $until) { return $false }   # no readable time at all: not evidence of a peer, so it never blocks a heal
+  if (-not $Now) { $Now = [DateTime]::UtcNow }
+  return (([DateTime]$Now).ToUniversalTime() -lt $until.AddMinutes([math]::Max($GraceMin, 0)))
+}
+function Get-CloudHealDecision {
+  # The ONE place that decides whether this client may reset/resume the workspace while its OWN job is
+  # still unclaimed. Pure: it reads only the evidence it is handed, so the whole policy (repeated bounded
+  # backoff, peer-in-flight guard, attempt cap) is provable offline. action:
+  #   none      - nothing to do (heal disabled, already claimed, heartbeat live, or no VM action)
+  #   wait      - the backoff for this attempt has not elapsed
+  #   cap       - the heal budget is spent: the workspace is NEVER reset again
+  #   skip-peer - ANOTHER job is in flight: NEVER reset, keep waiting (journaled as cloud-heal-skipped)
+  #   act       - stale and idle: the caller reads the VM state and resets/resumes
+  param(
+    [bool]$NoHeal = $false, [bool]$Claimed = $false,
+    [int]$HealCount = 0, [int]$HealMax = 3,
+    [double]$SinceCursorMin = 0, [double]$FirstIntervalMin = 3,
+    [object]$HeartbeatAgeSec = $null, [bool]$HeartbeatOlderThanQueue = $false,
+    [bool]$PeerBusy = $false
+  )
+  if ($NoHeal) { return @{ action = 'none'; reason = 'heal disabled (-NoHeal)' } }
+  if ($Claimed) { return @{ action = 'none'; reason = 'the job was claimed' } }
+  if ($HealMax -le 0 -or $HealCount -ge $HealMax) { return @{ action = 'cap'; reason = ('heal budget spent ({0}/{1})' -f $HealCount, $HealMax) } }
+  $due = Get-HealBackoffMin -HealsDone $HealCount -FirstMin $FirstIntervalMin
+  if ($SinceCursorMin -lt $due) { return @{ action = 'wait'; intervalMin = $due; reason = ('backoff not elapsed: {0:N1}m < {1:N1}m' -f $SinceCursorMin, $due) } }
+  $hb = $null
+  if ($null -ne $HeartbeatAgeSec -and "$HeartbeatAgeSec" -ne '') { $hb = [double]$HeartbeatAgeSec }
+  $stale = $HeartbeatOlderThanQueue -or ($null -ne $hb -and $hb -gt ($FirstIntervalMin * 60))
+  if (-not $stale) { return @{ action = 'none'; intervalMin = $due; reason = 'the heartbeat is live' } }
+  if ($PeerBusy) { return @{ action = 'skip-peer'; intervalMin = $due; reason = 'another job is in flight on this workspace' } }
+  return @{ action = 'act'; intervalMin = $due; reason = 'the workspace is stale and idle' }
 }
 # Transport: GCS JSON API + Compute REST with ONE gcloud access token. A gcloud process costs
 # 4-5 s on this machine (measured 2026-10-12), and a job made ~15 of them (83 s "upload").
@@ -454,27 +527,66 @@ try {
 
   # 6. stream the log until result.json exists
   $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin + 15)
-  $printed = 0; $claimedAt = $null; $runningAt = $null; $result = $null; $healedAt = $null
+  $hardDeadline = $queuedAt.AddMinutes($TimeoutMin + 135)   # a ceiling on every deadline extension below
+  $printed = 0; $claimedAt = $null; $runningAt = $null; $result = $null
+  # Repeated, BOUNDED, backed-off heal. The old one-shot $healedAt guard meant a SECOND failure was never
+  # healed and the run died at the deadline with "no result before deadline" (38 in the journal). Each
+  # attempt is (a) taken only when the workspace is stale, idle AND no peer job is in flight, (b) counted,
+  # and (c) paced by a doubling backoff. The cursor is reset after every EVALUATED attempt (heal or skip),
+  # so the evidence is read at most once per interval rather than on every 1.5 s tick.
+  $HealMax = 3
+  $healCount = 0
+  $healCursor = $queuedAt
+  $skippedPeers = @{}
   while ([DateTime]::UtcNow -lt $deadline) {
     if ($resumeAt -and -not $runningAt) { if ((Get-VmStatus) -eq 'RUNNING') { $runningAt = [DateTime]::UtcNow; Out-Line ("[agentq-cloud] {0} RUNNING after {1:N0}s" -f $Vm, ($runningAt - $resumeAt).TotalSeconds) } }
     if (-not $claimedAt) { if (Read-Gcs "$Bucket/jobs/$id/claimed") { $claimedAt = [DateTime]::UtcNow } }
-    if (-not $NoHeal -and -not $claimedAt -and -not $healedAt -and ([DateTime]::UtcNow - $queuedAt).TotalSeconds -ge $StaleClaimMin * 60) {
+    # Cheap pre-filter: no evidence is read (no GCS, no compute) until this attempt's backoff has elapsed.
+    $sinceCursor = ([DateTime]::UtcNow - $healCursor).TotalMinutes
+    if (-not $claimedAt -and -not $NoHeal -and $healCount -lt $HealMax -and $sinceCursor -ge (Get-HealBackoffMin -HealsDone $healCount -FirstMin $StaleClaimMin)) {
+      $sinceQueue = ([DateTime]::UtcNow - $queuedAt).TotalMinutes
       $hbAt = $null
       try { $hb = (Read-Gcs "$Bucket/ws/$Ws/heartbeat") | ConvertFrom-Json; if ($hb.PSObject.Properties['at']) { $hbAt = ([DateTime]$hb.at).ToUniversalTime() } } catch { $hbAt = $null }
       $hbAge = if ($hbAt) { [math]::Round(([DateTime]::UtcNow - $hbAt).TotalSeconds) } else { $null }
       # Older than the submission is the precise test; silent for the whole wait is the same thing seen
       # from the workspace's clock, so the OR survives a skew between it and this machine.
-      if ($hbAt -and ($hbAt -lt $queuedAt -or $hbAge -gt $StaleClaimMin * 60)) {
-        $vst = Get-VmStatus
-        $act = if ($vst -eq 'RUNNING') { 'reset' } elseif ($vst -eq 'SUSPENDED') { 'resume' } else { $null }
-        if ($act) {
-          Invoke-VmOp $act
-          Out-Line ("[agentq-cloud] unclaimed after {0} min and the heartbeat is {1}s old ($Vm $vst) - {2} {3}, waiting" -f $StaleClaimMin, $hbAge, $act, $Vm)
-          Write-Journal @{ event = 'cloud-heal'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; vmState = $vst; heartbeatAgeSec = $hbAge; action = $act }
-          $healedAt = [DateTime]::UtcNow
-          $deadline = $deadline.AddMinutes(10)
-        } else { Out-Line ("[agentq-cloud] unclaimed after {0} min but the heartbeat is {1}s old and $Vm is $vst - leaving it alone" -f $StaleClaimMin, $hbAge) }
+      # ws/<ws>/busy is written by the runner while it runs ANY job; honour it before touching the VM.
+      $busyRaw = $null
+      try { $busyRaw = Read-Gcs "$Bucket/ws/$Ws/busy" } catch { $busyRaw = $null }
+      $peerBusy = Test-CloudPeerBusy -Marker $busyRaw -SelfJobId $id -Now ([DateTime]::UtcNow)
+      $dec = Get-CloudHealDecision -NoHeal $false -Claimed $false -HealCount $healCount -HealMax $HealMax `
+        -SinceCursorMin $sinceCursor -FirstIntervalMin $StaleClaimMin `
+        -HeartbeatAgeSec $hbAge -HeartbeatOlderThanQueue ([bool]($hbAt -and $hbAt -lt $queuedAt)) -PeerBusy $peerBusy
+      $healCursor = [DateTime]::UtcNow   # an evaluated attempt: the next one waits a full backoff
+      switch ($dec.action) {
+        'act' {
+          $vst = Get-VmStatus
+          $act = if ($vst -eq 'RUNNING') { 'reset' } elseif ($vst -eq 'SUSPENDED') { 'resume' } else { $null }
+          if ($act) {
+            Invoke-VmOp $act
+            $healCount++
+            Out-Line ("[agentq-cloud] unclaimed after {0:N0} min and the heartbeat is {1}s old ($Vm $vst) - heal #{2}/{3}: {4} {5}, waiting" -f $sinceQueue, $hbAge, $healCount, $HealMax, $act, $Vm)
+            Write-Journal @{ event = 'cloud-heal'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; attempt = $healCount; maxAttempts = $HealMax; vmState = $vst; heartbeatAgeSec = $hbAge; action = $act }
+          } else { Out-Line ("[agentq-cloud] unclaimed after {0:N0} min and the heartbeat is {1}s old but $Vm is $vst - leaving it alone" -f $sinceQueue, $hbAge) }
+        }
+        'skip-peer' {
+          # NEVER reset a workspace a peer is running on. Journal once per peer job and keep waiting; the
+          # peer marker carries its own deadline, so this clears itself when that run's timeout passes.
+          $peerJob = ''
+          if ($busyRaw) { try { $bp = $busyRaw | ConvertFrom-Json; if ($bp.PSObject.Properties['job']) { $peerJob = "$($bp.job)" } } catch {} }
+          $peerKey = if ($peerJob) { $peerJob } else { 'unknown' }
+          if (-not $skippedPeers.ContainsKey($peerKey)) {
+            $skippedPeers[$peerKey] = [DateTime]::UtcNow
+            Out-Line ("[agentq-cloud] unclaimed after {0:N0} min but another job ({1}) is in flight on $Vm - NOT resetting, waiting" -f $sinceQueue, $peerKey)
+            Write-Journal @{ event = 'cloud-heal-skipped'; resource = "cloud:$Ws"; repo = $repoName; purpose = $Purpose; lane = $Lane; kind = 'cloud'; id = $id; peerJob = $peerKey; heartbeatAgeSec = $hbAge; reason = 'peer job in flight' }
+          }
+        }
       }
+      # Extend the deadline so this attempt's next backoff (plus one stale window) can be reached, instead
+      # of the old flat +10 min - bounded by $hardDeadline so a stuck run still ends on its own.
+      $want = [DateTime]::UtcNow.AddMinutes((Get-HealBackoffMin -HealsDone $healCount -FirstMin $StaleClaimMin) + $StaleClaimMin)
+      if ($want -gt $hardDeadline) { $want = $hardDeadline }
+      if ($deadline -lt $want) { $deadline = $want }
     }
     $logTxt = Read-Gcs "$Bucket/jobs/$id/log"
     if ($logTxt -and $logTxt.Length -gt $printed) { [Console]::Out.Write($logTxt.Substring($printed)); $printed = $logTxt.Length; if (-not $claimedAt) { $claimedAt = [DateTime]::UtcNow } }
