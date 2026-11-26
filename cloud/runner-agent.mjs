@@ -70,6 +70,8 @@ const gs = {
             body,
             headers: { "Content-Type": type },
         }),
+    // plain delete (404 is fine - `api` tolerates it): used to clear ws/<ws>/busy when a job ends.
+    del: async (b, o) => api(`https://storage.googleapis.com/storage/v1/b/${b}/o/${enc(o)}`, { method: "DELETE" }),
     // claim = delete with ifGenerationMatch: only one agent wins a queued job.
     claim: async (b, o, gen) => {
         const r = await fetch(`https://storage.googleapis.com/storage/v1/b/${b}/o/${enc(o)}?ifGenerationMatch=${gen}`, {
@@ -236,6 +238,40 @@ async function healKnownClaims() {
         } catch (e) {
             log("heal", repo, e.message);
         }
+    }
+}
+
+// The workspace advertises WHICH job it is running, for the WHOLE duration of that job, on
+// ws/<ws>/busy. A client that is about to reset a wedged workspace reads it first, so it never reboots
+// the VM out from under a peer's run - the old client only asked whether ITS OWN job had been claimed,
+// so a reset killed a peer build (ws-codai, 2026-11-26). `until` = at + the job's own timeoutSec: a
+// marker that has outlived its deadline is a wedge, not a live peer, and a client may then reset.
+async function markBusy(spec) {
+    const timeoutSec = Number(spec.timeoutSec) || 3600;
+    await gs
+        .put(
+            cfg.bucket,
+            `ws/${cfg.ws}/busy`,
+            JSON.stringify({
+                job: spec.id,
+                host: cfg.name,
+                at: new Date().toISOString(),
+                timeoutSec,
+                until: new Date(Date.now() + timeoutSec * 1000).toISOString(),
+            }),
+            "application/json",
+        )
+        .catch((e) => log("busy marker", e.message));
+}
+async function clearBusy(jobId) {
+    // Only clear the marker if it is OURS: never erase a peer's claim to this workspace.
+    try {
+        const raw = await gs.get(cfg.bucket, `ws/${cfg.ws}/busy`);
+        if (!raw) return;
+        if (JSON.parse(raw.toString()).job !== jobId) return;
+        await gs.del(cfg.bucket, `ws/${cfg.ws}/busy`);
+    } catch (e) {
+        log("busy clear", e.message);
     }
 }
 
@@ -565,6 +601,7 @@ async function main() {
             if (raw && (await gs.claim(cfg.bucket, it.name, it.generation))) {
                 const spec = JSON.parse(raw.toString());
                 log("claimed", spec.id, spec.cmd);
+                await markBusy(spec);
                 await hb("busy");
                 if (!turboToken) await loadTurbo();
                 inJob = true;
@@ -573,6 +610,7 @@ async function main() {
                 } finally {
                     inJob = false;
                     loopAt = Date.now();
+                    await clearBusy(spec.id);
                 }
                 lastWork = Date.now();
                 lastTick = Date.now();
