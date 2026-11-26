@@ -2190,6 +2190,9 @@ function Show-Status {
   # D5 (ADR 0014): my session's slot share, so an agent that only reads `status` sees why its next lease
   # would be refused and what it already holds. One line, never in -Json (that path returned above).
   Show-SlotShare
+  # Discoverability for the read-only `timings` verb: reading codai's 2.4k gate logs costs ~18 s, so it
+  # must never run HERE - one line naming it is the only cheap way an agent learns it exists. Never -Json.
+  Write-Output 'tip: agentq timings -Limit 5 -> per-suite gate wall times from the build logs (slowest last run first)'
   Format-V2Status $v2
   if ($rows) {
     Write-Output '== QUEUES'
