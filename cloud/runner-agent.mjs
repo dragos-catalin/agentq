@@ -190,6 +190,55 @@ async function publishKnown(repo, dir, sha) {
         .catch((e) => log("known", e.message));
 }
 
+// The bundle-base claim the client reads (ws/<ws>/repos/<repo>.json) is a CACHE of what this disk
+// already has, never data. A VM that was recreated, rebaked or reset keeps a job checkout with fewer
+// commits than the claim still names, so the client picks an unusable base and dies with "Repository
+// lacks these prerequisite commits" -- and re-sends the same thin bundle on every retry. workspace.ps1
+// clears the claim only on the instance-create path, so every other way a disk is lost leaves it stale.
+// Drop the shas this disk cannot prove, in place, keeping the newest-first order. A shorter or empty
+// claim can only ever make the client ship a BIGGER bundle, so this repair can never turn a working job
+// into a failing one; a healthy workspace changes nothing and writes nothing.
+async function healKnownClaims() {
+    let items;
+    try {
+        items = await gs.list(cfg.bucket, `ws/${cfg.ws}/repos/`);
+    } catch (e) {
+        log("heal list", e.message);
+        return;
+    }
+    for (const it of items) {
+        if (!it.name.endsWith(".json")) continue;
+        const repo = it.name.slice(it.name.lastIndexOf("/") + 1).replace(/\.json$/, "");
+        try {
+            const raw = await gs.get(cfg.bucket, it.name);
+            if (!raw) continue;
+            const doc = JSON.parse(raw.toString());
+            const shas = Array.isArray(doc.shas) ? doc.shas : [];
+            const dir = path.join(cfg.jobs, repo);
+            // A missing checkout dir, or one that is not a git repository, proves no sha: cat-file
+            // throws for each and the list collapses to [] (an empty claim = a full bundle).
+            const present = shas.filter((s) => {
+                try {
+                    sh("git", ["-C", dir, "cat-file", "-e", `${s}^{commit}`]);
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+            if (present.length === shas.length) continue; // healthy: zero writes
+            await gs.put(
+                cfg.bucket,
+                it.name,
+                JSON.stringify({ repo, shas: present, at: new Date().toISOString(), host: cfg.name }),
+                "application/json",
+            );
+            log("heal", repo, `${shas.length} -> ${present.length} shas`);
+        } catch (e) {
+            log("heal", repo, e.message);
+        }
+    }
+}
+
 async function runJob(spec) {
     const t0 = Date.now();
     const phases = {};
@@ -449,6 +498,8 @@ async function main() {
         }
     }
     await loadTurbo();
+    // Startup: a VM that just came up may already hold a claim from its previous disk. Never fatal.
+    await healKnownClaims().catch((e) => log("heal", e.message));
     log(
         "agent up",
         JSON.stringify({
@@ -465,6 +516,7 @@ async function main() {
     let lastWork = Date.now();
     let lastBusyCheck = 0;
     let lastHb = 0;
+    let lastHeal = 0;
     let lastTick = Date.now();
     let lastSelfCheck = Date.now();
     // Watchdog: timers still fire while the loop awaits. No loop pass for 5 min outside a job = something
@@ -530,6 +582,11 @@ async function main() {
         if (Date.now() - lastHb > 30_000) {
             lastHb = Date.now();
             await hb("idle");
+        }
+        // Same cadence as the idle heartbeat: re-check the claims against the disk we actually have.
+        if (Date.now() - lastHeal > 30_000) {
+            lastHeal = Date.now();
+            await healKnownClaims().catch((e) => log("heal", e.message));
         }
         // interactive devbox: every 30 s, a login session or load counts as work (idle clock restarts)
         if (cfg.interactive && Date.now() - lastBusyCheck > 30_000) {
