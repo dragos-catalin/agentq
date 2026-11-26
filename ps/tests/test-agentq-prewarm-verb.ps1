@@ -369,6 +369,12 @@ $r = Invoke-JobsSurface $jobsScript @('list')
 Check 'a local-only registry costs no cloud call' (-not (Contains $script:Calls 'describe')) "calls=$($script:Calls)"
 Check 'a local-only registry gets no hint' (-not (Contains $r.Out 'SUSPENDED')) "out=$($r.Out)"
 
+# One temp root per run (config, fake gcloud, fake repos, call log) and this suite runs inside EVERY land
+# gate and EVERY agentq install gate: measured 2026-11-26, that left 1 115 empty `prewarm-verb-test-*`
+# directories in %TEMP% in 48 h. Whoever runs the suite owns cleaning it up - the stray-reaper should not
+# have to know each suite's naming, and an unguarded Remove-Item would abort here under $ErrorActionPreference.
+Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host ''
 if ($script:Fail) { Write-Host "prewarm verb: $($script:Pass) passed, $($script:Fail) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "prewarm verb: $($script:Pass) passed, 0 failed" -ForegroundColor Green
