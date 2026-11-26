@@ -3041,6 +3041,7 @@ function Format-V2Status($v) {
   # the refusal message and in the journal `slot-admission-denied`. Get-TaskSlotBudget is one PSDrive read plus
   # one CIM read, cheap enough for `status` (and it is NOT called by agentq-sync, which reads the raw files).
   $tb = Get-TaskSlotBudget
+  $chatWin = [double](P (Get-Config) 'leaseChatGraceMin' 30)
   Write-Output ("== SLOT BUDGET cap {0} of {1} task slots in force (floor {2}, measured {3}; free {4} GB on the slot volume, {5} GB commit headroom)" -f $tb.cap, $tb.ceiling, $tb.floor, $tb.derived, $tb.freeGB, $tb.freeCommitGB)
   if ($v.releases) {
     # `phase` in the record is the LAST checkpoint the run entered (release-phase), and `state` is the
@@ -3068,15 +3069,16 @@ function Format-V2Status($v) {
     Write-Output '== SLOTS (leases)'
     # chatMin = minutes since the last tool call of a chat bound to the slot (OQ-001); '-' = no chat bound.
     # 'chat' state = the owner shell is gone and a live chat is what keeps the lease.
-    $v.leases | Sort-Object repo, slot | Format-Table @{n = 'slot'; e = { "$($_.repo)/$($_.slot)" } }, role, @{n = 'state'; e = { if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le 30) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' } } }, idleMin, @{n = 'chatMin'; e = { if ($null -ne $_.chatIdleMin) { $_.chatIdleMin } else { '-' } } }, branch, session, purpose, leaseId -AutoSize | Out-String -Width 230 | Write-Output
+    $v.leases | Sort-Object repo, slot | Format-Table @{n = 'slot'; e = { "$($_.repo)/$($_.slot)" } }, role, @{n = 'state'; e = { if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le $chatWin) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' } } }, idleMin, @{n = 'chatMin'; e = { if ($null -ne $_.chatIdleMin) { $_.chatIdleMin } else { '-' } } }, branch, session, purpose, leaseId -AutoSize | Out-String -Width 230 | Write-Output
   }
 }
 function ConvertTo-V2Json($v) {
+  $chatWin = [double](P (Get-Config) 'leaseChatGraceMin' 30)
   @{
     leases = @($v.leases | ForEach-Object { [pscustomobject]@{
         leaseId = $_.leaseId; repo = $_.repo; slot = $_.slot; role = $_.role
         # state mirrors Format-V2Status' == SLOTS column (the table and the JSON must agree).
-        state = $(if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le 30) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' })
+        state = $(if ($_.stale) { 'STALE' } elseif (-not $_.alive -and $null -ne $_.chatIdleMin -and $_.chatIdleMin -le $chatWin) { 'chat' } elseif (-not $_.alive) { 'owner-gone' } else { 'ok' })
         idleMin = $_.idleMin; chatIdleMin = $_.chatIdleMin; branch = $_.branch; session = $_.session; purpose = $_.purpose
         path = $_.path; pid = $_.pid; created = $_.created; beat = (Iso $_.beat); alive = $_.alive; stale = $_.stale } })
     releases = @($v.releases | ForEach-Object { $_ | Select-Object * -ExcludeProperty file })

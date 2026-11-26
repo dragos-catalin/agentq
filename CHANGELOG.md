@@ -50,7 +50,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   file, an escaping one writes outside `~/.copilot`). Measured on today's map: 98 destinations, 52 suites.
 - `agentq-cloud.ps1 -Status -Json`: a **read-only** JSON surface for every devcloud workspace in the
   registry (`{"v":1,"at":<ISO>,"workspaces":[{ws,vm,project,zone,state,heartbeatAt,heartbeatAgeSec,
-  idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - the verb Vitals waits
+idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - the verb Vitals waits
   for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md §6.3). `state` folds the VM
   status (`suspended`/`stopped`/`suspending`) with the heartbeat (`idle`/`busy`); a figure that cannot be
   measured is `null`, NEVER `0`, and a workspace with no readable heartbeat is `null` there and named in
@@ -101,6 +101,15 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
 - agentq-sync publishes v3 holders first so the hub's position model stays correct.
+- **One measured budget for task and scratch slots, instead of two independent ones.** `Get-SlotRoom`
+  derives the machine-wide room from the live numbers (`(free disk - 20 GB) / 8 GB` and
+  `(free commit - minFreeCommitGB) / 2 GB`, whichever is smaller) and `Get-TaskSlotBudget` subtracts the
+  machine-wide scratch leases, so a scratch slot and a task slot now cost the same room and cannot
+  together exceed the machine. Scratch floor 5 -> 8, ceiling 8 -> 12. A refused scratch lease reports the
+  measured offer and room instead of a bare "it is still held", and the refusal is journaled
+  (`scratch-alloc-denied`, `slot-admission-denied`) only when the allocation is really refused.
+  Measured live 2026-11-26: 26/26 reported slots were in fact 20 scratch + 15 task + 1 land against a
+  measured room of 30, i.e. the machine was over-subscribed rather than leaking slots.
 
 ### Security
 

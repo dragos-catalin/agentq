@@ -80,7 +80,7 @@
   "leaseOwnerGoneIdleMin": 120,
   "leaseIdleMin": 45,
   "leaseOwnerIdleMin": 90,
-  "leaseChatGraceMin": 20,
+  "leaseChatGraceMin": 30,
   "leaseScratchIdleMin": 15,
   "scratchSlots": 8,
   "scratchSlotsMax": 12,
