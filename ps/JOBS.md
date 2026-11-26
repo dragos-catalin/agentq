@@ -41,6 +41,25 @@ pwsh -NoProfile -File "$b\jobs.ps1" orphans [-Kill]
   with no live VS Code / copilot ancestor (scheduled-task children are excluded), plus DEAD and
   ownerless registry jobs. It never kills without `-Kill`.
 
+## The cloud prewarm hint
+
+`jobs list` and `wait-job` are where an agent looks at cloud work just before submitting more, so both
+print one line when the repo's cloud workspace is SUSPENDED:
+
+```text
+note: ws-vitals-win (where vitals runs in the cloud) is SUSPENDED - the next cloud job pays ~41 s
+      to resume it. Warm it now: agentq prewarm -Ws vitals-win
+```
+
+- Silent while the workspace is RUNNING, silent for a repo with no cloud workspace, and silent in
+  `-Json` (which stays parseable, and does not even pay for the measurement).
+- The hint itself pays nothing: it reads `<coord>\prewarm\vmstate-<ws>.json`, the record `agentq prewarm`
+  writes from the state it just measured, so the two can never disagree about one machine. A record older
+  than 30 minutes is ignored - an unknown state says nothing, and a fresh RUNNING record is what keeps
+  the line quiet.
+- It only ever prints. Warming is `agentq prewarm` (or the `codai-workspace-prewarm` scheduled task),
+  never a side effect of listing jobs.
+
 ## Registry
 
 `<AGENTQ_HOME or ~/.codai/coord>/jobs/<id>.json`:

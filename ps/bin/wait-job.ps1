@@ -96,6 +96,9 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $pos = 0L; $carry = ''; $lastGrowth = 0.0; $lastSize = -2L; $wasAlive = Test-PidAlive
 $label = if ($JobId) { "job $JobId" } elseif ($Log) { $Log } else { "pid $ProcId" }
 Say "waiting on $label (max $([math]::Round($maxS / 60, 2)) min, stall $([math]::Round($stallS / 60, 2)) min, done='$Done'$(if ($Fail) { " fail='$Fail'" })$(if ($ProcId) { " pid=$ProcId" }))"
+# The wait is the moment an agent next submits cloud work: if this job's workspace has gone back to
+# sleep, say so now rather than 41 s into the next queue wait (same hint as `agentq since`).
+if ($JobId -and $job) { Show-JobPrewarmHint "$($job['repo'])" }
 
 while ($true) {
   if ($script:RegistryMode) {

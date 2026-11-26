@@ -53,21 +53,28 @@ while ($i -lt $argv.Count) {
 
 function Show-List {
   $cut = [DateTime]::UtcNow.AddHours(-24)
+  $cloudRepos = @()
   $views = @(foreach ($j in Get-AllJobs) {
       $v = Get-JobView $j
+      if ("$($j['repo'])" -and "$($j['placement'])" -like 'cloud:*') { $cloudRepos += "$($j['repo'])" }
       $end = ConvertTo-JobUtc $j['endedAt']; $st = ConvertTo-JobUtc $j['startedAt']
       $ref = if ($end) { $end } else { $st }
       if (-not $All -and $v.state -notin 'running', 'suspect', 'starting', 'dead' -and $ref -and $ref -lt $cut) { continue }
       $v
     })
   if ($Json) { ConvertTo-Json -InputObject @($views) -Depth 4; return }
-  if (-not $views.Count) { 'no jobs' + $(if (-not $All) { ' (finished > 24 h hidden; -All shows them)' }); return }
+  if (-not $views.Count) {
+    Write-Output ('no jobs' + $(if (-not $All) { ' (finished > 24 h hidden; -All shows them)' }))
+    if ($cloudRepos.Count) { Show-JobPrewarmHint (@($cloudRepos | Select-Object -Unique)[0]) }
+    return
+  }
   $views | ForEach-Object {
     [pscustomobject]@{
       id = $_.id; label = $_.label; state = $_.state.ToUpperInvariant() + $(if ($null -ne $_.exitCode -and $_.state -ne 'running') { "($($_.exitCode))" })
       runMin = $_.runtimeMin; expMin = $_.expectedMin; quietMin = $_.lastOutputAgeMin; log = $_.log
     }
   } | Format-Table -AutoSize | Out-String -Width 260
+  if ($cloudRepos.Count) { Show-JobPrewarmHint (@($cloudRepos | Select-Object -Unique)[0]) }
 }
 
 function Show-UnknownId([string]$id) {

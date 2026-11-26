@@ -221,8 +221,11 @@ function Format-JobTree([int]$root) {
     })
 }
 
-# Shape mirrored to the hub (contract: id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,
-# startedAt,endedAt,lastOutputAt,log). command <= 500 chars; never env values.
+# Shape mirrored to the hub (contract: id,label,command,cwd,repo,host,placement,pid,state,exitCode,
+# expectedMin,startedAt,endedAt,lastOutputAt,log). command <= 500 chars; never env values.
+# placement = `cloud:<ws>` | `local` | `` and is written by the job that ran, never inferred: an empty
+# value means unknown, so it must NOT be read as local, or a job that ran on a cloud workspace becomes
+# indistinguishable from one that ran here (which is what /ops/agentq could not tell apart).
 # The mirror is a WINDOW, not an archive: a 7-day backlog reached ~3000 rows on this machine and the
 # gateway's schema rejected the WHOLE push (400 jobs>500) for a full day (2026-11-13), so the hub
 # mirrored nothing. Keep every non-terminal job (the ones the hub can act on) and the newest
@@ -245,7 +248,7 @@ function Get-JobsForSync([int]$days = 7, [int]$max = 500) {
       started = $(if ($st) { $st } else { [DateTime]::MinValue })
       row     = [ordered]@{
         id = "$($j['id'])"; label = "$($j['label'])"; command = $cmd; cwd = "$($j['cwd'])"; repo = "$($j['repo'])"; host = "$($j['host'])"
-        pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
+        placement = "$($j['placement'])"; pid = [int]$j['pid']; state = $v.state; exitCode = $v.exitCode; expectedMin = $j['expectedMin']
         startedAt = $j['startedAt']; endedAt = $j['endedAt']; lastOutputAt = $v.lastOutputAt; log = "$($j['log'])"
       }
     }
@@ -256,4 +259,58 @@ function Get-JobsForSync([int]$days = 7, [int]$max = 500) {
   $ordered = @($rows | Sort-Object -Property @{ Expression = 'active'; Descending = $true }, @{ Expression = 'started'; Descending = $true })
   if ($max -gt 0 -and $ordered.Count -gt $max) { $ordered = @($ordered[0..($max - 1)]) }
   @($ordered | ForEach-Object { $_.row })
+}
+
+# ---- prewarm hint (2026-11-25) ---------------------------------------------------------------------
+# A cloud job submitted while its workspace is suspended pays the ~41 s `gcloud resume` at the worst
+# moment: while an agent is already blocked on the queue, and with no warning anywhere in the job list.
+# `jobs list` and `wait-job` are where an agent looks at cloud work just before submitting, so both print
+# one line about it. Silent while the workspace is RUNNING - a hint that fires when everything is healthy
+# is a hint agents learn to skip, and that silence is what makes the SUSPENDED case readable.
+# One `gcloud describe` per workspace per 5 minutes, cached in the file the prewarm tool itself writes, so
+# the two never hold different opinions about the same machine. No config or no gcloud on PATH = silent.
+function Get-JobPrewarmConfig {
+  $path = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
+  $map = @{}; $reg = @{}
+  try {
+    if (Test-Path -LiteralPath $path) {
+      $c = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+      if ($c.PSObject.Properties['cloudWorkspaces']) {
+        foreach ($p in $c.cloudWorkspaces.PSObject.Properties) { $map["$($p.Name)"] = "$($p.Value)" }
+      }
+      if ($c.PSObject.Properties['cloudRegistry']) {
+        foreach ($p in $c.cloudRegistry.PSObject.Properties) {
+          $pv = $p.Value
+          $reg["$($p.Name)"] = @{ project = "$($pv.project)"; zone = "$($pv.zone)" }
+        }
+      }
+    }
+  } catch { }
+  @{ workspaces = $map; registry = $reg }
+}
+function Get-JobPrewarmVmStatus([string]$ws) {
+  if (-not $ws) { return $null }
+  $f = Join-Path (Join-Path (Get-JobCoordRoot) 'prewarm') "vmstate-$ws.json"
+  $nowSec = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  # CACHE ONLY - see Get-PrewarmVmStatus in agentq.ps1 for the measurement behind this: a live
+  # `gcloud instances describe` on this path made one suite run take 6 minutes instead of 52 seconds
+  # (2026-11-25). prewarm-cloud.ps1 rewrites the file for every workspace on each tick; anything older
+  # than 30 minutes is unknown, and unknown prints nothing.
+  if (-not (Test-Path -LiteralPath $f)) { return $null }
+  try {
+    $c = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    $pa = $c.PSObject.Properties['atSec']; $ps = $c.PSObject.Properties['status']
+    # StrictMode 3 makes a missing property an error, hence the property bag rather than $c.atSec.
+    if ($pa -and $ps -and "$($ps.Value)" -and ($nowSec - [int64]$pa.Value) -lt 1800) { return "$($ps.Value)" }
+  } catch { }
+  $null
+}
+function Show-JobPrewarmHint([string]$repoName) {
+  if (-not $repoName) { return }
+  $ws = "$((Get-JobPrewarmConfig).workspaces[$repoName])"
+  if (-not $ws) { return }
+  if ((Get-JobPrewarmVmStatus $ws) -ne 'SUSPENDED') { return }
+  Write-Output ''
+  Write-Output "note: ws-$ws (where $repoName runs in the cloud) is SUSPENDED - the next cloud job pays ~41 s"
+  Write-Output "      to resume it. Warm it now: agentq prewarm -Ws $ws"
 }

@@ -39,6 +39,11 @@ $suites = [ordered]@{
   'repo-migrate'   = @('-File', (Join-Path $PSScriptRoot 'test-repo-migrate.ps1'), '-Tool', (Join-Path $bin 'repo-migrate.ps1'))
   'guard'          = @('-File', (Join-Path $PSScriptRoot 'test-guard-v2.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'jobs'           = @('-File', (Join-Path $PSScriptRoot 'test-jobs.ps1'), '-Bin', $bin, '-Hooks', $hooks)
+    # 2026-11-25: both prewarm suites were runnable by hand and by NOTHING else - they were in neither this
+    # table nor the install map, so no gate ever executed them and a regression in the wake path would have
+    # shipped green. Registered here and in install.ps1 in the same slice (the wiring guard pins the two).
+    'prewarm verb'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-prewarm-verb.ps1'))
+    'prewarm cloud'  = @('-File', (Join-Path $PSScriptRoot 'test-prewarm-cloud.ps1'))
   'cloud place'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-cloud.ps1'), '-Aq', (Join-Path $stage 'agentq.ps1'))
     # 2026-11-25: a cloud run's log lived only in the job bucket and a terminal buffer, so a gate result was
     # an assertion rather than evidence. Every run now leaves runs/<jobid>.log plus ONE idempotent row in

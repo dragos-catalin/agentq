@@ -202,6 +202,13 @@ $script:FsNoted = ''
 # ("The variable '$script:MmFloors' cannot be retrieved because it has not been set"), which took down
 # every `agentq run` (2026-11-21, caught by this repository's own fair-share suite).
 $script:MmFloors = $null
+# prewarm (2026-11-25): knobs of prewarm-cloud.ps1, forwarded verbatim by `agentq prewarm`. The wait
+# is NOT $WaitSec - that name is already the wait loop's, and PowerShell variables ignore case, so the
+# two would be ONE slot and a prewarm would silently change the wait loop's bound.
+$ActivityMin = $null; $MaxResumesPerDay = $null; $PrewarmWaitSec = $null; $VmState = $null
+$GcloudExe = $null; $PrewarmRoot = $null; $PrewarmConfig = $null; $PrewarmTickLog = $null
+$MaxTickSec = $null; $ReportDays = $null; $PrewarmReport = $false
+$PrewarmOff = $false; $script:PrewarmCfg = $null
 $Rest = @()
 $argv = @($args)
 $dd = [array]::IndexOf($argv, '--')
@@ -307,6 +314,20 @@ while ($i -lt $argv.Count) {
       while ($i + 1 -lt $argv.Count -and "$($argv[$i + 1])" -notlike '-*') { $script:i++; $vals += "$($argv[$i])" }
       $DoctorOnly = @($vals | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
     }
+    # prewarm: the knobs of prewarm-cloud.ps1, forwarded. -VmState/-Gcloud/-Root/-ConfigPath/-TickLog
+    # exist so the suite (and a manual probe) can drive a fake gcloud instead of touching a real VM.
+    'activitymin' { $ActivityMin = [int](& $next) }
+    'maxresumesperday' { $MaxResumesPerDay = [int](& $next) }
+    'waitsec' { $PrewarmWaitSec = [int](& $next) }
+    'maxticksec' { $MaxTickSec = [int](& $next) }
+    'reportdays' { $ReportDays = [int](& $next) }
+    'report' { $PrewarmReport = $true }
+    'vmstate' { $VmState = & $next }
+    'gcloud' { $GcloudExe = & $next }
+    'root' { $PrewarmRoot = & $next }
+    'configpath' { $PrewarmConfig = & $next }
+    'ticklog' { $PrewarmTickLog = & $next }
+    'off' { $PrewarmOff = $true }
     'quiet' { $Quiet = $true }
     default {
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
@@ -2084,6 +2105,11 @@ function Show-Since {
   Write-Output "== agentq journal for $($repo.Name), last $Hours h"
   $items = @(Read-Journal 0 $from $repo.Name) | Where-Object { (JProp $_ 'event') -notin 'queued', 'reap' }
   if ($items) { $items | ForEach-Object { Format-Entry $_ } } else { Write-Output '(no entries)' }
+  # The NAME, not $Repo: `$repo = Get-RepoInfo $Repo` above overwrote $Repo itself (PowerShell variable
+  # names ignore case), so by here $Repo is the repo OBJECT and Get-RepoInfo would be handed a
+  # PSCustomObject, fail its `git -C` and return $null - which is how the hint first shipped silent
+  # (test-agentq-prewarm-verb.ps1, 2026-11-25).
+  Show-PrewarmHint $repo.Name
   Write-Output "== git log origin (last $Hours h)"
   & git -C $repo.Top fetch -q 2>$null
   $up = (& git -C $repo.Top rev-parse --abbrev-ref '@{u}' 2>$null)
@@ -2091,6 +2117,94 @@ function Show-Since {
   & git -C $repo.Top log $ref --since="$([int]($Hours * 60)) minutes ago" --format='%h %ad %an %s' --date=format:'%m-%d %H:%M' -n 60
   Write-Output '== live queues'
   Show-Status
+}
+
+# ---- prewarm (2026-11-25) -----------------------------------------------------------------------
+# A suspended cloud workspace pays ~41 s of resume on the FIRST job that needs it (measured), and
+# nothing in the queue announces that cost beforehand. prewarm-cloud.ps1 removes it by resuming a
+# workspace while the journal shows the repos it serves are working; this verb is the agent-facing way
+# in, so an agent does not have to know the script exists.
+function Invoke-Prewarm {
+  $tool = Join-Path $PSScriptRoot 'prewarm-cloud.ps1'
+  if (-not (Test-Path -LiteralPath $tool)) { [Console]::Error.WriteLine("agentq prewarm: $tool is missing (install drift - ps/install.ps1 mirrors it)"); exit 2 }
+  $named = @{}
+  if ($Ws) { $named['Ws'] = "$Ws" }
+  # No -Ws: name the repo we are in, so a bare `agentq prewarm` acts for this workspace instead of
+  # falling back to the tool's own default repo.
+  if (-not $Ws) { $here = Get-RepoInfo $Repo; if ($here) { $named['Repo'] = $here.Name } }
+  if ($All) { $named['All'] = $true }
+  if ($PrewarmReport) { $named['Report'] = $true }
+  if ($PrewarmOff) { $named['Off'] = $true }
+  if ($Quiet) { $named['Quiet'] = $true }
+  $pairs = @{ ActivityMin = $ActivityMin; MaxResumesPerDay = $MaxResumesPerDay; WaitSec = $PrewarmWaitSec; MaxTickSec = $MaxTickSec; ReportDays = $ReportDays; VmState = $VmState; Gcloud = $GcloudExe; Root = $PrewarmRoot; ConfigPath = $PrewarmConfig; TickLog = $PrewarmTickLog }
+  foreach ($k in @($pairs.Keys | Sort-Object)) { if ($null -ne $pairs[$k] -and "$($pairs[$k])" -ne '') { $named[$k] = "$($pairs[$k])" } }
+  # In-process on purpose: this runs on a schedule where the common outcome is "nothing to do", so a
+  # second pwsh start (~400 ms) would be most of the tick. Splatted as a HASHTABLE: an array splat is
+  # positional, and `'-ActivityMin','42'` then binds "-ActivityMin" to the third parameter's int
+  # (measured by test-agentq-prewarm-verb.ps1, which the array form failed).
+  & $tool @named
+  if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
+
+# Where a repo runs in the cloud, and whether that workspace is asleep. Read from agentq-config.json
+# (cloudWorkspaces + cloudRegistry) rather than duplicated, so a moved workspace is moved once.
+function Get-PrewarmConfig {
+  if ($script:PrewarmCfg) { return $script:PrewarmCfg }
+  $path = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
+  $wsmap = @{}; $reg = @{}
+  try {
+    if (Test-Path -LiteralPath $path) {
+      $c = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+      $m = $c.PSObject.Properties['cloudWorkspaces']
+      if ($m -and $m.Value) { foreach ($x in $m.Value.PSObject.Properties) { $wsmap[$x.Name] = "$($x.Value)" } }
+      $r = $c.PSObject.Properties['cloudRegistry']
+      if ($r -and $r.Value) { foreach ($x in $r.Value.PSObject.Properties) { $reg[$x.Name] = @{ project = "$($x.Value.project)"; zone = "$($x.Value.zone)" } } }
+    }
+  } catch { }
+  $script:PrewarmCfg = @{ workspaces = $wsmap; registry = $reg }
+  $script:PrewarmCfg
+}
+
+# The state of one workspace, cached for five minutes. `since` is the first call of nearly every task,
+# so an uncached describe would add a gcloud round-trip to all of them for a fact that changes on the
+# order of minutes. The cache stores EPOCH SECONDS, not the ISO string: ConvertFrom-Json returns a
+# [DateTime] whose printed form is culture-shaped, and comparing those silently failed once already
+# (prewarm-cloud.ps1, 2026-11-25).
+function Get-PrewarmVmStatus([string]$ws) {
+  $cfg = Get-PrewarmConfig
+  $reg = $cfg.registry[$ws]
+  if (-not $reg) { return '' }
+  $f = Join-Path (Join-Path $Root 'prewarm') "vmstate-$ws.json"
+  $nowSec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  # CACHE ONLY - never a live call. This function runs inside `agentq since`, `jobs` and `wait-job`, the
+  # first commands of a task, and an unbounded `gcloud instances describe` there turns a hint into a hang:
+  # measured 2026-11-25, one suite run took 6 minutes instead of 52 seconds because every hint call paid a
+  # real gcloud. prewarm-cloud.ps1 -All rewrites this file for every workspace on each 20-minute tick, so
+  # the worst case is a recommendation a later measure proves unnecessary - and `agentq prewarm` measures
+  # again before it acts, so a stale SUSPENDED can only waste one command. Anything older than 30 minutes
+  # is unknown, and unknown is silent: a hint that fires on the healthy path is noise, and noise is how
+  # agents learn to skip a block of output.
+  try {
+    if (-not (Test-Path -LiteralPath $f)) { return '' }
+    $c = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    if ($null -eq $c.atSec) { return '' }
+    if (($nowSec - [int64]$c.atSec) -gt 1800) { return '' }
+    "$($c.status)"
+  } catch { '' }
+}
+
+# One line, and only when the workspace is actually SUSPENDED. A hint that fires on the healthy path is
+# noise, and noise is how agents learn to skip a section of the output.
+function Show-PrewarmHint([string]$repoName) {
+  if (-not $repoName) { return }
+  $cfg = Get-PrewarmConfig
+  $ws = "$($cfg.workspaces[$repoName])"
+  if ($env:AGENTQ_PREWARM_DEBUG) { [Console]::Error.WriteLine("prewarm-hint: repo='$repoName' ws='$ws' cfgPath='$(if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' })' maps=$($cfg.workspaces.Count) regs=$($cfg.registry.Count) root='$Root'") }
+  if (-not $ws) { return }
+  if ((Get-PrewarmVmStatus $ws) -ne 'SUSPENDED') { return }
+  Write-Output '== workspace'
+  Write-Output "note: ws-$ws is SUSPENDED and $repoName runs there - the next cloud job pays ~41 s to resume it."
+  Write-Output "      Warm it now (about 15 s, agentq does it for you): agentq prewarm -Ws $ws"
 }
 
 function Set-Mark {
@@ -2282,6 +2396,7 @@ $script:AqHelp = [ordered]@{
   'status' = @{ g = 'Queue & run'; u = 'status [<repo>] [-All] [-Json]'; d = 'who holds what, waiters, stale, marks, leases, releases, load'; e = 'agentq status --json | ConvertFrom-Json' }
   'log' = @{ g = 'Queue & run'; u = 'log [-Last 30] [-All] [-Json]'; d = 'recent journal: queued/start/done/fail/break/mark/note/commit' }
   'since' = @{ g = 'Queue & run'; u = 'since [-Hours 12] [-Json]'; d = 'what changed in this repo: journal + git log' }
+  'prewarm' = @{ g = 'Queue & run'; u = 'prewarm [-Ws <ws>] [-Repo <r>] [-All] [-ActivityMin n] [-MaxResumesPerDay n] [-MaxTickSec n] [-Report] [-ReportDays n] [-Off] [-Quiet]'; d = 'resume a suspended warm workspace BEFORE the job that needs it, so the ~41 s resume is not paid by the first cloud gate; only SUSPENDED acts, only while this repo is working, capped per workspace per day; -All ticks every workspace (one describe each, newest activity first), -MaxTickSec stops a tick that is over budget, -Report reads the journal and says what the wakes bought'; e = 'agentq prewarm -All   |   agentq prewarm -Report' }
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
   'ask' = @{ g = 'Queue & run'; u = 'ask -To <repo:<name>|session:<term-id>|slot:<repo>:<slot>|any|owner> -Message "..." [-Resource <r>] [-Repo <r>]'; d = 'ask another LIVE agent a question; prints how many agents the address reaches, and a negative answer is not silent'; e = 'agentq ask -To repo:agentq -Message "is ps/bin/agentq.ps1 free to edit for 20 min?"' }
   'reply' = @{ g = 'Queue & run'; u = 'reply -Id <msg id> -Message "..."'; d = 'answer an ask (the asker replying again reopens the thread)' }
@@ -2385,6 +2500,7 @@ switch ($Verb.ToLowerInvariant()) {
     if ($Json) { [ordered]@{ probeMs = $v.last; medianMs = $v.median; samples = $v.n; ageSec = $v.ageSec; thresholdMs = $v.thresholdMs; saturated = [bool]$v.saturated; inputIdleSec = $idle } | ConvertTo-Json -Compress }
     else { Write-Output ("start probe {0} ms; median of last {1}: {2} ms; limit {3} ms; {4}; input idle {5}" -f $v.last, $v.n, $v.median, $v.thresholdMs, $(if ($v.saturated) { 'SATURATED' } else { 'ok' }), $(if ($null -ne $idle) { "$idle s" } else { 'unknown' })) }
   }
+  'prewarm' { Invoke-Prewarm }
   'lease' { Invoke-Lease }
   'claim' { Invoke-Claim }
   'unlease' { Invoke-Unlease }

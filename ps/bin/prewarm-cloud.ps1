@@ -15,7 +15,10 @@
       roughly 1.14 USD/h for a machine nobody is using.
     * It resumes only when the agentq journal shows the repo working. A scheduled tick with nothing
       to warm for does nothing AND writes nothing, so the log stays readable.
-    * -MaxResumesPerDay caps the day, and one file turns it off entirely.
+    * -MaxResumesPerDay caps the day PER WORKSPACE (it was one shared counter until 2026-11-25: the
+      measurement says ~25 legitimate wakes a day across five workspaces, so a single global budget of
+      6 either throttled three quarters of the useful wakes or let one busy repo starve the rest).
+      One file turns the whole tool off.
 
   It never creates, stops or suspends a VM. The only write is `gcloud compute instances resume`, and
   only for a suspended workspace that is under its cap.
@@ -30,6 +33,24 @@
   Repository whose activity justifies the resume (default vitals), and where -Ws comes from when -Ws
   is not given.
 
+.PARAMETER All
+  One tick per workspace in cloudRegistry, so every heavy workspace on the machine is covered rather
+  than the one repo that happened to be configured first. Each workspace is ticked by the same body
+  below (re-invoked with -Ws), so the bounds are identical per workspace and the day cap is shared.
+  Exit: 0 all clear, 3 some workspace resumed but did not come up inside -WaitSec, 1 a tick failed.
+
+.PARAMETER MaxTickSec
+  Wall-clock bound for one -All tick. Measured 2026-11-25: eight workspaces cost eight `describe`
+  calls, and a slow gcloud took the tick past two minutes, which risks overlapping the next one
+  (IgnoreNew would then skip it silently). 0 = unbounded.
+
+.PARAMETER Report
+  Print what the last -ReportDays of ticks cost and bought, then do nothing else: wakes per workspace,
+  how many were followed by a real cloud job inside the 45 minutes the VM stays up, the measured wake
+  latency, cap hits and the idle exposure in USD. Read-only by construction - it never measures a VM
+  and never resumes one. This is what makes the window, the cadence and the cap reviewable on data
+  instead of on a replay script.
+
 .PARAMETER VmState
   Skip the measurement and act as if the VM were in this state. For tests, and for a caller that has
   already measured it; without it the state comes from `gcloud compute instances describe`.
@@ -43,7 +64,15 @@
 .EXAMPLE
   pwsh -NoProfile -File prewarm-cloud.ps1 -Repo vitals
   pwsh -NoProfile -File prewarm-cloud.ps1 -Ws vitals-win -ActivityMin 30 -WaitSec 90
+  agentq prewarm -All                                     # the form a scheduled task runs
   New-Item -ItemType File "$HOME\.codai\coord\prewarm\off"    # stop it, now and later
+
+.NOTES
+  Root, ConfigPath and Gcloud fall back to AGENTQ_HOME, AGENTQ_CONFIG and AGENTQ_GCLOUD, so a caller can
+  redirect the whole tool through the environment instead of every flag. Until 2026-11-25 Gcloud did not:
+  its default was the literal 'gcloud' while agentq - the only caller - reads AGENTQ_GCLOUD for its own
+  measurement, so a test that exported the variable measured the fake and RESUMED REAL VMs. Same for
+  ConfigPath, which silently ignored a redirected config and used the registry of the installed copy.
 #>
 [CmdletBinding()]
 param(
@@ -53,18 +82,23 @@ param(
     [int]$ActivityMin = 10,
     [int]$WaitSec = 0,
     [int]$MaxJournalLines = 600,
+    [int]$MaxTickSec = 0,
+    [int]$ReportDays = 7,
     [string]$VmState,
-    [string]$Gcloud = 'gcloud',
+    [string]$Gcloud,
     [string]$Root,
     [string]$ConfigPath,
     [string]$TickLog,
+    [switch]$All,
+    [switch]$Report,
     [switch]$Off,
     [switch]$Quiet
 )
 $ErrorActionPreference = 'Stop'
 
 if (-not $Root) { $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' } }
-if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'agentq-config.json' }
+if (-not $ConfigPath) { $ConfigPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' } }
+if (-not $Gcloud) { $Gcloud = if ($env:AGENTQ_GCLOUD) { $env:AGENTQ_GCLOUD } else { 'gcloud' } }
 $dir = Join-Path $Root 'prewarm'
 if (-not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Force -Path $dir }
 $records = Join-Path $dir 'resumes.jsonl'
@@ -130,7 +164,9 @@ if ($Off -or (Test-Path -LiteralPath $kill)) { Say "disabled (kill switch $kill)
 # leaves an empty log, and an empty log is indistinguishable from a task that never fired - which is
 # how the unquoted --format below stayed invisible through the first scheduled run (measured live
 # 2026-11-25: the task reported success because wscript's own exit code says nothing about the child).
-Say "tick ws=$(if ($Ws) { $Ws } else { "repo:$Repo" })"
+# `-All` has no workspace of its own yet: naming one repo here read as "every workspace is gated on
+# the repo the caller happened to be standing in" in the owner's tick log (seen 2026-11-25).
+Say "tick $(if ($Ws) { "ws=$Ws" } elseif ($Report) { 'report' } elseif ($All) { 'all' } else { "ws=repo:$Repo" })"
 
 # ---- configuration ------------------------------------------------------------------------------
 # cloudWorkspaces maps a repo to the workspace that serves it; cloudRegistry maps a workspace to the
@@ -150,6 +186,171 @@ if (Test-Path -LiteralPath $ConfigPath) {
     } catch { Say "could not read $ConfigPath ($($_.Exception.Message))" }
 }
 
+# ---- what the last days cost ---------------------------------------------------------------------
+# The window, the cadence and the cap are money decisions, and a money decision needs a number rather
+# than an argument. This prints what the last -ReportDays of ticks actually did: how many wakes per
+# workspace, how many of them were followed by a real cloud job inside the 45 minutes the VM stays up,
+# the measured wake latency, and the idle exposure in USD. Read-only by construction - it never runs a
+# gcloud command, so it is safe from any context, including a tick that is mid-run.
+if ($Report) {
+  $since = [DateTime]::UtcNow.AddDays(-$ReportDays)
+  $idleUsdPerHour = 1.14
+  # The CPU-idle self-suspend is the cost policy: a wake nobody uses inside it is the whole waste.
+  $usableMin = 45
+  $keys = @($registry.Keys)
+  $wakes = @{}
+  $latencies = @{}
+  $failed = @{}
+  $caps = @{}
+  foreach ($w in $keys) {
+    $wakes[$w] = [Collections.Generic.List[object]]::new()
+    $latencies[$w] = [Collections.Generic.List[double]]::new()
+    $failed[$w] = 0
+    $caps[$w] = 0
+  }
+  $seen = 0
+  foreach ($line in Read-Lines $records 5000) {
+    if (-not "$line".Trim()) { continue }
+    try { $e = $line | ConvertFrom-Json } catch { continue }
+    $ws = "$($e.ws)"
+    if (-not $ws -or -not $wakes.ContainsKey($ws)) { continue }
+    $ts = To-UtcInstant $e.ts
+    if (-not $ts -or $ts -lt $since) { continue }
+    $seen++
+    switch ("$($e.action)") {
+      'resume' { $wakes[$ws].Add($ts) }
+      'resume-failed' { $failed[$ws]++ }
+      'cap' { $caps[$ws]++ }
+      'prewarm-verified' { if ($null -ne $e.prewarmSec) { $latencies[$ws].Add([double]$e.prewarmSec) } }
+    }
+  }
+  # Usefulness is judged against the journal, not against the tick's own narration: a wake bought
+  # something only if a cloud job for that workspace followed inside the window the VM stays up. The
+  # tail is deliberately generous - a 7-day window needs tens of thousands of lines, and a report that
+  # reads too little would report a wake as wasted simply because it could not see the job.
+  $jobs = @{}
+  foreach ($line in Read-Lines $journal ([Math]::Max($MaxJournalLines, 80000))) {
+    if (-not "$line".Trim()) { continue }
+    try { $e = $line | ConvertFrom-Json } catch { continue }
+    if ("$($e.event)" -ne 'cloud-queued') { continue }
+    $r = "$($e.repo)"
+    if (-not $r) { continue }
+    $ts = To-UtcInstant $e.ts
+    if (-not $ts) { continue }
+    if (-not $jobs.ContainsKey($r)) { $jobs[$r] = [Collections.Generic.List[object]]::new() }
+    $jobs[$r].Add($ts)
+  }
+  $days = if ($ReportDays -gt 0) { $ReportDays } else { 1 }
+  "prewarm report: last $days day(s), since $($since.ToString('yyyy-MM-dd HH:mm'))Z, $seen record(s)"
+  '{0,-16} {1,6} {2,7} {3,5} {4,7} {5,7} {6,7}' -f 'ws', 'wakes', 'failed', 'cap', 'useful', 'wasted', 'median'
+  $totWakes = 0; $totUseful = 0; $totWasted = 0; $totFailed = 0; $totCaps = 0
+  $allLat = [Collections.Generic.List[double]]::new()
+  foreach ($w in @($keys | Sort-Object)) {
+    $serves = @($map.Keys | Where-Object { @($map[$_]) -contains "$w" })
+    $useful = 0; $wasted = 0
+    foreach ($t in $wakes[$w]) {
+      $hit = $false
+      foreach ($r in $serves) {
+        if (-not $jobs.ContainsKey($r)) { continue }
+        foreach ($jt in $jobs[$r]) {
+          if ($jt -ge $t -and ($jt - $t).TotalMinutes -le $usableMin) { $hit = $true; break }
+        }
+        if ($hit) { break }
+      }
+      if ($hit) { $useful++ } else { $wasted++ }
+    }
+    $median = ''
+    if ($latencies[$w].Count) {
+      $sorted = @($latencies[$w] | Sort-Object)
+      $median = '{0:N1}s' -f $sorted[[int][Math]::Floor($sorted.Count / 2)]
+      foreach ($v in $latencies[$w]) { $allLat.Add($v) }
+    }
+    $totWakes += $wakes[$w].Count; $totUseful += $useful; $totWasted += $wasted
+    $totFailed += $failed[$w]; $totCaps += $caps[$w]
+    if ($wakes[$w].Count -or $caps[$w]) {
+      '{0,-16} {1,6} {2,7} {3,5} {4,7} {5,7} {6,7}' -f $w, $wakes[$w].Count, $failed[$w], $caps[$w], $useful, $wasted, $median
+    }
+  }
+  $pct = if ($totWakes) { [math]::Round(100 * $totUseful / $totWakes) } else { 0 }
+  $usd = [math]::Round($totWasted * ($usableMin / 60) * $idleUsdPerHour, 2)
+  "totals          : $totWakes wake(s) in $days day(s) = $([math]::Round($totWakes / $days, 1))/day; useful $totUseful ($pct%), wasted $totWasted, failed $totFailed, cap hits $totCaps"
+  "exposure        : at most $usd USD of idle VM time (every wasted wake x $usableMin min x $idleUsdPerHour USD/h)"
+  if ($allLat.Count) {
+    $s = @($allLat | Sort-Object)
+    "latency         : measured on $($allLat.Count) of $totWakes wake(s); median $('{0:N1}s' -f $s[[int][Math]::Floor($s.Count / 2)])"
+  } else {
+    'latency         : unmeasured - no wake in this window waited for RUNNING (-WaitSec 0)'
+  }
+  "settings        : -ActivityMin $ActivityMin, -MaxResumesPerDay $MaxResumesPerDay per workspace; the cadence is the scheduled task's"
+  exit 0
+}
+
+# -All: every registered workspace, not just the one this repo maps to. Each workspace is ticked by
+# RE-INVOKING this script with -Ws set, so there is exactly one implementation of the bounds and a
+# failure in one workspace cannot stop the rest. The child's `exit` returns here (script semantics).
+if ($All -and -not $Ws) {
+    if ($registry.Count -eq 0) { Say "no workspaces in $ConfigPath cloudRegistry; nothing to warm"; exit 0 }
+  # -Repo is deliberately NOT forwarded: each child derives the repos that map to its own workspace,
+  # and an inherited one silently became the activity gate of every unmapped workspace - ws-brivio and
+  # ws-caelia-android were warming on VITALS activity (measured 2026-11-25), i.e. waking a machine for
+  # another machine's work. A workspace no repo maps to is skipped below instead.
+  $fwd = @{ Root = $Root; ConfigPath = $ConfigPath; ActivityMin = $ActivityMin
+              MaxResumesPerDay = $MaxResumesPerDay; WaitSec = $WaitSec; MaxJournalLines = $MaxJournalLines; Gcloud = $Gcloud }
+    # Only when set, or an empty -TickLog would turn the child's log off and an empty -VmState is a no-op
+    # that reads like a measurement was passed in. Splatted as a HASHTABLE: an array splat is positional,
+    # so `'-Root','C:\...'` bound "-Root" to the next parameter's int and every child died on the argument
+    # conversion instead of ticking (found by test-agentq-prewarm-verb.ps1, which is why -All is tested).
+    if ($VmState) { $fwd['VmState'] = $VmState }
+    if ($TickLog) { $fwd['TickLog'] = $TickLog }
+    if ($Quiet) { $fwd['Quiet'] = $true }
+    # Most recently active first. A tick is bounded and the day cap can truncate it, so the wakes that
+    # survive should be the ones an agent is most likely to use: an idle workspace only costs money.
+    $lastAt = @{}
+    foreach ($line in Read-Lines $journal $MaxJournalLines) {
+      if (-not "$line".Trim()) { continue }
+      try { $e = $line | ConvertFrom-Json } catch { continue }
+      $ts = To-UtcInstant $e.ts
+      $r = "$($e.repo)"
+      if (-not $ts -or -not $r) { continue }
+      if (-not $lastAt.ContainsKey($r) -or $ts -gt $lastAt[$r]) { $lastAt[$r] = $ts }
+    }
+    $plan = foreach ($w in @($registry.Keys)) {
+      # A workspace with no repo mapped to it has no signal to gate on: ticking it would warm it on
+      # whatever -Repo said, i.e. wake a machine for another machine's work. Skip is the only honest
+      # option - and it is recorded, so a workspace that silently never warms is visible.
+      $serves = @($map.Keys | Where-Object { @($map[$_]) -contains "$w" })
+      $last = [DateTime]::MinValue
+      foreach ($r in $serves) { if ($lastAt.ContainsKey($r) -and $lastAt[$r] -gt $last) { $last = $lastAt[$r] } }
+      [pscustomobject]@{ Ws = "$w"; Serves = $serves; Last = $last }
+    }
+    $plan = @($plan | Sort-Object -Property @{ Expression = 'Last'; Descending = $true }, @{ Expression = 'Ws' })
+    Say "order: $(@($plan | ForEach-Object { $_.Ws }) -join ' > ')"
+
+    $worst = 0
+    $skipped = @()
+    $tick = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $plan.Count; $i++) {
+      $p = $plan[$i]
+      if ($MaxTickSec -gt 0 -and $tick.Elapsed.TotalSeconds -ge $MaxTickSec) {
+        Say "stopping at $([int]$tick.Elapsed.TotalSeconds)s (-MaxTickSec $MaxTickSec); $($plan.Count - $i) workspace(s) wait for the next tick"
+        break
+      }
+      if ($p.Serves.Count -eq 0) {
+        $skipped += $p.Ws
+        Say "skip ws-$($p.Ws) (no repo maps to it in cloudWorkspaces; nothing to gate a wake on)"
+        continue
+      }
+      & $PSCommandPath -Ws "$($p.Ws)" @fwd
+        if ($LASTEXITCODE -eq 1) { $worst = 1 }
+        elseif ($LASTEXITCODE -eq 3 -and $worst -eq 0) { $worst = 3 }
+    }
+    $ticked = $registry.Count - $skipped.Count
+    $skipNote = ''
+    if ($skipped.Count) { $skipNote = '; skipped ' + ((@($skipped) | Sort-Object) -join ', ') + ' (no mapped repo)' }
+    Say "all: $ticked of $($registry.Count) workspace(s) ticked$skipNote"
+    exit $worst
+}
+
 if (-not $Ws) {
     if (-not $map.ContainsKey($Repo)) { Say "no workspace mapped for '$Repo' in $ConfigPath; pass -Ws"; exit 1 }
     $list = @($map[$Repo])
@@ -167,6 +368,7 @@ $vm = "ws-$Ws"
 
 # ---- state -------------------------------------------------------------------------------------
 $state = $VmState
+$measured = $false
 if (-not $state) {
     if (-not (Get-Command $Gcloud -ErrorAction SilentlyContinue)) { Say "gcloud not found; nothing measured, nothing done"; exit 0 }
     # The filter is quoted on purpose: argument mode parses the parenthesis in `--format=value(status)`
@@ -175,12 +377,27 @@ if (-not $state) {
     $out = & $Gcloud compute instances describe $vm --project $reg.project --zone $reg.zone --format 'value(status)' 2>$null
     if ($LASTEXITCODE -ne 0 -or -not "$out".Trim()) { Say "could not measure $vm (describe exit $LASTEXITCODE); doing nothing"; exit 0 }
     $state = "$out".Trim()
+    $measured = $true
 }
 Say "$vm is $state"
+# What was just measured is written down, because the hint at first contact reads this record instead of
+# calling gcloud (Get-PrewarmVmStatus in agentq.ps1): that hint runs inside `agentq since`, an agent's
+# first command, and a live describe there made one suite run take 6 minutes instead of 52 seconds
+# (2026-11-25). Every measurement counts, RUNNING included - a fresh RUNNING is what keeps the hint
+# quiet, and silence on the healthy path is what keeps the hint readable. This is the only writer.
+if ($measured) {
+  try {
+    $rec = @{ atSec = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); status = $state }
+    [IO.File]::WriteAllText((Join-Path $dir "vmstate-$Ws.json"), ($rec | ConvertTo-Json -Compress))
+  } catch { }
+}
 if ($state -eq 'RUNNING') { Say 'already running; left to the idle self-suspend'; exit 0 }
 if ($state -ne 'SUSPENDED') { Say "state '$state' is not SUSPENDED; not mine to change"; exit 0 }
 
 # ---- the daily cap ------------------------------------------------------------------------------
+# PER WORKSPACE: the counter is filtered by ws below. A single shared budget looked equivalent until the
+# replay said otherwise (2026-11-25: ~25 legitimate wakes a day over five workspaces, so 6 shared either
+# throttled three quarters of them or let ws-codai - 215 of the 354 paid resumes - eat the whole day).
 $today = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
 $used = 0
 $capLogged = $false
@@ -189,11 +406,12 @@ foreach ($line in Read-Lines $records 400) {
     try { $e = $line | ConvertFrom-Json } catch { continue }
     $ts = To-UtcInstant $e.ts
     if (-not $ts -or $ts.ToString('yyyy-MM-dd') -ne $today) { continue }
-    if ("$($e.action)" -eq 'resume') { $used++ }
+  if ("$($e.ws)" -ne $Ws) { continue }
+  if ("$($e.action)" -eq 'resume') { $used++ }
     if ("$($e.action)" -eq 'cap') { $capLogged = $true }
 }
 if ($used -ge $MaxResumesPerDay) {
-    Say "daily cap reached ($used/$MaxResumesPerDay)"
+  Say "daily cap reached for ws-$Ws ($used/$MaxResumesPerDay today)"
     if (-not $capLogged) { Note @{ ws = $Ws; vm = $vm; action = 'cap'; state = $state; cap = $MaxResumesPerDay } }
     exit 0
 }
@@ -232,6 +450,17 @@ if ($WaitSec -le 0) { Say 'resumed; not waiting (-WaitSec 0)'; exit 0 }
 while ($sw.Elapsed.TotalSeconds -lt $WaitSec) {
     Start-Sleep -Seconds 5
     $s = & $Gcloud compute instances describe $vm --project $reg.project --zone $reg.zone --format 'value(status)' 2>$null
-    if ("$s".Trim() -eq 'RUNNING') { Say "RUNNING after $([int]$sw.Elapsed.TotalSeconds)s"; exit 0 }
+  if ("$s".Trim() -eq 'RUNNING') {
+    # The measured wake latency, recorded so the next decision about the window and the cadence uses
+    # a measurement instead of a replay estimate (owner, 2026-11-25). It is only written when RUNNING
+    # was actually seen: an unmeasured latency is absent, never 0 - a 0 s wake and a wake nobody
+    # watched are different facts, and averaging them together is how a budget lies.
+    $sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    Say "RUNNING after ${sec}s"
+    Note @{ ws = $Ws; vm = $vm; action = 'prewarm-verified'; prewarmSec = $sec }
+    exit 0
+  }
 }
-Say "still not RUNNING after ${WaitSec}s"; exit 3
+Say "still not RUNNING after ${WaitSec}s"
+Note @{ ws = $Ws; vm = $vm; action = 'prewarm-unmeasured'; waited = $WaitSec }
+exit 3
