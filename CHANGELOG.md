@@ -61,6 +61,18 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Fixed
 
+- **The scheduled terminal reap never finished, so no terminal was ever reaped.** `reap-terminals.ps1` called
+  `console-signal.ps1` with no timeout; console-signal wedges inside `AttachConsole`, so the reaper blocked there
+  **before** the grace/force steps, and every 30-minute run leaked two processes that never exited (11 stuck pairs,
+  +2 per run = 96/day) while the population stayed flat at ~460 shells / ~46 GB. The signal step is now bounded by
+  the new `-SignalTimeoutSec` (default 25): `Start-Process -PassThru`, `WaitForExit(ms)`, `taskkill /T /F` on
+  timeout, and the reap continues. Verified live: the same command that had run **477 s and produced nothing** now
+  finishes in **79 s** with `killed: 278, forced: 278`, freeing **279 processes and 26 GB**.
+- `console-signal.ps1`'s Ctrl+C does not actually close an idle shell, so every reap is a force-kill
+  (`graceful: 0, forced: 278`). Not fixed - noted so nobody reads `forced` as a defect of the timeout above;
+  force-killing is acceptable because chat foreground terminals and terminals younger than `-MinAgeHours` are
+  never candidates.
+
 - `agentq land` (and `publish -Land`) now reaps its own auto-generated `publish/*` SOURCE branch after a
   landed push - and only that: a human-named branch, the target itself, and the branch a working slot is on
   are kept. Origin had accumulated **466** `publish/*` branches, **201** provably already merged into `main`
