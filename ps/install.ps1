@@ -79,6 +79,8 @@ $map = [ordered]@{
   'tests\test-agentq-publish.ps1' = 'bin\test-agentq-publish.ps1'; 'tests\test-agentq-lease3.ps1' = 'bin\test-agentq-lease3.ps1'; 'tests\test-agentq-args.ps1' = 'bin\test-agentq-args.ps1'
   # 2026-11-20: `agentq help` + the unknown-verb/flag teaching (the suite is drift-locked against the script)
   'tests\test-agentq-help.ps1' = 'bin\test-agentq-help.ps1'
+  # 2026-11-26: `agentq lesson`/`lessons` (durable agent lessons) - verb inside agentq.ps1, suite beside it
+  'tests\test-agentq-lessons.ps1' = 'bin\test-agentq-lessons.ps1'
   # ADR 0003 W2-4 job objects + W4-4 SLO report
   'bin\agentq-jobobject-lib.ps1' = 'bin\agentq-jobobject-lib.ps1'; 'bin\agentq-jobobject.ps1' = 'bin\agentq-jobobject.ps1'; 'bin\agentq-slo.mjs' = 'bin\agentq-slo.mjs'; 'bin\agentq-store.mjs' = 'bin\agentq-store.mjs'; 'tests\test-store.mjs' = 'bin\test-store.mjs'; 'bin\agentq-flakes.mjs' = 'bin\agentq-flakes.mjs'; 'tests\test-flakes.mjs' = 'bin\test-flakes.mjs'; 'tests\test-land-flakes.ps1' = 'bin\test-land-flakes.ps1'; 'tests\test-agentq-claims.ps1' = 'bin\test-agentq-claims.ps1'; 'tests\test-land-batch.ps1' = 'bin\test-land-batch.ps1'; 'tests\fake-gate.ps1' = 'bin\fake-gate.ps1'
   'tests\test-jobobject.ps1' = 'bin\test-jobobject.ps1'; 'tests\test-land-finalize.ps1' = 'bin\test-land-finalize.ps1'; 'tests\test-land-reclaim.ps1' = 'bin\test-land-reclaim.ps1'; 'tests\test-land-precheck.ps1' = 'bin\test-land-precheck.ps1'
@@ -97,6 +99,16 @@ $map = [ordered]@{
   # read-only status; hook-pre.ps1 now lives in this repository (OQ-010).
   'bin\agentq-probe.ps1' = 'bin\agentq-probe.ps1'; 'bin\agentq-prune.ps1' = 'bin\agentq-prune.ps1'; 'bin\agentq-doctor.ps1' = 'bin\agentq-doctor.ps1'
   'hooks\hook-pre.ps1' = 'hooks\hook-pre.ps1'; 'tests\test-hook-pre.ps1' = 'hooks\test-hook-pre.ps1'
+  # 2026-11-26: the resident hook host finally has a home in the repo (it used to exist ONLY in
+  # ~\.copilot\hooks\resident\, which is how the `startMs` defect outlived a fix). hookc.exe is a
+  # compiled artifact (build-client.ps1), so only the text files travel here; resident-ensure.ps1 is the
+  # version-controlled launcher + the restart that install.ps1 now performs after a guard/server change.
+  'hooks\resident\resident-server.ps1' = 'hooks\resident\resident-server.ps1'
+  'hooks\resident\resident-ensure.ps1' = 'hooks\resident\resident-ensure.ps1'
+  'hooks\resident\hookc4.c' = 'hooks\resident\hookc4.c'
+  'hooks\resident\build-client.ps1' = 'hooks\resident\build-client.ps1'
+  'hooks\resident\verify-resident.ps1' = 'hooks\resident\verify-resident.ps1'
+  'hooks\resident\README.md' = 'hooks\resident\README.md'
   'tests\test-lease-chat.ps1' = 'bin\test-lease-chat.ps1'; 'tests\test-land-pregate.ps1' = 'bin\test-land-pregate.ps1'; 'tests\test-land-wait.ps1' = 'bin\test-land-wait.ps1'
   # 2026-11-23: land-autoreap (a wedged holder whose gate is green) + land-requeue (put the ticket back at
   # the HEAD on window expiry, bounded by landRequeueMax). Paired with the run-all.ps1 entry.
@@ -369,6 +381,13 @@ if ($drift | Where-Object { $_ -in 'bin\agentq-sync.ps1', 'bin\agentq-probe.ps1'
       'restarted the agentq-sync loop (it was running the previous code)'
     }
   } catch { "WARNING: could not restart agentq-sync: $($_.Exception.Message) - restart the scheduled task by hand" }
+}
+# The resident hook host runs hook-pre.ps1 IN-PROCESS and reads the guard text ONCE at startup, so a new
+# hook-pre.ps1 (or a new server) is NOT live until the host is replaced. 2026-11-26: a fixed hook-pre.ps1
+# kept recording the host's UPTIME as startMs (`agentq slo` read 318 162 h/day) precisely because the
+# running host still held the old text. resident-ensure.ps1 -Restart fixes that as part of the install.
+if ($drift | Where-Object { $_ -eq 'hooks\hook-pre.ps1' -or $_ -like 'hooks\resident\*' }) {
+  try { & (Join-Path $dst 'hooks\resident\resident-ensure.ps1') -Restart } catch { "WARNING: could not restart the resident hook server: $($_.Exception.Message)" }
 }
 # legacy test that encoded the retired ad-hoc naming
 $old = Join-Path $dst 'hooks\test-worktree-tools.ps1'

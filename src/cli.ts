@@ -22,6 +22,8 @@ Usage:
   agentq mark -r <resource> --state frozen|blocked|clear --reason <why>
   agentq break <ticket> --reason <why>             remove a stuck ticket
   agentq note <message> [-r <resource>]            leave a handoff in the journal
+    agentq lesson <message> [-r <resource>]          record a durable, reusable lesson in the journal
+    agentq lessons [-r <repo>] [--limit N]           list recorded lessons (read-only)
   agentq log [--limit N] [-r <resource>]           recent journal entries
   agentq verify-journal                            check the hash chain
   agentq mcp                                       MCP server (stdio) for agents
@@ -186,6 +188,7 @@ async function main(argv: string[]): Promise<number> {
             capacity: { type: "string" },
             timeout: { type: "string", default: "60" },
             limit: { type: "string", default: "30" },
+            repo: { type: "string" },
             port: { type: "string" },
             json: { type: "boolean", default: false },
             help: { type: "boolean", short: "h", default: false },
@@ -197,7 +200,19 @@ async function main(argv: string[]): Promise<number> {
         return 0;
     }
     const [cmd, ...rest] = positionals;
-    const known = ["daemon", "run", "status", "mark", "break", "note", "log", "verify-journal", "mcp"];
+    const known = [
+        "daemon",
+        "run",
+        "status",
+        "mark",
+        "break",
+        "note",
+        "lesson",
+        "lessons",
+        "log",
+        "verify-journal",
+        "mcp",
+    ];
     if (values.help || !cmd || !known.includes(cmd)) {
         console.log(HELP);
         return values.help ? 0 : 2;
@@ -295,6 +310,31 @@ async function main(argv: string[]): Promise<number> {
                 ...(values.resource ? { resource: values.resource } : {}),
             });
             out(e, `noted #${e.seq}`);
+            return 0;
+        }
+        case "lesson": {
+            if (!rest.length) {
+                console.error("agentq lesson: needs a message");
+                return 2;
+            }
+            const e = await call<JournalEntry>(ep, "acp.lesson", {
+                message: rest.join(" "),
+                session: session(),
+                ...(values.resource ? { resource: values.resource } : {}),
+            });
+            out(e, `lesson #${e.seq}`);
+            return 0;
+        }
+        case "lessons": {
+            // Read-only: reuse the journal RPC with a wide window, keep only lesson lines, then
+            // honour -Limit/--limit on the filtered result (the server filters by resource first).
+            const filter = values.repo ?? values.resource;
+            const window = await call<JournalEntry[]>(ep, "acp.journal", {
+                limit: Math.max(Number(values.limit) * 8, 200),
+                ...(filter ? { resource: filter } : {}),
+            });
+            const items = window.filter((e) => e.event === "lesson").slice(-Number(values.limit));
+            out(items, items.map(formatEntry).join("\n") || "(no lessons)");
             return 0;
         }
         case "log": {

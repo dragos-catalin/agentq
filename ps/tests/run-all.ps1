@@ -68,6 +68,8 @@ $suites = [ordered]@{
   'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'args'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'help'           = @('-File', (Join-Path $PSScriptRoot 'test-agentq-help.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-26: `agentq lesson`/`lessons` - a durable lesson on the SAME journal as `note`.
+  'lessons'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lessons.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # static guard for the 2026-11-22 class: a script-scope `$null` reset after a real value
   'script scope'   = @('-File', (Join-Path $PSScriptRoot 'test-script-scope.ps1'), '-Ps', $root)
   # 2026-11-22: the WIRING between this table and install.ps1's map. A suite whose tool is not in the

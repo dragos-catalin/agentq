@@ -36,6 +36,8 @@ const EXPECTED = [
     "acp_wait",
     "agentq_break",
     "agentq_land",
+    "agentq_lesson",
+    "agentq_lessons",
     "agentq_lease",
     "agentq_note",
     "agentq_propose",
@@ -69,6 +71,34 @@ describe("MCP tool registration", () => {
 describe("argument vectors", () => {
     it("keeps a value with a space as ONE element", () => {
         expect(mcpArgv.note({ message: "do not touch apps/x" })).toEqual(["note", "-Message", "do not touch apps/x"]);
+    });
+
+    it("keeps a lesson message with spaces as ONE element and appends repo/kind", () => {
+        expect(mcpArgv.lesson({ message: "vertex 400s on lone surrogates after json" })).toEqual([
+            "lesson",
+            "-Message",
+            "vertex 400s on lone surrogates after json",
+        ]);
+        expect(mcpArgv.lesson({ message: "x", repo: "codai", kind: "build" })).toEqual([
+            "lesson",
+            "-Message",
+            "x",
+            "-Repo",
+            "codai",
+            "-Kind",
+            "build",
+        ]);
+    });
+
+    it("filters lessons by repo and caps with -Limit", () => {
+        expect(mcpArgv.lessons({})).toEqual(["lessons"]);
+        expect(mcpArgv.lessons({ repo: "codai", limit: 10 })).toEqual([
+            "lessons",
+            "-Repo",
+            "codai",
+            "-Limit",
+            "10",
+        ]);
     });
 
     it("builds `agentq run` with the command after --", () => {

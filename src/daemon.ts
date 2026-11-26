@@ -129,6 +129,7 @@ export async function startDaemon(
             return c.mark(str(p, "resource"), state as MarkState | "clear", str(p, "reason"), str(p, "session"));
         },
         "acp.note": (p) => c.note(str(p, "message"), str(p, "session"), str(p, "resource", false) || undefined),
+        "acp.lesson": (p) => c.lesson(str(p, "message"), str(p, "session"), str(p, "resource", false) || undefined),
         "acp.status": (p) => c.status(str(p, "resource", false) || undefined),
         "acp.journal": (p) => {
             const after = num(p, "after");

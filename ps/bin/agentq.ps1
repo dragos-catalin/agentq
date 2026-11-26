@@ -252,6 +252,7 @@ while ($i -lt $argv.Count) {
     'timeoutmin' { $TimeoutMin = [int](& $next); $TimeoutGiven = $true }
     'stalemin' { $StaleMin = [int](& $next) }
     'last' { $Last = [int](& $next) }
+    'limit' { $Last = [int](& $next) }
     'hours' { $Hours = [double](& $next) }
     'minfreegb' { $MinFreeGB = [double](& $next) }
     'all' { $All = $true }
@@ -358,7 +359,7 @@ $script:DoctorExit = $null
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
 # consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
 # happens where work happens (run/commit/lease/land) and in `sweep`.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'metrics', 'doctor', 'help'
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'lessons', 'metrics', 'doctor', 'help'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -1344,8 +1345,17 @@ function Invoke-Propose {
         $actions += "bumped own ticket $($w.id) on $res (+20, waited $([math]::Round($waitedMin)) min)"
       }
     }
+    $ld = Get-AdmissionLoad -NoSample
     $mm = Get-MachineMemory ([double]$MinFreeGB)
-    if ($res -eq 'build:machine' -and $mine -and -not (Test-Path (BurstFile $res)) -and (Test-FreeRam $mm.burstFloorGB)) {
+    # A burst only raises capacity, and admission's load hold is applied AFTER the rank test
+    # (Test-Admissible) - so while the machine is saturated (OQ-004) a burst produces a slot nobody
+    # can use. Offering it as a remedy made `propose` report an action that changes nothing; say why
+    # and name the escape instead. Test-AdmissionOverride is deliberately not consulted: it is
+    # per-process state, not a property of the queue.
+    if ($res -eq 'build:machine' -and $mine -and $ld.saturated -and -not (Test-Path (BurstFile $res))) {
+      Write-Output ("skip: burst cannot admit anything while admission is saturated (start probe median {0} ms > {1} ms) - extra capacity is not the blocker. Use -Where cloud (or AGENTQ_WHERE=auto) for a repo with a cloudWorkspaces entry, or wait for the load hold to lift." -f $ld.median, $ld.thresholdMs)
+    }
+    elseif ($res -eq 'build:machine' -and $mine -and -not (Test-Path (BurstFile $res)) -and (Test-FreeRam $mm.burstFloorGB)) {
       $b = [ordered]@{ resource = $res; by = 1; until = (Iso ((Now).AddMinutes(20))); reason = "propose: $Reason"; session = $Session; at = (Iso (Now)) }
       [IO.File]::WriteAllText((BurstFile $res), ($b | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
       $actions += 'opened burst build:machine +1 for 20 min (RAM headroom >= 2x gate)'
@@ -1567,6 +1577,14 @@ function Resolve-Placement($repo, [string]$res, [string]$cmdLine) {
   $live = @(Get-Live 'build:machine' | Where-Object { (P $_ 'held' $false) -and -not (P $_ 'yielded' $false) })
   if ($live.Count -ge (Get-Capacity 'build:machine')) { return @{ where = 'cloud'; ws = $ws; why = "auto: build:machine full ($($live.Count) held)" } }
   if (-not (Test-FreeRam $MinFreeGB)) { return @{ where = 'cloud'; ws = $ws; why = 'auto: local RAM/commit below the gate' } }
+  # The machine can be SATURATED without `build:machine` being full: admission holds a new gate back
+  # when the start probe is over its limit (OQ-004), and a cloud-eligible run then waits for a LOCAL
+  # slot it does not need. Measured 2026-11-25: a codai land pre-gate sat in `waiting - build:machine
+  # [gate] machine saturated (start probe median 864.5 ms > 400 ms)` while its real work ran on
+  # ws-codai. The shared record is READ (-NoSample), never sampled, so this costs no probe; and the
+  # branch is reached only on the auto path (an explicit -Where local is honoured above).
+  $ld = Get-AdmissionLoad -NoSample
+  if ($ld.enabled -and $ld.saturated) { return @{ where = 'cloud'; ws = $ws; why = "auto: machine saturated (start probe median $($ld.median) ms > $($ld.thresholdMs) ms)" } }
   $minSec = if ($cfg.ContainsKey('cloudAutoMinSec')) { [double]$cfg['cloudAutoMinSec'] } else { 240.0 }
   $holds = @(Read-Journal 0 ((Now).AddDays(-7)) $repo.Name | Where-Object { (JProp $_ 'event') -in 'done', 'fail' -and $_.PSObject.Properties['holdSec'] -and (P $_ 'kind' '') -eq $kind } | ForEach-Object { [double]$_.holdSec } | Sort-Object)
   if ($holds.Count -ge 3) {
@@ -1622,6 +1640,10 @@ function Invoke-Run {
   $resList = @(Expand-Resources $Resource $repo)
   foreach ($r in $resList) { Assert-NotMarked $r }
   $pl = Resolve-Placement $repo $resList[0] $cmdLine
+  # Additive (2026-11-26): expose the RESOLVED placement to the child, so a wrapper that must not
+  # mistake a cloud wait for a local wedge (run-build.ps1's wedge watch) reads the engine's decision
+  # instead of re-deriving it. local for every ordinary run; cloud only when cloud was chosen.
+  $env:AGENTQ_PLACEMENT = "$($pl.where)"
   if ($Where -or $env:AGENTQ_WHERE) { Write-Journal @{ event = 'placement'; resource = $resList[0]; repo = $(if ($repo) { $repo.Name } else { '' }); where = $pl.where; ws = "$($pl.ws)"; reason = $pl.why; purpose = $Purpose; cmd = $cmdLine } }
   if ($pl.where -eq 'cloud') { [Console]::Error.WriteLine("agentq: placement cloud:$($pl.ws) ($($pl.why))"); Invoke-CloudRun $repo $cmdArgs $pl }
   $tickets = @()
@@ -2398,6 +2420,8 @@ $script:AqHelp = [ordered]@{
   'since' = @{ g = 'Queue & run'; u = 'since [-Hours 12] [-Json]'; d = 'what changed in this repo: journal + git log' }
   'prewarm' = @{ g = 'Queue & run'; u = 'prewarm [-Ws <ws>] [-Repo <r>] [-All] [-ActivityMin n] [-MaxResumesPerDay n] [-MaxTickSec n] [-Report] [-ReportDays n] [-Off] [-Quiet]'; d = 'resume a suspended warm workspace BEFORE the job that needs it, so the ~41 s resume is not paid by the first cloud gate; only SUSPENDED acts, only while this repo is working, capped per workspace per day; -All ticks every workspace (one describe each, newest activity first), -MaxTickSec stops a tick that is over budget, -Report reads the journal and says what the wakes bought'; e = 'agentq prewarm -All   |   agentq prewarm -Report' }
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
+  'lesson' = @{ g = 'Queue & run'; u = 'lesson -Message "..." [-Repo <r>] [-Kind <class>]'; d = 'record a durable, reusable lesson (symptom -> what you believed -> what proved it -> the fix) so future agents in this repo do not relearn it'; e = 'agentq lesson -Message "vertex 400s on lone surrogates after JSON.stringify: strip them post-stringify"' }
+  'lessons' = @{ g = 'Queue & run'; u = 'lessons [-Repo <r>] [-Limit 30] [-Json]'; d = 'list recorded lessons, newest first (read-only)' }
   'ask' = @{ g = 'Queue & run'; u = 'ask -To <repo:<name>|session:<term-id>|slot:<repo>:<slot>|any|owner> -Message "..." [-Resource <r>] [-Repo <r>]'; d = 'ask another LIVE agent a question; prints how many agents the address reaches, and a negative answer is not silent'; e = 'agentq ask -To repo:agentq -Message "is ps/bin/agentq.ps1 free to edit for 20 min?"' }
   'reply' = @{ g = 'Queue & run'; u = 'reply -Id <msg id> -Message "..."'; d = 'answer an ask (the asker replying again reopens the thread)' }
   'inbox' = @{ g = 'Queue & run'; u = 'inbox [-All] [-Id <msg id>] [-Json]'; d = 'the open messages addressed to me (repo/session/slot/any); -Id prints the whole thread' }
@@ -2477,6 +2501,32 @@ switch ($Verb.ToLowerInvariant()) {
     $repo = Get-RepoInfo $Repo
     Write-Journal @{ event = 'note'; resource = $(if ($repo) { "note:$($repo.Name)" } else { 'note' }); message = $Message; repo = $(if ($repo) { $repo.Name } else { '' }) }
     Write-Output 'noted'
+  }
+  # A durable lesson any future agent can read back (`agentq lessons`). Another journal event next to
+  # `note`, so it inherits the hash chain and the hub mirror for free; -Kind is an optional free class
+  # (it reuses the parser's existing 'kind' slot - feedback and a lesson never run in the same process).
+  'lesson' {
+    if (-not $Message) { throw 'agentq lesson -Message "..."' }
+    $rawRepo = $Repo   # $repo/$Repo are ONE slot (PowerShell is case-insensitive); capture before Get-RepoInfo
+    $repo = Get-RepoInfo $rawRepo
+    # -Repo may be a path (resolved to its repo name) or a bare repo name; use the name literally then.
+    $repoName = if ($repo) { $repo.Name } elseif ($rawRepo) { "$rawRepo".ToLowerInvariant() } else { '' }
+    $entry = @{ event = 'lesson'; resource = $(if ($repoName) { "lesson:$repoName" } else { 'lesson' }); message = $Message; repo = $repoName }
+    if ($FbKind) { $entry.kind = $FbKind }
+    Write-Journal $entry
+    Write-Output 'lesson recorded'
+  }
+  'lessons' {
+    $rawRepo = $Repo
+    $repo = Get-RepoInfo $rawRepo
+    $name = if ($repo) { $repo.Name } elseif ($rawRepo) { "$rawRepo".ToLowerInvariant() } else { $null }
+    # Read a generous window so the event filter sees enough lessons, keep the newest -Limit ($Last), then
+    # reverse so the newest prints first (the help text promises "newest first"; the file order is oldest).
+    $items = @(Read-Journal ([math]::Max($Last * 10, 400)) $null $name | Where-Object { (JProp $_ 'event') -eq 'lesson' } | Select-Object -Last $Last)
+    [array]::Reverse($items)
+    if ($Json) { $items | ConvertTo-Json -Depth 5 }
+    elseif (-not $items) { Write-Output '(no lessons)' }
+    else { $items | ForEach-Object { Format-Entry $_ } }
   }
   # A directed channel between agents (agentq-msgs.ps1). Next to `note`, which has no addressee, no answer
   # and no notification: an agent that needs a decision from the agent next door asks instead of guessing.

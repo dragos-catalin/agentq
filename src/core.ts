@@ -301,6 +301,13 @@ export class Coordinator {
         return e;
     }
 
+    /** A durable, reusable lesson (symptom -> belief -> proof -> fix); same hash-chained journal as a note. */
+    lesson(message: string, session: string, resource?: string): JournalEntry {
+        const e = this.journal.append({ event: "lesson", session, message, ...(resource ? { resource } : {}) });
+        this.changed();
+        return e;
+    }
+
     status(filter?: string): ResourceStatus[] {
         this.reap();
         const names = new Set<string>([...[...this.tickets.values()].map((t) => t.resource), ...this.marks.keys()]);

@@ -47,6 +47,18 @@ export const mcpArgv = {
         a.message,
         ...(a.repo ? ["-Repo", a.repo] : []),
     ],
+    lesson: (a: { message: string; repo?: string | undefined; kind?: string | undefined }): string[] => [
+        "lesson",
+        "-Message",
+        a.message,
+        ...(a.repo ? ["-Repo", a.repo] : []),
+        ...(a.kind ? ["-Kind", a.kind] : []),
+    ],
+    lessons: (a: { repo?: string | undefined; limit?: number | undefined }): string[] => [
+        "lessons",
+        ...(a.repo ? ["-Repo", a.repo] : []),
+        ...(a.limit ? ["-Limit", String(a.limit)] : []),
+    ],
     break: (a: { resource: string; reason: string; id?: string | undefined }): string[] => [
         "break",
         "-Resource",
@@ -465,6 +477,32 @@ export function buildMcpServer(ep: Endpoint, session: string): McpServer {
             inputSchema: { message: z.string(), repo: z.string().optional() },
         },
         (a) => scripted(AGENTQ_EXIT, () => runPwsh("agentq.ps1", mcpArgv.note(a), { timeoutMs: FAST_MS })),
+    );
+    server.registerTool(
+        "agentq_lesson",
+        {
+            description:
+                "Record a durable, reusable lesson (symptom -> what you believed -> what proved it -> the fix) so future agents in this repo do not relearn it. One concrete sentence, no secrets.",
+            inputSchema: {
+                message: z.string().describe("The lesson, one concrete sentence, no secrets"),
+                repo: z.string().optional().describe("Repo the lesson applies to, e.g. codai"),
+                kind: z.string().optional().describe("Optional short class, e.g. build|git|env|verify"),
+            },
+        },
+        (a) => scripted(AGENTQ_EXIT, () => runPwsh("agentq.ps1", mcpArgv.lesson(a), { timeoutMs: FAST_MS })),
+    );
+    server.registerTool(
+        "agentq_lessons",
+        {
+            description:
+                "List recorded lessons, newest first: read what earlier agents learned in this repo before you start. Read-only.",
+            inputSchema: {
+                repo: z.string().optional().describe("Only this repo's lessons"),
+                limit: z.number().int().min(1).max(200).optional().describe("How many, newest first (default 30)"),
+            },
+            annotations: { readOnlyHint: true },
+        },
+        (a) => scripted(AGENTQ_EXIT, () => runPwsh("agentq.ps1", mcpArgv.lessons(a), { timeoutMs: FAST_MS })),
     );
     server.registerTool(
         "agentq_break",
