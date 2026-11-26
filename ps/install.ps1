@@ -384,6 +384,26 @@ if ($wipTask -and "$($wipTask.Actions[0].Arguments)" -notmatch 'git-wip-snapshot
   Set-ScheduledTask -TaskName 'codai-git-wip-snapshot' -Action $a | Out-Null
   'task codai-git-wip-snapshot -> bin\git-wip-snapshot.ps1 -All'
 }
+# gateSuites is a POLICY list, and the merge above deliberately keeps the installed value of a key that
+# already exists there (that rule protects slot caps and workspace maps, which are machine-local). For
+# this key the rule is wrong: adding a suite to the source left the land gate on this machine reading the
+# old list until the installed config was edited by hand - measured 2026-11-26, source 29 entries,
+# installed 27, and the land gate reads the INSTALLED one. So append what is missing, keep every existing
+# entry, and name what was added.
+$dstCfgPath = Join-Path $dst $cfgKey
+try {
+  $srcCfg = Get-Content -LiteralPath (Join-Path $src $cfgKey) -Raw | ConvertFrom-Json
+  $dstCfg = Get-Content -LiteralPath $dstCfgPath -Raw | ConvertFrom-Json
+  $wantSuites = @($srcCfg.gateSuites.agentq)
+  $haveSuites = @($dstCfg.gateSuites.agentq | ForEach-Object { "$_" })
+  $missingSuites = @($wantSuites | Where-Object { $haveSuites -notcontains "$_" })
+  if ($missingSuites.Count) {
+    $dstCfg.gateSuites.agentq = @($haveSuites + $missingSuites)
+    ($dstCfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $dstCfgPath -Encoding utf8
+    "gateSuites.agentq: appended $($missingSuites -join ', ') (the installed registry had an older list)"
+  }
+} catch { "WARNING: could not append the gateSuites entries: $($_.Exception.Message)" }
+
 # The prewarm task runs the agentq copy too (registered 2026-11-25). It has to be re-pointed by PATH,
 # not by file name: a task naming E:\gh\agentq\ps\bin\prewarm-cloud.ps1 passes a name check while running
 # the SOURCE checkout - measured live 2026-11-26, that is exactly what the registered task did, so every
