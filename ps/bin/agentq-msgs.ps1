@@ -19,6 +19,13 @@
   Read: `agentq help ask`. Acting verbs: ask, reply, inbox. State: $Root/msgs, $Root/agents (read-only here).
 #>
 
+# Per-process memo for the two identity helpers below. They are asked per MESSAGE (Test-MsgMine), and the
+# answers cannot change inside one CLI invocation: without this, an `inbox` of 14 rows paid 14 git spawns
+# plus 14 walks of the lease tree before printing anything, and Show-MessageNotices - which runs on EVERY
+# non-read-only verb - paid the same 3.1 s on every call (measured 2026-11-26).
+$script:MyRepoNamesCache = $null
+$script:MySlotRefsCache = $null
+
 function Get-MsgDir {
   $d = Join-Path $Root 'msgs'
   if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force $d | Out-Null }
@@ -33,22 +40,30 @@ function Get-MyRepoName {
 # Every repo name I am reachable UNDER: the one I am working in, and the one my own registry record names
 # (the agent that asked me knows the name I had the last time I ran anything here).
 function Get-MyRepoNames {
+  # Computed once per process - see the cache declaration above.
+  if ($null -ne $script:MyRepoNamesCache) { return $script:MyRepoNamesCache }
   $out = @()
   $r = Get-MyRepoName; if ($r) { $out += $r }
   try {
     $f = Join-Path (Join-Path $Root 'agents') ((Safe $Session) + '.json')
     if (Test-Path -LiteralPath $f) { $j = Read-MsgJson $f; if ($j -and $j['repo']) { $out += "$($j['repo'])" } }
   } catch {}
-  @($out | Select-Object -Unique)
+  $script:MyRepoNamesCache = @($out | Select-Object -Unique)
+  $script:MyRepoNamesCache
 }
 # The addresses that belong to ME: my session, and every lease I hold (the slot's repo counts too - an
 # agent working IN a repo is reachable by that repo's name even when its cwd is somewhere else).
 function Get-MySlotRefs {
+  # Computed once per process, and the walk pre-filters on the RAW text before parsing: a lease that does
+  # not name my session in its bytes cannot be mine. Same shape as Get-SessionTickets in agentq.ps1.
+  if ($null -ne $script:MySlotRefsCache) { return $script:MySlotRefsCache }
   $out = @()
   try {
     $ld = Join-Path $SysRoot 'leases'
     if (Test-Path -LiteralPath $ld) {
+      $needle = '"' + "$Session" + '"'
       foreach ($f in @(Get-ChildItem -LiteralPath $ld -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        try { if (-not ([IO.File]::ReadAllText($f.FullName).Contains($needle))) { continue } } catch { continue }
         $j = Read-MsgJson $f.FullName
         if (-not $j) { continue }
         if ("$($j['session'])" -eq "$Session" -and $j['repo'] -and $j['slot']) {
@@ -58,7 +73,8 @@ function Get-MySlotRefs {
       }
     }
   } catch {}
-  @($out | Select-Object -Unique)
+  $script:MySlotRefsCache = @($out | Select-Object -Unique)
+  $script:MySlotRefsCache
 }
 function Get-LiveAgents([int]$Minutes = 30) {
   $out = @()

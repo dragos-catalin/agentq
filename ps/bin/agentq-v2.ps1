@@ -32,6 +32,10 @@ $script:PregateResult = $null
 # AGENTQ_CONFIG overrides the file (tests); missing keys fall back to these defaults.
 $script:Cfg = $null
 $script:LeaseActivity = $null
+# Per-process cache of the parsed journal tail (see Get-JournalTailItems in agentq.ps1).
+$script:JTail = $null
+# Per-process cache of the ALL-repos lease view (see Read-Leases below).
+$script:LeaseAll = $null
 function Get-Config {
   if ($script:Cfg) { return $script:Cfg }
   $c = @{
@@ -369,7 +373,10 @@ function Show-LeaseNotices {
 function Get-RecentLeaseLosses([int]$hours = 24) {
   try {
     $cut = (Now).AddHours(-$hours)
-    @(Get-JournalFiles | ForEach-Object { Get-Content -LiteralPath $_ -Tail 4000 -ErrorAction Stop } | Where-Object { $_ -match '"event":"(lease-expire|lease-break)"' } | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ -and (ParseUtc $_.ts) -gt $cut })
+    # Served from the per-process journal-tail cache (2026-11-26): this used to re-read and re-parse
+    # the journal tail on every call, and `status`/`since` call it on top of Get-LandHoldStats. The
+    # `only` filter keeps the parse to the lines that can possibly match (25 of 4 000 here).
+    @(Get-JournalTailItems 4000 @('"event":"lease-expire"', '"event":"lease-break"') | Where-Object { "$(P $_ 'event' '')" -match '^(lease-expire|lease-break)$' -and (ParseUtc "$(P $_ 'ts' '')") -gt $cut })
   } catch { @() }
 }
 
@@ -418,14 +425,45 @@ function Get-LeaseChatFacts($l) {
   $live = ($null -ne $idle) -and ($idle -le 30) -and (-not $byChat) -and (-not (@($ch.chats) -contains $Session))
   [pscustomobject]@{ chats = @($ch.chats); idle = $idle; byChat = $byChat; live = $live }
 }
+# PERF (2026-11-26). `status`, `since` and `show-scale` each read the ALL-repos lease view several
+# times per command (Get-V2Status, Get-TaskSlotBudget -> Get-ScratchLeaseCount, Get-TaskLeaseCount,
+# Show-SlotShare, Test-SlotShareRefusal), and one read used to cost ~0.6 s over 19 lease records, each
+# paying a pid liveness probe plus the per-repo directory enumeration in Read-LeasesUncached (measured
+# 2026-11-26). The slot "git activity" beat is file MTIMEs only (~2 ms/lease) and was never the cost. The signature
+# is the set of lease RECORD files with mtime+size, so any write - create, renew, touch, expire, delete -
+# changes it and the cache can never serve a view older than the last write. No TTL is needed: a
+# read-only verb is one command that ends, and a mutating verb invalidates by writing.
+function Get-LeaseReadKey {
+  @(Get-ChildItem -LiteralPath $LDir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    ForEach-Object { "$($_.FullName)|$($_.LastWriteTimeUtc.Ticks)|$($_.Length)" }) -join "`n"
+}
 function Read-Leases([string]$repoName) {
-  $dirs = if ($repoName) { @(Join-Path $LDir $repoName) } else { @(Get-ChildItem $LDir -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
+  if ($repoName) { return Read-LeasesUncached $repoName }
+  $key = Get-LeaseReadKey
+  $c = $script:LeaseAll
+  if ($c -and $c.key -eq $key) { return $c.items }
+  $items = @(Read-LeasesUncached $null)
+  $script:LeaseAll = @{ key = $key; items = $items }
+  return $items
+}
+function Read-LeasesUncached([string]$repoName) {
   $cfg = Get-Config
+  # PERF (2026-11-26). The loop below used to enumerate every REPO directory one at a time (42 dirs x one
+  # Get-ChildItem each, 2-8 ms for a directory that holds nothing) before it could read 19 lease files:
+  # measured 290 ms of a 493 ms Read-Leases. ONE recursive walk of leases/ costs ~25 ms, the -Filter still
+  # excludes the `*.json.hb` / `.work` sidecars, and grouping by directory keeps the old order (sorted keys,
+  # then the files of each directory in the order the walk returned them).
+  $lfiles = @(Get-ChildItem -LiteralPath $LDir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)
+  $groups = @{}
+  foreach ($f in $lfiles) {
+    $k = $f.DirectoryName
+    if (-not $groups.ContainsKey($k)) { $groups[$k] = [System.Collections.ArrayList]::new() }
+    [void]$groups[$k].Add($f)
+  }
   $out = @()
-  foreach ($d in $dirs) {
-    if (-not (Test-Path -LiteralPath $d)) { continue }
-    # -ErrorAction: on a multi-user machine another group's repo dir is unreadable by design (skip it)
-    foreach ($f in @(Get-ChildItem -LiteralPath $d -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+  foreach ($d in @($groups.Keys | Sort-Object)) {
+    if ($repoName -and (Split-Path $d -Leaf) -ne $repoName) { continue }
+    foreach ($f in @($groups[$d])) {
       $l = Read-JsonFile $f.FullName
       if ($null -eq $l) { continue }
       if ($l -eq 'UNREADABLE') {

@@ -342,7 +342,8 @@ while ($i -lt $argv.Count) {
     }
   }
   $i++
-}$ErrorActionPreference = 'Stop'
+}
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 # Pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22). Only the two
 # exit codes need it; every other name here has its default in the initialiser block ABOVE the argument loop.
@@ -451,14 +452,30 @@ function Get-SessionId {
 }
 $Session = Get-SessionId
 
+# Declared here, not first-assigned in the function: Set-StrictMode -Version 3 makes READING an unset
+# variable a terminating error, and Get-RepoInfo can be called before anything else writes it.
+$script:RepoInfoCache = $null
+# Same reason, same shape: one Win32_OperatingSystem query costs ~100 ms on this machine and a single
+# `status` asks for it twice (its own headroom line, then Get-MachineBudget for slot admission).
+$script:MemInfoCache = $null
+
 function Get-RepoInfo([string]$path) {
   $p = if ($path) { $path } else { (Get-Location).Path }
+  # PERF (2026-11-26). Two `git` spawns, ~105 ms each on this machine, and one verb asks several times
+  # (status has its own get-repoinfo phase, Renew-ForSession, the message notices, Register-Agent).
+  # The identity of a path cannot change inside one CLI invocation, so the answer is memoized per path -
+  # including the "not a repo" answer, which is why ContainsKey is the test, not truthiness.
+  if ($null -eq $script:RepoInfoCache) { $script:RepoInfoCache = @{} }
+  $key = $p.ToLowerInvariant()
+  if ($script:RepoInfoCache.ContainsKey($key)) { return $script:RepoInfoCache[$key] }
   $top = (& git -C $p rev-parse --show-toplevel 2>$null)
-  if (-not $top) { return $null }
+  if (-not $top) { $script:RepoInfoCache[$key] = $null; return $null }
   $common = (& git -C $p rev-parse --path-format=absolute --git-common-dir 2>$null)
   $name = Split-Path (Split-Path $common -Parent) -Leaf
   $ds = [IO.Path]::DirectorySeparatorChar
-  [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
+  $info = [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
+  $script:RepoInfoCache[$key] = $info
+  $info
 }
 
 # A commit or a land made IN the SHARED clone of a repo the owner marked read-only
@@ -679,15 +696,18 @@ function Get-SysTimes {
 # Free RAM / commit headroom in KB, same fields as Win32_OperatingSystem. Linux: MemAvailable, and
 # CommitLimit - Committed_AS as the commit headroom (overcommit makes it advisory, like Windows' pagefile).
 function Get-MemInfo {
+  if ($null -ne $script:MemInfoCache) { return $script:MemInfoCache }
   if (-not $IsWindows) {
     $m = @{}; foreach ($l in Get-Content -LiteralPath '/proc/meminfo') { if ($l -match '^(\w+):\s+(\d+)') { $m[$Matches[1]] = [double]$Matches[2] } }
     $commit = if ($m.ContainsKey('CommitLimit') -and $m.ContainsKey('Committed_AS')) { [math]::Max(0, $m['CommitLimit'] - $m['Committed_AS']) } else { $m['MemAvailable'] }
     # vm.overcommit_memory=0 (Ubuntu default) never refuses on CommitLimit: report MemAvailable+swap as headroom
     $mode = try { [int](Get-Content -LiteralPath '/proc/sys/vm/overcommit_memory' -Raw) } catch { 0 }
     if ($mode -ne 2) { $commit = $m['MemAvailable'] + $(if ($m.ContainsKey('SwapFree')) { $m['SwapFree'] } else { 0 }) }
-    return [pscustomobject]@{ FreePhysicalMemory = $m['MemAvailable']; FreeVirtualMemory = $commit }
+    $script:MemInfoCache = [pscustomobject]@{ FreePhysicalMemory = $m['MemAvailable']; FreeVirtualMemory = $commit }
+    return $script:MemInfoCache
   }
-  Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory, FreeVirtualMemory
+  $script:MemInfoCache = Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory, FreeVirtualMemory
+  $script:MemInfoCache
 }
 function Get-AdaptiveMachineCap {
   $cfg = Get-Config
@@ -1339,12 +1359,43 @@ function Find-MyTickets {
 # caller's own session only); with $OnlyWaiting it drops the held ones. `status` uses it to print a
 # session's OWN waiting ticket ids - the other half of the bump bug: the id was never visible, so a
 # waiter could not target `bump -Id <hash>` even though -Id existed.
-function Get-SessionTickets([string]$sess, [bool]$OnlyWaiting) {
+# PERF (2026-11-26). `status` enumerates the ~120 resource directories TWICE (the queue table and the
+# `== MINE` line) and every per-directory Get-ChildItem costs 2-5 ms even when the directory is empty,
+# which almost all of them are (measured: 120 dirs, 4 with a JSON file). ONE recursive walk of the whole
+# queue tree costs 53 ms. The map is directory -> its JSON files, so a directory with no file is absent -
+# exactly the set the old loops skipped after a wasted enumeration.
+function Get-QueueIndex {
+  $map = @{}
+  foreach ($f in @(Get-ChildItem $QDir -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+    if ($f.Name -eq 'adaptive.json') { continue }
+    $k = $f.DirectoryName
+    if (-not $map.ContainsKey($k)) { $map[$k] = [System.Collections.ArrayList]::new() }
+    [void]$map[$k].Add($f)
+  }
+  $map
+}
+function Get-QueueSample($files) {
+  # burst.json is a BURST record, not a ticket: `status` (and the burst read below) keeps it in the same
+  # directory, so a resource whose only *.json is a burst record must not be represented by one.
+  foreach ($f in $files) { if ($f.Name -notin 'adaptive.json', 'burst.json') { return $f } }
+  $null
+}
+function Get-SessionTickets([string]$sess, [bool]$OnlyWaiting, $qidx = $null) {
   $out = @()
-  foreach ($d in @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
+  if (-not $qidx) { $qidx = Get-QueueIndex }
+  foreach ($k in @($qidx.Keys)) {
+    $files = @($qidx[$k])
+    $sample = Get-QueueSample $files
     if (-not $sample) { continue }
-    $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
+    # Only a resource that HAS a ticket naming this session can produce a row for it, and the loop below
+    # calls Get-Live on every resource. One raw read per ticket file (~0.1 ms) settles it; a false positive
+    # only costs the pass it would have paid anyway.
+    $maybe = $false
+    foreach ($f in $files) {
+      try { if ([IO.File]::ReadAllText($f.FullName).Contains("`"$sess`"")) { $maybe = $true; break } } catch { }
+    }
+    if (-not $maybe) { continue }
+    $res = ([IO.File]::ReadAllText($sample.FullName) | ConvertFrom-Json -DateKind String).resource
     $live = @(Get-Live $res); $cap = Get-Capacity $res
     foreach ($t in $live) {
       if ("$($t.session)" -ne "$sess") { continue }
@@ -2044,13 +2095,14 @@ function Get-LandHoldStats([string]$repoName, [int]$days = 3) {
 
 function Show-Status {
   $repo = Get-RepoInfo $Repo
-  $dirs = @(Get-ChildItem $QDir -Directory -ErrorAction SilentlyContinue)
+  $qidx = Get-QueueIndex
+  $dirs = @($qidx.Keys)
   $rows = @()
   $landEta = @{}
-  foreach ($d in $dirs) {
-    $sample = Get-ChildItem $d.FullName -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'adaptive.json' | Select-Object -First 1
+  foreach ($k in $dirs) {
+    $sample = Get-QueueSample @($qidx[$k])
     if (-not $sample) { continue }
-    $res = (Get-Content $sample.FullName -Raw | ConvertFrom-Json -DateKind String).resource
+    $res = ([IO.File]::ReadAllText($sample.FullName) | ConvertFrom-Json -DateKind String).resource
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
     # B) the negative ledger for this land queue (branch -> {at,tree,reason}), read once per resource.
     $qmap = if ($res -like 'land:*') { Get-LandQuarantine (Get-ResourceRepo $res) } else { $null }
@@ -2106,7 +2158,16 @@ function Show-Status {
   $agl = Get-AgentLimit
   # machine-wide count; with -All (or outside a repo) the leases were just read, so they are not read twice
   $leasedTasks = if ($All -or -not $repo) { @($v2.leases | Where-Object { "$($_.role)" -eq 'task' }).Count } else { Get-TaskLeaseCount }
-  $bursts = @(Get-ChildItem $QDir -Recurse -Filter 'burst.json' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json -DateKind String } | Where-Object { (ParseUtc $_.until) -gt (Now) })
+  # PERF (2026-11-26). The burst records sit next to the tickets, so the queue index that was built for
+  # the ticket scan already knows where they are - the recursive walk this replaces was a SECOND pass
+  # over the same 120 directories.
+  $bursts = @(foreach ($k in @($qidx.Keys)) {
+      foreach ($bf in @($qidx[$k])) {
+        if ($bf.Name -ne 'burst.json') { continue }
+        $b = try { Get-Content $bf.FullName -Raw | ConvertFrom-Json -DateKind String } catch { $null }
+        if ($b -and (ParseUtc $b.until) -gt (Now)) { $b }
+      }
+    })
   if ($Json) {
     $o = ConvertTo-V2Json $v2; $o.tickets = $rows; $o.marks = $marks; $o.bursts = $bursts
     $o.load = [ordered]@{ enabled = [bool]$ld.enabled; saturated = [bool]$ld.saturated; probeMs = $ld.last; medianMs = $ld.median; samples = $ld.n; ageSec = $ld.ageSec; thresholdMs = $ld.thresholdMs; src = "$($ld.src)" }
@@ -2152,7 +2213,7 @@ function Show-Status {
   # and it never said WHICH row was the caller's, so a waiter could not read the id of its own ticket.
   # Print the caller's own waiting tickets (all repos) with the id, so `bump -Id <hash>` / `-Session <s>`
   # has a target. Read-only: Get-Live/Get-Capacity never write on a read-only verb.
-  $mine = @(Get-SessionTickets $Session $true)
+  $mine = @(Get-SessionTickets $Session $true $qidx)
   if ($mine) { Write-Output ("== MINE session {0}: {1}" -f $Session, (($mine | ForEach-Object { "$($_.id) on $($_.resource)" }) -join '; ')) }
   else { Write-Output ("== MINE session {0}: no waiting ticket" -f $Session) }
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
@@ -2168,13 +2229,73 @@ function JProp($o, [string]$k) { $p = $o.PSObject.Properties[$k]; if ($p) { $p.V
 function Read-Journal([int]$n, $since, [string]$repoName) {
   $files = @(Get-JournalFiles)
   if (-not $files) { return @() }
-  $lines = foreach ($jf in $files) { if ($n -gt 0) { Get-Content $jf -Tail ([math]::Max($n * 8, 400)) } else { Get-Content $jf } }
-  $items = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
-  if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$(JProp $_ 'ts')" }) }
+  if ($n -gt 0) {
+    # The tail is what almost every caller wants, and the same tail is asked for several times per command.
+    $items = @(Get-JournalTailItems ([math]::Max($n * 8, 400)))
+  } else {
+    $lines = foreach ($jf in $files) { Get-Content $jf }
+    # PERF (2026-11-26). The journal is one append-only file that reached 42 MB / 97 000 lines, and a
+    # `since` query used to ConvertFrom-Json EVERY line and then ParseUtc each one to compare (measured
+    # 6.1 s + 9.8 s on this machine for a 12 h window - the single biggest cost in `agentq since`, which
+    # agents run at the start of every task). Every line carries exactly one "ts":"..." key, verified on
+    # all 97 107 lines, and the timestamps are ISO-8601 UTC, which compares correctly as a STRING. So the
+    # cheap native IndexOf/Substring below cuts the set to the window BEFORE any JSON is parsed; the exact
+    # filter still runs afterwards, and the cheap one was proved to select the identical set
+    # (4211 = 4211 for a 12 h window). Keep the exact filter: this is a pre-filter, never a substitute.
+    if ($since) {
+      $cutStr = ([datetime]$since).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')
+      $lines = @($lines | Where-Object {
+          $i = $_.IndexOf('"ts":"')
+          ($i -ge 0) -and ($i + 25 -le $_.Length) -and ($_.Substring($i + 6, 19) -ge $cutStr)
+        })
+    }
+    $items = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
+    if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$(JProp $_ 'ts')" }) }
+  }
   if ($since) { $items = @($items | Where-Object { (JProp $_ 'ts') -and (ParseUtc (JProp $_ 'ts')) -ge $since }) }
-  if ($repoName) { $items = @($items | Where-Object { ($_.PSObject.Properties.Name -contains 'repo' -and $_.repo -eq $repoName) -or ("$(JProp $_ 'resource')" -match "(^|:)$([regex]::Escape($repoName))(:|$)") }) }
+  # The regex is constant, so build it ONCE: the old form compiled it again for every item.
+  if ($repoName) {
+    $rxRepo = "(^|:)$([regex]::Escape($repoName))(:|$)"
+    $items = @($items | Where-Object { ($_.PSObject.Properties.Name -contains 'repo' -and $_.repo -eq $repoName) -or ("$(JProp $_ 'resource')" -match $rxRepo) })
+  }
   if ($n -gt 0) { $items = @($items | Select-Object -Last $n) }
   $items
+}
+
+# One read+parse of the journal TAIL per process. `status`, `since` and `jobs` each read this tail
+# several times (Get-LandHoldStats once per land:* resource, Get-RecentLeaseLosses once more), and a
+# read+parse of 16 000 lines cost 0.5-1.5 s EVERY time on the machine of 2026-11-26. The tail is a
+# suffix, so a deeper read serves every shallower request: cache the parsed items of the deepest tail
+# asked for and slice the end for anything smaller. Read-only verbs exit after one command, so nothing
+# outlives the call and a stale cache cannot cross two commands.
+function Get-JournalTailItems([int]$nLines, [string[]]$only = $null) {
+  if ($nLines -lt 1) { $nLines = 400 }
+  $key = "$nLines|$(if ($only) { $only -join ',' } else { '' })"
+  $items = @()
+  $c = $script:JTail
+  if ($c -and $c.ContainsKey($key)) {
+    $it = @($c[$key])
+    if ($it.Count -le $nLines) { $items = $it } else { $items = @($it[($it.Count - $nLines)..($it.Count - 1)]) }
+  } else {
+    $files = @(Get-JournalFiles)
+    if ($files) {
+      $lines = foreach ($jf in $files) { Get-Content $jf -Tail $nLines }
+      # `only`: parse nothing that cannot match, the same trick the `since` prefilter uses. A caller that
+      # wants one event kind used to ConvertFrom-Json all 4 000 tail lines to keep 25 of them (measured
+      # 2026-11-26: 629 ms per call, and it is called on every `status`). A false positive only costs a
+      # parse - the caller's own exact filter still runs on the parsed item.
+      if ($only) {
+        $keep = [System.Collections.Generic.List[string]]::new()
+        foreach ($s in $lines) { foreach ($m in $only) { if ($s.Contains($m)) { $keep.Add($s); break } } }
+        $lines = $keep
+      }
+      $items = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json -DateKind String } catch { $null } } | Where-Object { $_ })
+      if ($files.Count -gt 1) { $items = @($items | Sort-Object { "$(JProp $_ 'ts')" }) }
+      if (-not $script:JTail) { $script:JTail = @{} }
+      $script:JTail[$key] = $items
+    }
+  }
+  return $items
 }
 
 function Format-Entry($e) {
