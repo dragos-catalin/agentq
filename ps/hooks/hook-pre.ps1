@@ -49,8 +49,18 @@ try {
     # The host passes the request's receipt time; that, not the process, is the call's arrival.
     $hookStartMs = [math]::Round(([DateTime]::Now - [DateTimeOffset]::FromUnixTimeMilliseconds([long]$reqMs).LocalDateTime).TotalMilliseconds)
   } elseif (-not $resident) {
-    # A fresh process per call: its creation IS the moment the call arrived.
-    $hookStartMs = [math]::Round(([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds)
+    # A fresh process per call: its creation IS the moment the call arrived - but ONLY while it is
+    # still fresh. A warm pwsh that is neither the resident host nor a per-call spawn (a terminal
+    # running this script by hand) would otherwise record ITS UPTIME as startMs: 2026-11-26 wrote
+    # values of 83-104 million ms (23-29 h) whenever a long-lived process reached line 1, which is
+    # what made `agentq slo`'s hook cost unphysical. Fail closed: a number under 5 min is a spawn,
+    # anything older is not a measurement of this call. The bound is overridable ONLY so a test can
+    # squeeze it to a millisecond and force the stale branch against a real (fresh) process;
+    # production never sets it.
+    $maxAge = 300000
+    if ($env:CODAI_HOOK_MAX_AGE_MS -match '^\d+$') { $maxAge = [int]$env:CODAI_HOOK_MAX_AGE_MS }
+    $age = [math]::Round(([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds)
+    if ($age -ge 0 -and $age -lt $maxAge) { $hookStartMs = $age } else { $hookStartMs = $null }
   }
   # else: hosted with no receipt time -> leave $null. The contract is explicit above: without a number
   # the field is null, not a lie. Never fall back to the host's uptime.
@@ -167,7 +177,12 @@ if ($runGate -and (Test-Path $axiomCmd)) {
     }
     $axOwnRun = -not $axRepoHook
   }
-  if (-not $ownAxiom) {
+  if ($axiomEnforce -and -not $ownAxiom) {
+    # Observe-only: while $axiomEnforce is $false the verdict below is discarded, but the node
+    # process's cold start (~108 ms measured here) is still paid on EVERY call that can change state -
+    # most calls. Skip the spawn until enforcement is on; the cutover re-enables it and the
+    # decisions.jsonl record it leaves. A repo judged by its OWN profile is NOT this branch: it is
+    # $axOwnRun below, which enforces regardless of $axiomEnforce and is set above, outside this gate.
     $axOut = ''
     try { $axOut = (($raw | & $axiomCmd gate --stdin --format auto 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
     if ($axiomEnforce -and $axOut -match '"permissionDecision"\s*:\s*"deny"' -and $axOut -match '"code"\s*:\s*"(house|git|coord|blind|command)\.') {

@@ -206,6 +206,15 @@ try {
   Remove-Item Env:CODAI_HOOK_RESIDENT -ErrorAction SilentlyContinue
   $residentLine = @(Cost-Lines) | Select-Object -Last 1
   Ok ($residentLine -and $null -eq $residentLine.startMs -and $residentLine.tool -eq 'read_file') 'cost log: resident marker with no receipt time writes startMs null (never the host uptime)' ($residentLine | ConvertTo-Json -Compress)
+  # 2026-11-27: the process-start branch must FAIL CLOSED too. A warm process that is neither the
+  # resident host nor a per-call spawn used to record ITS OWN UPTIME as startMs (2026-11-26: rows of
+  # 83-104 million ms = 23-29 h). Squeezing the freshness bound to a millisecond makes the real (fresh)
+  # child 'stale', so the field must be null; remove the age check and this line carries a number.
+  $env:CODAI_HOOK_MAX_AGE_MS = '1'
+  [void](Invoke-Hook ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }))
+  Remove-Item Env:CODAI_HOOK_MAX_AGE_MS -ErrorAction SilentlyContinue
+  $staleLine = @(Cost-Lines) | Select-Object -Last 1
+  Ok ($staleLine -and $null -eq $staleLine.startMs -and $staleLine.tool -eq 'read_file') 'cost log: a process older than the freshness bound writes startMs null (fail closed, never an uptime)' ($staleLine | ConvertTo-Json -Compress)
   Ok (@($cl | Where-Object { $_.tool -eq 'bash' -and $_.deny }).Count -ge 1) 'cost log: the CLI dialect (exit-code deny) is logged too'
   # Re-read: the cases above (the marker case included) write lines AFTER $cl was captured.
   $n0 = @(Cost-Lines).Count
