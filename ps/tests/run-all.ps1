@@ -134,6 +134,13 @@ $suites = [ordered]@{
   # 2026-11-21: `run-build.ps1 -Class web|scripts` - the second build RESOURCE for script-only builds.
   # Drives the REAL hooks/run-build.ps1 through -Plan and a fake agentq, so it takes no build:* ticket.
   'build class'     = @('-File', (Join-Path $PSScriptRoot 'test-build-class.ps1'), '-RunBuild', (Join-Path $hooks 'run-build.ps1'))
+  # 2026-11-26: the cloud-aware half of run-build (forwarding the placement as `-Where`, and NOT marking a
+  # cloud-bound run WEDGED). Also drives the REAL hooks/run-build.ps1 with a fake agentq (no build ticket).
+  # Registered here AND in install.ps1's map in the same slice - 'install wiring' pins the two.
+  'runbuild cloud aware' = @('-File', (Join-Path $PSScriptRoot 'test-runbuild-cloud-aware.ps1'), '-RunBuild', (Join-Path $hooks 'run-build.ps1'))
+  # 2026-11-26: placement + propose while the machine is SATURATED (auto->cloud, and propose must not offer
+  # a burst that admission would refuse). Offline: faked load probe + cloud stub. Paired with the map entry.
+  'saturated placement' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-saturated-placement.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-21: the gate itself runs as a registered BACKGROUND JOB (bin\run-tests-job.ps1). The reaper
   # closed this gate's terminal mid-run - 24 of 45 suites green, a free shell, nothing installed. The
   # suite drives the real wrapper + job-start + wait-job and pins exit 0/1/2/3/4 and the foreground path.

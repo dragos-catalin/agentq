@@ -22,6 +22,7 @@
     run-build.ps1 -Plan -Class scripts -Command 'pnpm exec eslint .'   # print the class plan, run nothing
     run-build.ps1 -Status          # who holds the lock, where is the log
     run-build.ps1 -Wait            # block until free, then run
+    run-build.ps1 -Where cloud -Command 'pnpm build'   # place in the cloud (forwarded to agentq run)
 
 .OUTPUTS
   Exit code of the build, or 3 if the lock was held and -Wait was not given.
@@ -53,6 +54,13 @@ param(
   # Deliberately NOT in a parameter set, so `-Status -Class scripts` also works.
   [ValidateSet('web', 'scripts')][string]$Class = 'web',
   [Parameter(ParameterSetName = 'Run')][int]$Priority = 0,
+  # Cloud placement (devcloud F2, DC-037): local|cloud|auto, forwarded verbatim to
+  # `agentq run -Where`. Unset ($null) forwards NOTHING, so agentq run keeps its own default
+  # ($env:AGENTQ_WHERE, else local). When unset but AGENTQ_WHERE is present, that value is
+  # forwarded instead, so a caller's placement intent survives run-build's re-entry into the queue.
+  # A cloud run's real work is on a VM: it emits no LOCAL CPU and no output while it waits, so the
+  # wedge watch below is disabled for it (a 0-output cloud wait is correct, not a wedge).
+  [Parameter(ParameterSetName = 'Run')][ValidateSet('local', 'cloud', 'auto')][string]$Where,
   # Build log silent this long -> WEDGED marker on the agentq ticket (shown by `agentq status`) and
   # a console warning. Cleared when output resumes. 0 disables.
   [Parameter(ParameterSetName = 'Run')][double]$WedgeMin = 10,
@@ -105,6 +113,17 @@ function Get-RepoLeafName {
 $root = Get-RepoRoot -Explicit $Root
 $dir = Join-Path $root '.copilot-tmp'
 $null = New-Item -ItemType Directory -Force -Path $dir -EA SilentlyContinue
+
+# --- effective placement (devcloud DC-037) --------------------------------------------------------
+# An explicit -Where wins; otherwise a caller's AGENTQ_WHERE is honoured (and forwarded on re-entry,
+# so the intent survives). Neither set -> agentq run keeps its own default (env, else local).
+$whereEff = if ($Where) { $Where } elseif ($env:AGENTQ_WHERE) { $env:AGENTQ_WHERE } else { $null }
+# A cloud-bound run does its real work on a VM: it emits no LOCAL CPU and no output while it waits, so
+# the wedge watch below would be a false positive by construction (measured 2026-11-26: a land
+# pre-gate waited 10 min with 0 local output and was marked WEDGED while the cloud VM did the work).
+# Skip the marker when placement is (or was requested as) cloud, or when agentq run resolved the child
+# to cloud and exported AGENTQ_PLACEMENT. Env names are case-insensitive in PowerShell's -eq.
+$cloudBound = ($whereEff -eq 'cloud') -or ($env:AGENTQ_PLACEMENT -eq 'cloud')
 
 # --- build class -> resource / lane / lock / mutex (2026-11-21) --------------------------------
 # `web` (the default) keeps TODAY'S behaviour name for name: resource `build`, lock `build.lock` and
@@ -220,6 +239,7 @@ if ($Plan) {
   Write-Host "plan: class=$Class resource=$resource lane=$laneEff"
   Write-Host "      lock=$lockPath"
   Write-Host "      mutex=$mutexName"
+  Write-Host "      where=$(if ($whereEff) { $whereEff } else { 'default' })$(if ($cloudBound) { ' (cloud-bound: wedge watch disabled)' } else { '' })"
   exit 0
 }
 
@@ -242,6 +262,9 @@ if ((Test-Path $agentq) -and ("$env:AGENTQ_HELD" -notmatch '(^|,)build:') -and -
   $self = @('-NoProfile', '-File', $PSCommandPath, '-Command', $Command, '-TimeoutMin', "$TimeoutMin", '-HeapMb', "$HeapMb", '-Wait', '-Lane', $laneEff, '-WedgeMin', "$WedgeMin", '-Class', $Class)
   if ($Root) { $self += @('-Root', $Root) }
   $aqArgs = @('-NoProfile', '-File', $agentq, 'run', '-Resource', $resource, '-Purpose', $why, '-TimeoutMin', "$TimeoutMin", '-Repo', $root, '-Lane', $laneEff, '-Priority', "$Priority")
+  # Forward the caller's placement intent (explicit -Where, else AGENTQ_WHERE) so agentq run resolves
+  # the queue placement instead of falling back to the `local` default.
+  if ($whereEff) { $aqArgs += @('-Where', $whereEff) }
   if (-not $Wait) { $aqArgs += '-NoWait' }
   & pwsh @aqArgs -- pwsh @self
   exit $LASTEXITCODE
@@ -378,20 +401,158 @@ try {
   }
   # Wedge watch: no new output for -WedgeMin -> <ticket>.wedged beside each agentq ticket we run
   # under (AGENTQ_TICKET_FILES, set by `agentq run`), so `agentq status` shows WEDGED for this holder.
+  # Cloud-bound runs are exempt: a VM-side run legitimately emits no LOCAL output, so 0 output is not
+  # a wedge. The marker is still written (and cleared on resume) for every local run.
+  #
+  # Silence alone is not a wedge for a LOCAL run either: one long compile (a single rustc/tsc
+  # invocation) prints nothing for minutes while it burns CPU. So the watch also samples the child
+  # process TREE and treats CPU progress as activity -- a wedge now needs silence AND a tree that has
+  # burned no CPU since the previous sample. (Measured 2026-11-26.)
   $ticketFiles = @("$env:AGENTQ_TICKET_FILES" -split ';' | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
-  $lastGrowth = [DateTime]::UtcNow; $lastPos = 0L; $wedged = $false
+  # NOT set here: the silence clock starts AFTER the init tree discovery below. The FIRST
+  # `Get-Process` sweep is the expensive one (measured 218 ms idle, 5-12 s under load) and it used to
+  # run inside the clock, so a fresh, silent child started the loop with a quiet age of 5-30 s and the
+  # verdict fired on the first iteration. (Measured 2026-11-26 on the wedge fixture.)
+  $lastPos = 0L; $wedged = $false
+  # CPU probe. Three measured traps (2026-11-26), each fatal if ignored:
+  #  1. CIM is used NOWHERE. `Get-CimInstance Win32_Process ...KernelModeTime,UserModeTime` costs
+  #     ~1190 ms AND returned FROZEN values for 3 consecutive probes while a child burned a core
+  #     (0.484 -> 2.547 -> 2.547 -> 2.547). Worse, calling it from inside the watch blocked the wedge
+  #     CLOCK itself: one loop iteration then took longer than -WedgeMin, so a burn child was falsely
+  #     marked ('=== WEDGED' in the log, then 'quiet but working' 1.5 s later). `Process.Parent` is
+  #     present on `Get-Process` objects, so the parent map needs no CIM at all.
+  #  2. Sampling and DISCOVERY are separated, because their costs differ by three orders of magnitude
+  #     and only one of them runs per probe:
+  #       * CPU sample = `Get-Process -Id <pid>` over the handful of tree pids (1-4 ms).
+  #       * Discovery = one `Get-Process` sweep (1352 processes: 218 ms idle, SECONDS under load).
+  #     A sweep on EVERY probe stretched the loop to ~3 s per iteration and pushed the verdict from 3 s
+  #     to ~7.5 s (measured: marker appeared at 7.5 s, `quietMin 0.1`), which is how a 13 s poll window
+  #     failed. Discovery therefore runs at init and only when the sample looks flat -- never on a
+  #     growing tree, where the verdict clock must stay tight.
+  #  3. Clock shape: the baseline is taken BEFORE the loop; the interval is clamped to a THIRD of
+  #     -WedgeMin (two windows always precede the verdict, else a 30 s probe with -WedgeMin 0.05 (3 s)
+  #     never runs first); the FIRST window is discarded (a child's own startup burst is real CPU and
+  #     read as 'working'); and the threshold is a RATIO of the window, not an absolute 0.25 s (which
+  #     broke the moment the clamp shrank the window).
+  # Env overrides exist so a fixture can drive both branches in seconds.
+  $CpuProbeSec = if ($env:RUN_BUILD_CPU_PROBE_SEC) { [double]$env:RUN_BUILD_CPU_PROBE_SEC } else { 30 }
+  if ($WedgeMin -gt 0) { $CpuProbeSec = [Math]::Min($CpuProbeSec, $WedgeMin * 60.0 / 3.0) }
+  # 0.25 = 25 % of one core over the WHOLE window (a single-core spin reports ~0.5-1.0 of that ratio
+  # on a box other builds are starving; an idle child ~0). The 0.2 floor keeps a very short window
+  # from flagging ordinary timer noise.
+  $CpuActiveRatio = if ($env:RUN_BUILD_CPU_ACTIVE_SEC) { [double]$env:RUN_BUILD_CPU_ACTIVE_SEC } else { 0.25 }
+  # A discovery that is merely slow is worth a line in the build log: it is the only step that can
+  # hide output, and a verdict that later needs explaining must be explainable from the log alone.
+  $DiscoveryNoteMs = 250
+  $tree = @{}
+  $cpuPrimed = $false
+  $quietNotedAt = [DateTime]::MinValue
+  $windowSec = $CpuProbeSec
+  # NOT $pId: PowerShell variable names are case-INsensitive and $PID is read-only, so
+  # `foreach ($pId in ...)` aborts the whole script ("Cannot overwrite variable PID").
+  function Update-TreePids {
+    param([int]$Root, [hashtable]$Tree)
+    # EXPENSIVE (a full get-Process sweep). Discovery only: call it on a flat sample, never on a
+    # growing one, so the verdict clock stays tight exactly when it matters.
+    $kids = @{}
+    foreach ($x in @(Get-Process -ErrorAction SilentlyContinue)) {
+      $xid = [int]$x.Id
+      try { $par = $x.Parent; if ($par) { $parId = [int]$par.Id; if (-not $kids.ContainsKey($parId)) { $kids[$parId] = @() }; $kids[$parId] += $xid } } catch { }
+    }
+    $seen = @{}; $frontier = @($Root)
+    for ($d = 0; $d -lt 6 -and $frontier.Count -gt 0; $d++) {
+      $next = @()
+      foreach ($procId in $frontier) {
+        if ($seen.ContainsKey($procId)) { continue }
+        $seen[$procId] = $true
+        if (-not $Tree.ContainsKey($procId)) { $Tree[$procId] = 0.0 }
+        if ($kids.ContainsKey($procId)) { $next += $kids[$procId] }
+      }
+      $frontier = $next
+    }
+  }
+  function Get-TreeCpu {
+    param([hashtable]$Tree)
+    # CHEAP (1-4 ms): one Get-Process per tree pid. MONOTONIC per pid, so a pid never loses the CPU it
+    # already burned and one that has disappeared keeps its last value instead of dropping the sum.
+    $sum = 0.0
+    foreach ($procId in @($Tree.Keys)) {
+      $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+      if ($p) { try { $v = [double]$p.CPU; if ($v -gt $Tree[$procId]) { $Tree[$procId] = $v } } catch { } }
+      $sum += $Tree[$procId]
+    }
+    return $sum
+  }
+  $treeSw = [Diagnostics.Stopwatch]::StartNew()
+  Update-TreePids -Root ([int]$proc.Id) -Tree $tree
+  $treeSw.Stop()
+  $lastCpu = Get-TreeCpu -Tree $tree                         # baseline BEFORE the loop
+  if ($treeSw.ElapsedMilliseconds -ge $DiscoveryNoteMs) { "=== tree discovery took $($treeSw.ElapsedMilliseconds) ms ($($tree.Count) pids)" | Add-Content $logPath -Encoding UTF8 }
+  # The clock starts here: silence is only silence we actually watched for.
+  $lastGrowth = [DateTime]::UtcNow
+  $lastCpuAt = [DateTime]::UtcNow                            # window 1 starts with the loop
+  $nextDiscoveryAt = [DateTime]::UtcNow                      # first flat probe may discover
   while (-not $proc.WaitForExit(500)) {
     Send-NewOutput $outFile $logPath $pos
-    if ($pos.Value -ne $lastPos) {
-      $lastPos = $pos.Value; $lastGrowth = [DateTime]::UtcNow
+    $outGrew = $false; $cpuGrew = $false
+    if ($pos.Value -ne $lastPos) { $lastPos = $pos.Value; $outGrew = $true }
+    if (([DateTime]::UtcNow - $lastCpuAt).TotalSeconds -ge $CpuProbeSec) {
+      $cpuSum = Get-TreeCpu -Tree $tree
+      $cpuDelta = $cpuSum - $lastCpu
+      $windowSec = ([DateTime]::UtcNow - $lastCpuAt).TotalSeconds
+      # Window 1 is the child's own startup burst: take the delta, discard the verdict.
+      if ($cpuPrimed) {
+        if ($cpuDelta -ge [Math]::Max(0.2, $CpuActiveRatio * $windowSec)) { $cpuGrew = $true }
+        else {
+          # Flat sample: pay for discovery (a full sweep) -- but AT MOST one every 5 s, because the
+          # sweep is the only expensive step left and running it on every flat probe pushed the verdict
+          # from WedgeMin (3 s) to ~7.5 s, past the poll window of a loaded box.
+          # A pid that appears mid-run must NOT count as growth. `.CPU` is LIFETIME cpu, so adding a
+          # newly spawned child to the sum looks like a jump in this window -- but a spawn is
+          # instantaneous and proves nothing. Treating it as growth REFRESHED lastGrowth and postponed
+          # the verdict by seconds for a child that was genuinely idle: measured, an idle `node` child
+          # was marked at +7.7 s instead of +3 s and the log carried the giveaway
+          # `quiet but working (child CPU +0,0s in 1,1s)` -- a "growth" line with a zero delta.
+          # Re-baseline instead: the NEXT window measures the new pid's real CPU, so a burning
+          # grandchild is still caught (one window later), and a silent one is not excused.
+          $nowDt = [DateTime]::UtcNow
+          if ($nowDt -ge $nextDiscoveryAt) {
+            $nextDiscoveryAt = $nowDt.AddSeconds(5)
+            $before = $tree.Count
+            $discSw = [Diagnostics.Stopwatch]::StartNew()
+            Update-TreePids -Root ([int]$proc.Id) -Tree $tree
+            $discSw.Stop()
+            if ($tree.Count -ne $before) { $cpuSum = Get-TreeCpu -Tree $tree }
+            # A discovery is WORK, not silence: it takes 380-968 ms under load (measured), the loop is
+            # blind to output while it runs, and on a fixture threshold (3 s) the sweep alone could push
+            # quietAge past the limit and write '=== WEDGED' for a child that never stopped. Reset the
+            # clock after it; the NEXT window measures the new pids' real CPU, so a burning grandchild
+            # is still caught (one window later) and a silent one is not excused.
+            $lastGrowth = [DateTime]::UtcNow
+            if ($discSw.ElapsedMilliseconds -ge $DiscoveryNoteMs) { "=== tree discovery took $($discSw.ElapsedMilliseconds) ms ($($tree.Count) pids)" | Add-Content $logPath -Encoding UTF8 }
+          }
+        }
+      } else { $cpuPrimed = $true }
+      $lastCpu = $cpuSum; $lastCpuAt = [DateTime]::UtcNow
+    }
+    if ($outGrew -or $cpuGrew) {
+      $lastGrowth = [DateTime]::UtcNow
       if ($wedged) { $wedged = $false; foreach ($tf in $ticketFiles) { Remove-Item -LiteralPath "$tf.wedged" -Force -ErrorAction SilentlyContinue }; Write-Host 'build output resumed (WEDGED cleared)' -ForegroundColor DarkGray }
-    } elseif (-not $wedged -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $lastGrowth).TotalMinutes -ge $WedgeMin) {
+      elseif ($cpuGrew -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $quietNotedAt).TotalMinutes -ge 2) {
+        $quietNotedAt = [DateTime]::UtcNow
+        # BOTH sinks, like the WEDGED line: the fixture and any log reader look at the FILE, a human
+        # watches the console. A Write-Host alone is invisible to every log-based check.
+        $msg = ("quiet but working (child CPU +{0:N1}s in {1:N1}s) - no output, not a wedge" -f $cpuDelta, $windowSec)
+        Add-Content -LiteralPath $logPath -Value "$msg $(Get-Date -Format o)" -Encoding UTF8
+        Write-Host $msg -ForegroundColor DarkGray
+      }
+    } elseif (-not $cloudBound -and -not $wedged -and $WedgeMin -gt 0 -and ([DateTime]::UtcNow - $lastGrowth).TotalMinutes -ge $WedgeMin) {
       $wedged = $true
       $quiet = [math]::Round(([DateTime]::UtcNow - $lastGrowth).TotalMinutes, 1)
       $w = @{ since = [DateTime]::UtcNow.ToString('o'); quietMin = $quiet; log = $logPath; pid = $proc.Id } | ConvertTo-Json -Compress
       foreach ($tf in $ticketFiles) { try { [IO.File]::WriteAllText("$tf.wedged", $w) } catch { } }
-      "=== WEDGED: no output for $quiet min (pid $($proc.Id)) $(Get-Date -Format o)" | Add-Content $logPath -Encoding UTF8
-      Write-Host "WEDGED: build output silent for $quiet min (pid $($proc.Id)). Inspect: wait-job.ps1 -Log '$logPath' -Pid $($proc.Id)" -ForegroundColor Yellow
+      "=== WEDGED: no output AND no child CPU for $quiet min (pid $($proc.Id)) $(Get-Date -Format o)" | Add-Content $logPath -Encoding UTF8
+      Write-Host "WEDGED: build output silent AND the process tree idle for $quiet min (pid $($proc.Id)). Inspect: wait-job.ps1 -Log '$logPath' -Pid $($proc.Id)" -ForegroundColor Yellow
     }
   }
   Send-NewOutput $outFile $logPath $pos

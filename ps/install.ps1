@@ -149,6 +149,11 @@ $map = [ordered]@{
   'tests\test-agentq-cwd.ps1' = 'bin\test-agentq-cwd.ps1'
   # 2026-11-21: `run-build.ps1 -Class web|scripts` (the second build resource for script-only builds).
   'tests\test-build-class.ps1' = 'bin\test-build-class.ps1'
+  # 2026-11-26: the cloud-aware run-build suite + the saturated-placement suite. Both sat in tests\ with no
+  # entry here and none in run-all.ps1, so no gate ever ran them. Paired with the run-all.ps1 entries in
+  # this same slice - 'install wiring' pins the two, and the install gate could not run what it never had.
+  'tests\test-runbuild-cloud-aware.ps1' = 'bin\test-runbuild-cloud-aware.ps1'
+  'tests\test-agentq-saturated-placement.ps1' = 'bin\test-agentq-saturated-placement.ps1'
   # 2026-11-21: the gate itself runs as a registered background job (bin\run-tests-job.ps1), so a quiet
   # 30-minute suite can never be killed by the terminal reaper - which is exactly what happened to this
   # gate on 2026-11-21: 24 of 45 suites green, then silence, a free shell, and NOTHING installed.
