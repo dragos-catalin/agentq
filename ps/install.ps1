@@ -154,6 +154,11 @@ $map = [ordered]@{
   # this same slice - 'install wiring' pins the two, and the install gate could not run what it never had.
   'tests\test-runbuild-cloud-aware.ps1' = 'bin\test-runbuild-cloud-aware.ps1'
   'tests\test-agentq-saturated-placement.ps1' = 'bin\test-agentq-saturated-placement.ps1'
+  # 2026-11-26: the gate-wrapper PLACEMENT rule itself (a Windows-only wrapper must stay off the pool).
+  # Unit-level, offline, and driven through the LIVE bin\agentq-v2.ps1, so a later rename or a silently
+  # inert form of the rule (the missing-@() bug that made it match nothing) fails the gate instead of
+  # shipping. Paired with the run-all.ps1 entry in this same slice - 'install wiring' pins the two.
+  'tests\test-gate-where-placement.ps1' = 'bin\test-gate-where-placement.ps1'
   # 2026-11-21: the gate itself runs as a registered background job (bin\run-tests-job.ps1), so a quiet
   # 30-minute suite can never be killed by the terminal reaper - which is exactly what happened to this
   # gate on 2026-11-21: 24 of 45 suites green, then silence, a free shell, and NOTHING installed.

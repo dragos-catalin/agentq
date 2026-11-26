@@ -141,6 +141,10 @@ $suites = [ordered]@{
   # 2026-11-26: placement + propose while the machine is SATURATED (auto->cloud, and propose must not offer
   # a burst that admission would refuse). Offline: faked load probe + cloud stub. Paired with the map entry.
   'saturated placement' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-saturated-placement.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+    # 2026-11-26: the placement RULE a gate wrapper is judged by (bin\agentq-v2.ps1 Get-GateRunWhere), so
+    # the pwsh-stays-local rule and its replacement in Invoke-GateRun are pinned, not just the outcomes.
+    # Paired with the install.ps1 map entry in this same slice - 'install wiring' pins the two.
+    'gate where'      = @('-File', (Join-Path $PSScriptRoot 'test-gate-where-placement.ps1'), '-V2', (Join-Path $bin 'agentq-v2.ps1'))
   # 2026-11-21: the gate itself runs as a registered BACKGROUND JOB (bin\run-tests-job.ps1). The reaper
   # closed this gate's terminal mid-run - 24 of 45 suites green, a free shell, nothing installed. The
   # suite drives the real wrapper + job-start + wait-job and pins exit 0/1/2/3/4 and the foreground path.

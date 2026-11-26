@@ -1963,19 +1963,51 @@ function Get-LandPregateOn([string]$repoName) {
 function Invoke-GateRun([string]$dir, [string]$purpose) {
   $rb = if ($env:AGENTQ_RUN_BUILD) { $env:AGENTQ_RUN_BUILD } else { Join-Path $env:USERPROFILE '.copilot\hooks\run-build.ps1' }
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  # The gate must not wait for a LOCAL build slot when its work runs in the cloud. run-build re-enters
-  # `agentq run -Resource build` and forwards no placement flag, so the decision came from the `local`
-  # default: measured 2026-11-25, a codai land pre-gate sat in `build:machine [gate] machine saturated`
-  # while the gate script was submitting to ws-codai. `auto` lets Resolve-Placement decide (cloud only
-  # when build:machine is full, RAM is below the gate, or admission is saturated) and degrades to local
-  # when the repo has no cloudWorkspaces entry or the workspace is down. An explicit -Where or
-  # AGENTQ_WHERE from the caller is left alone.
+  # Placement of the gate WRAPPER (see Get-GateRunWhere for why `auto` was reverted). A gate whose work
+  # runs on the pool still waits for a local gate slot, because the wrapper itself - the process that
+  # submits to the pool - is Windows-only: that is the price of not shipping it to Linux, where it died
+  # with exit 64 in 0.1 s. Measured 2026-11-26: the codai pre-gate queued on `build:codai [gate] cap 1`
+  # and ran; before the fix the same gate was escalated to ws-codai, answered 64, and quarantined the
+  # topic before the land ticket existed. An explicit -Where or AGENTQ_WHERE from the caller is left
+  # alone, and the wrapper's own `agentq run -Where cloud` still wins over the env it inherits
+  # (agentq.ps1: explicit -Where beats AGENTQ_WHERE), so pool work still lands on the pool.
   $prevWhere = $env:AGENTQ_WHERE
-  if (-not $prevWhere) { $env:AGENTQ_WHERE = 'auto' }
+  if (-not $prevWhere) { $env:AGENTQ_WHERE = Get-GateRunWhere $Gate }
   try { & pwsh -NoProfile -File $rb -Root $dir -Wait -TimeoutMin 120 -Purpose $purpose -Command $Gate }
   finally { if ($prevWhere) { $env:AGENTQ_WHERE = $prevWhere } else { Remove-Item Env:AGENTQ_WHERE -ErrorAction SilentlyContinue } }
   $script:GateExit = [int]$LASTEXITCODE
   $script:GateSec = [int][math]::Round($sw.Elapsed.TotalSeconds)
+}
+# Placement for a GATE wrapper (2026-11-26). `auto` lets Resolve-Placement escalate to a cloud workspace
+# when `build:machine` is saturated - right for a command the pool can run, fatal for the gate wrappers
+# that are actually declared. Every `landGate.<repo>` entry is `pwsh -NoProfile -File <script>`, and
+# run-build ships THAT STRING to the workspace, so the pool is asked to run `pwsh -NoProfile -File
+# C:\Users\...\run-build.ps1`: a Linux pool answers 64 in 0.1 s having executed nothing. agentq reads the
+# 64 as a pre-gate failure, fails the land BEFORE the queue and QUARANTINES the topic, so no later batch
+# absorbs it either - the lane looks held and the exit code describes the runner, not the gate. Measured
+# 2026-11-26: `cloud:codai` `{"exit":64,"event":"cloud-fail","phases":{"sync":0.4,"install":0,"run":0.1},
+# "host":"ws-codai"}` for the codai land pre-gate, `reason: auto: build:machine full (3 held)`, then
+# `land-topic-quarantined` on every subsequent land of that branch. A PowerShell host command is
+# Windows-only, so it stays local; its real work still runs on the pool because the wrapper submits it
+# there itself (run-build.ps1 carries no platform knowledge of the workspace, so the rule lives here).
+function Get-GateRunWhere([string]$GateCommand) {
+  $first = @("$GateCommand".Trim() -split '\s+' | Where-Object { $_ })[0]
+  if (-not $first) { return 'auto' }
+  # The LEAF of a possibly absolute or extension-qualified token, so the rule survives the forms a
+  # gate is actually written in: 'pwsh', 'pwsh.exe', 'C:\Program Files\PowerShell\7\pwsh.exe'.
+  # Matching the bare token only let a fully-qualified pwsh - and every other Windows-only command -
+  # escalate to the pool and die with exit 64 before the queue, which is the defect the bare name fixed.
+  $leaf = ($first -replace '(?i)\.(exe|cmd|bat|ps1)$', '').ToLowerInvariant()
+  # @() is load-bearing: without it a single-segment result stays a scalar String and [-1] indexes its
+  # last CHARACTER ('pwsh' -> 'h'), so the pwsh rule silently stopped matching. Measured 2026-11-26.
+  $leaf = @($leaf -split '[\\/]' | Where-Object { $_ })[-1]
+  # `cmd` is in this list for the same reason as a PowerShell host: `cmd /c ...` is a Windows-only
+  # interpreter and the pool answers 64 for it identically. A fully-qualified `C:\...\cmd.exe` is already
+  # caught by the drive-letter rule below, but the BARE token is not.
+  if (@('pwsh', 'powershell', 'powershell_ise', 'cmd') -contains $leaf) { return 'local' }
+  # A Windows executable path (drive letter or UNC) cannot exist on a Linux workspace at all.
+  if ($first -match '^[A-Za-z]:[\\/]' -or $first -match '^\\\\') { return 'local' }
+  'auto'
 }
 # Whether the pre-gate may take a scratch slot when `agentq land` is started from the shared clone.
 # Config: `landPregateFromMain` = true (default) or a map per repo name. The cost of the change is that a
