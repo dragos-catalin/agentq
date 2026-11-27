@@ -131,6 +131,19 @@ Check 'gate.ps1 threads it everywhere and leaves no hardcoded pool concurrency' 
 # from $PSBoundParameters is what makes the knob real; without it the parameter is silently inert.
 Check 'gate.ps1 re-asserts -PoolParallel after the dot-source (else it is silently inert)' `
   ($gateText -match "\`$PSBoundParameters\['PoolParallel'\]")
+
+# --- the serial-only barrier is ANNOUNCED, not silent (2026-11-27) ----------------------------------
+# Under -Parallel > 1 run-all.ps1 drains the pool for the `$serialOnly` suites (install, term interrupt,
+# reap terminals, git-autosync, guard cloud, deploy guard) and runs each ALONE. A long one is minutes of
+# legitimate silence with no line saying why - read once as "the run hangs" (a `-Parallel 8` "hang" was
+# exactly the `install` barrier's silence). run-all.ps1 now brackets each barrier with a named start and
+# end line, turning that silence into a stated fact. Written as the RULE: the words BARRIER (both sides)
+# and the reason `serial-only` must reach stdout, so removing either bracket turns this suite red.
+$runAllPath = Join-Path $psRoot 'tests\run-all.ps1'
+$runAllText = if (Test-Path -LiteralPath $runAllPath) { Get-Content -LiteralPath $runAllPath -Raw } else { '' }
+Check 'run-all announces each serial-only barrier by name (start AND end), so its silence is stated' `
+        (([regex]::Matches($runAllText, 'BARRIER\s+\$k\b')).Count -ge 2 -and $runAllText -match 'serial-only')
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aq-lgpool-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {

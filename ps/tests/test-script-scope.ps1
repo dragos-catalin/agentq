@@ -8,12 +8,19 @@
 # soft slots (quick burst, beside-batch) and the priority order never fired, and three cases of
 # test-agentq-v3.ps1 went red. The same commit put `$script:ReadOnly = $null` at the top of agentq-v2.ps1,
 # which agentq.ps1 dot-sources AFTER computing `$script:ReadOnly`, turning every read-only verb into a
-# writer. Two rules, one per shape:
+# writer. Three rules, one per shape:
 #   A (intra-file)  : a column-0 `NAME = $null` in file F, where F assigned NAME a non-null value earlier
 #                     and references NAME later.
 #   B (cross-file)  : a column-0 `NAME = $null` at a dot-sourced child's top level, where the parent's last
 #                     write to NAME before the dot-source is non-null and the parent references NAME later.
-# The test also mutates a temp copy to prove it would catch both defects again.
+#   C (param clobber): a dot-sourced child C declares NAME in its own `param()` block, and the parent P both
+#                     writes NAME before the dot-source and reads NAME after it. Dot-sourcing assigns C's
+#                     parameters INTO P's scope, so C's default (or bound value) for NAME silently overwrites
+#                     P's, with NO assignment visible in P for a grep to find. 2026-11-27: gate.ps1's
+#                     `-PoolParallel 7` was accepted, then read back as the child's default 4 (it printed 7 at
+#                     the top of the script and 4 thirty lines later). B is blind to it - B only looks for a
+#                     column-0 `$script:NAME = $null` reset in C, and a `param()` declaration is not that.
+# The test also mutates temp copies to prove it would catch every defect again.
 param([string]$Ps = (Join-Path $PSScriptRoot '..'))
 $ErrorActionPreference = 'Stop'
 $Ps = (Resolve-Path $Ps).Path
@@ -66,15 +73,43 @@ function Get-DotSources([hashtable]$src, [string]$name) {
   $out = @(); $lines = $src[$name]; if (-not $lines) { return $out }
   for ($i = 0; $i -lt $lines.Count; $i++) {
     $l = $lines[$i]
-    if ($l -match "\.\s*\(Join-Path\s+\`$PSScriptRoot\s+'([^']+)'\)") { $out += [pscustomobject]@{ Line = $i + 1; Child = $Matches[1] } }
+    # `. (Join-Path $Any 'path')` - the variable need not be $PSScriptRoot (gate.ps1 uses `$repoRoot` with a
+    # `ps\bin\...` path), so the child is matched by its LEAF name (the map is keyed by file name).
+    if ($l -match "\.\s*\(Join-Path\s+\`$\w+\s+'([^']+)'\)") { $out += [pscustomobject]@{ Line = $i + 1; Child = (Split-Path -Leaf $Matches[1]) } }
     elseif ($l -match '^\s*\.\s+\$(\w+)') {
       $var = $Matches[1]
       for ($j = $i - 1; $j -ge 0; $j--) {
-        if ($lines[$j] -match "\`$$var\s*=\s*Join-Path\s+\`$PSScriptRoot\s+'([^']+)'") { $out += [pscustomobject]@{ Line = $i + 1; Child = $Matches[1] }; break }
+        if ($lines[$j] -match "\`$$var\s*=\s*Join-Path\s+\`$\w+\s+'([^']+)'") { $out += [pscustomobject]@{ Line = $i + 1; Child = (Split-Path -Leaf $Matches[1]) }; break }
       }
     }
   }
   $out
+}
+# the PARAMETER NAMES declared in a file's TOP-LEVEL `param(...)` block: every `$name` on a non-comment
+# line between `param(` and its matching `)` (depth-tracked, so defaults/arrays/attributes need no special
+# casing). Lines before it may be comments, `<#...#>` blocks, `#requires` or `[CmdletBinding()]`; a real
+# statement before `param()` means there is no top-level param block.
+function Get-ParamNames([string[]]$lines) {
+  $names = @(); $start = -1; $inBlock = $false
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    $l = $lines[$i]
+    if ($inBlock) { if ($l -match '#>') { $inBlock = $false }; continue }
+    if ($l -match '^\s*<#') { if ($l -notmatch '#>') { $inBlock = $true }; continue }
+    if ($l -match '^\s*#') { continue }
+    if ($l -match '^\s*param\s*\(') { $start = $i; break }
+    if ($l -match '^\s*\[CmdletBinding') { continue }
+    if ($l -match '^\s*\S') { break }
+  }
+  if ($start -lt 0) { return $names }
+  $depth = 0
+  for ($i = $start; $i -lt $lines.Count; $i++) {
+    $l = $lines[$i]
+    if ($l -notmatch '^\s*#') { foreach ($m in [regex]::Matches($l, '\$(\w+)')) { $names += $m.Groups[1].Value } }
+    $depth += ([regex]::Matches($l, '\(')).Count
+    $depth -= ([regex]::Matches($l, '\)')).Count
+    if ($depth -le 0) { break }
+  }
+  @($names | Select-Object -Unique)
 }
 function Get-RuleB([hashtable]$src) {
   $f = @()
@@ -102,9 +137,31 @@ function Get-RuleB([hashtable]$src) {
   }
   $f
 }
+function Get-RuleC([hashtable]$src) {
+  $f = @()
+  foreach ($pname in $src.Keys) {
+    foreach ($ds in (Get-DotSources $src $pname)) {
+      if (-not $src.ContainsKey($ds.Child)) { continue }
+      $childParams = @(Get-ParamNames $src[$ds.Child])
+      if (-not $childParams.Count) { continue }
+      $plines = $src[$pname]
+      foreach ($n in $childParams) {
+        if ($n -in $script:Skip) { continue }
+        # the parent must have a write to NAME somewhere BEFORE the dot-source and a read somewhere AFTER it
+        $wrote = $false; $readAfter = $false
+        for ($j = 0; $j -lt $plines.Count; $j++) {
+          if ($j + 1 -lt $ds.Line) { foreach ($b in (Get-Assignments $plines[$j])) { if ($b.Name -eq $n) { $wrote = $true } } }
+          elseif ($j + 1 -gt $ds.Line) { if ($plines[$j] -match "(?<![\w:`$])\`$(script:)?$n\b") { $readAfter = $true } }
+        }
+        if ($wrote -and $readAfter) { $f += [pscustomobject]@{ Parent = $pname; Dot = $ds.Line; Child = $ds.Child; Name = $n } }
+      }
+    }
+  }
+  $f
+}
 function Get-Clobber([string]$dir) {
   $src = Get-SourceMap $dir
-  @{ A = @(Get-RuleA $src); B = @(Get-RuleB $src) }
+  @{ A = @(Get-RuleA $src); B = @(Get-RuleB $src); C = @(Get-RuleC $src) }
 }
 
 # 1) the tree is clean today
@@ -112,6 +169,10 @@ $r = Get-Clobber $Ps
 $all = @($r.A) + @($r.B)
 Check '1 no script-scope null reset after a real value (rule A: same file)' ($r.A.Count -eq 0) (($r.A | ForEach-Object { "$($_.File):$($_.Line) $($_.Name) -> $($_.Text)" }) -join ' | ')
 Check '1 no script-scope null reset after a real value (rule B: dot-sourced child)' ($r.B.Count -eq 0) (($r.B | ForEach-Object { "$($_.Child):$($_.ChildLine) $($_.Name) <- $($_.Parent):$($_.Dot)" }) -join ' | ')
+# rule C: a dot-sourced child's `param()` colliding with a parent value the parent passes through. Exactly
+# ONE real hit today - gate.ps1's $PoolParallel, mitigated there by a re-assert from $PSBoundParameters.
+# Two or none is a change that must be looked at, not silently accepted.
+Check '1c rule C: exactly the gate.ps1 $PoolParallel param clobber and nothing else' ((@($r.C | Where-Object { $_.Parent -eq 'gate.ps1' -and $_.Name -eq 'PoolParallel' }).Count -eq 1) -and ($r.C.Count -eq 1)) ('C=' + (@($r.C | ForEach-Object { "$($_.Parent):$($_.Name)" }) -join ','))
 
 # 2) the pre-init block in agentq.ps1 resets only the two exit codes (the concrete 2026-11-22 regression)
 $aq = @(Get-Content (Join-Path $Ps 'bin\agentq.ps1'))
@@ -144,7 +205,28 @@ New-Item -ItemType Directory -Force (Join-Path $bare 'bin') | Out-Null
 [IO.File]::WriteAllText((Join-Path $bare 'bin\agentq.ps1'), $t.Replace('Set-StrictMode -Version 3', "Set-StrictMode -Version 3`n" + '$Lane = $null'))
 $mb = Get-Clobber $bare
 Check '4 mutation: rule A catches the bare form too' (@($mb.A | Where-Object Name -eq 'Lane').Count -ge 1) ("names=" + (@($mb.A | ForEach-Object Name | Sort-Object -Unique) -join ','))
+# 5) rule C mutation: the REAL defect reproduced on a temp copy. The child IS the real
+#    bin\agentq-suite-inputs.ps1 (its own param() block is the collision, RunPool/Skip/SuiteRepoKey/
+#    PoolParallel) and the parent reproduces gate.ps1's exact shape - `. (Join-Path $repoRoot
+#    'ps\bin\agentq-suite-inputs.ps1')` plus a later read of $PoolParallel.
+$rc = Join-Path ([IO.Path]::GetTempPath()) ('aqrulec-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+New-Item -ItemType Directory -Force (Join-Path $rc 'bin') | Out-Null
+Copy-Item (Join-Path $Ps 'bin\agentq-suite-inputs.ps1') (Join-Path $rc 'bin\agentq-suite-inputs.ps1') -Force
+$parentC = @('param([int]$PoolParallel = 4)', '. (Join-Path $repoRoot ''ps\bin\agentq-suite-inputs.ps1'')', '"pool=$PoolParallel"') -join "`n"
+[IO.File]::WriteAllText((Join-Path $rc 'parent.ps1'), $parentC)
+$mC = @(Get-RuleC (Get-SourceMap $rc))
+Check '5 mutation: rule C catches a child param() clobbering the parent -PoolParallel' (@($mC | Where-Object { $_.Parent -eq 'parent.ps1' -and $_.Name -eq 'PoolParallel' }).Count -ge 1) ('C=' + (@($mC | ForEach-Object { "$($_.Parent):$($_.Name)" }) -join ','))
+# 6) rule C negative control: the SAME child, a parent whose parameter does NOT collide -> ZERO findings.
+$rc2 = Join-Path ([IO.Path]::GetTempPath()) ('aqrulec2-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+New-Item -ItemType Directory -Force (Join-Path $rc2 'bin') | Out-Null
+Copy-Item (Join-Path $Ps 'bin\agentq-suite-inputs.ps1') (Join-Path $rc2 'bin\agentq-suite-inputs.ps1') -Force
+$parentC2 = @('param([string]$Workspace = ''agentq'')', '. (Join-Path $PSScriptRoot ''agentq-suite-inputs.ps1'')', '"ws=$Workspace"') -join "`n"
+[IO.File]::WriteAllText((Join-Path $rc2 'parent.ps1'), $parentC2)
+$mC2 = @(Get-RuleC (Get-SourceMap $rc2))
+Check '6 mutation control: a non-colliding dot-source yields ZERO rule C findings' ($mC2.Count -eq 0) ('C=' + (@($mC2 | ForEach-Object { "$($_.Parent):$($_.Name)" }) -join ','))
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $bare -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $rc -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $rc2 -ErrorAction SilentlyContinue
 
 if ($fail) { "FAILED $fail"; exit 1 } else { 'ALL OK'; exit 0 }

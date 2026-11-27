@@ -966,7 +966,10 @@ function Test-SlotShareRefusal([string]$repoName, [string]$role) {
   $sh = Get-SlotShare (Read-Leases $null) $Session $cap
   if (-not $sh.competing -or $sh.held -lt $sh.share) { return $null }
   $mine = @(Read-Leases $null | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
-  $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+  # repo/slot, not the bare slot: this list is built from Read-Leases $null (EVERY repo), and the same
+  # slot NAME lives in each repo (`codai/scratch-1` beside `marcai/scratch-1`), so a bare name read as one
+  # duplicate lease held twice (the same 2026-11-27 display defect fixed in Show-SlotShare).
+  $heldTxt = ($mine | ForEach-Object { "$($_.repo)/$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
   if (-not $script:SlotShareSaid) {
     $script:SlotShareSaid = $true
     Write-Journal @{ event = 'slot-fair-share'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; slots = @($mine | ForEach-Object { "$($_.slot)" }); repo = $repoName; reason = "this session already holds $($sh.held) slot(s); its share of the machine task cap $($sh.taskCap) is $($sh.share) while $($sh.sessions) sessions compete" }

@@ -5,6 +5,9 @@ agentq-cloud — run one command on a devcloud warm workspace (DC-037). Job cont
   agentq-cloud.ps1 -Ws codai -Status          VM state + heartbeat + known shas
   agentq-cloud.ps1 -Ws codai -Suspend         suspend now (the agent also does it after idle-min)
   agentq-cloud.ps1 -Ws codai -StaleClaimMin 3 [-NoHeal]   recycle a wedged workspace, see HEAL
+  agentq-cloud.ps1 -Ws codai -Purpose 'why' -AsyncResume -- <cmd>   opt-in: FILE the wake and build the
+          delta while it warms; the one wait kept is at the queue point (see FLOW). Also cloudAsyncResume:true
+          in bin/agentq-config.json. Default OFF = the wake is awaited before the bundle, exactly as before.
 
 WHAT TRAVELS (git delta, never the whole tree)
   base  = HEAD of the local repo. The workspace publishes the shas it has (ws/<ws>/repos/<repo>.json);
@@ -13,7 +16,10 @@ WHAT TRAVELS (git delta, never the whole tree)
   patch = working tree vs HEAD, untracked included, built in a TEMP index (GIT_INDEX_FILE) so the
           shared index is never touched: read-tree HEAD; add -A; diff --cached --binary HEAD.
 FLOW  resume VM if SUSPENDED/TERMINATED -> upload bundle/patch -> queue spec (written LAST) ->
-      stream jobs/<id>/log -> result.json -> exit with the remote exit code.
+  stream jobs/<id>/log -> result.json -> exit with the remote exit code.
+  With -AsyncResume (cloudAsyncResume) the wake is FILED without waiting and the bundle/patch/upload
+  proceed while it warms; the ONE wait kept is just before the queue entry - the point where the VM
+  must actually accept the job (bounded by -AsyncResumeWaitSec / cloudAsyncResumeWaitSec). Default OFF.
 HEAL  nobody claimed the job and the workspace heartbeat has not moved since the submission: the runner
   wedged across a suspend (a resume does NOT re-run the startup script, so the VM keeps the frozen
   process, looks RUNNING and never reads the queue - ws-vitals-win, 2026-11-25, five jobs, an hour).
@@ -45,6 +51,10 @@ EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavai
 $Ws = 'codai'; $Purpose = $null; $Lane = 'gate'; $TimeoutMin = 60; $RepoArg = $null; $NoPatch = $false
 $Status = $false; $Suspend = $false; $Json = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
 $StaleClaimMin = 3; $NoHeal = $false
+# Opt-in non-blocking wake. OFF by default: the default path is untouched (the resume is awaited before
+# the bundle, exactly as before). ON (-AsyncResume or cloudAsyncResume:true) files the wake and lets the
+# delta build while the VM warms, with the only wait moved to the acceptance point (see Wait-VmWake).
+$AsyncResume = $false; $AsyncResumeWaitSec = 600
 $argv = @($args); $Rest = @()
 $dd = [array]::IndexOf($argv, '--')
 if ($dd -ge 0) { $Rest = @($argv | Select-Object -Skip ($dd + 1)); $argv = @($argv | Select-Object -First $dd) }
@@ -56,6 +66,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     'timeoutmin' { $TimeoutMin = [int](& $val) } 'repo' { $RepoArg = & $val } 'nopatch' { $NoPatch = $true }
     'noinstall' { $NoInstall = $true } 'status' { $Status = $true } 'suspend' { $Suspend = $true } 'json' { $Json = $true }
     'staleclaimmin' { $StaleClaimMin = [int](& $val) } 'noheal' { $NoHeal = $true }
+    'asyncresume' { $AsyncResume = $true } 'asyncresumewaitsec' { $AsyncResumeWaitSec = [int](& $val) }
     'project' { $Project = & $val } 'zone' { $Zone = & $val } 'ctlproject' { $CtlProject = & $val }
     default { [Console]::Error.WriteLine("agentq-cloud: unknown argument '$a' (put the command after --)"); exit 2 }
   }
@@ -70,8 +81,15 @@ $Registry = @{ codai = @{ project = 'codai-training'; zone = 'europe-west4-a' };
 try {
   $cfgPath = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
   if (Test-Path -LiteralPath $cfgPath) {
-    $cr = (Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties['cloudRegistry']
+    $cfgObj = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+    $cr = $cfgObj.PSObject.Properties['cloudRegistry']
     if ($cr -and $cr.Value) { foreach ($p in $cr.Value.PSObject.Properties) { $Registry[$p.Name] = @{ project = "$($p.Value.project)"; zone = "$($p.Value.zone)" } } }
+    # The switch is opt-IN either way round (arg or config): only a truthy value flips it, so a config
+    # that says false never turns off an explicit -AsyncResume. Read exactly like cloudRegistry above.
+    $ar = $cfgObj.PSObject.Properties['cloudAsyncResume']
+    if ($ar -and ($ar.Value -eq $true -or "$($ar.Value)" -match '^(?i)true|1$')) { $AsyncResume = $true }
+    $aw = $cfgObj.PSObject.Properties['cloudAsyncResumeWaitSec']
+    if ($aw -and "$($aw.Value)" -match '^\d+$') { $AsyncResumeWaitSec = [int]$aw.Value }
   }
 } catch { [Console]::Error.WriteLine("agentq-cloud: cloudRegistry ignored ($($_.Exception.Message))") }
 if (-not $Registry.ContainsKey($Ws) -and -not ($Project -and $Zone)) { [Console]::Error.WriteLine("agentq-cloud: unknown workspace '$Ws' (known: $($Registry.Keys -join ', '); or pass -Project/-Zone)"); exit 2 }
@@ -340,6 +358,34 @@ function Write-Obj([string]$name, [string]$file, [string]$type = 'application/oc
 $VmUrl = "https://compute.googleapis.com/compute/v1/projects/$Project/zones/$Zone/instances/$Vm"
 function Get-VmStatus { $r = Invoke-Api GET "$VmUrl`?fields=status"; if ($r.code -ne 200) { throw "compute GET $Vm -> $($r.code) $($r.body)" }; ($r.body | ConvertFrom-Json).status }
 function Invoke-VmOp([string]$op) { $r = Invoke-Api POST "$VmUrl/$op"; if ($r.code -ne 200) { throw "compute $op $Vm -> $($r.code) $($r.body)" } }
+# FILE a VM lifecycle op (resume/start) without waiting for the response, so the delta build and the
+# uploads run while the VM warms. The request is in flight the moment SendAsync returns; the caller parks
+# the handle and awaits it once, at the acceptance point (Wait-VmWake). Used only by -AsyncResume.
+function Start-VmOpAsync([string]$op) {
+  $req = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new('POST'), "$VmUrl/$op")
+  $req.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', (Get-Token))
+  [pscustomobject]@{ op = $op; req = $req; task = $script:Http.SendAsync($req) }
+}
+# The ONE wait the async path keeps, placed at the acceptance point - just before the queue entry, the
+# instant the VM must actually take the job. It exists so a job is never queued to a VM that stays
+# suspended (no blind upload to a sleeping workspace) and so a rejected/slow wake is a CLEAR error rather
+# than a silent wait to the deadline: await the filed op (surfacing its own HTTP status), then confirm
+# RUNNING. Bounded by -AsyncResumeWaitSec / cloudAsyncResumeWaitSec; a timeout throws and the caller
+# exits "4 = workspace unavailable, NOTHING submitted" - the existing contract, unchanged.
+function Wait-VmWake($wake, [int]$TimeoutSec) {
+  if (-not $wake) { return }
+  try {
+    if (-not $wake.task.Wait([TimeSpan]::FromSeconds($TimeoutSec))) { throw "compute $($wake.op) $Vm did not answer within ${TimeoutSec}s" }
+    $r = $wake.task.Result
+    try { if ([int]$r.StatusCode -ne 200) { throw "compute $($wake.op) $Vm -> $([int]$r.StatusCode) $($r.Content.ReadAsStringAsync().GetAwaiter().GetResult())" } } finally { $r.Dispose() }
+  } finally { $wake.req.Dispose() }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+    if ((Get-VmStatus) -eq 'RUNNING') { Out-Line ("[agentq-cloud] {0} RUNNING after {1:N0}s (async wake; the wait was moved to the queue point)" -f $Vm, $sw.Elapsed.TotalSeconds); return }
+    Start-Sleep -Seconds 5
+  }
+  throw "$Vm did not reach RUNNING within ${TimeoutSec}s of the async resume"
+}
 function Read-Gcs([string]$uri) { Read-Obj ($uri -replace "^gs://$BucketName/", '') }
 
 # ---- read-only devcloud status (ADR 0050): the surface Vitals calls ------------------------------
@@ -460,10 +506,18 @@ $submitted = $false
 $DownDir = Join-Path $Root 'cloud-down'; $DownFile = Join-Path $DownDir "$Ws.json"
 $DownMin = if ($env:AGENTQ_CLOUD_DOWN_MIN) { [int]$env:AGENTQ_CLOUD_DOWN_MIN } else { 15 }
 try {
-  # 1. resume first (runs in parallel with delta building)
-  $st = Get-VmStatus; $resumeFrom = $st; $resumeAt = $null
-  if ($st -eq 'SUSPENDED') { Invoke-VmOp resume; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] resuming $Vm (was SUSPENDED)" }
-  elseif ($st -eq 'TERMINATED') { Invoke-VmOp start; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] starting $Vm (was TERMINATED)" }
+  # 1. resume first (runs in parallel with delta building). OFF (default): await it here, exactly as
+  #    before. ON (-AsyncResume): FILE it and let the bundle/patch/upload proceed while the VM warms; the
+  #    handle is awaited once, at the queue point (Wait-VmWake), so the wake is off the pre-upload path.
+  $st = Get-VmStatus; $resumeFrom = $st; $resumeAt = $null; $wake = $null
+  if ($st -eq 'SUSPENDED') {
+    if ($AsyncResume) { $wake = Start-VmOpAsync resume; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] resuming $Vm (was SUSPENDED) - filed async, the delta builds while it warms" }
+    else { Invoke-VmOp resume; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] resuming $Vm (was SUSPENDED)" }
+  }
+  elseif ($st -eq 'TERMINATED') {
+    if ($AsyncResume) { $wake = Start-VmOpAsync start; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] starting $Vm (was TERMINATED) - filed async, the delta builds while it warms" }
+    else { Invoke-VmOp start; $resumeAt = [DateTime]::UtcNow; Out-Line "[agentq-cloud] starting $Vm (was TERMINATED)" }
+  }
   elseif ($st -eq 'SUSPENDING') { Out-Line "[agentq-cloud] $Vm is SUSPENDING; will resume when it settles" }
 
   # 2. bundle: newest known sha that is an ancestor of HEAD
@@ -510,6 +564,9 @@ try {
     timeoutSec = $TimeoutMin * 60; lane = $Lane; purpose = $Purpose; session = $Session; noInstall = $NoInstall
     submittedAt = [DateTime]::UtcNow.ToString('o'); client = $env:COMPUTERNAME }
   $sf = Join-Path $tmp 'spec.json'; [IO.File]::WriteAllText($sf, ($spec | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+  # The acceptance point: with an async wake in flight, confirm the VM can actually take the job before
+  # the queue entry lands. $wake is $null when OFF (or a SUSPENDING VM), so the default path is untouched.
+  if ($wake) { Wait-VmWake -wake $wake -TimeoutSec $AsyncResumeWaitSec }
   Write-Obj "ws/$Ws/queue/$id.json" $sf 'application/json'
   $submitted = $true
   Remove-Item -LiteralPath $DownFile -ErrorAction SilentlyContinue
