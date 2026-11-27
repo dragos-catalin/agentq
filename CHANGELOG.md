@@ -137,6 +137,27 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   room, the task cap, the scratch offer, what is held) and states the part that is easy to misread: a
   per-repo `N/N` is the LANES, not the machine, because `build:<repo>` tickets are independent and only
   `build:machine` (max 2) is shared. `-Json` returns the same as an object; `agentq help scale` documents it.
+- **Six `git` processes fewer per re-lease, and a re-lease no longer pays for a registration check.**
+  `Get-RepoInfo` asked `rev-parse` twice (top-level, then common dir); the two directives are independent,
+  so one process now prints both lines in argument order - a saving paid at the start of EVERY verb, not
+  only `lease`. A slot that is already registered is recognised by reading `gitdir:` out of the slot's own
+  `.git` file instead of running `git worktree list --porcelain`, and the unconditional `git worktree prune`
+  moved into the branch that actually adds a worktree. Measured with a `git.cmd` shim, same slot, 6 leases:
+  10.33 -> 7.5 `git` spawns per lease (-27.4 %), `worktree list` 6 -> 0, `worktree prune` 6 -> 1. Pinned by
+  the new `ps/tests/test-lease-spawns.ps1` (11 checks), which fails if the combined directive is split and
+  whose mutation arm proves the check is not vacuous.
+- **A `lease` no longer hands a repo-info OBJECT to `git` - the reason the message notices degraded in
+  silence.** `$repo` and `$Repo` are ONE variable in PowerShell (names ignore case), so a script-scope
+  `$repo = Get-RepoInfo $Repo` leaves `$Repo` holding the object; the next `Get-RepoInfo $Repo` stringified
+  it into `-C "@{Top=...; Common=...; Name=...}"`, which git rejects, so the caller got `$null` and said
+  nothing. `Get-RepoInfo` now returns a repo-info object handed to it, which fixes the class in one place
+  rather than the one call site. Found by the shape assertion above, red on the re-lease arm before the fix.
+  The same bug cost every READ verb that assigns `$repo` before a callee reads `$Repo`, so the fix is not
+  lease-only: measured with the same shim, `git` spawns per run are `status` 2 -> 1 (-50 %), `since` 6 -> 4
+  (-33 %, and its `-C "@{...}"` line is gone) and `who` 0 -> 0. The suite also deletes its
+  `%TEMP%\aqspawn-<pid>-<hex>` fixture tree in a `finally`, guarded by an exact match on the leaf it minted
+  from its own pid, because a killed run used to leave that tree behind for the nightly sweep and a pattern
+  guard would have let one of two concurrent runs delete the other's live tree.
 
 ### Security
 

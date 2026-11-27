@@ -140,6 +140,12 @@ $suites = [ordered]@{
   # 2026-11-23: elastic scratch slots (an index beyond the floor needs room) + the resource-derived
   # machine task-slot budget (AGENTQ_TEST_SLOT_BUDGET injects the measurement).
   'slot budget'    = @('-File', (Join-Path $PSScriptRoot 'test-slot-budget.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-27: the SPAWN SHAPE of a lease. The 10.33 -> 7.5 spawn/lease cut is invisible to every
+  # behavioural test (the slot still ends up right; it just costs two fewer `git` processes), so a
+  # `git.cmd` shim on PATH records the calls and pins the shape: a re-lease must run NO `worktree list`
+  # and resolve the repo with ONE combined rev-parse. Its second arm is a mutation control, so the
+  # shape check is proven to bite the regression it names.
+  'lease spawns'   = @('-File', (Join-Path $PSScriptRoot 'test-lease-spawns.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-21: the release `phase` is the last checkpoint ENTERED, not the step that failed; the display
   # must show `last-phase=` + the run's own `exit=` separately, and the record keeps its `phase` field.
   'release phase honesty' = @('-File', (Join-Path $PSScriptRoot 'test-release-phase-honesty.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
