@@ -500,8 +500,16 @@ $script:RepoInfoCache = $null
 # `status` asks for it twice (its own headroom line, then Get-MachineBudget for slot admission).
 $script:MemInfoCache = $null
 
-function Get-RepoInfo([string]$path) {
-  $p = if ($path) { $path } else { (Get-Location).Path }
+function Get-RepoInfo($path) {
+  # A repo-info OBJECT is a valid input and comes straight back. `$repo` and `$Repo` are ONE variable in
+  # PowerShell (names ignore case), so a script-scope `$repo = Get-RepoInfo $Repo` - the dispatcher does
+  # exactly that before the verb switch - leaves $Repo holding the OBJECT. A later `Get-RepoInfo $Repo`
+  # then stringified it into `-C "@{Top=...; Common=...; Name=...}"`, which git rejects: the caller got
+  # $null and degraded in silence (measured 2026-11-27 on the `lease` reuse arm - two combined rev-parse
+  # spawns, the second one carrying the object as -C). Accepting the object fixes the whole class in one
+  # place rather than the one call site, and costs nothing: the answer is already computed.
+  if ($null -ne $path -and $path -isnot [string] -and (@($path.PSObject.Properties.Name) -contains 'Top')) { return $path }
+  $p = if ($path) { "$path" } else { (Get-Location).Path }
   # PERF (2026-11-26). Two `git` spawns, ~105 ms each on this machine, and one verb asks several times
   # (status has its own get-repoinfo phase, Renew-ForSession, the message notices, Register-Agent).
   # The identity of a path cannot change inside one CLI invocation, so the answer is memoized per path -
@@ -509,9 +517,13 @@ function Get-RepoInfo([string]$path) {
   if ($null -eq $script:RepoInfoCache) { $script:RepoInfoCache = @{} }
   $key = $p.ToLowerInvariant()
   if ($script:RepoInfoCache.ContainsKey($key)) { return $script:RepoInfoCache[$key] }
-  $top = (& git -C $p rev-parse --show-toplevel 2>$null)
-  if (-not $top) { $script:RepoInfoCache[$key] = $null; return $null }
-  $common = (& git -C $p rev-parse --path-format=absolute --git-common-dir 2>$null)
+  # PERF (2026-11-27). ONE spawn, not two: `rev-parse` prints one line per directive in ARGUMENT order,
+  # so both answers come out of a single process. This runs at the start of EVERY verb (status, commit,
+  # run, slo, lease), so the saving is not lease-only. A non-repo fails the whole call (exit 128, stderr
+  # suppressed) -> zero lines -> the cached "not a repo" answer, exactly as before.
+  $out = @((& git -C $p rev-parse --show-toplevel --path-format=absolute --git-common-dir 2>$null) | Where-Object { "$_" -ne '' })
+  if ($LASTEXITCODE -or $out.Count -lt 2) { $script:RepoInfoCache[$key] = $null; return $null }
+  $top = $out[0]; $common = $out[1]
   $name = Split-Path (Split-Path $common -Parent) -Leaf
   $ds = [IO.Path]::DirectorySeparatorChar
   $info = [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
@@ -724,6 +736,18 @@ function Get-Capacity([string]$res) {
     $f = Join-Path (QPath $res) 'capacity'
     try { if (-not (Test-Path $f) -or [int](Get-Content $f -Raw) -ne $cap) { New-Item -ItemType Directory -Force (QPath $res) | Out-Null; [IO.File]::WriteAllText($f, "$cap") } } catch {}
     return $cap
+  }
+  if ($res -eq 'gate:machine') {
+    # The MACHINE-WIDE bound on heavy gate/verify runs. A heavy land pre-gate takes only verify:<repo>
+    # (cap 1 PER REPO), so before this existed N repos ran N ~90-fork gates at once - 13 concurrent
+    # measured on this machine, 2026-11-26. The cap is FIXED; the load hold below is the part that
+    # follows real load, and it narrows this to ONE heavy run while the machine is saturated. Never
+    # below 1 - that is the progress guarantee. Read from config on purpose: a sticky capacity file
+    # must not be able to raise a machine-wide bound.
+    $gc = Get-Config
+    $gateCap = if ($gc.ContainsKey('gateMachineCap')) { [int]$gc['gateMachineCap'] } else { 3 }
+    if ($gateCap -lt 1) { $gateCap = 1 }
+    return $gateCap + (Get-BurstExtra $res)
   }
   # land:<repo> (TASK 1): the config flag wins over the sticky file, for the same reason build:machine
   # does - a sticky `1` written before the flag was turned on must not pin a repo at capacity 1, and a
@@ -1135,10 +1159,11 @@ function Test-Admissible($t, [scriptblock]$gate) {
       if ($ok) { $script:PreemptNote = "beside $heldBatch batch holder(s)" }
     }
   }
-  # OQ-004: a saturated machine does not get a second gate/heavy/batch build. One build always runs, and
-  # it is the FIRST in rank: without the rank test a lower-priority waiter that polled right after the
-  # holder ended started first and the higher-priority one was then held by load behind it.
-  if ($ok -and $t.resource -eq 'build:machine' -and $lane -notin 'interactive', 'quick' -and ($held.Count -ge 1 -or $rank -ge 1)) {
+  # OQ-004: a saturated machine does not get a second gate/heavy/batch run - a build (build:machine) or a
+  # heavy gate (gate:machine) alike. One such run always starts, and it is the FIRST in rank: without the
+  # rank test a lower-priority waiter that polled right after the holder ended started first and the
+  # higher-priority one was then held by load behind it.
+  if ($ok -and $t.resource -in 'build:machine', 'gate:machine' -and $lane -notin 'interactive', 'quick' -and ($held.Count -ge 1 -or $rank -ge 1)) {
     # -NoSample: this runs under the scheduler mutex; Wait-All refreshes the sample before taking it.
     $ld = Get-AdmissionLoad -NoSample
     if ($ld.saturated -and -not (Test-AdmissionOverride $t.resource "$(P $t 'purpose' '')" $ld)) {
@@ -1376,6 +1401,10 @@ function Expand-Resources([string]$kind, $repo) {
   $primary = Resolve-Resource $kind $repo
   $list = @($primary)
   if ($primary -like 'build:*' -and $primary -ne 'build:machine') { $list += 'build:machine' }
+  # A HEAVY gate (gate/heavy/batch) on a verify:* resource takes the machine-wide gate ticket too, so N
+  # repos cannot run N heavy gates at once. verify:* ONLY: a build already takes build:machine, and
+  # coupling the two would queue an ordinary build behind the gate cap.
+  if ($primary -like 'verify:*' -and (Resolve-Lane $primary $script:Lane) -in 'gate', 'heavy', 'batch') { $list += 'gate:machine' }
   foreach ($a in $Also) { $list += (Resolve-Resource $a $repo) }
   $list
 }
@@ -1516,7 +1545,7 @@ function Invoke-Propose {
   $repo = Get-RepoInfo $Repo
   $c = Get-Config
   $actions = @()
-  foreach ($res in @('build:machine') + @(if ($repo) { "build:$($repo.Name)", "commit:$($repo.Name)", "install:$($repo.Name)" })) {
+  foreach ($res in @('build:machine', 'gate:machine') + @(if ($repo) { "build:$($repo.Name)", "commit:$($repo.Name)", "install:$($repo.Name)" })) {
     $live = @(Get-Live $res); if (-not $live) { continue }
     $cap = Get-Capacity $res
     foreach ($h in @($live | Where-Object { Test-Held $_ $live $cap })) {
@@ -1849,7 +1878,7 @@ function Invoke-Run {
       $gates[$t.id] = if ($t.resource -eq 'build:machine' -and $MinFreeGB -gt 0) { { Test-FreeRam $MinFreeGB } } else { $null }
     }
     if ($NoWait) {
-      if ($resList -contains 'build:machine') { $null = Get-AdmissionLoad }
+      if ($resList -contains 'build:machine' -or $resList -contains 'gate:machine') { $null = Get-AdmissionLoad }
       $busy = @($tickets | Where-Object { -not (Test-Admissible $_ $gates[$_.id]).ok })
       if ($busy) {
         $h = @(Get-Live $busy[0].resource)[0]
@@ -2170,7 +2199,7 @@ function Show-Status {
     $sample = Get-QueueSample @($qidx[$k])
     if (-not $sample) { continue }
     $res = ([IO.File]::ReadAllText($sample.FullName) | ConvertFrom-Json -DateKind String).resource
-    if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -ne 'build:machine') { continue }
+    if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -notin 'build:machine', 'gate:machine') { continue }
     # B) the negative ledger for this land queue (branch -> {at,tree,reason}), read once per resource.
     $qmap = if ($res -like 'land:*') { Get-LandQuarantine (Get-ResourceRepo $res) } else { $null }
     # r7: hold-time history for this land queue (null when the journal has too little history).

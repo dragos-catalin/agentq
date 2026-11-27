@@ -189,7 +189,8 @@ function Show-Scale {
   Write-Output ("  held now: {0} task + {1} scratch, against a room of {2} worktrees" -f $taskHeld, $scratchHeld, $room.total)
   Write-Output ''
   Write-Output '  A per-repo N/N is the LANES, not the machine: build:<repo> tickets are per repo and'
-  Write-Output '  independent, so a busy repo never blocks another. Only build:machine (max 2) is shared.'
+  Write-Output '  independent, so a busy repo never blocks another. The shared machine-wide tickets are'
+  Write-Output '  build:machine (max 2) and gate:machine (max 3, taken by heavy gate/verify runs).'
   Write-Output '  Elastic by design - a scratch slot rides on free room; a refused slot now reports the'
   Write-Output '  measured offer and room instead of a bare "it is still held".'
 }
@@ -833,10 +834,23 @@ function Prepare-Slot([string]$main, [string]$path, [string]$repoName) {
 # Bring a slot to a fresh state at $ref (+ optional branch). The caller holds the lease and has
 # already backed up anything unique, so discarding inside THIS slot is safe by construction.
 function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$branch, [bool]$copyEnv) {
-  & git -C $main worktree prune 2>$null
-  $registered = @(& git -C $main worktree list --porcelain | Where-Object { $_ -like 'worktree *' } | ForEach-Object { Norm-Dir $_.Substring(9) })
-  $isReg = $registered -contains (Norm-Dir $path)
+  # Registration is decided with ZERO git spawns: a linked worktree's `.git` is a FILE holding
+  # `gitdir: <common>/worktrees/<name>`, and that admin directory existing IS what `worktree list
+  # --porcelain` reports for a live worktree. The old `worktree prune` + O(n) `worktree list` cost TWO
+  # git spawns on every lease (measured 2026-11-27), both on the reuse hot path, where neither does work.
+  $isReg = $false
+  $slotGit = Join-Path $path '.git'
+  if (Test-Path -LiteralPath $slotGit -PathType Leaf) {
+    try {
+      $gd = ([IO.File]::ReadAllText($slotGit) -replace '^gitdir:\s*', '').Trim()
+      if ($gd -and -not [IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $path $gd }
+      $isReg = [bool](Test-Path -LiteralPath $gd)
+    } catch { $isReg = $false }
+  }
   if (-not $isReg) {
+    # `worktree prune` lives HERE now: its only job is to clear a stale admin entry so that `worktree
+    # add` for THIS path cannot trip over it, and this is the one branch that adds.
+    & git -C $main worktree prune 2>$null
     if (Test-Path -LiteralPath $path) {
       $left = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'node_modules', '.copilot-tmp' })
       if ($left.Count) { throw "slot ${path}: directory exists but is not a worktree of $main ($($left.Count) entries) - run 'worktree.ps1 migrate' first" }
