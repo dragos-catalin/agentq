@@ -239,6 +239,42 @@ function With-Mutex([string]$name, [scriptblock]$body) {
   try { try { [void]$m.WaitOne(30000) } catch [Threading.AbandonedMutexException] {} ; & $body }
   finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
+# TASK 1: with `landCapacity: 2` TWO lands may hold `land:<repo>` at once, and the merge/push phase - the
+# part that actually moves origin/<onto> - must still be mutually exclusive per repo. This is that mutex:
+# the SAME primitive With-Mutex uses (a named [Threading.Mutex], AGENTQ_HOME-suffixed so a test coordinate
+# root gets its own mutex and can never serialise a real one), but BOUNDED - WaitOne returns $false on
+# timeout instead of blocking forever, so the second land REFUSES (exit 3, nothing queued, nothing pushed)
+# rather than deadlocking. An abandoned mutex (the previous holder died mid-merge) counts as acquired: the
+# OS already released it, and refusing there would wedge the repo until a human intervened.
+function Get-LandMergeMutexName([string]$repoName) {
+  "Global\agentq-land-merge-$(Safe $repoName)$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })"
+}
+function Enter-LandMergeMutex([string]$repoName, [int]$boundSec) {
+  $name = Get-LandMergeMutexName $repoName
+  $m = [Threading.Mutex]::new($false, $name)
+  $ok = $false
+  try { $ok = $m.WaitOne([int]([math]::Max(1, $boundSec) * 1000)) }
+  catch [Threading.AbandonedMutexException] { $ok = $true }
+  catch { $ok = $false }
+  if (-not $ok) { try { $m.Dispose() } catch {} ; return $null }
+  [pscustomobject]@{ repo = $repoName; name = $name; at = (Iso (Now)); mutex = $m }
+}
+function Exit-LandMergeMutex($lock) {
+  if (-not $lock) { return }
+  try { $lock.mutex.ReleaseMutex() } catch {}
+  try { $lock.mutex.Dispose() } catch {}
+}
+# How long a second land waits for the per-repo merge mutex before refusing. Config `landMergeWaitMin`
+# (default 90): long enough for a real merge + in-ticket gate, short enough that a wedged holder is reported
+# instead of hanging the caller. A refusal is cheap - the land has already passed its own pre-gate.
+function Get-LandMergeWaitSec {
+  # The suite drives the REFUSAL path with a bound of a few seconds: `landMergeWaitMin` is whole minutes
+  # (a real merge is minutes, not seconds), so a one-minute floor would make the case cost a minute.
+  if ($env:AGENTQ_LAND_MERGE_WAIT_SEC) { return [int]([math]::Max(1, [int]$env:AGENTQ_LAND_MERGE_WAIT_SEC)) }
+  $c = Get-Config
+  $min = if ($c -and $c.ContainsKey('landMergeWaitMin')) { [int]$c['landMergeWaitMin'] } else { 90 }
+  [int]([math]::Max(1, $min) * 60)
+}
 function Get-MainTop($repo) { Split-Path -Parent $repo.Common }
 function Get-SlotPath([string]$repoName, [string]$slot) { Join-Path (Join-Path (Get-WtRoot) $repoName) $slot }
 # Which clone owns the worktree at $slotPath (the main top of its git common dir), or $null when the path
@@ -409,6 +445,35 @@ function Read-LeaseChat([string]$leaseFile) {
     if ([IO.File]::Exists($rf)) { $r.releaseAt = [IO.File]::GetLastWriteTimeUtc($rf); $r.releaseBy = "$([IO.File]::ReadAllText($rf))".Trim() }
   } catch {}
   $r
+}
+# TASK 2: WHICH chat is running THIS agentq call, best effort. A take-over must be announced unless the
+# chat that took the slot is the SAME chat that was working in it. The suppression used to key on the
+# SESSION, and `Publish-SlotTakeover` dropped its note whenever `$holder -eq $Session` - so a SIBLING chat
+# of the same session could reset a slot over another chat's unsaved work with no announcement at all,
+# even though `Backup-Slot` had really run (the work was saved, but nobody was told).
+# agentq has no chat id on its command line. The guard hook knows it (it is the harness's `session_id`) and
+# records the chat it is serving in <Root>/chats/.last.json immediately before the tool call runs. So:
+#   1. an explicit $env:AGENTQ_CHAT_ID wins (scripts, and the suite drives this deterministically);
+#   2. otherwise the chat the hook recorded within the last `chatNowSec` seconds (default 30);
+#   3. otherwise $null - and a $null current chat NEVER suppresses a note, because an extra note is cheap
+#      and a silent clobber is not.
+function Get-CurrentChatId {
+  if ($env:AGENTQ_CHAT_ID) { return "$env:AGENTQ_CHAT_ID" }
+  try {
+    $f = Join-Path (Join-Path $Root 'chats') '.last.json'
+    if (-not [IO.File]::Exists($f)) { return $null }
+    $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json -AsHashtable
+    $id = "$(P $j 'chatId' '')"; $at = P $j 'at' $null
+    if (-not $id -or $null -eq $at) { return $null }
+    # ParseUtc takes the RAW value: ConvertFrom-Json already turned the ISO-8601 string into a [datetime]
+    # (Kind=Utc), and casting it back with "$( )" renders it in the host culture with no zone, which ParseUtc
+    # then reads as LOCAL time. On this UTC+2 box that made a marker written a second ago 7215 s old, so the
+    # freshness window never matched and the suppression never fired (measured 2026-11-27, D1 of the takeover
+    # suite). A [datetime] goes through ToUniversalTime, a string through DateTimeOffset.Parse.
+    $win = [double](P (Get-Config) 'chatNowSec' 30)
+    if (((Now) - (ParseUtc $at)).TotalSeconds -gt $win) { return $null }
+    return $id
+  } catch { return $null }
 }
 # OQ-001 / ADR 0009 stage 0: the chat side of a lease, computed in ONE place so `unlease` and the journal
 # cannot drift apart (they did: the reaper's 20-min chat grace sat INSIDE the SLO's 30-min live window, so
@@ -931,6 +996,9 @@ function Get-ScratchLeaseCount { @(Read-Leases $null | Where-Object { (P $_ 'rol
 function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [string]$branch, [int]$owner, [int]$timeoutMin, [bool]$noWait, [bool]$wait, $maxMin, [bool]$maxMinGiven) {
   $repoName = $repo.Name
   $cfg = Get-Config
+  # TASK 2: the chats of the lease this call takes over, filled by the candidate loop BEFORE the expire
+  # deletes the sidecar (StrictMode 3: initialised here so the read can never throw).
+  $script:TakeoverChats = @()
   # `-Wait` (2026-11-18): the bound is -MaxMin (default 5 min) and expiry exits 7 with one stdout line.
   # Without it the legacy -TimeoutMin (default 60) applies and expiry exits 3, exactly as before.
   $boundMin = if ($wait) { if ($maxMinGiven) { [double]$maxMin } else { 5 } } else { $timeoutMin }
@@ -1054,6 +1122,13 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       $budgetHit = $false
       foreach ($s in $cands) {
         $cur = $leases | Where-Object { $_.slot -eq $s } | Select-Object -First 1
+        # TASK 2: capture the chats of the lease we are about to take over BEFORE it is expired.
+        # Expire-Lease -> Remove-LeaseRecord deletes the <lease>.json.chat sidecar, so reading it later (in
+        # New-Lease, after the reset) always came back empty: measured 2026-11-27, holderChats=[] and every
+        # same-session take-over announced itself as "displaced chat unknown" (5 assertions red). The chat
+        # list is the ONLY record of which chat was working in the slot, so it must be read while it exists.
+        $script:TakeoverChats = @()
+        if ($cur) { try { $script:TakeoverChats = @((Read-LeaseChat $cur.file).chats) } catch { $script:TakeoverChats = @() } }
         if ($cur -and $cur.stale) { if (-not (Expire-Lease $cur "stale (idle $($cur.idleMin) min, owner alive=$($cur.alive)) - reclaimed by $Session")) { continue }; $cur = $null }
         # -Reclaim (idea 8): a live lease whose ONLY protection is a chat grace (idle past its threshold,
         # not held) is taken for a blocked agent instead of a foreign `unlease` break. Requires -Reason.
@@ -1079,11 +1154,26 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
         }
         $f = Get-LeaseFile $repoName $s
         # a chat binding / work clock left by a previous lease of this slot must not keep the new one alive
+        # TASK 2: read the chats before deleting them - they are the only record of WHICH chats were working
+        # in the slot when it was taken over, and Publish-SlotTakeover needs them to tell a sibling chat of
+        # the same session from the chat that actually lost the tree. Losing this file without reading it is
+        # what made the suppression session-wide in the first place. The candidate loop reads them FIRST
+        # ($script:TakeoverChats, before Expire-Lease deletes the sidecar); the read below is the fallback for
+        # a slot whose previous lease was already released and left its binding behind.
+        $prevChats = @($script:TakeoverChats)
+        if (-not $prevChats.Count) {
+          try {
+            if ([IO.File]::Exists("$f.chat")) {
+              $cj = [IO.File]::ReadAllText("$f.chat") | ConvertFrom-Json
+              if ("$(P $cj 'leaseId' '')") { $prevChats = @(P $cj 'chats' @() | ForEach-Object { "$_" } | Where-Object { $_ }) }
+            }
+          } catch { $prevChats = @() }
+        }
         Remove-Item -LiteralPath "$f.chat", "$f.work", "$f.release" -Force -ErrorAction SilentlyContinue
         Write-JsonAtomic $f $l
         [IO.File]::WriteAllText("$f.hb", '')
         Write-Journal @{ event = 'lease'; resource = "slot:${repoName}:$s"; ticket = $l.leaseId; purpose = $purpose; branch = "$branch"; repo = $repoName; loadWaitSec = (Get-LoadWaitSec) }
-        return ([pscustomobject]$l | Add-Member -NotePropertyName file -NotePropertyValue $f -PassThru)
+        return ([pscustomobject]$l | Add-Member -NotePropertyName file -NotePropertyValue $f -PassThru | Add-Member -NotePropertyName prevChats -NotePropertyValue @($prevChats) -PassThru)
       }
       if ($capHit) { 'MACHINE-CAP' } elseif ($budgetHit) { 'SLOT-BUDGET' } else { $null }
     }
@@ -1279,7 +1369,7 @@ function Invoke-Lease {
         $h = @(Get-SlotHistory $repo.Name $l.slot 20 | Where-Object { (P $_ 'holder') -and (P $_ 'holder') -ne "$Session" })
         if ($h.Count -and (P $h[-1] 'ref')) { $prevRef = "$(P $h[-1] 'ref')" }
       }
-      if ($prevRef) { Publish-SlotTakeover $repo.Name $l.slot $prevRef $l.leaseId $l.path }
+      if ($prevRef) { Publish-SlotTakeover $repo.Name $l.slot $prevRef $l.leaseId $l.path @(P $l 'prevChats' @()) }
     }
     Initialize-Slot $main $l.path $refToUse $Branch (-not $env:AGENTQ_NO_ENV_COPY)
     if ($l.role -in 'task', 'pinned', 'scratch') { [void](Prepare-Slot $main $l.path $repo.Name) }
@@ -1413,19 +1503,46 @@ function Resolve-BackupRef([string]$repoName, [string]$what) {
 }
 # A take-over is loud now: journal + slot history + a notice to the previous holder + the note the new
 # holder reads on stdout. The note is also printed when the lease FAILS after the backup, so it cannot be lost.
-function Publish-SlotTakeover([string]$repoName, [string]$slot, [string]$ref, [string]$leaseId, [string]$path) {
+# TASK 2: the previous holder is matched by CHAT, not by session, and `$prevChats` is the chat list the
+# previous lease left in <lease>.json.chat (captured by New-Lease before it removed that sidecar). A
+# sibling chat of the same session is a DIFFERENT worker: it can lose the other chat's unsaved work, so it
+# must be told. The notice keeps the session as its key (notices are per session, and both chats of a
+# session read that session's notices).
+function Publish-SlotTakeover([string]$repoName, [string]$slot, [string]$ref, [string]$leaseId, [string]$path, [string[]]$prevChats = @()) {
   $sha = ''
   try { $sha = "$(& git -C $path rev-parse --short $ref 2>$null)".Trim() } catch { }
-  $prev = @(Get-SlotHistory $repoName $slot 20 | Where-Object { (P $_ 'event') -eq 'lease' -and (P $_ 'holder') -and (P $_ 'holder') -ne "$Session" })
+  # No `-ne $Session` filter: the slot history records the holder SESSION, and excluding my own session hid
+  # the exact case this task is about (a sibling chat of my session was the previous holder). The history
+  # is the fallback source of the holder name when no chat sidecar survived.
+  $prev = @(Get-SlotHistory $repoName $slot 20 | Where-Object { (P $_ 'event') -eq 'lease' -and (P $_ 'holder') })
   $holder = if ($prev.Count) { "$(P $prev[-1] 'holder')" } else { '' }
+  $prevChats = @($prevChats | Where-Object { $_ })
+  $current = Get-CurrentChatId
+  # Suppress ONLY when the current chat is provably one of the chats that was working in the slot: then the
+  # work never left this chat's hands and the note would be noise. An unknown chat id never suppresses.
+  $sameChat = [bool]($current -and ($prevChats -contains $current))
   Add-SlotHistory $repoName $slot 'takeover-backup' $holder $ref $sha "taken by $Session for lease $leaseId"
-  Write-Journal @{ event = 'lease-takeover'; resource = "slot:${repoName}:$slot"; ticket = $leaseId; holderSession = $holder; by = $Session; ref = $ref; sha = $sha; repo = $repoName }
-  if ($holder -and $holder -ne "$Session") {
+  Write-Journal @{ event = 'lease-takeover'; resource = "slot:${repoName}:$slot"; ticket = $leaseId; holderSession = $holder; holderChats = @($prevChats); by = $Session; byChat = "$current"; sameChat = $sameChat; ref = $ref; sha = $sha; repo = $repoName }
+  if (-not $sameChat -and ($holder -or $prevChats.Count)) {
     # The same notice channel a holder already reads (any agentq call prints its notices).
-    Add-LeaseNotice ([ordered]@{ repo = $repoName; slot = $slot; leaseId = $leaseId; purpose = "slot taken over by $Session"; branch = ''; session = $holder }) 'lease-takeover' "another session leased $repoName/$slot while your unsaved work was still in it; it was backed up BEFORE the reset" $ref
+    $displaced = if ($prevChats.Count) { " (chats displaced: $(@($prevChats) -join ', '))" } elseif ($holder -ne "$Session") { '' } else { ' (displaced chat unknown)' }
+    Add-LeaseNotice ([ordered]@{ repo = $repoName; slot = $slot; leaseId = $leaseId; purpose = "slot taken over by $Session$(if ($current) { " (chat $current)" })"; branch = ''; session = $holder }) 'lease-takeover' "another chat/session leased $repoName/$slot while your unsaved work was still in it$displaced; it was backed up BEFORE the reset" $ref
   }
   $who = if ($holder) { " (last holder: $holder)" } else { '' }
-  $script:TakeoverNote = "agentq: this slot still held another session's unsaved work$who - it was backed up BEFORE the reset, nothing was discarded.`n  ref      $ref  ($sha)`n  see it   agentq recover -Repo $repoName -Slot $slot`n  restore  agentq recover -Repo $repoName -Ref $ref -To `"<path of YOUR slot>`" -Apply"
+  # TASK 2: the NEW holder's note is suppressed on the SAME per-CHAT condition as the notice. This is the
+  # bug's other half: the old code suppressed it on `$holder -eq $Session`, so a sibling chat was told
+  # nothing, and a same-chat re-lease (where the note really is noise) has to stay quiet to keep the
+  # suppression meaningful. An unknown current chat ($sameChat false) NEVER suppresses - an extra note is
+  # cheap, a silent clobber is not.
+  if (-not $sameChat) {
+    # Name the displaced CHATS too: the session alone no longer identifies who lost the tree (a sibling chat
+    # of the same session re-leases without changing $holder), and the note is the only place that says so.
+    $chatTxt = if ($prevChats.Count) { " (chats displaced: $(@($prevChats) -join ', '))" } else { '' }
+    # "another session's" stays the wording for a genuine cross-session take-over (the recover suite pins that
+    # literal); a same-session sibling says "another chat's", which is what actually happened.
+    $rel = if ($holder -and $holder -ne "$Session") { "another session's" } else { "another chat's" }
+    $script:TakeoverNote = "agentq: this slot still held $rel unsaved work$who$chatTxt - it was backed up BEFORE the reset, nothing was discarded.`n  ref      $ref  ($sha)`n  see it   agentq recover -Repo $repoName -Slot $slot`n  restore  agentq recover -Repo $repoName -Ref $ref -To `"<path of YOUR slot>`" -Apply"
+  }
 }
 function Invoke-Recover {
   $repoName = $null
@@ -3022,7 +3139,7 @@ function Invoke-Land {
   try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
   $landQueuedAt = Now
-  $lease = $null; $hb = $null; $set = @(); $peersDone = $false
+  $lease = $null; $hb = $null; $set = @(); $peersDone = $false; $mergeLock = $null
   $bdir = Join-Path (Join-Path $Root 'batches') $repo.Name
   $myResult = Join-Path $bdir "$($t.id).json"
   $script:LandExit = 1
@@ -3046,8 +3163,29 @@ function Invoke-Land {
       $tl = Format-LandTiming $landQueuedAt $landAcquiredAt; if ($tl) { Write-Output $tl }
       $script:LandExit = $x; return
     }
+    # The ticket heartbeat starts BEFORE the merge mutex below, because waiting for the mutex can take
+    # minutes and a ticket whose `.hb` stops moving is reaped as STALE (Get-Live) - the land would lose its
+    # own lock to the wedge reaper while it was queued behind a sibling. The lease file does not exist yet,
+    # so it is passed by its (known) path: New-Lease writes the record and the heartbeat file later, and
+    # SetLastWriteTimeUtc on a missing path is caught and ignored until then.
+    $leaseHb = "$(Get-LeaseFile $repo.Name 'land').hb"
+    $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", $leaseHb)) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
+    # TASK 1: only ONE land may be in its merge/push phase per repo, whatever `land:<repo>` capacity says.
+    # At the default capacity 1 the ticket is already exclusive, so nothing is taken and the path is
+    # byte-for-byte the old one. At capacity 2 the second land waits here (bounded) instead of racing the
+    # same `land` worktree and the same origin/<onto> ref.
+    if ((Get-LandCapacity) -gt 1) {
+      $mergeBound = Get-LandMergeWaitSec
+      $mergeLock = Enter-LandMergeMutex $repo.Name $mergeBound
+      if (-not $mergeLock) {
+        Write-Journal @{ event = 'land-merge-mutex-timeout'; resource = $res; branch = $Onto; boundSec = $mergeBound; reason = "another land held the per-repo merge mutex for more than $([math]::Round($mergeBound / 60.0, 1)) min"; repo = $repo.Name }
+        [Console]::Error.WriteLine("land: REFUSED - another land is in its merge/push phase for $($repo.Name) and the merge mutex was not free within $([math]::Round($mergeBound / 60.0, 1)) min (config landMergeWaitMin). Nothing queued, nothing pushed, no slot taken. Re-run the land when the other one finished (agentq status -All / agentq log).")
+        $script:LandExit = 3
+        return
+      }
+      Write-Journal @{ event = 'land-merge-enter'; resource = $res; branch = $Onto; ticket = $t.id; repo = $repo.Name }
+    }
     $lease = New-Lease $repo 'land' 'land' $why '' $PID 10 $false
-    $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", "$($lease.file).hb")) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
     $wt = $lease.path
     & git -C $main fetch -q origin 2>$null
@@ -3121,6 +3259,15 @@ function Invoke-Land {
     if ($lease) {
       $l = (Read-Leases $repo.Name | Where-Object { $_.slot -eq 'land' -and $_.leaseId -eq $lease.leaseId } | Select-Object -First 1)
       if ($l) { $ref = try { Backup-Slot $l.path $repo.Name 'land' 'land finished' } catch { "backup-failed: $($_.Exception.Message)" }; Remove-LeaseRecord $l 'unlease' 'land finished' $ref }
+    }
+    # TASK 1: the per-repo merge mutex is given back LAST, after the `land` slot lease is gone. The next land
+    # that wins the mutex immediately leases the single `land` slot, and there is exactly one of those per
+    # repo: releasing the mutex first would let it block on the slot this land had not yet handed back.
+    # Journaled, so a repo's merge windows are readable from the log without a lock dump.
+    if ($mergeLock) {
+      Exit-LandMergeMutex $mergeLock
+      Write-Journal @{ event = 'land-merge-exit'; resource = $res; branch = $Onto; ticket = $t.id; repo = $repo.Name }
+      $mergeLock = $null
     }
     Remove-Item -LiteralPath $t.file, "$($t.file).hb" -Force -ErrorAction SilentlyContinue
   }
