@@ -201,6 +201,44 @@ Check 'an unregistered task is not a failure' (($r.Exit -eq 0) -and (Contains $r
 $r = Invoke-Prewarm @('-RepairTask', '-TaskFile', $elsewhere)
 Check 'a repair refuses to run from the test seam' (($r.Exit -eq 2) -and (Contains $r.Out 'cannot run from -TaskFile'))
 
+# 12b. The window against the cadence. A window shorter than the interval between ticks cannot see work
+# that begins just after the previous tick, and the interval is not always the nominal one: measured
+# 2026-11-27 over 105 intervals, 10 ran past the PT20M cadence and 3 past 25 min, worst 99.8 min, every
+# one of them with the machine heavily loaded. A skipped trigger is invisible in a log that only records
+# the ticks that did fire, so the guard reads the trigger itself. The seam supplies the cadence, so this
+# is proven without reading or rewriting this machine's real task.
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $target, '-TaskCadenceMin', '20')
+Check 'a window at the default clears a 20 min cadence' (($r.Exit -eq 0) -and (Contains $r.Out 'window 25 min against a cadence of 00:20'))
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $target, '-TaskCadenceMin', '20', '-ActivityMin', '10')
+Check 'a window narrower than the cadence is refused' (($r.Exit -eq 1) -and (Contains $r.Out 'TOO NARROW'))
+Check 'the refusal names the number that would pass' (Contains $r.Out '-ActivityMin 25')
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $target, '-TaskCadenceMin', '26')
+Check 'a cadence wider than the default window is refused' (($r.Exit -eq 1) -and (Contains $r.Out 'TOO NARROW'))
+$r = Invoke-Prewarm @('-VerifyTask', '-TaskFile', $target, '-ActivityMin', '31', '-TaskCadenceMin', '26')
+Check 'the window the refusal names passes its own cadence' (($r.Exit -eq 0) -and (Contains $r.Out 'window 31 min'))
+
+# 12c. The self-sizing window. What the gate must cover is the interval since the machine was last
+# LOOKED AT, because a round that was delayed or skipped leaves a hole no fixed window can see into.
+# All three directions are asserted: an event outside the floor is still warmed when the previous round
+# was further back; the same event is ignored when that round was recent (so the floor still means
+# something); and a long outage is capped rather than resurrecting work nobody is waiting for.
+$stampFile = Join-Path $coord 'prewarm\last-tick-vitals-win'
+Reset-State
+Journal 'vitals' 35
+[IO.File]::WriteAllText($stampFile, [DateTime]::UtcNow.AddMinutes(-40).ToString('o'))
+$r = Invoke-Prewarm @('-VmState', 'SUSPENDED')
+Check 'an event outside the floor is warmed when the previous round was further back' ((Contains $script:Calls 'resume ws-vitals-win') -and (Contains $r.Out 'extended to 41 min')) "out=$($r.Out.Trim())"
+Reset-State
+Journal 'vitals' 35
+[IO.File]::WriteAllText($stampFile, [DateTime]::UtcNow.ToString('o'))
+$r = Invoke-Prewarm @('-VmState', 'SUSPENDED')
+Check 'the same event is ignored when the previous round was recent' ((-not (Contains $script:Calls 'resume')) -and (Contains $r.Out 'nothing to warm for'))
+Reset-State
+Journal 'vitals' 50
+[IO.File]::WriteAllText($stampFile, [DateTime]::UtcNow.AddMinutes(-90).ToString('o'))
+$r = Invoke-Prewarm @('-VmState', 'SUSPENDED')
+Check 'the window is capped so a long outage does not resurrect old work' ((-not (Contains $script:Calls 'resume')) -and (Contains $r.Out 'extended to 45 min'))
+
 # 13. The doctor's own prewarm check. Everything above proves the tick is bounded; this proves the
 # report a person reads agrees with the exit code a scheduler reads, in all four states. It is driven
 # with -Only prewarm so it stays fast and isolated, and with AGENTQ_PREWARM_TICKLOG pointed at a

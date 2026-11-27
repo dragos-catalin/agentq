@@ -102,7 +102,18 @@ param(
     [string]$Ws,
     [string]$Repo = 'vitals',
     [int]$MaxResumesPerDay = 6,
-    [int]$ActivityMin = 10,
+  # Must exceed the scheduled task's interval (PT20M) by a margin. The journal is only read when the
+  # tick fires, so activity starting just after a tick is invisible to a window shorter than the
+  # cadence: measured with -ActivityMin 10 against PT20M, activity in the 25 min before the tick but
+  # not in the 10 min before it was missed on 76 of 409 (workspace, tick) pairs - 19% of the ticks
+  # that had something to warm ran blind. -VerifyTask fails when this is below the task's interval.
+  [int]$ActivityMin = 25,
+  # The ceiling for the self-sized window (see the gate below): twice the cadence plus margin, so a
+  # skipped tick is still covered but a long outage is not. Past this the warm is pointless anyway -
+  # the whole job of a prewarm is to hide a ~41 s resume behind an imminent gate, and work submitted
+  # more than 45 min before the tick runs has already been waiting on a machine that never came up.
+  # It caps the window, not the number of resumes: -MaxResumesPerDay does that.
+  [int]$MaxWindowMin = 45,
     [int]$WaitSec = 0,
     [int]$MaxJournalLines = 600,
     [int]$MaxTickSec = 0,
@@ -121,6 +132,9 @@ param(
     # able to run the task's OWN recorded command line against the copy it names.
     [string]$TaskName = 'codai-workspace-prewarm',
     [string]$TaskFile,
+    # A second test seam: the cadence a real scheduled task would report. Kept apart from -TaskFile so a
+    # test can exercise the window-vs-cadence guard without reading, or rewriting, a real task.
+    [int]$TaskCadenceMin = 0,
     [switch]$VerifyTask,
     [switch]$RepairTask
 )
@@ -143,14 +157,23 @@ $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Pa
 if ($VerifyTask -or $RepairTask) {
     $tn = if ($TaskName) { $TaskName } else { 'codai-workspace-prewarm' }
     $action = $null
+    $cadences = @()
     if ($TaskFile) {
         # A test seam: no scheduled task is read, and -RepairTask is refused below, because a value a
         # test supplied must never rewrite a real task.
         $action = [pscustomobject]@{ Execute = 'pwsh.exe'; Arguments = ('-NoProfile -File "' + $TaskFile + '"') }
+      if ($TaskCadenceMin -gt 0) { $cadences = @([TimeSpan]::FromMinutes($TaskCadenceMin)) }
     } else {
         $task = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
         if (-not $task) { Write-Output ("task '{0}' is not registered on this host - nothing points at any copy" -f $tn); exit 0 }
         $action = @($task.Actions)[0]
+      # ISO 8601 (PT20M), which is what a ScheduledTasks repetition interval holds - TimeSpan.Parse
+      # does not read that form, XmlConvert does. A trigger without a repetition has no cadence to
+      # compare against, and the guard then stays silent rather than guessing one.
+      foreach ($tr in @($task.Triggers)) {
+        $iv = "$($tr.Repetition.Interval)"
+        if ($iv) { try { $cadences += [Xml.XmlConvert]::ToTimeSpan($iv) } catch { } }
+      }
     }
     $argLine = "$($action.Arguments)"
     $found = [regex]::Match($argLine, '-File\s+"?([^"]+?)"?(\s|$)')
@@ -170,10 +193,30 @@ if ($VerifyTask -or $RepairTask) {
         Write-Output ("re-pointed '{0}' but it now names '{1}' - read it back by hand" -f $tn, $now)
         exit 1
     }
-    if ($same) { Write-Output ("task '{0}' runs this copy ({1})" -f $tn, $self); exit 0 }
-    Write-Output ("task '{0}' runs a DIFFERENT copy: '{1}'" -f $tn, $runs)
-    Write-Output ('fix: pwsh -NoProfile -File "' + $self + '" -RepairTask')
-    exit 1
+    if (-not $same) {
+      Write-Output ("task '{0}' runs a DIFFERENT copy: '{1}'" -f $tn, $runs)
+      Write-Output ('fix: pwsh -NoProfile -File "' + $self + '" -RepairTask')
+      exit 1
+    }
+    # The window is an argument of the action, not a property of the path, so it is read from the same
+    # line the path came from: -VerifyTask must judge what the tick will actually use, not this file's
+    # default. A path-only repair cannot fix a wrong window, which is why this is a separate verdict.
+    $window = $ActivityMin
+    $fromAction = [regex]::Match($argLine, '-ActivityMin\s+(\d+)')
+    if ($fromAction.Success) { $window = [int]$fromAction.Groups[1].Value }
+    if ($cadences.Count) {
+      $cad = ($cadences | Measure-Object -Minimum).Minimum
+      $margin = [TimeSpan]::FromMinutes(5)
+      if ([TimeSpan]::FromMinutes($window) -lt $cad + $margin) {
+        Write-Output ("task '{0}' runs this copy ({1}) but its window is TOO NARROW: -ActivityMin {2} against a cadence of {3:hh\:mm} - the journal is read only when the tick fires, so activity that starts just after a tick is invisible to the window and the tick skips a machine it had something to warm" -f $tn, $self, $window, $cad)
+        Write-Output ('fix: run the task with -ActivityMin {0} or more (cadence + 5 min), and put the same number in this file''s default' -f [int]($cad.TotalMinutes + 5))
+        exit 1
+      }
+      Write-Output ("task '{0}' runs this copy ({1}); window {2} min against a cadence of {3:hh\:mm}" -f $tn, $self, $window, $cad)
+      exit 0
+    }
+    Write-Output ("task '{0}' runs this copy ({1})" -f $tn, $self)
+    exit 0
 }
 
 $dir = Join-Path $Root 'prewarm'
@@ -443,6 +486,29 @@ if ($served.Count -eq 0) { $served = @($Repo) }
 $reg = $registry[$Ws]
 $vm = "ws-$Ws"
 
+# ---- how far back the activity gate must look ---------------------------------------------------
+# A fixed window cannot see work that began just after a tick, and the trigger does not always fire on
+# time: measured 2026-11-27 over 105 tick intervals, 10 exceeded the 20 min cadence and 3 exceeded
+# 25 min (worst 99.8 min), each of them while the machine was heavily loaded - so ticks are skipped
+# exactly when there is work to warm for. The window is therefore at least -ActivityMin and at least
+# the interval since this machine was last decided on, which makes coverage independent of punctuality.
+# The stamp is written when the round STARTS, so it records when the machine was last looked at rather
+# than what was found, and it is advanced even by a round that decides to do nothing. It is PER
+# WORKSPACE: a targeted `agentq prewarm -Ws x` says only that x was looked at, and letting it shrink
+# every other machine's window would recreate the hole this exists to close.
+$windowMin = $ActivityMin
+$gapMin = $null
+$stamp = Join-Path $dir "last-tick-$Ws"
+if (Test-Path -LiteralPath $stamp) {
+  $prev = To-UtcInstant (Get-Content -LiteralPath $stamp -Raw -ErrorAction SilentlyContinue)
+  if ($prev) {
+    # +1 min: the round's own duration and scheduler jitter must not leave a sliver no tick covers.
+    $gapMin = [Math]::Round(([DateTime]::UtcNow - $prev).TotalMinutes, 1) + 1
+    if ($gapMin -gt $windowMin) { $windowMin = [int][Math]::Min($gapMin, [Math]::Max($MaxWindowMin, $ActivityMin)) }
+  }
+}
+try { [IO.File]::WriteAllText($stamp, [DateTime]::UtcNow.ToString('o'), [Text.UTF8Encoding]::new($false)) } catch { }
+
 # ---- state -------------------------------------------------------------------------------------
 $state = $VmState
 $measured = $false
@@ -497,7 +563,11 @@ if ($used -ge $MaxResumesPerDay) {
 # The journal is the record of what agents actually did (agentq writes one line per acquisition, start
 # and finish). Activity on the repos this workspace serves, inside the window, is the whole signal: no
 # entries means nothing to warm for, and the tick costs one file read.
-$since = [DateTime]::UtcNow.AddMinutes(-$ActivityMin)
+# The sentence keeps the -ActivityMin number as the floor a caller asked for, and names the extension
+# separately when the window had to grow: a reader who set 25 and sees "47 min" would otherwise think
+# the tool ignored the flag.
+$ext = if ($windowMin -ne $ActivityMin) { " (extended to ${windowMin} min: the previous tick was $($gapMin - 1) min ago)" } else { '' }
+$since = [DateTime]::UtcNow.AddMinutes(-$windowMin)
 $active = 0
 $newest = $null
 foreach ($line in Read-Lines $journal $MaxJournalLines) {
@@ -508,17 +578,17 @@ foreach ($line in Read-Lines $journal $MaxJournalLines) {
     if ($served -contains "$($e.repo)") { $active++; if (-not $newest -or $ts -gt $newest) { $newest = $ts } }
 }
 if ($active -eq 0) {
-    Say "no $($served -join '/') activity in the last ${ActivityMin} min (last $MaxJournalLines journal lines); nothing to warm for"
+  Say "no $($served -join '/') activity in the last ${ActivityMin} min$ext (last $MaxJournalLines journal lines); nothing to warm for"
     exit 0
 }
-Say "$active journal entr$(if ($active -eq 1) { 'y' } else { 'ies' }) in the last ${ActivityMin} min (newest $($newest.ToString('HH:mm:ss'))Z); warming"
+Say "$active journal entr$(if ($active -eq 1) { 'y' } else { 'ies' }) in the last ${ActivityMin} min$ext (newest $($newest.ToString('HH:mm:ss'))Z); warming"
 
 # ---- resume -------------------------------------------------------------------------------------
 Say "resuming $vm ($($used + 1)/$MaxResumesPerDay today)"
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 & $Gcloud compute instances resume $vm --project $reg.project --zone $reg.zone --quiet | Out-Null
 $rc = $LASTEXITCODE
-Note @{ ws = $Ws; vm = $vm; action = $(if ($rc -eq 0) { 'resume' } else { 'resume-failed' }); state = $state; reason = "activity:$active/${ActivityMin}min"; exit = $rc }
+Note @{ ws = $Ws; vm = $vm; action = $(if ($rc -eq 0) { 'resume' } else { 'resume-failed' }); state = $state; reason = "activity:$active/${windowMin}min"; exit = $rc }
 if ($rc -ne 0) { Say "resume failed (exit $rc)"; exit 1 }
 if ($WaitSec -le 0) { Say 'resumed; not waiting (-WaitSec 0)'; exit 0 }
 
