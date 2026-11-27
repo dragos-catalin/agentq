@@ -27,6 +27,13 @@ HEAL  nobody claimed the job and the workspace heartbeat has not moved since the
   state: it fires when the heartbeat is older than the submission (precise) or has been silent for the
   whole wait (robust to a clock skew between this machine and the workspace), and the 3 min wait is only
   a floor - the heartbeat comparison is what makes the reset safe.
+  A wake THIS run performed (SUSPENDED/TERMINATED -> resume/start) shortens the FIRST wait before the
+  evidence is read (-WakeFirstHealMin / cloudWakeFirstHealMin, default 0.5 min = 30 s): a resumed VM does
+  not re-run its startup script, so a runner frozen across the suspend is the dominant hypothesis and a
+  3 min observation window only delays the fix (measured 2026-11-27: land #5 spent 217 s of its 892 s
+  landing in queue->claim, 180 s of it exactly that first window, then a 37 s reset+claim). The DECISION
+  is unchanged - a live heartbeat still yields 'none' and a live peer marker still yields 'skip-peer' -
+  only the wait before the SAME evidence is read shrinks; a VM that was already RUNNING keeps the floor.
   The heal is REPEATED and BOUNDED (3 attempts) with a doubling backoff (StaleClaimMin, 2x, 4x), and the
   deadline is extended to reach each attempt: a one-shot guard let a SECOND failure die at the deadline
   with "no result before deadline" (38 in the journal). -NoHeal runs exactly as before, with no heals.
@@ -51,6 +58,9 @@ EXIT  remote exit code; 3 = timed out waiting after submit; 4 = workspace unavai
 $Ws = 'codai'; $Purpose = $null; $Lane = 'gate'; $TimeoutMin = 60; $RepoArg = $null; $NoPatch = $false
 $Status = $false; $Suspend = $false; $Json = $false; $Project = $null; $Zone = $null; $CtlProject = 'dragos-devcloud'; $NoInstall = $false
 $StaleClaimMin = 3; $NoHeal = $false
+# The first heal wait when THIS run performed the wake (see the HEAL note in the header). Only the base
+# of the doubling changes, so the attempts still pace 30 s, 1 min, 2 min instead of 3, 6, 12 min.
+$WakeFirstHealMin = 0.5
 # Opt-in non-blocking wake. OFF by default: the default path is untouched (the resume is awaited before
 # the bundle, exactly as before). ON (-AsyncResume or cloudAsyncResume:true) files the wake and lets the
 # delta build while the VM warms, with the only wait moved to the acceptance point (see Wait-VmWake).
@@ -66,6 +76,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     'timeoutmin' { $TimeoutMin = [int](& $val) } 'repo' { $RepoArg = & $val } 'nopatch' { $NoPatch = $true }
     'noinstall' { $NoInstall = $true } 'status' { $Status = $true } 'suspend' { $Suspend = $true } 'json' { $Json = $true }
     'staleclaimmin' { $StaleClaimMin = [int](& $val) } 'noheal' { $NoHeal = $true }
+    'wakefirsthealmin' { $WakeFirstHealMin = [double](& $val) }
     'asyncresume' { $AsyncResume = $true } 'asyncresumewaitsec' { $AsyncResumeWaitSec = [int](& $val) }
     'project' { $Project = & $val } 'zone' { $Zone = & $val } 'ctlproject' { $CtlProject = & $val }
     default { [Console]::Error.WriteLine("agentq-cloud: unknown argument '$a' (put the command after --)"); exit 2 }
@@ -90,6 +101,8 @@ try {
     if ($ar -and ($ar.Value -eq $true -or "$($ar.Value)" -match '^(?i)true|1$')) { $AsyncResume = $true }
     $aw = $cfgObj.PSObject.Properties['cloudAsyncResumeWaitSec']
     if ($aw -and "$($aw.Value)" -match '^\d+$') { $AsyncResumeWaitSec = [int]$aw.Value }
+    $wf = $cfgObj.PSObject.Properties['cloudWakeFirstHealMin']
+    if ($wf -and "$($wf.Value)" -match '^\d+(\.\d+)?$') { $WakeFirstHealMin = [double]$wf.Value }
   }
 } catch { [Console]::Error.WriteLine("agentq-cloud: cloudRegistry ignored ($($_.Exception.Message))") }
 if (-not $Registry.ContainsKey($Ws) -and -not ($Project -and $Zone)) { [Console]::Error.WriteLine("agentq-cloud: unknown workspace '$Ws' (known: $($Registry.Keys -join ', '); or pass -Project/-Zone)"); exit 2 }
@@ -595,12 +608,16 @@ try {
   $healCount = 0
   $healCursor = $queuedAt
   $skippedPeers = @{}
+  # The base of the heal backoff: short only when THIS run woke the VM ($resumeAt is set by a resume/start
+  # in this run), because then a heartbeat that predates our own queue is proof of a frozen runner rather
+  # than an unknown peer's long job. A VM that was already RUNNING keeps the conservative StaleClaimMin.
+  $healFirstMin = if ($resumeAt) { $WakeFirstHealMin } else { $StaleClaimMin }
   while ([DateTime]::UtcNow -lt $deadline) {
     if ($resumeAt -and -not $runningAt) { if ((Get-VmStatus) -eq 'RUNNING') { $runningAt = [DateTime]::UtcNow; Out-Line ("[agentq-cloud] {0} RUNNING after {1:N0}s" -f $Vm, ($runningAt - $resumeAt).TotalSeconds) } }
     if (-not $claimedAt) { if (Read-Gcs "$Bucket/jobs/$id/claimed") { $claimedAt = [DateTime]::UtcNow } }
     # Cheap pre-filter: no evidence is read (no GCS, no compute) until this attempt's backoff has elapsed.
     $sinceCursor = ([DateTime]::UtcNow - $healCursor).TotalMinutes
-    if (-not $claimedAt -and -not $NoHeal -and $healCount -lt $HealMax -and $sinceCursor -ge (Get-HealBackoffMin -HealsDone $healCount -FirstMin $StaleClaimMin)) {
+    if (-not $claimedAt -and -not $NoHeal -and $healCount -lt $HealMax -and $sinceCursor -ge (Get-HealBackoffMin -HealsDone $healCount -FirstMin $healFirstMin)) {
       $sinceQueue = ([DateTime]::UtcNow - $queuedAt).TotalMinutes
       $hbAt = $null
       try { $hb = (Read-Gcs "$Bucket/ws/$Ws/heartbeat") | ConvertFrom-Json; if ($hb.PSObject.Properties['at']) { $hbAt = ([DateTime]$hb.at).ToUniversalTime() } } catch { $hbAt = $null }
