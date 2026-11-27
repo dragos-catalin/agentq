@@ -110,6 +110,11 @@ $poolPath = Join-Path $psRoot 'devcloud\pool-suites.ps1'
 $poolText = if (Test-Path -LiteralPath $poolPath) { Get-Content -LiteralPath $poolPath -Raw } else { '' }
 Check 'pool-suites passes a -LogDir to run-all (the per-suite logs outlive the job)' ($poolText -match '(?m)-LogDir\s+\$\w+')
 Check 'pool-suites echoes the FAILED suites own logs into stdout (the streaming channel)' (($poolText -match '(?m)-Filter\s+\*\.log') -and ($poolText -match 'AGENTQ-POOL-SUITES: ----'))
+# A WEDGED suite must be reported, not left holding a pool slot until the infrastructure timeout
+# (2026-11-27: the whole gate was one suite waiting out a bound, and nothing bounded a genuinely hung
+# one). -TimeoutMin is the bound; -Parallel is pinned so a parallelism change is a deliberate edit.
+Check 'pool-suites bounds every suite with -TimeoutMin (a wedge is reported, not held)' ($poolText -match '(?m)-TimeoutMin\s+\d+')
+Check 'pool-suites passes an explicit -Parallel' ($poolText -match '(?m)-Parallel\s+\$Parallel')
 
 # --- MUTATION: a bare local command must be DETECTED (the rule is not vacuous) ---------------------
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aq-lgpool-' + [guid]::NewGuid().ToString('N').Substring(0, 6))

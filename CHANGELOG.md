@@ -61,6 +61,26 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Fixed
 
+- **A re-lease that NAMES a slot my own session already holds waited out the whole scratch staleness bound
+  (15 min).** `-Slot scratch-N` skipped D5's reuse-before-renting fast path, which only fired for an UNNAMED
+  request: it fell into `New-Lease`, found the slot held by my own still-fresh session and NOT stale, and
+  polled until `leaseScratchIdleMin` (15 min) expired it - every poll hand-building a string of every held
+  lease. Measured in `ps/tests/test-lease-spawns.ps1`: **905 s** at `-Parallel 4` and **906 s** at `-Parallel 8`
+  (constant, so contention is not the cause), while every other suite in the same runs is 2-60 s - that ONE
+  wait was **87% of the devcloud pool gate (1044 s)** and of every land pre-gate that rents through it.
+  `Get-SlotReuse` now takes the explicit slot, so a named re-lease of my own CLEAN slot returns at once (the
+  same reuse, only reached through `-Slot`). `Test-GitClean` still refuses a dirty slot, which keeps the old
+  wait-then-take-over path and its backup, and `-Wait` is still excluded, so the pre-gate - which RESETS the
+  slot it rents - is unaffected. Verified: the same suite on the same machine, **10 s**, `PASS (11)`
+  (906 s -> 10 s), with the reuse leg still resolving the repo in ONE combined `rev-parse` and ZERO
+  `worktree list`/`prune` spawns.
+- **Nothing bounded a genuinely wedged pool suite.** `devcloud/pool-suites.ps1` called `run-all.ps1` with no
+  `-TimeoutMin`, so a hung suite held its pool slot until the job's own infrastructure timeout. It now passes
+  `-TimeoutMin 20` - ~10x the honest worst case (slowest suite 60 s, whole 16-suite run < 2 min) - so a wedge
+  is reported as a failed suite WITH its log (the `-LogDir` echo) instead of a silent hold. The static ratchet
+  in `test-land-gate-pool.ps1` now pins both `-TimeoutMin` and an explicit `-Parallel`, so changing either is
+  a deliberate edit rather than an accident.
+
 - **The scheduled terminal reap never finished, so no terminal was ever reaped.** `reap-terminals.ps1` called
   `console-signal.ps1` with no timeout; console-signal wedges inside `AttachConsole`, so the reaper blocked there
   **before** the grace/force steps, and every 30-minute run leaked two processes that never exited (11 stuck pairs,

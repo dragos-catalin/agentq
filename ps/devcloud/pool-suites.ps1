@@ -67,7 +67,12 @@ if (-not (Test-Path -LiteralPath $runAll)) { "AGENTQ-POOL-SUITES: no $runAll - r
 # unreadable). We keep the logs, and echo every FAILED suite's log into STDOUT - stdout IS
 # streamed to jobs/<id>/log, so the evidence outlives the VM. No devcloud-side change needed.
 $poolLogDir = Join-Path ([IO.Path]::GetTempPath()) ('aq-pool-logs-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-& pwsh -NoProfile -File $runAll -Only ($gateList -join ',') -Parallel $Parallel -LogDir $poolLogDir
+# -TimeoutMin: a WEDGED suite must not hold a pool slot until the infrastructure timeout. Measured
+# 2026-11-27 (per-suite table of a full pool run): apart from the 900 s lease-reuse wait that agentq
+# itself now fixes, the slowest suite is 60 s and the whole 16-suite run finishes in < 2 min, so 20 min
+# is ~10x the honest worst case and only fires on a real wedge. Bounded, so it is a report and not a
+# silent hold; a suite that hits it is reported as failed with its log (the -LogDir block below).
+& pwsh -NoProfile -File $runAll -Only ($gateList -join ',') -Parallel $Parallel -TimeoutMin 20 -LogDir $poolLogDir
 $rc = $LASTEXITCODE
 if (Test-Path -LiteralPath $poolLogDir) {
     foreach ($lf in @(Get-ChildItem -LiteralPath $poolLogDir -Filter *.log -ErrorAction SilentlyContinue)) {
