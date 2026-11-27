@@ -981,7 +981,10 @@ function Show-SlotShare {
   $cap = [int](Get-TaskSlotBudget).cap
   $sh = Get-SlotShare $leases $Session $cap
   $mine = @($leases | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
-  $held = ($mine | ForEach-Object { " [$($_.slot) $(P $_ 'role' '')]" }) -join ''
+  # repo/slot, not the bare slot: the same slot NAME lives in every repo (`codai\scratch-1` next to
+  # `marcai\scratch-1`), so a bare name made two sessions in different repos read as one duplicate lease
+  # (2026-11-27: a "duplicate leases" report that was two repos, the display was the only thing wrong).
+  $held = ($mine | ForEach-Object { " [$($_.repo)/$($_.slot) $(P $_ 'role' '')]" }) -join ''
   Write-Output ("SLOT SHARE {0}{1} held by my session {2}{3}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) sessions compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (no other session competes)' }), $Session, $held)
 }
 # Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one

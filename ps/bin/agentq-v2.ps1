@@ -237,8 +237,19 @@ function Read-JsonFile([string]$file) {
 }
 function With-Mutex([string]$name, [scriptblock]$body) {
   $m = [Threading.Mutex]::new($false, "Global\agentq-$(Safe $name)$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
-  try { try { [void]$m.WaitOne(30000) } catch [Threading.AbandonedMutexException] {} ; & $body }
-  finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
+  # 2026-11-27: 30000 was a SILENT cap - the boolean was discarded, so a caller that lost the race sat in
+  # WaitOne for the full 30 s of dead time and then ran the body ANYWAY (the mutex is not held by then, so
+  # 30 s bought nothing). Every `land capacity` pool run reported sec=30, and a local land that contended
+  # twice took 64.7 s = 2x30 + work, while the suite's own assertions take ~1 s. Bound it, say so when the
+  # wait is exhausted, and let a test shrink it (AGENTQ_MUTEX_WAIT_MS) instead of waiting 30 s to prove a
+  # timeout path.
+  $w = [int]$env:AGENTQ_MUTEX_WAIT_MS; if ($w -le 0) { $w = 30000 }
+  try {
+    try {
+      if (-not $m.WaitOne($w)) { try { Write-Journal @{ event = 'mutex-timeout'; mutex = "agentq-$name"; waitedMs = $w } } catch {} }
+    } catch [Threading.AbandonedMutexException] {}
+    & $body
+  } finally { try { $m.ReleaseMutex() } catch {} ; $m.Dispose() }
 }
 # TASK 1: with `landCapacity: 2` TWO lands may hold `land:<repo>` at once, and the merge/push phase - the
 # part that actually moves origin/<onto> - must still be mutually exclusive per repo. This is that mutex:

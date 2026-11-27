@@ -99,6 +99,15 @@ try {
   $c5 = LandCap '' 'cap-after'
   Check '1e an explicit land -Capacity does not outlive the flag' ($c5 -eq '1') "cap=$c5"
 
+  # 1f/1g: With-Mutex capped its wait at 30 s and DISCARDED the result, so a caller that lost the race sat
+  # the full 30 s of dead time and then ran the body anyway - the mutex is free by then, so the 30 s bought
+  # nothing at all. Every pool run of this suite reported sec=30 while its own assertions take ~1 s. Pin that
+  # the bound is a knob and that an exhausted wait is OBSERVED, not silently swallowed (2026-11-27).
+  $v2Text = Get-Content -LiteralPath (Join-Path (Split-Path $Aq -Parent) 'agentq-v2.ps1') -Raw
+  Check '1f With-Mutex bounds the wait through a knob, not a bare silent 30000' ($v2Text -match 'AGENTQ_MUTEX_WAIT_MS')
+  Check '1g the exhausted mutex wait is observable (WaitOne result used + journalled)' `
+    (($v2Text -match 'if \(-not \$m\.WaitOne\(\$w\)\)') -and ($v2Text -match "event = 'mutex-timeout'"))
+
   # ======================= 2+3. cap 2: two lands at once, merges strictly serialised =======================
   WriteCfg '"landCapacity":2'
   foreach ($b in 'b1', 'b2') {

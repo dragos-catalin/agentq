@@ -54,6 +54,13 @@
   was structurally below the ~4200-4600 s the full list needs. A gate that cannot finish inside its
   own cap is a land that can never pass.
 
+.PARAMETER PoolParallel
+  Suite concurrency inside the pool job. Default 4, the value every measurement so far was taken at.
+  Raising it barely moves the total: the effective concurrency measured ~0.8 at 4 and the suites are
+  contention-bound on ONE pool checkout (git/lease work shares the same tree), so 4 -> 8 bought 1.3%
+  (1035.7 s vs 1049.2 s, i.e. inside the noise - a `-Parallel 8` "hang" was a misread of the serial
+  `install` barrier's legitimate silence). Exposed so a future change is measurable, not assumed.
+
 .PARAMETER Repo
   Repository to bundle. Default: this script's own repo (resolved through git, so a leased worktree
   slot resolves to the repo agentq knows about).
@@ -81,6 +88,7 @@ param(
     [string]$Resource = 'verify',
     [string]$Workspace = 'agentq',
     [int]$TimeoutMin = 90,
+    [int]$PoolParallel = 4,
     [string]$Repo,
     [string]$Purpose,
     [switch]$LocalOnly,
@@ -162,6 +170,12 @@ if (-not $gateList.Count) {
 $selection = $null
 try {
     . (Join-Path $repoRoot 'ps\bin\agentq-suite-inputs.ps1')
+# Dot-sourcing does NOT scope the sourced script's parameters: ITS `param()` block assigns
+# $RunPool / $Skip / $SuiteRepoKey / $PoolParallel straight INTO THIS SCOPE. Only PoolParallel collides
+# here, and the effect is completely silent - `-PoolParallel 7` is accepted and then reads back as the
+# sourced default 4, with no assignment anywhere in this file to grep for (2026-11-27; found by printing
+# the variable: 7 at the top of the script, 4 thirty lines later). Re-assert from the BINDING.
+if ($PSBoundParameters.ContainsKey('PoolParallel')) { $PoolParallel = [int]$PSBoundParameters['PoolParallel'] }
     $base = ''
     $u = "$(& git -C $repoRoot rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null)".Trim()
     if ($LASTEXITCODE -eq 0 -and $u) { $base = $u }
@@ -184,11 +198,11 @@ if (-not $Purpose) { $Purpose = "devcloud pool land gate (gateSuites.$RepoKey - 
 if ($LocalOnly) {
     $runAll = Join-Path $repoRoot 'ps\tests\run-all.ps1'
     "AGENTQ-CLOUD-GATE: -LocalOnly - running TODAY's local command on this workstation; nothing is submitted to the pool."
-    "AGENTQ-CLOUD-GATE: & pwsh -NoProfile -File $runAll -RepoSuites -Parallel 4"
+    "AGENTQ-CLOUD-GATE: & pwsh -NoProfile -File $runAll -RepoSuites -Parallel $PoolParallel"
     # run-all.ps1 reads AGENTQ_TEST_SKIP (its documented -Skip override), so the same narrowing applies here.
     if ($narrow) { $env:AGENTQ_TEST_SKIP = ($selection.Skip -join ',') } else { Remove-Item Env:AGENTQ_TEST_SKIP -ErrorAction SilentlyContinue }
     if ($narrow) { "AGENTQ-CLOUD-GATE: $selectionReason (AGENTQ_TEST_SKIP=$env:AGENTQ_TEST_SKIP)" } else { "AGENTQ-CLOUD-GATE: full list - $selectionReason" }
-    & pwsh -NoProfile -File $runAll -RepoSuites -Parallel 4
+    & pwsh -NoProfile -File $runAll -RepoSuites -Parallel $PoolParallel
     $localCode = $LASTEXITCODE
     if ($localCode -eq 0) { "AGENTQ-CLOUD-GATE: PASS (local exit 0; the pool was not used)" }
     else { "AGENTQ-CLOUD-GATE: FAILED (local exit $localCode; the pool was not used)" }
@@ -203,9 +217,9 @@ if ($LocalOnly) {
 # checkout and a missing key still fails loudly there. With no proven narrowing the command is
 # byte-for-byte today's, so the fallback path carries no new risk.
 if ($narrow) {
-    $inner = @('pwsh', '-NoProfile', '-File', 'ps/bin/agentq-suite-inputs.ps1', '-RunPool', '-SuiteRepoKey', $RepoKey, '-PoolParallel', '4', '-Skip', ($selection.Skip -join ','))
+    $inner = @('pwsh', '-NoProfile', '-File', 'ps/bin/agentq-suite-inputs.ps1', '-RunPool', '-SuiteRepoKey', $RepoKey, '-PoolParallel', "$PoolParallel", '-Skip', ($selection.Skip -join ','))
 } else {
-    $inner = @('pwsh', '-NoProfile', '-File', 'ps/devcloud/pool-suites.ps1', '-RepoKey', $RepoKey, '-Parallel', '4')
+    $inner = @('pwsh', '-NoProfile', '-File', 'ps/devcloud/pool-suites.ps1', '-RepoKey', $RepoKey, '-Parallel', "$PoolParallel")
 }
 
 $agentq = Join-Path $HOME '.copilot/bin/agentq.ps1'
@@ -217,6 +231,7 @@ $argv = @(
 ) + $inner
 
 if ($DryRun) {
+
     'agentq ' + ($argv[3..($argv.Count - 1)] -join ' ')
     "  workspace: $Workspace   resource: $Resource"
     "  repo key:  $RepoKey ($($gateList.Count) suites: $($gateList -join ', '))"

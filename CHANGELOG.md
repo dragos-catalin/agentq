@@ -81,6 +81,27 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   in `test-land-gate-pool.ps1` now pins both `-TimeoutMin` and an explicit `-Parallel`, so changing either is
   a deliberate edit rather than an accident.
 
+- **`With-Mutex` capped the wait at 30 s and then threw the answer away.** The `WaitOne(30000)` result was
+  discarded, so a caller that LOST the race sat in the wait for the full 30 s of dead time and then ran the
+  body anyway - the mutex is not held by then, so the 30 s bought nothing at all. Every `land capacity` pool
+  run reported `sec=30` while its own assertions take ~1 s, and a local land that contended twice took
+  **64.7 s** = 2x30 + work. The wait is now bounded by `$env:AGENTQ_MUTEX_WAIT_MS` (default 30000, so
+  production behaviour is unchanged), a `mutex-timeout` journal event records an exhausted wait, and a test
+  can shrink the bound instead of sleeping 30 s to exercise the timeout path.
+- **`SLOT SHARE` printed the bare slot name, so the same slot in two repos read as one duplicate lease.**
+  Slot names repeat per repo (`codai\scratch-1` beside `marcai\scratch-1`); a 2026-11-27 report of "duplicate
+  leases" was two repos with the display as the only defect. It now prints `[<repo>/<slot> <role>]`.
+- **`devcloud/gate.ps1` hardcoded the pool suite concurrency in four places** (the `-LocalOnly` run, its
+  echo, and both `$inner` argv shapes). There is now a `-PoolParallel` parameter (default 4, the value every
+  measurement was taken at) threaded through all four, and a help entry recording that 4 -> 8 is inside the
+  noise because the suites are contention-bound on one pool checkout. The parameter also exposed a scoping
+  trap worth naming: gate.ps1 dot-sources `ps/bin/agentq-suite-inputs.ps1`, whose OWN `param()` block
+  declares `[int]$PoolParallel = 4` - and dot-sourcing does not scope a sourced script's parameters, it
+  assigns them into the CALLER's scope. So `-PoolParallel 7` was accepted and then read back as **4**, with
+  no assignment anywhere in the file to grep for (the variable printed 7 at the top of the script and 4
+  thirty lines later). The knob is re-asserted from `$PSBoundParameters` after the dot-source, and a static
+  ratchet fails the suite if that re-assert is ever removed - otherwise the parameter is silently inert.
+
 - **The scheduled terminal reap never finished, so no terminal was ever reaped.** `reap-terminals.ps1` called
   `console-signal.ps1` with no timeout; console-signal wedges inside `AttachConsole`, so the reaper blocked there
   **before** the grace/force steps, and every 30-minute run leaked two processes that never exited (11 stuck pairs,
