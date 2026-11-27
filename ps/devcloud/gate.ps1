@@ -47,8 +47,12 @@
   agentq cloud workspace name. Default `agentq` (`cloudWorkspaces.agentq` -> `cloudRegistry.agentq`).
 
 .PARAMETER TimeoutMin
-  Wall-clock cap given to agentq. Default 60. The first run on a cold workspace also warms its
-  checkouts and its pnpm store.
+  Wall-clock cap given to agentq. Default 90. The first run on a cold workspace also warms its
+  checkouts and its pnpm store. Raised 60 -> 90 on 2026-11-27: `gateSuites.agentq` grew to 42 suites
+  and a live run was killed at `[devcloud] timeout after 3600s` with 30/42 done (measured effective
+  concurrency ~0.8 at -Parallel 4 - the suites are contention-bound on one pool checkout), so 3600 s
+  was structurally below the ~4200-4600 s the full list needs. A gate that cannot finish inside its
+  own cap is a land that can never pass.
 
 .PARAMETER Repo
   Repository to bundle. Default: this script's own repo (resolved through git, so a leased worktree
@@ -76,7 +80,7 @@
 param(
     [string]$Resource = 'verify',
     [string]$Workspace = 'agentq',
-    [int]$TimeoutMin = 60,
+    [int]$TimeoutMin = 90,
     [string]$Repo,
     [string]$Purpose,
     [switch]$LocalOnly,
@@ -98,7 +102,7 @@ ps/devcloud/gate.ps1 - agentq's land gate on the devcloud pool (landGate.agentq)
   pwsh -NoProfile -File ps/devcloud/gate.ps1                 submit gateSuites.agentq to ws-agentq
   pwsh -NoProfile -File ps/devcloud/gate.ps1 -DryRun         print the plan, submit nothing
   pwsh -NoProfile -File ps/devcloud/gate.ps1 -LocalOnly      run today's local command, verbatim
-  pwsh -NoProfile -File ps/devcloud/gate.ps1 -Resource verify -Workspace agentq -TimeoutMin 60
+  pwsh -NoProfile -File ps/devcloud/gate.ps1 -Resource verify -Workspace agentq -TimeoutMin 90
 
   -LocalOnly  runs `run-all.ps1 -RepoSuites -Parallel 4` HERE, on this workstation, and submits
               nothing. For a pool outage only - it is never a way to make a land pass.
