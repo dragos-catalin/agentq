@@ -61,6 +61,15 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Fixed
 
+- **Landing into the cloud pool waited the full three-minute staleness window on the first job after a
+  suspend.** A resumed VM does not re-run its startup script, so a runner frozen across the suspend looks
+  exactly like a healthy-but-busy one and the client only asked after `-StaleClaimMin` (3 min) had passed:
+  measured 2026-11-27, land #5 spent 217 s in `queue->claim`, 180 s of it exactly that window and 37 s of
+  reset+claim. The base of the heal doubling is now short (~30 s) **only when THIS run performed the
+  wake**; a VM this run did not wake keeps the conservative floor, and `Test-CloudPeerBusy` still refuses
+  to reset under a peer. New `-WakeFirstHealMin` / `cloudWakeFirstHealMin` (default 0.5 min); the policy
+  is the pure `Get-HealFirstIntervalMin`, driven by `ps/tests/test-agentq-cloud-heal.ps1` (behaviour, not
+  a text pin - the previous checks passed even with the three-minute window restored).
 - **A re-lease that NAMES a slot my own session already holds waited out the whole scratch staleness bound
   (15 min).** `-Slot scratch-N` skipped D5's reuse-before-renting fast path, which only fired for an UNNAMED
   request: it fell into `New-Lease`, found the slot held by my own still-fresh session and NOT stale, and

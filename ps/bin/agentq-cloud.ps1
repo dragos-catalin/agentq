@@ -263,6 +263,18 @@ function Get-HealBackoffMin {
   if ($FirstMin -le 0) { return 0 }
   [double]($FirstMin * [math]::Pow(2, [math]::Max(0, $HealsDone)))
 }
+function Get-HealFirstIntervalMin {
+  # The BASE of the doubling above (the 3 in 3, 6, 12) - short ONLY when THIS run performed the wake.
+  # A resumed VM does not re-run its startup script, so a heartbeat that predates our own queue entry is
+  # the signature of a runner frozen across the suspend, and the full -StaleClaimMin window is dead wait:
+  # measured 2026-11-27, land #5 spent 217 s in queue->claim, 180 s of it exactly that window and 37 s of
+  # reset+claim. A VM this run did NOT wake keeps the conservative floor, because a peer's long job there
+  # is indistinguishable from a wedge until its own marker says otherwise (Test-CloudPeerBusy still owns
+  # that decision - this only decides how long we look before asking).
+  param([bool]$Resumed = $false, [double]$WakeFirstHealMin = 0.5, [double]$StaleClaimMin = 3)
+  if ($Resumed) { return $WakeFirstHealMin }
+  return $StaleClaimMin
+}
 function Test-CloudPeerBusy {
   # True when ANOTHER job is in flight on this workspace. The runner publishes ws/<ws>/busy while it runs
   # a job ({job, host, at, timeoutSec, until}); a marker that names THIS job is not a peer, and a marker
@@ -611,7 +623,7 @@ try {
   # The base of the heal backoff: short only when THIS run woke the VM ($resumeAt is set by a resume/start
   # in this run), because then a heartbeat that predates our own queue is proof of a frozen runner rather
   # than an unknown peer's long job. A VM that was already RUNNING keeps the conservative StaleClaimMin.
-  $healFirstMin = if ($resumeAt) { $WakeFirstHealMin } else { $StaleClaimMin }
+  $healFirstMin = Get-HealFirstIntervalMin -Resumed ([bool]$resumeAt) -WakeFirstHealMin $WakeFirstHealMin -StaleClaimMin $StaleClaimMin
   while ([DateTime]::UtcNow -lt $deadline) {
     if ($resumeAt -and -not $runningAt) { if ((Get-VmStatus) -eq 'RUNNING') { $runningAt = [DateTime]::UtcNow; Out-Line ("[agentq-cloud] {0} RUNNING after {1:N0}s" -f $Vm, ($runningAt - $resumeAt).TotalSeconds) } }
     if (-not $claimedAt) { if (Read-Gcs "$Bucket/jobs/$id/claimed") { $claimedAt = [DateTime]::UtcNow } }

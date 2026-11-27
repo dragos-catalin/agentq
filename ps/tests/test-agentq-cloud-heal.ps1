@@ -22,7 +22,7 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
 # ---- the policy helpers, straight out of the production file --------------------------------------
 $tok = $null; $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tok, [ref]$errs)
-$fns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -match '(?i)CloudHeal|HealBackoff|CloudPeerBusy' }, $true))
+$fns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -match '(?i)CloudHeal|HealBackoff|HealFirstInterval|CloudPeerBusy' }, $true))
 Check 'the heal-policy helpers are defined in agentq-cloud.ps1' ($fns.Count -ge 3) "found $($fns.Count) in $Source"
 if ($fns.Count) { . ([scriptblock]::Create((($fns | ForEach-Object { $_.Extent.Text }) -join "`n"))) }
 if (-not (Get-Command Get-CloudHealDecision -ErrorAction SilentlyContinue)) {
@@ -87,13 +87,18 @@ Check 'the script journals a heal attempt index' ($src.Contains('attempt = $heal
 Check 'the one-shot $healedAt guard is GONE (assignment and gate both removed)' ((-not $src.Contains('$healedAt = [DateTime]::UtcNow')) -and (-not $src.Contains('-not $healedAt'))) 'still present'
 Check 'the runner publishes and clears ws/<ws>/busy' ((Test-Path (Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')) -and ([IO.File]::ReadAllText((Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')).Contains('ws/${cfg.ws}/busy'))) 'runner marker absent'
 # ---- the wake-shortened FIRST wait (2026-11-27): 180 s of dead wait per landing after a resume -----
-# The pre-filter's first interval is the base of the doubling, so the three checks below pin (a) that the
-# wake case is WIRED into the pre-filter (not merely declared), (b) that a VM this run did NOT wake keeps
-# the conservative floor, and (c) that the short value is configurable and defaults to 30 s. Remove any of
-# the three and the 3 min observation window is back for every first job after a suspend.
-Check 'the FIRST heal wait is short when THIS run woke the VM ($healFirstMin)' ($src.Contains('$healFirstMin = if ($resumeAt) { $WakeFirstHealMin } else { $StaleClaimMin }')) ''
-Check 'the pre-filter actually uses $healFirstMin (wired, not just declared)' ($src.Contains('-FirstMin $healFirstMin')) ''
-Check 'a VM this run did not wake keeps StaleClaimMin as the base' ($src.Contains('else { $StaleClaimMin }')) ''
-Check 'the wake-shortened first interval defaults to 0.5 min and is configurable' (($src.Contains('$WakeFirstHealMin = 0.5')) -and ($src.Contains("'wakefirsthealmin'")) -and ($src.Contains('cloudWakeFirstHealMin'))) ''
+# The pre-filter's first interval is the base of the doubling, so the checks below pin (a) the POLICY of
+# the helper itself, driven from the production definition, (b) that the helper is WIRED into the
+# pre-filter rather than declared and forgotten, and (c) that the short value is configurable and
+# defaults to 30 s. Delete (a) and the three-minute window is back for every first job after a suspend
+# while the text-style dispatch checks still pass - which is exactly what the previous, text-only pins
+# could not see.
+Check '(a) a wake in THIS run shortens the first interval to the wake value' ((Get-HealFirstIntervalMin -Resumed $true -WakeFirstHealMin 0.5 -StaleClaimMin 3) -eq 0.5) "got $(Get-HealFirstIntervalMin -Resumed $true -WakeFirstHealMin 0.5 -StaleClaimMin 3)"
+Check '(a) a VM this run did NOT wake keeps StaleClaimMin as the base' ((Get-HealFirstIntervalMin -Resumed $false -WakeFirstHealMin 0.5 -StaleClaimMin 3) -eq 3) "got $(Get-HealFirstIntervalMin -Resumed $false -WakeFirstHealMin 0.5 -StaleClaimMin 3)"
+Check '(a) the defaults are 30 s for the wake case and 3 min for the rest' (((Get-HealFirstIntervalMin -Resumed $true) -eq 0.5) -and ((Get-HealFirstIntervalMin -Resumed $false) -eq 3)) "got $(Get-HealFirstIntervalMin -Resumed $true)/$(Get-HealFirstIntervalMin -Resumed $false)"
+Check '(a) the shortened base still feeds the doubling (6 s->30 s then 1, 2 min)' (((Get-HealBackoffMin -HealsDone 0 -FirstMin (Get-HealFirstIntervalMin -Resumed $true)) -eq 0.5) -and ((Get-HealBackoffMin -HealsDone 1 -FirstMin (Get-HealFirstIntervalMin -Resumed $true)) -eq 1)) ''
+Check '(b) the pre-filter derives $healFirstMin from the helper (wired, not just declared)' ($src.Contains('$healFirstMin = Get-HealFirstIntervalMin')) ''
+Check '(b) the pre-filter actually uses $healFirstMin' ($src.Contains('-FirstMin $healFirstMin')) ''
+Check '(c) the wake-shortened first interval defaults to 0.5 min and is configurable' (($src.Contains('$WakeFirstHealMin = 0.5')) -and ($src.Contains("'wakefirsthealmin'")) -and ($src.Contains('cloudWakeFirstHealMin'))) ''
 
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }
