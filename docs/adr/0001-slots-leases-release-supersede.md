@@ -145,7 +145,9 @@ of the gate and given back. Three failure modes measured on 2026-11-23 are close
   Scratch slots are elastic by the same rule: `scratchSlots` (5) is the guaranteed floor, `scratchSlotsMax` (8) the
   ceiling, `scratchMinFreeGB` (25) the gate - a hard floor of 3 starved the `land` pre-gate, which rents a scratch
   slot for the length of the gate.
-- No global git config writes by any tool. All resources are per repo except `build:machine`.
+- No global git config writes by any tool. All resources are per repo except `build:machine` and
+  `gate:machine` (capacity 3 since 2026-11-27, config `gateMachineCap`, floor 1: a heavy gate/verify run takes
+  it beside its repo's `verify:<repo>`, so N repos cannot saturate the machine with N turbo gates at once).
 - Side locks are folded into agentq: brivio `deploy-mjs.lock` is skipped when `AGENTQ_HELD` contains `deploy:brivio`, and `deploy.mjs` builds services from `DEPLOY_WORKTREE` instead of creating its own worktree.
 
 ### 6. Visibility
