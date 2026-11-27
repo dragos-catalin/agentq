@@ -176,10 +176,6 @@ try {
 # sourced default 4, with no assignment anywhere in this file to grep for (2026-11-27; found by printing
 # the variable: 7 at the top of the script, 4 thirty lines later). Re-assert from the BINDING.
 if ($PSBoundParameters.ContainsKey('PoolParallel')) { $PoolParallel = [int]$PSBoundParameters['PoolParallel'] }
-  # ...and only then may the repo's own poolParallel apply: assigned ABOVE the dot-source it would be
-  # clobbered to the sourced default exactly like an explicit -PoolParallel was. An explicit binding
-  # still wins, so the knob is (1) argv, (2) agentq-config.json, (3) the param default 4.
-  if (-not $PSBoundParameters.ContainsKey('PoolParallel') -and $cfg -is [Collections.IDictionary] -and $cfg.ContainsKey('poolParallel') -and "$($cfg['poolParallel'])" -match '^\d+$') { $PoolParallel = [int]$cfg['poolParallel'] }
     $base = ''
     $u = "$(& git -C $repoRoot rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null)".Trim()
     if ($LASTEXITCODE -eq 0 -and $u) { $base = $u }
