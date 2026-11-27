@@ -86,5 +86,14 @@ Check 'the script caps the heal count at 3' ($src.Contains('$HealMax = 3')) ''
 Check 'the script journals a heal attempt index' ($src.Contains('attempt = $healCount')) ''
 Check 'the one-shot $healedAt guard is GONE (assignment and gate both removed)' ((-not $src.Contains('$healedAt = [DateTime]::UtcNow')) -and (-not $src.Contains('-not $healedAt'))) 'still present'
 Check 'the runner publishes and clears ws/<ws>/busy' ((Test-Path (Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')) -and ([IO.File]::ReadAllText((Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')).Contains('ws/${cfg.ws}/busy'))) 'runner marker absent'
+# ---- the wake-shortened FIRST wait (2026-11-27): 180 s of dead wait per landing after a resume -----
+# The pre-filter's first interval is the base of the doubling, so the three checks below pin (a) that the
+# wake case is WIRED into the pre-filter (not merely declared), (b) that a VM this run did NOT wake keeps
+# the conservative floor, and (c) that the short value is configurable and defaults to 30 s. Remove any of
+# the three and the 3 min observation window is back for every first job after a suspend.
+Check 'the FIRST heal wait is short when THIS run woke the VM ($healFirstMin)' ($src.Contains('$healFirstMin = if ($resumeAt) { $WakeFirstHealMin } else { $StaleClaimMin }')) ''
+Check 'the pre-filter actually uses $healFirstMin (wired, not just declared)' ($src.Contains('-FirstMin $healFirstMin')) ''
+Check 'a VM this run did not wake keeps StaleClaimMin as the base' ($src.Contains('else { $StaleClaimMin }')) ''
+Check 'the wake-shortened first interval defaults to 0.5 min and is configurable' (($src.Contains('$WakeFirstHealMin = 0.5')) -and ($src.Contains("'wakefirsthealmin'")) -and ($src.Contains('cloudWakeFirstHealMin'))) ''
 
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }
