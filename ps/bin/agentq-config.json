@@ -89,6 +89,12 @@
   "holdDefaultMin": 180,
   "unleasedRemoveIdleHours": 168,
   "minFreeCommitGB": 12,
+  "landBatch": {
+    "codai": true,
+    "brivio": true,
+    "agentq": true
+  },
+  "poolParallel": 4,
   "machineCap": 2,
   "machineCapAdaptive": {
     "min": 2,

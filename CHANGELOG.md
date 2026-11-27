@@ -69,7 +69,24 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   wake**; a VM this run did not wake keeps the conservative floor, and `Test-CloudPeerBusy` still refuses
   to reset under a peer. New `-WakeFirstHealMin` / `cloudWakeFirstHealMin` (default 0.5 min); the policy
   is the pure `Get-HealFirstIntervalMin`, driven by `ps/tests/test-agentq-cloud-heal.ps1` (behaviour, not
-  a text pin - the previous checks passed even with the three-minute window restored).
+  a text pin - the previous checks passed even with the three-minute window restored). Reachable from the
+  MCP as well (`cloud_submit.wakeFirstHealMin`, the sibling of the already-exposed `staleClaimMin`).
+- **`agentq` was silently opted OUT of land batching - the one repo whose gate is the entire 43-suite pool
+  run (~11 min).** The default list is `codai` + `brivio`, so a repo named nowhere batches nothing, and two
+  agents landing `agentq` at the same time run TWO full gates back to back: measured 2026-11-27,
+  `fix/lease-reuse-hot-path` and `perf/lease-spawn-stale-base` gated 43 suites twice within four minutes,
+  and the second land also paid 412 s waiting for `verify:agentq`. The shipped config now names
+  `agentq`, so a holder absorbs up to three waiting land tickets of the same `-Onto` into ONE gate and ONE
+  push (bisected if the batch fails, quarantined topics excluded). Pinned by `ps/tests/test-land-batch.ps1`
+  - deleting the key returns silently to the two-gates-per-pair behaviour.
+- **A half-reverted `poolParallel` knob made every `agentq` land fail at the gate.** The revert removed the
+  key from `agentq-config.json` but left the reader in `ps/devcloud/gate.ps1` and the assertions in
+  `ps/tests/test-land-gate-pool.ps1`, so the composed tree a land gates on failed with
+  `FAIL the repo pins a poolParallel in 4..8 ... value=` and refused the push (land #7: `LAND_EXIT=6`,
+  22,7 min and 43 suites spent, nothing pushed). Restored as ONE consistent state: the key is back, pinned at
+  **4** - the width measured tonight (`-Parallel 4` vs `8` = 1035,7 s vs 1049,2 s, i.e. noise, so widening the
+  pool is not the lever) - the reader keeps its rule-C-safe position AFTER the dot-source re-assert, and the
+  assertions pass again (`land gate pool` 52 pass, was 51/1).
 - **A re-lease that NAMES a slot my own session already holds waited out the whole scratch staleness bound
   (15 min).** `-Slot scratch-N` skipped D5's reuse-before-renting fast path, which only fired for an UNNAMED
   request: it fell into `New-Lease`, found the slot held by my own still-fresh session and NOT stale, and

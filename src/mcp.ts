@@ -200,6 +200,7 @@ export const mcpArgv = {
         noPatch?: boolean | undefined;
         noInstall?: boolean | undefined;
         staleClaimMin?: number | undefined;
+        wakeFirstHealMin?: number | undefined;
         noHeal?: boolean | undefined;
     }): string[] => [
         "-Ws",
@@ -212,6 +213,7 @@ export const mcpArgv = {
         ...(a.noPatch ? ["-NoPatch"] : []),
         ...(a.noInstall ? ["-NoInstall"] : []),
         ...(a.staleClaimMin !== undefined ? ["-StaleClaimMin", String(a.staleClaimMin)] : []),
+        ...(a.wakeFirstHealMin !== undefined ? ["-WakeFirstHealMin", String(a.wakeFirstHealMin)] : []),
         ...(a.noHeal ? ["-NoHeal"] : []),
         "--",
         ...a.command,
@@ -729,6 +731,11 @@ export function buildMcpServer(ep: Endpoint, session: string): McpServer {
                     .min(0)
                     .optional()
                     .describe("Minutes before the heal reclaims a wedged workspace; default 3"),
+                wakeFirstHealMin: z
+                    .number()
+                    .min(0)
+                    .optional()
+                    .describe("Minutes before the FIRST heal when THIS run performed the wake; default 0.5"),
                 noHeal: z.boolean().default(false),
                 timeoutSec: z.number().int().min(1).optional(),
             },
