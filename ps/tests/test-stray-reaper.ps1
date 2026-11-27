@@ -173,5 +173,15 @@ if (Test-Path -LiteralPath $installerRepo) {
   }
 }
 
+# --- (7) the log rotation is BEST-EFFORT, never fatal ----------------------------------------------
+# Seen live 2026-11-27: a reader holding the log (a tail, another agent's Get-Content, a concurrent
+# -Report run) made Move-Item throw "being used by another process" while the sweep itself was fine.
+# A terminating error there would abort a whole-night sweep long before it deletes anything, so the
+# rotation is pinned as advisory: it must keep its 2 MB gate and it must not be able to stop the run.
+$rot = @($lines | Where-Object { $_ -match 'Move-Item -Force -LiteralPath \$Log -Destination "\$Log\.1"' })
+Check 'the log rotation exists exactly once' ($rot.Count -eq 1) "got $($rot.Count): $($rot -join ' | ')"
+Check 'the log rotation cannot abort the sweep' (($rot.Count -eq 1) -and ($rot[0] -match '-ErrorAction SilentlyContinue')) "got: $($rot -join ' | ')"
+Check 'the rotation gate is still two megabytes' (($lines | Where-Object { $_ -match '\.Length -gt 2MB' }).Count -eq 1)
+
 Write-Host "stray-reaper: $script:Pass passed, $script:Fail failed" -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

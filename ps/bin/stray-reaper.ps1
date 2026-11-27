@@ -72,7 +72,11 @@ $pnpmStoreDrives = @('C:', 'D:')
 $logDir = Split-Path -Parent $Log
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 if ((Test-Path -LiteralPath $Log) -and ((Get-Item -LiteralPath $Log).Length -gt 2MB)) {
-  Move-Item -Force -LiteralPath $Log -Destination "$Log.1"
+  # Best-effort on purpose. A reader holding the log - a tail, another agent's Get-Content, a
+  # concurrent -Report run - makes Move-Item fail with "being used by another process"; that must
+  # never abort a sweep on its way to deleting anything, and the only cost is the log keeping its
+  # history one more day. Seen live 2026-11-27 (the sweep ran and freed 108.8 MB anyway).
+  Move-Item -Force -LiteralPath $Log -Destination "$Log.1" -ErrorAction SilentlyContinue
 }
 $stamp = Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'
 Add-Content -LiteralPath $Log -Value "=== $stamp reaper start (pid $PID) mode=$(if ($Report) { 'report' } else { 'apply' }) minAge=${MinAgeHours}h fastAge=${FastAgeHours}h tempDays=${TempDays}"
