@@ -190,6 +190,10 @@ $map = [ordered]@{
   # `agentq status -All -Json` lease list AND the per-slot lease files, and fails safe (skip, loud)
   # when neither is usable. Was live-only in ~/.copilot/bin and never carried by the repo before this.
   'bin\clean-build-artifacts.ps1' = 'bin\clean-build-artifacts.ps1'; 'tests\test-clean-build-artifacts.ps1' = 'bin\test-clean-build-artifacts.ps1'
+  # 2026-11-27: the machine-local litter sweeper (nightly task codai-stray-reaper) existed ONLY as an
+  # unversioned file in ~\.copilot\bin, so a reinstall could not restore it and no gate could reach it.
+  # Paired with the run-all.ps1 entry in this same slice - 'install wiring' pins the two lists together.
+  'bin\stray-reaper.ps1' = 'bin\stray-reaper.ps1'; 'tests\test-stray-reaper.ps1' = 'bin\test-stray-reaper.ps1'
   # 2026-11-22: static guard for the script-scope clobber class (a top-level `$null` reset after a real
   # value). A suite in run-all belongs in this map too, or the install gate cannot run what it never
   # installed - the same gap `test-land-default-gate.ps1` had (see the note above).

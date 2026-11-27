@@ -201,6 +201,12 @@ $suites = [ordered]@{
   # `agentq status -All -Json` lease list AND the per-slot lease files, skip a slot either marks in
   # use, and fail SAFE (say `live NOT DETERMINED` + skip slot output) when the coord dir is unreadable.
   'clean artifacts' = @('-File', (Join-Path $PSScriptRoot 'test-clean-build-artifacts.ps1'), '-Tool', (Join-Path $bin 'clean-build-artifacts.ps1'))
+  # 2026-11-27: the litter sweeper (codai-stray-reaper, nightly at 04:50) was live-only in ~\.copilot\bin -
+  # a reinstall could not restore it and no gate could reach it. It is now a tracked artefact with this
+  # suite, which pins its $tempDirRules array (the hand-added 12h/24h family patterns AND their anchors, so
+  # `agentq-cloud-prod` is never reaped) and its task name / log path against the live copy. Paired with the
+  # install.ps1 map entry in this same slice - 'install wiring' pins the two together.
+  'stray reaper'   = @('-File', (Join-Path $PSScriptRoot 'test-stray-reaper.ps1'), '-Tool', (Join-Path $bin 'stray-reaper.ps1'))
   # 2026-11-22: the shared-clone janitor. It builds throwaway bare origins + clones under %TEMP% and
   # drives the REAL agentq publish, with the log/backup/coord roots and AGENTQ_HOME/AGENTQ_CONFIG all
   # redirected into the scratch dir, so nothing touches a real shared clone. Dry-run by default; the
