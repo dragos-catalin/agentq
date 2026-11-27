@@ -129,6 +129,10 @@ $map = [ordered]@{
   # the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
   'tests\test-agentq-orphan-broken-slot.ps1' = 'bin\test-agentq-orphan-broken-slot.ps1'
   'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
+  # 2026-11-27: the machine-wide gate bound (gate:machine) - the bound, its config knob, its floor and
+  # its separation from build:machine. Paired with the run-all.ps1 entry in this same commit - 'install
+  # wiring' pins the two, so a suite the installed gate cannot run is impossible.
+  'tests\test-agentq-gate-machine.ps1' = 'bin\test-agentq-gate-machine.ps1'
   # 2026-11-21: the release `phase` is the last checkpoint, not the failed step - display + schema pinned
   'tests\test-release-phase-honesty.ps1' = 'bin\test-release-phase-honesty.ps1'
   'tests\test-agentq-prune.ps1' = 'bin\test-agentq-prune.ps1'; 'tests\test-agentq-doctor.ps1' = 'bin\test-agentq-doctor.ps1'

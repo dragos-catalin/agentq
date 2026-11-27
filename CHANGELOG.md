@@ -158,6 +158,19 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   `%TEMP%\aqspawn-<pid>-<hex>` fixture tree in a `finally`, guarded by an exact match on the leaf it minted
   from its own pid, because a killed run used to leave that tree behind for the nightly sweep and a pattern
   guard would have let one of two concurrent runs delete the other's live tree.
+- **A machine-wide bound on heavy gates (`gate:machine`), pinned by a suite whose mutation arm goes red.**
+  A heavy land pre-gate took only `verify:<repo>` - cap 1 PER REPO - so N repos ran N ~90-fork gates at
+  once (13 concurrent gates measured on this machine, 2026-11-26). `Expand-Resources` now adds
+  `gate:machine` to any `verify:*` primary in the gate/heavy/batch lanes, and its cap is read from config
+  (`gateMachineCap`, default 3, floor 1) rather than from the queue's sticky `capacity` file: a sticky file
+  must not be able to raise a machine-wide bound, and a bound that stops all progress is not a bound. A
+  plain `build:machine` run is never gated by it. Pinned by the new
+  `ps/tests/test-agentq-gate-machine.ps1` (16 checks in 7 cases, ~51 s, deliberately NOT in
+  `gateSuites.agentq` because it spawns and waits on holders): blinding the `Get-Capacity` branch turns it
+  red on exactly the two checks that state "the cap is config, not a file" - raising `gateMachineCap` to 2
+  must admit the same command, and a hand-written `queues\gate_machine\capacity` of 9 must be ignored
+  (3 FAILED, exit 1) - while the floor-1 case stays green, so the arm is a semantic mutation, not a syntax
+  break.
 
 ### Security
 

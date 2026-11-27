@@ -146,6 +146,18 @@ $suites = [ordered]@{
   # and resolve the repo with ONE combined rev-parse. Its second arm is a mutation control, so the
   # shape check is proven to bite the regression it names.
   'lease spawns'   = @('-File', (Join-Path $PSScriptRoot 'test-lease-spawns.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-27: the MACHINE-WIDE gate bound (`gate:machine`). A heavy land pre-gate used to take only
+  # `verify:<repo>` (cap 1 PER REPO), so N repos ran N ~90-fork gates at once - 13 concurrent gates were
+  # measured on this machine on 2026-11-26. A capacity bound is easy to write and easy to fake (always
+  # return 3, or read the queue's own sticky file, or gate plain builds too), and none of that is caught
+  # by the other suites, so this one pins the properties that make it a bound: a heavy verify run HOLDS
+  # a gate:machine ticket and takes no build:machine one; at the cap the second heavy gate is refused
+  # (exit 3) and raising gateMachineCap admits the SAME command (the discriminating case - with the
+  # branch removed it is the one that goes red); gateMachineCap 0 still admits exactly one (the progress
+  # guarantee) and a hand-written capacity file of 9 is ignored; a build:machine run is never gated by it.
+  # Local-only by design (it spawns pwsh holders and waits on them) - like 'admission', it is NOT in
+  # gateSuites.agentq, whose pool must stay timing-stable.
+  'gate machine'   = @('-File', (Join-Path $PSScriptRoot 'test-agentq-gate-machine.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-21: the release `phase` is the last checkpoint ENTERED, not the step that failed; the display
   # must show `last-phase=` + the run's own `exit=` separately, and the record keeps its `phase` field.
   'release phase honesty' = @('-File', (Join-Path $PSScriptRoot 'test-release-phase-honesty.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
