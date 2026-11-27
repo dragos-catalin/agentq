@@ -153,12 +153,12 @@ distinct losses; the code change stops the re-count and the permanent lease.)
 
 Measured, in the leased slot `agentq/task-1` at `origin/main`, same session for every before/after:
 
-| what | before | after | how |
-| --- | --- | --- | --- |
-| git spawns per `agentq lease` (shim count in `test-lease-spawns.ps1`) | fresh 8 / reuse 4 | fresh 7 / reuse 3 | `head` read from the repo resolution's combined `rev-parse` instead of a second one |
-| `lease spawns` in the devcloud pool gate | 905-906 s (87 % of a 1044 s gate) | 11 s | cause was a NAMED re-lease of the caller's own slot waiting out `leaseScratchIdleMin` = 900 s; fixed on main as `0507fec`, re-measured `TOTAL sec=67 suites=8 failed=0` |
-| a hung fixture child | no verdict, gate wedged for hours | red verdict in ~18 s with stdout/stderr and elapsed | bounded child wait in the suite (`AGENTQ_TEST_CHILD_BOUND_SEC`) |
-| a merge resolution that reverts main | would land silently (invisible to the `merge-tree` conflict precheck) | refused, offending paths named, journaled `land-stale-base` | new guard + `test-land-stale-base.ps1` (4 fixtures, mutation-tested) |
+| what                                                                  | before                                                                | after                                                       | how                                                                                                                                                                     |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| git spawns per `agentq lease` (shim count in `test-lease-spawns.ps1`) | fresh 8 / reuse 4                                                     | fresh 7 / reuse 3                                           | `head` read from the repo resolution's combined `rev-parse` instead of a second one                                                                                     |
+| `lease spawns` in the devcloud pool gate                              | 905-906 s (87 % of a 1044 s gate)                                     | 11 s                                                        | cause was a NAMED re-lease of the caller's own slot waiting out `leaseScratchIdleMin` = 900 s; fixed on main as `0507fec`, re-measured `TOTAL sec=67 suites=8 failed=0` |
+| a hung fixture child                                                  | no verdict, gate wedged for hours                                     | red verdict in ~18 s with stdout/stderr and elapsed         | bounded child wait in the suite (`AGENTQ_TEST_CHILD_BOUND_SEC`)                                                                                                         |
+| a merge resolution that reverts main                                  | would land silently (invisible to the `merge-tree` conflict precheck) | refused, offending paths named, journaled `land-stale-base` | new guard + `test-land-stale-base.ps1` (4 fixtures, mutation-tested)                                                                                                    |
 
 Hook cost, measured on this machine while the box was saturated: the hook is **verb-blind** (~470-500 ms per
 call, of which 35 % is process start and 65 % the guard scripts), while `agentq` itself costs ~850 ms fixed
