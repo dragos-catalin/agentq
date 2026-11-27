@@ -108,10 +108,18 @@ $env:CODAI_HOOK_RESIDENT = '1'
 # 2026-11-25 - a name still held by a session that was just torn down is released asynchronously, the
 # constructor threw, and the log said `listening` while every client correctly fell back. So: retry the
 # creation (bounded), and report a real failure instead of dying mute.
-function New-Pipe {
+#
+# ONE instance is not enough. While a request is being SERVED nothing is listening on the name, so a call
+# arriving in that window finds no free instance, waits WaitNamedPipeW's 250 ms and then hands itself to
+# the classic path - a whole powershell.exe (~900 ms, measured live 2026-11-27). 16 % of the calls in one
+# measured window did exactly that. A call queued on the pipe costs nothing; a call that spawns powershell
+# costs a core on a machine that is already loaded. The DEPTH of a name is fixed by the FIRST instance that
+# creates it - constructing with 1 makes instance #2 throw "All pipe instances are busy" - so the pool
+# opens the name with MaxAllowedServerInstances (-1) and arms one instance per pool slot.
+function New-Pipe([int]$MaxInstances = -1) {
     for ($i = 1; $i -le 20; $i++) {
         try {
-            return [IO.Pipes.NamedPipeServerStream]::new($PipeName, [IO.Pipes.PipeDirection]::InOut, 1,
+            return [IO.Pipes.NamedPipeServerStream]::new($PipeName, [IO.Pipes.PipeDirection]::InOut, $MaxInstances,
                 [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::None)
         } catch {
             if ($i -ge 20) { throw }
@@ -119,22 +127,38 @@ function New-Pipe {
         }
     }
 }
-try { $server = New-Pipe } catch { Log "pipe creation failed after retries: $($_.Exception.Message)"; exit 1 }
-Set-Content -LiteralPath $log -Value ("{0}  listening on \\.\pipe\{1}  mode={2}  script={3} ({4} chars, parsed in {5:N0} ms)  pid={6}" -f `
-    (Get-Date -Format 'HH:mm:ss.fff'), $PipeName, $modeName, $GuardName, $text.Length, $sw0.Elapsed.TotalMilliseconds, $PID)
+$poolSize = 4
+if ($env:HOOKC_POOL -match '^\d+$' -and [int]$env:HOOKC_POOL -gt 0) { $poolSize = [int]$env:HOOKC_POOL }
+$pipes = @(); $tasks = @()
+for ($i = 0; $i -lt $poolSize; $i++) {
+    try { $p = New-Pipe } catch { Log "pool instance $i failed: $($_.Exception.Message)"; break }
+    $pipes += $p; $tasks += $p.WaitForConnectionAsync()
+}
+if ($pipes.Count -eq 0) { Log "pipe creation failed after retries (pool of $poolSize)"; exit 1 }
+Set-Content -LiteralPath $log -Value ("{0}  listening on \\.\pipe\{1}  mode={2}  script={3} ({4} chars, parsed in {5:N0} ms)  pid={6}  instances={7}" -f `
+    (Get-Date -Format 'HH:mm:ss.fff'), $PipeName, $modeName, $GuardName, $text.Length, $sw0.Elapsed.TotalMilliseconds, $PID, $pipes.Count)
 $psHost = $null
 $served = 0
 $recreated = 0
 while ($true) {
-    # A lost client must NOT end the server. Observed 2026-11-25: a client whose watchdog expired closed
-    # the handle mid-write, the server logged `write failed: ... Pipe is broken.` and then died on the
-    # next WaitForConnection - so ONE slow tool call would take the resident path down for the rest of
-    # the session and every later call silently paid the spawn again. Recreate the instance instead.
-    try { $server.WaitForConnection() } catch {
-        Log "wait failed: $($_.Exception.Message) - recreating the pipe"
+    # Wait for WHICHEVER instance a client connected to, and recreate only the instance that failed.
+    # Guard the empty case first: WaitAny THROWS on an empty array rather than returning -1, and a throw
+    # here would kill the host - which costs every later call the ~900 ms spawn this file exists to avoid.
+    if ($tasks.Count -eq 0) { Log 'no armed pipe instance - exiting'; break }
+    # A lost client must NOT end the server: observed 2026-11-25, a client whose watchdog expired closed
+    # the handle mid-write, the server logged `write failed: ... Pipe is broken.` and then died on the next
+    # WaitForConnection - so ONE slow tool call took the resident path down for the rest of the session and
+    # every later call silently paid the spawn again.
+    $idx = [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks)
+    if ($idx -lt 0) { Log 'WaitAny had no armed instance - exiting'; break }
+    $server = $pipes[$idx]
+    try { $tasks[$idx].GetAwaiter().GetResult() } catch {
+        Log "connect failed on instance $idx ($($_.Exception.Message)) - recreating it"
         try { $server.Dispose() } catch { }
         Start-Sleep -Milliseconds 50
         try { $server = New-Pipe } catch { Log "recreate failed: $($_.Exception.Message)"; break }
+        $pipes[$idx] = $server
+        $tasks[$idx] = $server.WaitForConnectionAsync()
         $recreated++; if ($recreated -ge 100) { Log "too many recreations ($recreated) - exiting"; break }
         continue
     }
@@ -143,7 +167,7 @@ while ($true) {
 
     $hdr = New-Object byte[] 4; $got = 0
     while ($got -lt 4) { $n = $server.Read($hdr, $got, 4 - $got); if ($n -le 0) { break }; $got += $n }
-    if ($got -lt 4) { Log 'short header - dropping connection'; continue }
+    if ($got -lt 4) { Log 'short header - dropping connection'; try { $server.Disconnect() } catch { }; $tasks[$idx] = $server.WaitForConnectionAsync(); continue }
     $raw = [BitConverter]::ToInt32($hdr, 0)
     $binary = $raw -lt 0
     $len = if ($binary) { -$raw - 1 } else { $raw }
@@ -226,7 +250,12 @@ while ($true) {
     $sw.Stop(); $served++
     Log ("req $served  total {0:N0} ms (read {1:N0}, run {2:N0})  exit {3}{4}  bin={5}  stdout {6} B  stderr {7} B" -f `
             $sw.Elapsed.TotalMilliseconds, $readMs, $runMs, $exit, $(if ($note) { " ($note)" } else { '' }), $binary, $stdout.Length, $stderr.Length)
+    # Re-arm THIS instance for the next call. Disconnect first: the short-header path above and any error
+    # path may leave the stream connected, and WaitForConnectionAsync on a connected stream throws.
+    try { $server.Disconnect() } catch { }
+    $tasks[$idx] = $server.WaitForConnectionAsync()
     if ($MaxRequests -gt 0 -and $served -ge $MaxRequests) { Log "served $served - exiting"; break }
 }
 if ($psHost) { $psHost.Dispose() }
-$rs.Dispose(); $server.Dispose()
+foreach ($p in $pipes) { try { $p.Dispose() } catch { } }
+$rs.Dispose()

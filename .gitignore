@@ -6,3 +6,11 @@ coverage/
 .env*
 __pycache__/
 .axiom/
+
+# Resident hook acceptance run (ps/hooks/resident/verify-resident.ps1): the client it compiles and the
+# per-case scratch it drops next to itself. `server.log` is already covered by *.log above.
+ps/hooks/resident/hookc4.exe
+ps/hooks/resident/verify-resident.out.txt
+ps/hooks/resident/v.so.*
+ps/hooks/resident/v.se.*
+ps/hooks/resident/v.conc.*

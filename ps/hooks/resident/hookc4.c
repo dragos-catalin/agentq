@@ -145,10 +145,33 @@ int wmain(int argc, wchar_t** argv) {
         len += got;
     }
 
-    /* 2. connect; a short wait only - a hook must not stall the harness when the server is down. */
-    if (!WaitNamedPipeW(pipeBuf, 250)) { DWORD e = GetLastError(); note_err("no server", e); int rc = fallback(guard, buf, len, NULL); free(buf); return rc; }
-    HANDLE p = CreateFileW(pipeBuf, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (p == INVALID_HANDLE_VALUE) { DWORD e = GetLastError(); note_err("pipe not openable", e); int rc = fallback(guard, buf, len, NULL); free(buf); return rc; }
+    /* 2. connect. A pipe that EXISTS but is BUSY is not a reason to hand the call to the classic path:
+       spawning powershell costs ~900 ms (measured live 2026-11-27) while the resident answer is ~50 ms,
+       so waiting for a free instance is the cheaper of the two. 14-16 % of one measured window's calls
+       fell back with "no server (win32 121)" or win32 231 while the host was alive and merely serving the
+       call before. Only "no pipe at all" means the server is down, and that one still falls back at once,
+       so a dead host can never stall the harness. */
+    HANDLE p = INVALID_HANDLE_VALUE;
+    /* Never wait longer than the path being avoided: past that the call is better off taking the path it
+       was going to take anyway, with a bounded tail. */
+    const DWORD waitBudget = g_budget < 900 ? g_budget : 900;
+    DWORD busyMs = 0;
+    for (;;) {
+        if (!WaitNamedPipeW(pipeBuf, 250)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_SEM_TIMEOUT && e != ERROR_PIPE_BUSY) { note_err("no server", e); break; }
+            busyMs += 250;
+            if (busyMs >= waitBudget) { note_err("server busy past the connect budget", e); break; }
+            continue;
+        }
+        p = CreateFileW(pipeBuf, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (p != INVALID_HANDLE_VALUE) break;
+        DWORD e = GetLastError();
+        if (e == ERROR_PIPE_BUSY && busyMs < waitBudget) { busyMs += 250; Sleep(10); continue; }
+        note_err("pipe not openable", e);
+        break;
+    }
+    if (p == INVALID_HANDLE_VALUE) { int rc = fallback(guard, buf, len, NULL); free(buf); return rc; }
     g_pipe = p;
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main,

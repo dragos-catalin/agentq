@@ -1,4 +1,4 @@
-# Focused acceptance check for the resident hook client (run after ANY change to hookc4/server4).
+# Focused acceptance check for the resident hook (run after ANY change to hookc4/resident-server).
 #   powershell -NoProfile -File verify-resident.ps1 [-N 5]
 # Prints ONE verdict block and writes verify-resident.out.txt. Asserts, in this order:
 #   0. CORPUS parity: every guard path returns the same DECISION (and stderr) in both paths, with
@@ -28,7 +28,11 @@ $env:HOOKC_TIMEOUT_MS = "$TimeoutMs"
 $hooks  = Join-Path $env:USERPROFILE '.copilot\hooks'
 $guard  = Join-Path $hooks 'hook-pre.ps1'
 $client = Join-Path $here 'hookc4.exe'
-$server = Join-Path $here 'server4.ps1'
+# 2026-11-27: this pointed at server4.ps1, which no longer exists (the host lives in
+# resident-server.ps1 since it moved into the repo), so the suite could not run at all and the
+# pool change went in untested. A path here IS the test's precondition: assert it.
+$server = Join-Path $here 'resident-server.ps1'
+if (-not (Test-Path $server)) { throw "missing $server - the host lives in this directory" }
 # The DEFAULT pipe name, not a private test one: the installed form is a BARE "command": "<...>\hookc.exe"
 # with no arguments, so the client defaults to BOTH hook-pre.ps1 and this pipe - the test can only be
 # faithful if it uses the same name. A foreign server on this pipe cannot silently answer the run: the
@@ -142,7 +146,7 @@ $corpus = @(
 # -HostMode file server made the CLI case report exit 0 and the encoding differ, which read as two
 # "failures" in a client that was correct. So: kill every holder of the pipe NAME, clear the log,
 # start ours, and require the log's own pid to be the process we started.
-Stop-Matched '*server4.ps1*'; Stop-Matched '*dummy-silent*'; Stop-Matched "*$pipe*"
+Stop-Matched '*resident-server.ps1*'; Stop-Matched '*dummy-silent*'; Stop-Matched "*$pipe*"
 Start-Sleep -Milliseconds 300
 Remove-Item (Join-Path $here 'server.log') -EA SilentlyContinue
 $srv = Start-Process pwsh -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$server,'-GuardName','hook-pre.ps1','-PipeName',$pipe,'-HostMode','subst','-MaxRequests','200') -WindowStyle Hidden -PassThru
@@ -241,8 +245,18 @@ W ("empty payload: classic exit={0} out={1} B | resident exit={2} out={3} B | sa
 # spawn again. The fix must be proven on the failing path, not just asserted: the same PROCESS must keep
 # serving, and its log must show the recovery line.
 $logPath = Join-Path $here 'server.log'
+# The DETECTOR moved with the design. The old host dropped the whole pipe on a broken write and logged
+# "recreating the pipe"; the pooled host instead disconnects and re-arms that ONE instance, so that
+# string no longer exists and this case would fail on a HEALTHY server (measured 2026-11-27: `recovery
+# lines 0->0` while the server served its next request 1 ms later). What the case exists to protect is
+# the GUARANTEE - one rude caller must not take the resident path down for the session - so it is now
+# asserted from observables that survive any recovery mechanism, and the PREMISE is asserted too
+# (a server that never saw a broken write would make the whole case vacuous).
+$reqLine = { param($p) @(Get-Content $p -EA SilentlyContinue | Where-Object { $_ -match '\breq \d+ ' }).Count }
+$brkLine = { param($p) @(Get-Content $p -EA SilentlyContinue | Where-Object { $_ -match 'write failed' }).Count }
 $rd1 = Call $client @($guard,$pipe) $allowJson 'rude.pre'
-$recBefore = @(Get-Content $logPath -EA SilentlyContinue | Where-Object { $_ -match 'recreating the pipe' }).Count
+$reqBefore = & $reqLine $logPath
+$brkBefore = & $brkLine $logPath
 $srvPidBefore = $srv.Id
 try {
     $cp = [IO.Pipes.NamedPipeClientStream]::new('.', $pipe, [IO.Pipes.PipeDirection]::InOut)
@@ -254,16 +268,41 @@ try {
     W 'rude client: sent a request and vanished without reading the reply'
 } catch { W "rude client: setup failed: $($_.Exception.Message)" }
 Start-Sleep -Milliseconds 800
-$recAfter = @(Get-Content $logPath -EA SilentlyContinue | Where-Object { $_ -match 'recreating the pipe' }).Count
+$brkAfter = & $brkLine $logPath
 $rd2 = Call $client @($guard,$pipe) $allowJson 'rude.post'
+$reqAfter = & $reqLine $logPath
 $alive = [bool](Get-Process -Id $srvPidBefore -EA SilentlyContinue)
 $rudeOk = (-not ($rd1.err -match 'falling back')) -and (-not ($rd2.err -match 'falling back')) -and `
-          ((Sem $rd1.out) -eq (Sem $rd2.out)) -and $alive -and ($recAfter -gt $recBefore)
-W ("rude client: before fell={0} | recovery lines {1}->{2} | after fell={3} same={4} | server pid {5} alive={6}" -f `
-    [bool]($rd1.err -match 'falling back'), $recBefore, $recAfter, [bool]($rd2.err -match 'falling back'), ((Sem $rd1.out) -eq (Sem $rd2.out)), $srvPidBefore, $alive)
+          ((Sem $rd1.out) -eq (Sem $rd2.out)) -and $alive -and `
+          ($brkAfter -gt $brkBefore) -and ($reqAfter -ge ($reqBefore + 2))
+W ("rude client: before fell={0} | broken writes {1}->{2} | req lines {3}->{4} | after fell={5} same={6} | server pid {7} alive={8}" -f `
+    [bool]($rd1.err -match 'falling back'), $brkBefore, $brkAfter, $reqBefore, $reqAfter, [bool]($rd2.err -match 'falling back'), ((Sem $rd1.out) -eq (Sem $rd2.out)), $srvPidBefore, $alive)
+
+# 3e. CONCURRENCY - why a POOL of pipe instances exists at all. One instance serves one request at a time,
+# so simultaneous tool calls (a batch resolved in parallel, several chats on one machine) made the later
+# callers see ERROR_PIPE_BUSY, and before 2026-11-27 they paid the spawn instead. The signature of a
+# regression to a single instance is MEASURED, not guessed: on the rig a burst of 8 against `instances=1`
+# fell back 5.3 and 6 times per 8, against the pooled host 0.7 and 2 (and 0 in its best rounds). One
+# straggler is tolerated here: a client waits up to 900 ms for a busy instance and a loaded machine can
+# exceed that, so the threshold catches the 5-6-of-6 signature and not the machine.
+$cc = 6
+$ccIn = Join-Path $here 'v.conc.in'
+Set-Content -LiteralPath $ccIn -Value $allowJson -NoNewline -Encoding utf8
+$ccProc = @()
+for ($i = 0; $i -lt $cc; $i++) {
+    $ccProc += Start-Process -FilePath $client -ArgumentList @($guard, $pipe) -RedirectStandardInput $ccIn `
+                -RedirectStandardOutput (Join-Path $here "v.conc.$i.out") -RedirectStandardError (Join-Path $here "v.conc.$i.err") -NoNewWindow -PassThru
+}
+$ccProc | Wait-Process -Timeout 90 -EA SilentlyContinue
+$concServed = 0; $concFall = 0
+for ($i = 0; $i -lt $cc; $i++) {
+    if ((Get-Content (Join-Path $here "v.conc.$i.err") -Raw -Encoding utf8 -EA SilentlyContinue) -match 'falling back') { $concFall++ } else { $concServed++ }
+}
+$concOk = ($concServed -ge ($cc - 1))
+W ("concurrent burst ({0} at once): served by the resident {1}/{0}, fell back {2}  (one-instance host: 5-6 of 8)" -f $cc, $concServed, $concFall)
 
 # 4. server down -> classic answer with the SAME payload (byte-for-byte stdout)
-Stop-Matched '*server4.ps1*'; Start-Sleep -Milliseconds 400
+Stop-Matched '*resident-server.ps1*'; Start-Sleep -Milliseconds 400
 $cd = Call 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',$guard) $denyJson 'dn.cl'
 $rd = Call $client @($guard, $pipe) $denyJson 'dn.rs'
 $downOk = ($cd.rc -eq $rd.rc) -and ($cd.out -eq $rd.out)
@@ -282,8 +321,8 @@ $env:HOOKC_TIMEOUT_MS = "$TimeoutMs"
 Stop-Matched '*dummy-silent*'
 
 W ''
-W ("VERDICT corpus={0}/{1} parity={2} classicUnchanged={3} pipeUsed={4} deny={5} fallback={6} deadline={7} encOnly={8} installedForm={9} emptyPayload={10} rudeClient={11}" -f `
-    ($corpus.Count - $bad.Count), $corpus.Count, $parity, $wantOk, $noFallback, $denyOk, $downOk, $deadlineOk, $enc, $bareOk, $emptyOk, $rudeOk)
-W ("  ALL PASS: {0}" -f ($parity -and $wantOk -and $noFallback -and $denyOk -and $downOk -and $deadlineOk -and $bareOk -and $emptyOk -and $rudeOk))
+W ("VERDICT corpus={0}/{1} parity={2} classicUnchanged={3} pipeUsed={4} deny={5} fallback={6} deadline={7} encOnly={8} installedForm={9} emptyPayload={10} rudeClient={11} concurrent={12}" -f `
+    ($corpus.Count - $bad.Count), $corpus.Count, $parity, $wantOk, $noFallback, $denyOk, $downOk, $deadlineOk, $enc, $bareOk, $emptyOk, $rudeOk, $concOk)
+W ("  ALL PASS: {0}" -f ($parity -and $wantOk -and $noFallback -and $denyOk -and $downOk -and $deadlineOk -and $bareOk -and $emptyOk -and $rudeOk -and $concOk))
 $L | Set-Content -LiteralPath $out -Encoding utf8
 Get-Content $out

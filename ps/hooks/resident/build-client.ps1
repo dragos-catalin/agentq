@@ -13,7 +13,11 @@ $gcc = (Get-Command gcc -EA SilentlyContinue).Source
 if (-not $gcc) { throw 'gcc not found on PATH (mingw-w64)' }
 $target = if ($Check) { Join-Path $here ("hookc4.check.{0}.exe" -f (Get-Date -Format 'HHmmss')) } else { $exe }
 # -municode: wmain(); -O2; no console window is not needed (the harness owns the console).
-& $gcc -O2 -municode -Wall -Wextra -o $target $src
+# -Wl,--no-insert-timestamp: mingw stamps the PE header with the build time, so two builds of the SAME
+# source differed (measured 2026-11-27: 7221F83F... vs C4243162..., identical length) and -Check's verdict
+# was a coin flip. With the timestamp suppressed the same source gives byte-identical output (F45BD25D...),
+# which is the only thing that makes -Check mean anything.
+& $gcc -O2 -municode -Wall -Wextra '-Wl,--no-insert-timestamp' -o $target $src
 if ($LASTEXITCODE -ne 0) { throw "gcc failed with $LASTEXITCODE" }
 if ($Check) {
     $a = (Get-FileHash $target -Algorithm SHA256).Hash
