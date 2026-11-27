@@ -20,6 +20,19 @@ $env:AGENTQ_HOME = Join-Path $tmp 'coord'
 $env:CODAI_WT_ROOT = Join-Path $tmp 'wt'
 $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'; $env:AGENTQ_NO_ENV_COPY = '1'; $env:AGENTQ_NO_PREP = '1'
 $env:AGENTQ_NO_ADMISSION = '1'; $env:AGENTQ_NO_AGENT_LIMIT = '1'; $env:AGENTQ_NO_PRUNE = '1'
+# fairShare is enabled by default, and Get-SlotReuse then hands an UNNAMED, non--Wait request from a session
+# that already holds a scratch slot back ITS OWN slot. That is right in production, but A1/C1 hold 1..5 slots
+# from ONE session to exercise the OFFER path (room/floor/ceiling), so reuse collapses them onto scratch-1 and
+# eight assertions cascade. The reuse rule has its own suite (test-agentq-slotshare.ps1); isolate it here the
+# same way the flags above isolate signal/registry/admission. 2026-11-27: this suite was red at HEAD (9 fails,
+# 3847 s) until it opted out - `git log` shows A2/A3 were migrated to an explicit -Slot and A1/C1 were not.
+$env:AGENTQ_NO_FAIRSHARE = '1'
+# ...and neither does it need the slot's ref FETCHED. This suite leases 1..5 slots per block in a throwaway
+# two-commit repo whose origin is a local bare dir: `git fetch origin` cannot change any answer it asserts,
+# yet it was the single largest cost of the whole suite (700-1800 ms x 46 leases = about 60 s, measured
+# 2026-11-27 on a saturated machine). AGENTQ_NO_FETCH is the opt-out in the lease path; production keeps the
+# fetch so a rented slot still starts at a fresh origin/<branch>.
+$env:AGENTQ_NO_FETCH = '1'
 $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NAME = 't'; $env:GIT_COMMITTER_EMAIL = 't@t'
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $cfg = Join-Path $tmp 'cfg.json'

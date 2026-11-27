@@ -155,6 +155,11 @@ $PickSession = $null
 $Capacity = 1; $TimeoutMin = 60; $StaleMin = 10; $Last = 30; $Hours = 12; $MinFreeGB = 6
 $All = $false; $NoPush = $false; $NoWait = $false; $Json = $false; $CapacityGiven = $false
 $StaleOnly = $false; $IdleHours = [double]0; $Reclaim = $false; $Track = $false
+# timings: a flag this dispatcher does not type itself is forwarded verbatim to agentq-timings.ps1, so a
+# knob that module already supports (-LogDir, -Top, -AllSlots, -WorktreeRoot, -NoLastGreen) is reachable
+# from `agentq timings` without a second edit here. `-Root` is deliberately NOT one of them: that name is
+# prewarm's (it has its own case above) and would be swallowed there.
+$TimingsExtra = @()
 # bounded slot acquisition for `lease -Wait` (exit 7 on the bound; 0/3 otherwise).
 $Wait = $false; $MaxMin = $null; $MaxMinGiven = $false
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
@@ -331,6 +336,16 @@ while ($i -lt $argv.Count) {
     'off' { $PrewarmOff = $true }
     'quiet' { $Quiet = $true }
     default {
+      # timings forwards an untyped flag (with its value) straight to the module instead of refusing it.
+      # The usage string is the only place a user learns the flags, so a supported-but-untyped knob is
+      # otherwise unreachable from the verb (2026-11-27: `timings -LogDir <dir>` was refused with
+      # "unknown argument" while the module accepted exactly that flag and its own error text told the
+      # user to pass it).
+      if ($Verb -and $Verb.ToLowerInvariant() -eq 'timings' -and $a -like '-*') {
+        $TimingsExtra += $a
+        while ($i + 1 -lt $argv.Count -and "$($argv[$i + 1])" -notlike '-*') { $script:i++; $TimingsExtra += "$($argv[$i])" }
+        break
+      }
       if ($Verb -and $Verb.ToLowerInvariant() -eq 'run' -and $a -notlike '-*') {
         [Console]::Error.WriteLine("agentq: unknown argument '$a' - the command must follow '--'. In-process calls (& agentq.ps1 ... -- cmd) lose a bare -- in PowerShell: quote it as '--' or call 'pwsh -NoProfile -File agentq.ps1 ... -- cmd'.")
         exit 2
@@ -2620,7 +2635,7 @@ $script:AqHelp = [ordered]@{
   'note' = @{ g = 'Queue & run'; u = 'note -Message "..." [-Repo <r>]'; d = 'free-form journal entry: handoff, "do not touch X"' }
   'lesson' = @{ g = 'Queue & run'; u = 'lesson -Message "..." [-Repo <r>] [-Kind <class>]'; d = 'record a durable, reusable lesson (symptom -> what you believed -> what proved it -> the fix) so future agents in this repo do not relearn it'; e = 'agentq lesson -Message "vertex 400s on lone surrogates after JSON.stringify: strip them post-stringify"' }
   'lessons' = @{ g = 'Queue & run'; u = 'lessons [-Repo <r>] [-Limit 30] [-Json]'; d = 'list recorded lessons, newest first (read-only)' }
-  'timings' = @{ g = 'Queue & run'; u = 'timings [-Limit 5] [-Json]'; d = 'per-suite gate wall times, slowest LAST run first (read-only; it reads the gate build logs, so it costs ~18 s on codai)'; e = 'agentq timings -Limit 3' }
+  'timings' = @{ g = 'Queue & run'; u = 'timings [-Limit 5] [-Json] [-LogDir <dir>] [-AllSlots] [-Top n]'; d = 'per-suite gate wall times, slowest LAST run first (read-only; it reads the gate build logs, so it costs ~18 s on codai). The default dir is the CURRENT repo''s .copilot-tmp\build-logs; a repo whose real logs live in a leased slot needs -LogDir or -AllSlots'; e = 'agentq timings -LogDir "E:\gh\.wt\codai\land\.copilot-tmp\build-logs" -Top 10' }
   'approve' = @{ g = 'Slots & leases (ADR 0001/0012)'; u = 'approve -Paths a,b -Purpose "why" [-Hours 2] [-MaxMin 10] [-Json]'; d = 'ask the OWNER to approve an edit ticket: a window states exactly which paths it unlocks, and Approve mints it here (exit 0 approved, 3 denied, 4 recorded for the hub/phone with -MaxMin 0, 5 the mint failed, 7 no answer)'; e = 'agentq approve -Paths "packages/x/**" -Purpose "fix the guard"' }
   'ask' = @{ g = 'Queue & run'; u = 'ask -To <repo:<name>|session:<term-id>|slot:<repo>:<slot>|any|owner> -Message "..." [-Resource <r>] [-Repo <r>]'; d = 'ask another LIVE agent a question; prints how many agents the address reaches, and a negative answer is not silent'; e = 'agentq ask -To repo:agentq -Message "is ps/bin/agentq.ps1 free to edit for 20 min?"' }
   'reply' = @{ g = 'Queue & run'; u = 'reply -Id <msg id> -Message "..."'; d = 'answer an ask (the asker replying again reopens the thread)' }
@@ -2738,6 +2753,7 @@ switch ($Verb.ToLowerInvariant()) {
     $n = if ($Last -is [int] -and $Last -gt 0) { $Last } else { 5 }
     $argv = @('-NoProfile', '-File', $t, '-Last', "$n")
     if ($Json) { $argv += '-Json' }
+    if ($TimingsExtra.Count) { $argv += $TimingsExtra }
     $out = @(& pwsh @argv 2>&1)
     $code = $LASTEXITCODE
     $out | ForEach-Object { Write-Output "$_" }

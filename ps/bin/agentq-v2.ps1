@@ -782,12 +782,34 @@ function Initialize-Slot([string]$main, [string]$path, [string]$ref, [string]$br
     if ($LASTEXITCODE) { throw "slot ${path}: git worktree add failed" }
   } else {
     Clear-StaleIndexLock $path
-    foreach ($op in 'merge', 'cherry-pick', 'rebase') { & git -C $path $op --abort 2>$null | Out-Null }
-    & git -C $path reset -q --hard 2>$null
-    & git -C $path checkout -q --detach $ref 2>$null
-    if ($LASTEXITCODE) { Clear-StaleIndexLock $path; & git -C $path reset -q --hard 2>$null; & git -C $path checkout -q -f --detach $ref 2>$null }
+    # The three --abort calls ran UNCONDITIONALLY and failed every time on a healthy slot (rc=128, ~200 ms
+    # each on this machine). Measured 2026-11-27 over 46 leases: 3 of the 7 git spawns per lease were these
+    # no-ops (~600 ms), and a make-believe repo in a unit suite paid them 46 times. A linked worktree's
+    # `.git` is a FILE holding `gitdir: <path>`, so the in-progress state can be read with NO git spawn:
+    # abort only when there is something to abort. If .git is unreadable, keep the old unconditional loop.
+    $wd = ''
+    try {
+      $gf = Join-Path $path '.git'
+      if (Test-Path -LiteralPath $gf -PathType Leaf) {
+        $wd = ([IO.File]::ReadAllText($gf) -replace '^gitdir:\s*', '').Trim()
+        if ($wd -and -not [IO.Path]::IsPathRooted($wd)) { $wd = Join-Path $path $wd }
+      }
+    } catch { $wd = '' }
+    if ($wd) {
+      $stateFile = @{ 'merge' = 'MERGE_HEAD'; 'cherry-pick' = 'CHERRY_PICK_HEAD'; 'rebase' = 'REBASE_HEAD' }
+      foreach ($op in 'merge', 'cherry-pick', 'rebase') {
+        $busy = Test-Path -LiteralPath (Join-Path $wd $stateFile[$op])
+        if (-not $busy -and $op -eq 'rebase') { $busy = (Test-Path -LiteralPath (Join-Path $wd 'rebase-merge')) -or (Test-Path -LiteralPath (Join-Path $wd 'rebase-apply')) }
+        if ($busy) { & git -C $path $op --abort 2>$null | Out-Null }
+      }
+    } else {
+      foreach ($op in 'merge', 'cherry-pick', 'rebase') { & git -C $path $op --abort 2>$null | Out-Null }
+    }
+    # `reset --hard` + `checkout --detach` + `reset --hard $ref` was three git spawns doing what ONE forced
+    # checkout does (discard local changes, then move HEAD). Measured 2026-11-27: ~450 ms per lease.
+    & git -C $path checkout -q -f --detach $ref 2>$null
+    if ($LASTEXITCODE) { Clear-StaleIndexLock $path; & git -C $path checkout -q -f --detach $ref 2>$null }
     if ($LASTEXITCODE) { $why = @(& git -C $path checkout -q --detach $ref 2>&1 | ForEach-Object { "$_" }) -join ' | '; throw "slot ${path}: checkout $ref failed ($why)" }
-    & git -C $path reset -q --hard $ref
     & git -C $path clean -fdq 2>$null   # not -x: keeps node_modules and build caches (the point of reuse)
   }
   if ($branch) {
@@ -1234,7 +1256,12 @@ function Invoke-Lease {
     } catch { [Console]::Error.WriteLine("agentq: -Hold could not be recorded: $($_.Exception.Message)") }
   }
   try {
-    & git -C $main fetch -q origin 2>$null
+    # AGENTQ_NO_FETCH follows the same opt-out idiom as AGENTQ_NO_PREP / NO_SIGNAL / NO_REGISTRY. The fetch
+    # exists so a rented slot starts at a fresh origin/<branch>; production keeps it. A caller that only pins
+    # lease BOOKKEEPING (unit suites, probes) paid 700-1800 ms per lease for it - measured 2026-11-27, the
+    # single largest item in 46 leases of one suite (197 s total). `@{u}` still resolves from the local
+    # remote-tracking ref, so the slot ref is chosen exactly as before.
+    if ($env:AGENTQ_NO_FETCH -ne '1') { & git -C $main fetch -q origin 2>$null }
     $refToUse = if ($Ref) { $Ref } else { $up = (& git -C $main rev-parse --abbrev-ref '@{u}' 2>$null); if ($up) { $up } else { 'HEAD' } }
     # Anything still unique in the dir (previous holder crashed between backup and release, a legacy
     # tree) is backed up before the reset. A failed backup aborts the lease: nothing is discarded.

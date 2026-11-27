@@ -71,8 +71,15 @@ foreach ($t in $cases) {
 #    so only when the caller left the variable unset (an explicit -Where / AGENTQ_WHERE is the caller's).
 $call = [regex]::Match($raw, '(?m)^\s*if \(-not \$prevWhere\) \{ \$env:AGENTQ_WHERE = Get-GateRunWhere \$Gate \}')
 Check 'Invoke-GateRun sets AGENTQ_WHERE from Get-GateRunWhere when the caller left it unset' $call.Success
-$restore = [regex]::Match($raw, '(?m)^\s*finally \{ if \(\$prevWhere\)')
-Check 'Invoke-GateRun restores the caller env in a finally block' $restore.Success
+# ORDER, not spacing. This used to pin `finally { if ($prevWhere)` to ONE line; 2026-11-26 reformatted the
+# block to a bare `finally {` plus two guarded restores, one per line, so it failed a test whose guarantee
+# was intact (the suite was red at HEAD, 1 fail, while the behaviour was correct). The guarantee the name
+# states is that the restore sits INSIDE the finally that follows the set - which a renamed `finally`, a
+# deleted restore, or a restore hoisted above the try all break.
+$setAt = $raw.IndexOf('if (-not $prevWhere) { $env:AGENTQ_WHERE = Get-GateRunWhere $Gate }')
+$finAt = if ($setAt -ge 0) { $raw.IndexOf('finally {', $setAt) } else { -1 }
+$resAt = if ($finAt -ge 0) { $raw.IndexOf('if ($prevWhere) { $env:AGENTQ_WHERE = $prevWhere }', $finAt) } else { -1 }
+Check 'Invoke-GateRun restores the caller env in a finally block' ($setAt -ge 0 -and $finAt -gt $setAt -and $resAt -gt $finAt -and ($resAt - $finAt) -lt 1200)
 Check 'the gate placement is read from $Gate, not a hard-coded value' ($raw -match 'Get-GateRunWhere \$Gate')
 
 Write-Host "--- $pass pass / $fail fail"
