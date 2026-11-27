@@ -85,6 +85,10 @@ try {
   Check 'A8 a zero/unknown task cap still floors the derived share at 1' ($s.share -eq 1) ($s | ConvertTo-Json -Compress)
   Check 'A9 the lease path and status both use the helper (one config shape, one store)' `
     ($src -match 'Get-SlotShare \(Read-Leases \$null\) \$Session' -and $src -match 'event = ''slot-reuse''' -and $src -match 'event = ''slot-fair-share''' -and $src -match 'SLOT SHARE')
+  # Slot names repeat per repo (`codai\scratch-1` sits beside `marcai\scratch-1`), so a bare slot in the
+  # status line made two sessions in DIFFERENT repos read as one duplicate lease - a 2026-11-27 report whose
+  # only defect was the display. The line must name repo/slot.
+  Check 'A10 the SLOT SHARE line names repo/slot, not a bare slot' ($src -match '\$\(\$_\.repo\)/\$\(\$_\.slot\)')
 } catch { Check 'A the helpers run' $false "$_" }
 
 # ---------------------------------------------------------------- part B: end to end on the real lease path

@@ -116,7 +116,21 @@ Check 'pool-suites echoes the FAILED suites own logs into stdout (the streaming 
 Check 'pool-suites bounds every suite with -TimeoutMin (a wedge is reported, not held)' ($poolText -match '(?m)-TimeoutMin\s+\d+')
 Check 'pool-suites passes an explicit -Parallel' ($poolText -match '(?m)-Parallel\s+\$Parallel')
 
-# --- MUTATION: a bare local command must be DETECTED (the rule is not vacuous) ---------------------
+# The pool CONCURRENCY must be a knob, not four separate literals: gate.ps1 hardcoded `4` in the -LocalOnly
+# run, in its echo and in both $inner argv shapes, so raising it meant editing a script and re-landing. 4 is
+# still the default AND the value every measurement was taken at - 4 -> 8 is inside the noise, because the
+# suites are contention-bound on ONE pool checkout (2026-11-27: 1035.7 s vs 1049.2 s; a `-Parallel 8` "hang"
+# was a misread of the serial `install` barrier's legitimate silence).
+$gatePath = Join-Path $psRoot 'devcloud\gate.ps1'
+$gateText = if (Test-Path -LiteralPath $gatePath) { Get-Content -LiteralPath $gatePath -Raw } else { '' }
+Check 'gate.ps1 exposes the pool concurrency as -PoolParallel (default 4)' ($gateText -match '(?m)\[int\]\$PoolParallel\s*=\s*4')
+Check 'gate.ps1 threads it everywhere and leaves no hardcoded pool concurrency' `
+    ((@([regex]::Matches($gateText, '\$PoolParallel')).Count -ge 4) -and ($gateText -notmatch "(?m)-Parallel',\s*'4'"))
+# ...and it must SURVIVE the dot-source: the sourced script's own `param()` assigns its defaults into the
+# caller's scope, so -PoolParallel read back as 4 with no assignment in the file to grep for. The re-assert
+# from $PSBoundParameters is what makes the knob real; without it the parameter is silently inert.
+Check 'gate.ps1 re-asserts -PoolParallel after the dot-source (else it is silently inert)' `
+  ($gateText -match "\`$PSBoundParameters\['PoolParallel'\]")
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aq-lgpool-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {
