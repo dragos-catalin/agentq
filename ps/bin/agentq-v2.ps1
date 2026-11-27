@@ -1331,11 +1331,19 @@ function Invoke-Lease {
   # already holds a CLEAN slot of the requested role in this repo gets that slot back instead of renting a
   # second one, so a fan-out of subagents stops multiplying leases. Measured 2026-11-26: ONE session held
   # 12 of a pool of 8 scratch + 4 task slots, so the land PRE-GATE found no scratch slot, was SKIPPED, and
-  # ran a 5-40 min repo gate inside the cap-1 land mutex. Only an UNNAMED, non-`-Wait` request reuses:
-  # `-Slot scratch-N` asks for THAT slot, and `-Wait` is the probe/pre-gate path - the pre-gate RESETS the
-  # slot it rents to origin/<onto>, so handing it a slot this session is still writing in would lose that tree.
-  if (-not $Slot -and -not $Wait) {
-    $reuse = Get-SlotReuse $repo.Name $Role
+  # ran a 5-40 min repo gate inside the cap-1 land mutex. `-Wait` is the probe/pre-gate path and never
+  # reuses - the pre-gate RESETS the slot it rents to origin/<onto>, so handing it a slot this session is
+  # still writing in would lose that tree.
+  # 2026-11-27: a NAMED slot this session already holds now reuses immediately too - the same reuse, only
+  # reached through `-Slot`. Before this, `-Slot scratch-N` on my own lease skipped D5, fell into New-Lease,
+  # found the slot held and NOT stale (scratch staleness is leaseScratchIdleMin = 15 min) and waited the
+  # whole bound out: measured 905-906 s in ps/tests/test-lease-spawns.ps1, i.e. 87% of the devcloud pool
+  # gate (1044 s) and of every land pre-gate. `-Wait` stays excluded, so the pre-gate is unaffected and
+  # Test-GitClean still refuses to hand back a dirty slot.
+  if (-not $Wait) {
+    $reuseRole = $Role
+    if ($Slot -and -not $reuseRole) { $reuseRole = Get-SlotRole $repo.Name $Slot }
+    $reuse = if ($Slot) { Get-SlotReuse $repo.Name $reuseRole $Slot } else { Get-SlotReuse $repo.Name $Role }
     if ($reuse) {
       $rp = "$(P $reuse 'path')"
       $res = [pscustomobject]@{ leaseId = "$(P $reuse 'leaseId')"; repo = $repo.Name; slot = "$($reuse.slot)"; role = "$(P $reuse 'role')"; path = $rp; branch = "$(P $reuse 'branch')"; head = "$(& git -C $rp rev-parse --short HEAD 2>$null)".Trim(); reused = $true }

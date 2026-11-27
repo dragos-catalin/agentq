@@ -935,10 +935,17 @@ function Get-SlotShare($leases, [string]$sess, [int]$taskCap) {
 # (1) REUSE BEFORE RENTING: the CLEAN slot of $role this session already holds in $repoName, else $null.
 # The dirty test is the SAME one the pre-gate uses (tracked OR non-ignored untracked changes disqualify):
 # handing a slot back while the caller is still writing in it would silently lose that work.
-function Get-SlotReuse([string]$repoName, [string]$role) {
+function Get-SlotReuse([string]$repoName, [string]$role, [string]$slot) {
   if (-not (Get-FairShare).enabled) { return $null }
   foreach ($l in @(Read-Leases $repoName)) {
     if (-not $l -or $l.stale) { continue }
+    # 2026-11-27: an EXPLICIT -Slot reuses too - the named-slot twin of D5. Without it `-Slot scratch-N`
+    # on a lease MY session already holds skipped D5, fell into New-Lease, found the slot held and NOT
+    # stale (scratch staleness is leaseScratchIdleMin = 15 min) and waited the full 15 min: measured
+    # 905-906 s in ps/tests/test-lease-spawns.ps1, i.e. 87% of the whole devcloud pool gate (1044 s) and
+    # of every land pre-gate that rents through it. Test-GitClean still gates the reuse, so a DIRTY own
+    # slot keeps the old wait-then-take-over path (nothing is lost).
+    if ($slot -and "$(P $l 'slot' '')" -cne "$slot") { continue }
     if ("$(P $l 'role' '')" -ne "$role") { continue }
     if ("$(P $l 'session' '')" -ne "$Session") { continue }
     $p = Norm-Dir "$(P $l 'path' '')"
