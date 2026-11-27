@@ -188,9 +188,18 @@ function Invoke-BlockGroup([string]$g, [string]$fx) {
     # ONE spawn per case: the block verdict and the advisory are read off the SAME output (the
     # pre-parallel suite spawned twice per warn case - same verdict, twice the wait).
     $out = Hook $Guard $c.cwd $c.cmd
+    # A BLANK capture is not a verdict. The guard writes its refusal/advisory to stderr and exits 0,
+    # so an empty result means the child never ran (or lost its stdin payload - guard-tooluse.ps1:38
+    # `catch { Flush-Stderr; exit 0 }` on an unparseable payload), NOT that the rule said nothing.
+    # Measured in the cloud land-gate pool on 2026-11-27 under load: ONE case in 54 came back empty
+    # and failed the whole gate, while the byte-identical tree passed the two runs either side of it.
+    # Re-run it ONCE, and only for a case that MUST produce output (`block` writes the deny JSON on
+    # stdout, `warn` the advisory on stderr): a real regression always produces output, so the retry
+    # cannot hide one, and the ~15 cases whose CORRECT answer is silence pay no extra spawn.
+    if (-not "$out".Trim() -and ($c.block -or $c.warn)) { $out = Hook $Guard $c.cwd $c.cmd }
     $b = HookDenies $out
     Check (BlockId $c.block $k) ($b -eq $c.block) "(got block=$b)"
-    if ($c.warn) { Check (WarnId $k) ($out -match 'WARNING \(guard-command\)') }
+    if ($c.warn) { Check (WarnId $k) ($out -match 'WARNING \(guard-command\)') ("took: " + ((("$out").Trim() -split '\r?\n' | Where-Object { $_ } | Select-Object -First 1) -join '')) }
   }
 }
 
