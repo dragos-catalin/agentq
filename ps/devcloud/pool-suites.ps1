@@ -61,5 +61,24 @@ if ($List) { exit 0 }
 
 $runAll = Join-Path $root 'ps/tests/run-all.ps1'
 if (-not (Test-Path -LiteralPath $runAll)) { "AGENTQ-POOL-SUITES: no $runAll - refusing."; exit 2 }
-& pwsh -NoProfile -File $runAll -Only ($gateList -join ',') -Parallel $Parallel
+# -LogDir: run-all.ps1 writes one FULL log per suite under this dir. Without it they go to a
+# per-run %TEMP% stage dir that run-all.ps1:484 deletes at the end, so a flaky suite could not
+# be diagnosed from jobs/<id>/log (2026-11-27: `guard format` failed ~40% of pool runs, reason
+# unreadable). We keep the logs, and echo every FAILED suite's log into STDOUT - stdout IS
+# streamed to jobs/<id>/log, so the evidence outlives the VM. No devcloud-side change needed.
+$poolLogDir = Join-Path ([IO.Path]::GetTempPath()) ('aq-pool-logs-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+& pwsh -NoProfile -File $runAll -Only ($gateList -join ',') -Parallel $Parallel -LogDir $poolLogDir
+$rc = $LASTEXITCODE
+if (Test-Path -LiteralPath $poolLogDir) {
+    foreach ($lf in @(Get-ChildItem -LiteralPath $poolLogDir -Filter *.log -ErrorAction SilentlyContinue)) {
+        $body = @(Get-Content -LiteralPath $lf.FullName -ErrorAction SilentlyContinue)
+        $nf = @($body | Where-Object { $_ -match '^\s*FAIL\b' }).Count
+        if (-not $nf) { continue }
+        "AGENTQ-POOL-SUITES: ---- $($lf.Name) (FAIL=$nf) ----"
+        @($body) | Select-Object -Last 200 | ForEach-Object { $_ }
+        "AGENTQ-POOL-SUITES: ---- end $($lf.Name) ----"
+    }
+    Remove-Item -LiteralPath $poolLogDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+exit $rc
 exit $LASTEXITCODE
