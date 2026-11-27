@@ -51,7 +51,13 @@ try {
   # The next land takes the slot over (backup + expire) instead of waiting.
   [IO.File]::SetLastWriteTimeUtc("$f.hb", [DateTime]::UtcNow.AddMinutes(-5))
   git -C $repo checkout -q -b topic; Set-Content (Join-Path $repo 'b.txt') 'b'; git -C $repo add b.txt; git -C $repo commit -qm 'topic b'; git -C $repo push -q origin topic 2>$null; git -C $repo checkout -q dev
-  $o = AQ land -Branch topic -Onto dev -Purpose 'land after dead land' -TimeoutMin 2
+  # -TimeoutMin 2 -> 8 (2026-11-27): on the devcloud pool this exact land was measured at 609 s of
+  # suite wall against 36 s on this workstation - the full 42-suite gate is contention-bound there
+  # (measured effective concurrency ~0.8, the suites share one pool checkout), so the land gave up on
+  # its own 2-minute cap and failed BOTH assertions below. The suite is about RECLAIMING a dead land
+  # lease, not about how fast the machine is; 8 minutes still catches the pre-2026-11-27 ten-minute
+  # wait this test was written to prevent.
+  $o = AQ land -Branch topic -Onto dev -Purpose 'land after dead land' -TimeoutMin 8
   Check 'land reclaims the dead land slot and lands' ($code -eq 0 -and $o -match 'landed topic') $o
   $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.event -eq 'lease-expire' -and $_.resource -match 'land' })
   Check 'reclaim journaled as lease-expire' ($j.Count -ge 1) ''
