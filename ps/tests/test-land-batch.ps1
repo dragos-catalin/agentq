@@ -107,6 +107,19 @@ try {
   Check '3 off: both land' ($r.codes['tC1'] -eq 0 -and $r.codes['tC2'] -eq 0 -and (Remote 'z2.txt') -eq 'tC2')
   $gates = @(Get-Content $env:FAKE_GATE_LOG | Where-Object { $_ -match 'tC' -and $_ -notmatch 'pregate' })
   Check '3 off: one gate per topic, no batch' ($gates.Count -eq 2 -and @(Events 'land-batch').Count -eq $nb) ($gates -join ' | ')
+
+  # 4. the SHIPPED config must batch the repos whose gate is expensive. The default list is codai + brivio,
+  #    so a repo that is NOT named there is silently opted OUT - and `agentq` is the one repo whose gate is
+  #    the whole 43-suite pool run (~11 min). Measured 2026-11-27: two agents landing agentq concurrently
+  #    (fix/lease-reuse-hot-path and perf/lease-spawn-stale-base) ran TWO full gates back to back, and the
+  #    second land additionally paid 412 s waiting for `verify:agentq`. Naming it here is the fix; deleting
+  #    the key silently returns it to the two-gates-per-pair behaviour.
+  $shipped = Join-Path (Split-Path $PSScriptRoot) 'bin\agentq-config.json'
+  $shippedObj = Get-Content -LiteralPath $shipped -Raw | ConvertFrom-Json
+  $lb = $shippedObj.PSObject.Properties['landBatch']
+  $lbJson = if ($lb) { $lb.Value | ConvertTo-Json -Compress } else { 'ABSENT (defaults: codai+brivio only)' }
+  Check '4 the shipped config batches agentq lands' ($lb -and "$($lb.Value.PSObject.Properties['agentq'].Value)" -eq 'True') "landBatch = $lbJson"
+  Check '4 the shipped config keeps codai and brivio batching' ($lb -and "$($lb.Value.PSObject.Properties['codai'].Value)" -eq 'True' -and "$($lb.Value.PSObject.Properties['brivio'].Value)" -eq 'True') "landBatch = $lbJson"
 } finally {
   Pop-Location
   foreach ($p in $script:procs) { try { if (-not $p.HasExited) { $p.Kill($true) } } catch {} }
