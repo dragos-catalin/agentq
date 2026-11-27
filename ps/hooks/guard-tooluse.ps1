@@ -103,11 +103,26 @@ function Flush-Stderr {
 
 # Physical "blocked" signal (room bulb flash / desk screen). Background so the
 # block itself is not delayed; the receiver is vmui on this PC.
+# TEMP can be EMPTY, and `Join-Path '' 'x'` THROWS "Cannot bind argument to parameter 'Path' because
+# it is an empty string" (measured 2026-11-27). Line 586 below runs on EVERY invocation, so that
+# exception killed the guard before it judged anything - and a hook that dies is a hook that ALLOWS
+# (exit != 2 = fail-open). The whole formatter rule silently disabled itself; the suite showed it as
+# 27 x "got block=False" with TEMP/TMP cleared. Resolve a real temp dir once, here.
+function Get-GuardTemp {
+  $t = $env:TEMP
+  if (-not $t) { $t = $env:TMP }
+  if (-not $t) { try { $t = [IO.Path]::GetTempPath() } catch { $t = $null } }
+  if (-not $t -or -not "$t".Trim()) { $t = $env:USERPROFILE }
+  if (-not $t -or -not "$t".Trim()) { $t = $env:SystemRoot }
+  if (-not $t -or -not "$t".Trim()) { $t = (Get-Location).ProviderPath }
+  if (-not [IO.Path]::IsPathRooted($t)) { $t = Join-Path (Get-Location).ProviderPath $t }
+  return $t
+}
 function Signal-Blocked([string]$Why) {
   $sid = "$($payload.session_id)"
   $envFile = 'E:\gh\vmui\.private\credentials.env'
   if (-not (Test-Path $envFile)) { return }
-  $tmp = Join-Path $env:TEMP ("copilot-signal-{0}.json" -f [guid]::NewGuid())
+  $tmp = Join-Path (Get-GuardTemp) ("copilot-signal-{0}.json" -f [guid]::NewGuid())
   (@{ _m = 'POST'; event = 'blocked'; text = $Why.Substring(0, [Math]::Min(120, $Why.Length)); session = $sid; source = 'guard' } | ConvertTo-Json -Compress) | Set-Content $tmp
   $worker = Join-Path $PSScriptRoot 'lib\copilot-signal-send.ps1'
   Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $worker, '-Queue', $tmp, '-EnvFile', $envFile -ErrorAction SilentlyContinue | Out-Null
@@ -583,7 +598,7 @@ if ($cmd -match '\bgit\b[^;|&]*\bworktree\s+(remove|move)\b' -and $cmd -notmatch
 # Stale-script trap (hit 3x, last 2026-10-05: a denied create_file of ship5.ps1 was run in the
 # SAME parallel tool block, so the OLD script re-committed files under a wrong message). Every
 # denied whole-file write leaves a marker; running a script with that path within 10 min is blocked.
-$script:DeniedDir = Join-Path $env:TEMP 'copilot-guard-denied'
+$script:DeniedDir = Join-Path (Get-GuardTemp) 'copilot-guard-denied'
 if (-not $isEditTool -and $cmd -and (Test-Path $script:DeniedDir)) {
   foreach ($m in Get-ChildItem $script:DeniedDir -File -EA SilentlyContinue) {
     if ($m.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)) { Remove-Item $m.FullName -EA SilentlyContinue; continue }
@@ -1083,7 +1098,7 @@ if (Test-Path $d) { $stores += [pscustomobject]@{ Name = 'DEFAULT'; Path = $d } 
 
 $owners = @()
 foreach ($s in $stores) {
-  $tmp = Join-Path $env:TEMP "gw_$($s.Name).db"
+  $tmp = Join-Path (Get-GuardTemp) "gw_$($s.Name).db"
   try {
     Copy-Item $s.Path $tmp -Force -EA Stop
     # Recent writes live in the WAL; without it the newest rows are invisible,

@@ -46,6 +46,28 @@ $script:fails = 0
 $script:pass = 0
 $script:ids = New-Object System.Collections.Generic.List[string]
 $script:idFile = ''
+# One place that answers "where does this fixture live", because the obvious answer is a trap.
+# `[IO.Path]::GetTempPath()` THROWS when TEMP and TMP are both empty - measured 2026-11-27:
+#   Exception calling "GetTempPath" with "0" argument(s): "The filename, directory name, or volume
+#   label syntax is incorrect. : ''."
+# The old code let that escape from a bare `Join-Path ([IO.Path]::GetTempPath()) 'gf-...'`, so no
+# fixture root was ever created and every -WorkDir handed to a worker became a RELATIVE path: the
+# workers then created their fixtures in the process's CWD. That is how 325 junk directories appeared
+# at the codai repo root (had to be quarantined by hand; a full disc walk found them).
+# This helper always returns an ABSOLUTE, EXISTING directory, and asserts it - a silently relative
+# root is what turns a test fixture into litter, and the assertion is cheaper than finding it twice.
+function Get-FixtureRoot([string]$Prefix) {
+  $base = $null
+  try { $base = [IO.Path]::GetTempPath() } catch { $base = $null }
+  if (-not $base -or -not "$base".Trim()) { $base = $env:USERPROFILE }
+  if (-not $base -or -not "$base".Trim()) { $base = $env:TEMP }
+  if (-not $base -or -not "$base".Trim()) { $base = (Get-Location).ProviderPath }
+  if (-not [IO.Path]::IsPathRooted($base)) { $base = Join-Path (Get-Location).ProviderPath $base }
+  $d = Join-Path $base ($Prefix + [guid]::NewGuid().ToString('N').Substring(0, 6))
+  New-Item -ItemType Directory -Force -Path $d | Out-Null
+  if (-not [IO.Path]::IsPathRooted($d)) { throw "fixture root is not absolute: '$d' (base '$base')" }
+  return $d
+}
 # PASS/FAIL is the contract run-all.ps1 counts ('^\s*(PASS|ok)\b' vs '^\s*FAIL\b') - never change it.
 function Check([string]$n, [bool]$ok, [string]$d = '') {
   if ($ok) { Write-Host "PASS $n"; $script:pass++ } else { Write-Host "FAIL $n $d" -ForegroundColor Red; $script:fails++ }
@@ -426,7 +448,7 @@ if ($List) {
 
 # ---------------------------------------------------------------- worker: run ONE group in this process
 if ($Group -ne 'auto') {
-  $fx = if ($WorkDir) { $WorkDir } else { Join-Path ([IO.Path]::GetTempPath()) ('gf-' + [guid]::NewGuid().ToString('N').Substring(0, 6)) }
+  $fx = if ($WorkDir) { $WorkDir } else { Get-FixtureRoot 'gf-' }
   $ownDir = -not $WorkDir
   New-Item -ItemType Directory -Force -Path $fx | Out-Null
   $script:idFile = Join-Path $fx 'ids.txt'
@@ -464,8 +486,7 @@ if ($w -le 0 -and $env:AGENTQ_GUARD_FORMAT_WORKERS) { $w = [int]$env:AGENTQ_GUAR
 if ($w -le 0) { $w = $order.Count }
 if ($w -gt $order.Count) { $w = $order.Count }
 if ($w -lt 1) { $w = 1 }
-$root = Join-Path ([IO.Path]::GetTempPath()) ('gf-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-New-Item -ItemType Directory -Force -Path $root | Out-Null
+$root = Get-FixtureRoot 'gf-'
 $hostExe = Get-HostExe
 $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 Write-Host ("guard-format: running $($order.Count) group(s) with $w worker(s) via $hostExe")
