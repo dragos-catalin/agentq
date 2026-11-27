@@ -97,6 +97,20 @@ foreach ($rel in 'devcloud\gate.ps1', 'devcloud\pool-suites.ps1') {
     Check "the staged pool gate file exists: ps\$rel" (Test-Path -LiteralPath (Join-Path $psRoot $rel))
 }
 
+# --- the pool gate KEEPS the per-suite logs (2026-11-27) -------------------------------------------
+# run-all.ps1 writes one FULL log per suite under -LogDir, or - when -LogDir is absent - under a
+# %TEMP%\aq-runall-<6hex> stage dir that run-all.ps1:484 deletes at the end. So WITHOUT -LogDir the
+# per-suite logs never leave the pool and only the summary lines Report-Suite prints reach
+# jobs/<id>/log. That is exactly why `guard format` could fail ~40% of pool runs on 2026-11-27
+# (`FAIL warn cargo fmt (no rustfmt.toml)`) and still not be diagnosable: the guard's own output
+# lived in a file deleted with the job. The wrapper must therefore pass -LogDir AND echo the FAILED
+# suites' logs into STDOUT (stdout is what streams to jobs/<id>/log). Written as the RULE, not as a
+# copy of today's code.
+$poolPath = Join-Path $psRoot 'devcloud\pool-suites.ps1'
+$poolText = if (Test-Path -LiteralPath $poolPath) { Get-Content -LiteralPath $poolPath -Raw } else { '' }
+Check 'pool-suites passes a -LogDir to run-all (the per-suite logs outlive the job)' ($poolText -match '(?m)-LogDir\s+\$\w+')
+Check 'pool-suites echoes the FAILED suites own logs into stdout (the streaming channel)' (($poolText -match '(?m)-Filter\s+\*\.log') -and ($poolText -match 'AGENTQ-POOL-SUITES: ----'))
+
 # --- MUTATION: a bare local command must be DETECTED (the rule is not vacuous) ---------------------
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('aq-lgpool-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 New-Item -ItemType Directory -Force $tmp | Out-Null

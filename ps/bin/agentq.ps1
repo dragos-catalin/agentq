@@ -358,6 +358,32 @@ while ($i -lt $argv.Count) {
   }
   $i++
 }
+# TASK 3: reject a comma-joined value on a parameter that holds ONE value.
+# `pwsh -NoProfile -File agentq.ps1 -Repo a,b` does NOT build an array: PowerShell's `-File` binder hands the
+# whole `a,b` token to the parameter as ONE string, so the verb quietly looks up a repo literally named
+# "a,b" and prints nothing - which reads as "no such work" instead of "your value is nonsense". Two real
+# round trips died on this (codai scripts/ops/forensics/README.md: `dead-leases.ps1 -Repo a,b` printed
+# `0 lease(s), 0 DEAD`). Commas only expand for `-Command` or an in-session call, so a value for one of
+# these parameters can NEVER legitimately contain one: refuse it, with the fix, instead of guessing.
+# `-Paths`, `-Claims`, `-Also` and `-Only` accept a comma list ON PURPOSE (they split it themselves) and are
+# deliberately absent here. `-Gate`, `-Message`, `-Purpose`, `-Reason` and the path flags are absent too:
+# those are free text or real filesystem paths, where a comma is legal.
+$script:CommaSingles = [ordered]@{
+  Repo = 'Repo'; ExpectRepo = 'ExpectRepo'; Slot = 'Slot'; Role = 'Role'; Branch = 'Branch'; Onto = 'Onto'
+  Target = 'Target'; Sha = 'Sha'; Ref = 'Ref'; Base = 'Base'; Ws = 'Ws'; Name = 'WsName'; State = 'State'
+  Kind = 'FbKind'; Lane = 'Lane'; Where = 'Where'; Session = 'PickSession'; Id = 'Id'; LeaseId = 'LeaseId'
+  Follow = 'Follow'; RunId = 'RunId'; Phase = 'Phase'
+}
+foreach ($cn in $script:CommaSingles.Keys) {
+  $cv = Get-Variable -Name $script:CommaSingles[$cn] -ValueOnly -ErrorAction SilentlyContinue
+  if ($null -eq $cv -or "$cv" -notmatch ',') { continue }
+  [Console]::Error.WriteLine("agentq: -$cn got ONE value containing a comma: '$cv'")
+  [Console]::Error.WriteLine("  -$cn holds a SINGLE value, so '$cv' can never match anything.")
+  [Console]::Error.WriteLine("  'pwsh -File agentq.ps1 -$cn a,b' binds the whole 'a,b' as ONE string: a comma list only")
+  [Console]::Error.WriteLine("  expands for -Command or an in-session call, and the run then filters on 'a,b' in silence.")
+  [Console]::Error.WriteLine("  Pass it once per value (-$cn a -$cn b), or use the verb's list flag (-Paths/-Claims/-Also/-Only).")
+  exit 2
+}
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 # Pre-initialised so a read-before-assignment cannot throw under StrictMode 3 (2026-11-22). Only the two
@@ -686,6 +712,21 @@ function Get-Live([string]$res) {
   $out
 }
 
+# TASK 1: how many `land:<repo>` tickets may be live at once. `land` was capacity-1 because the merge to
+# origin/<onto> is a single per-repo operation - but the ticket was ALSO the only place a pre-gate could
+# run, so a land that waited 13 min (p90) held the whole lock while its own gate ran, and land was 60 % of
+# all fleet queue time (7 days to 2026-11-26: 83.6 h, p90 13.3 min, max 6.4 h). Config `landCapacity`
+# (default 1 = today's behaviour) may raise it to 2 - two lands then pre-gate and queue in parallel, and
+# the merge/push phase takes a bounded per-repo mutex (Enter-LandMergeMutex), so only ONE land is ever
+# merging/pushing. Clamped to 1..2: there is one `land` worktree per repo, and a third waiter would only
+# lengthen the mutex queue without buying a second merge.
+# `-Capacity` on `land:` is deliberately NOT honoured - the config flag is the switch, so a stray
+# `-Capacity 2` cannot silently enable the concurrent path.
+function Get-LandCapacity {
+  $c = Get-Config
+  $v = if ($c -and $c.ContainsKey('landCapacity')) { [int]$c['landCapacity'] } else { 1 }
+  if ($v -lt 1) { 1 } elseif ($v -gt 2) { 2 } else { $v }
+}
 function Get-Capacity([string]$res) {
   # build:machine: config machineCap (+ an active, unexpired burst) wins over the sticky capacity
   # file, which is rewritten so the hub/sync readers see the effective value (DC-014).
@@ -707,6 +748,17 @@ function Get-Capacity([string]$res) {
     $gateCap = if ($gc.ContainsKey('gateMachineCap')) { [int]$gc['gateMachineCap'] } else { 3 }
     if ($gateCap -lt 1) { $gateCap = 1 }
     return $gateCap + (Get-BurstExtra $res)
+  }
+  # land:<repo> (TASK 1): the config flag wins over the sticky file, for the same reason build:machine
+  # does - a sticky `1` written before the flag was turned on must not pin a repo at capacity 1, and a
+  # sticky `2` left behind must not keep the concurrent path alive after the flag was turned off. The
+  # file is rewritten so the hub/sync readers and the queue display show the effective value.
+  if ($res -like 'land:*') {
+    $cap = Get-LandCapacity
+    if ($script:ReadOnly) { return $cap }
+    $f = Join-Path (QPath $res) 'capacity'
+    try { if (-not (Test-Path $f) -or [int](Get-Content $f -Raw) -ne $cap) { New-Item -ItemType Directory -Force (QPath $res) | Out-Null; [IO.File]::WriteAllText($f, "$cap") } } catch {}
+    return $cap
   }
   $f = Join-Path (QPath $res) 'capacity'
   $base = if (Test-Path $f) { [int](Get-Content $f -Raw) } elseif ($DefaultCapacity.ContainsKey($res)) { $DefaultCapacity[$res] } elseif ($DefaultCapacity.ContainsKey(($res -split ':')[0] + ':*')) { $DefaultCapacity[($res -split ':')[0] + ':*'] } else { 1 }

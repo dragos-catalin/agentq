@@ -81,6 +81,7 @@
   "leaseIdleMin": 45,
   "leaseOwnerIdleMin": 90,
   "leaseChatGraceMin": 30,
+  "chatNowSec": 30,
   "leaseScratchIdleMin": 15,
   "scratchSlots": 8,
   "scratchSlotsMax": 12,
@@ -131,6 +132,7 @@
       "publish",
       "lease liveness",
       "land precheck",
+      "land capacity",
       "land pregate",
       "land batch",
       "land default gate",
@@ -158,7 +160,9 @@
       "gate input selection",
       "agentq timings",
       "agentq reclaim",
-      "agentq approve"
+      "agentq approve",
+      "takeover chat",
+      "args comma"
     ]
   },
   "sharedCloneMode": "warn",
@@ -207,6 +211,8 @@
   "landPregateRounds": 2,
   "landPregateScratchWaitMin": 5,
   "landGateRunsMax": 4,
+  "landCapacity": 1,
+  "landMergeWaitMin": 90,
   "landRequeueMax": 3,
   "landFreezeMaxMin": 30,
   "greenTtlHours": 168,
