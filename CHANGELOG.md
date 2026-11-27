@@ -31,7 +31,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq bump`, `agentq burst`, `agentq propose` overrides — reason required, journaled, rate-limited.
 - `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
 - Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
-- Config knobs in `agentq-config.json` (machineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
+- Config knobs in `agentq-config.json` (machineCap, gateMachineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
 - Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
 - Orchestrator stage 0 ([ADR 0009](docs/adr/0009-orchestrator-daemon-tasks-control-plane.md), tracker OQ-001 to OQ-012; details in [docs/orchestrator-stage-0.md](docs/orchestrator-stage-0.md)): chat keep-alive for slot leases, land pre-gate in the slot and a green ledger, admission by load and by owner presence, `agentq probe`, `prune` and `doctor`, more numbers in `agentq slo`, `hook-pre.ps1` installed from this repository, an installer that merges the config, and the suites in CI.
 - `git-autosync -ParkConflictingCommits` (fleet config `autosync.parkConflictingCommits`): a local commit
@@ -269,6 +269,9 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   must admit the same command, and a hand-written `queues\gate_machine\capacity` of 9 must be ignored
   (3 FAILED, exit 1) - while the floor-1 case stays green, so the arm is a semantic mutation, not a syntax
   break.
+- `gateMachineCap` is pinned explicitly in the shipped `agentq-config.json` (3, the value that was
+  previously only the code default), and `gate:machine` is listed in the README's resource list and in
+  `spec/acp-lock.md`'s resource conventions, so the resource is discoverable outside the source tree.
 
 ### Security
 

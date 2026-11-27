@@ -105,6 +105,7 @@
     "minFreeCommitGB": 12,
     "everySec": 15
   },
+  "gateMachineCap": 3,
   "quickBurst": 2,
   "agingMin": 5,
   "idleYieldMin": 5,
