@@ -148,3 +148,40 @@ distinct losses; the code change stops the re-count and the permanent lease.)
   documents as a deliberately separate gate, so it was left alone. Machine: 191.8 GB RAM, 119 GB free.
 - **`lostWorkIncidents` 6** and **`lease-break 23 / lease-expire 17`** need their own investigation.
 - **The 154 MB `agentq.db`** is unused by the read path; either use it (slice 5) or delete it.
+
+## Round 2026-11-27 — lease spawn shape, fixture bound, stale-base land guard
+
+Measured, in the leased slot `agentq/task-1` at `origin/main`, same session for every before/after:
+
+| what | before | after | how |
+| --- | --- | --- | --- |
+| git spawns per `agentq lease` (shim count in `test-lease-spawns.ps1`) | fresh 8 / reuse 4 | fresh 7 / reuse 3 | `head` read from the repo resolution's combined `rev-parse` instead of a second one |
+| `lease spawns` in the devcloud pool gate | 905-906 s (87 % of a 1044 s gate) | 11 s | cause was a NAMED re-lease of the caller's own slot waiting out `leaseScratchIdleMin` = 900 s; fixed on main as `0507fec`, re-measured `TOTAL sec=67 suites=8 failed=0` |
+| a hung fixture child | no verdict, gate wedged for hours | red verdict in ~18 s with stdout/stderr and elapsed | bounded child wait in the suite (`AGENTQ_TEST_CHILD_BOUND_SEC`) |
+| a merge resolution that reverts main | would land silently (invisible to the `merge-tree` conflict precheck) | refused, offending paths named, journaled `land-stale-base` | new guard + `test-land-stale-base.ps1` (4 fixtures, mutation-tested) |
+
+Hook cost, measured on this machine while the box was saturated: the hook is **verb-blind** (~470-500 ms per
+call, of which 35 % is process start and 65 % the guard scripts), while `agentq` itself costs ~850 ms fixed
+(pwsh start 372 ms + parse/dispatch ~480 ms) plus the verb's own work - so the hook is 36 % of `agentq help`,
+17 % of `status`, 5 % of `since`. The cost ledger (`coord/hooks/cost-*.jsonl`) records **only the VS Code tool
+name**, never the verb or the command line, so no per-verb split can be derived from it after the fact; it has
+to be measured live. The single most reducible item: ~38 % of all calls (78 400 of 205 870) are read-only tools
+the hook can never deny, and they still pay the guard scripts - ~5.9 h/day of the measured hook cost. Two
+figures in this document need their provenance re-checked against a clean window: the 8.60 h/day baseline here
+vs ~16.8 h/day measured 2026-11-27, and the resident hook client's ledger now under-counts ~7x because its
+timing window starts inside the already-running server.
+
+Not done, stated so nobody assumes it is covered: the pool's `AqSuiteInputMap` has no entry for 8 of the 43
+`gateSuites.agentq` names (`lease spawns`, `land capacity`, `agentq reclaim`, `agentq approve`, `takeover chat`,
+`args comma`, `gate input selection`, `agentq timings`), so those can never be SKIPPED - but filling the map
+outside `ps/` selects zero suites (`$proved` needs both a run and a skip), which makes `gate.ps1` fall back to
+the full 43-suite pool: fixes for it need a measurement, not a guess.
+
+Shared-clone note from the same round: `git-autosync` refused `agentq` for **14 h 49 m** over ONE obsolete
+local commit (`main` ahead 1, behind 10) while every other repo synced. Pushing that commit to a branch does
+**not** clear the refusal - the condition is `origin/main..HEAD` being empty - and the repo is PUBLIC, so the
+private-backup-convention does not apply. What clears it (and is what autosync itself does, keeping the old
+value in `refs/backup/autosync/main`): a ref-only `update-ref refs/heads/main origin/main <old>`, then align
+the files whose worktree content still equals the old commit (and re-add the ones upstream added), leaving any
+path a live session has edited exactly as it is. Verified: 13 files aligned, the 10 files of the sibling
+session byte-identical before and after, `git-autosync -WhatIf` -> `agentq in sync`.

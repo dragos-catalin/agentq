@@ -521,12 +521,19 @@ function Get-RepoInfo($path) {
   # so both answers come out of a single process. This runs at the start of EVERY verb (status, commit,
   # run, slo, lease), so the saving is not lease-only. A non-repo fails the whole call (exit 128, stderr
   # suppressed) -> zero lines -> the cached "not a repo" answer, exactly as before.
-  $out = @((& git -C $p rev-parse --show-toplevel --path-format=absolute --git-common-dir 2>$null) | Where-Object { "$_" -ne '' })
-  if ($LASTEXITCODE -or $out.Count -lt 2) { $script:RepoInfoCache[$key] = $null; return $null }
+  # 2026-11-27: the SHORT HEAD rides along as a THIRD directive, so `lease` reads the sha off THIS
+  # process instead of spawning `rev-parse --short HEAD` again (measured: -1 spawn on BOTH the fresh and
+  # the re-lease arm). An UNBORN HEAD fails the directive (exit 128) while the first two lines are still
+  # printed, so "is this a repo" is the LINE COUNT, not $LASTEXITCODE - keying on the exit code would
+  # turn a fresh `git init` (no commit) into "not a repo" for every verb. Line 3 is absent when HEAD does
+  # not resolve, which is exactly the '' the old separate spawn produced.
+  $out = @((& git -C $p rev-parse --show-toplevel --path-format=absolute --git-common-dir --short HEAD 2>$null) | Where-Object { "$_" -ne '' })
+  if ($out.Count -lt 2) { $script:RepoInfoCache[$key] = $null; return $null }
   $top = $out[0]; $common = $out[1]
+  $sha = if ($out.Count -ge 3) { "$($out[2])" } else { '' }
   $name = Split-Path (Split-Path $common -Parent) -Leaf
   $ds = [IO.Path]::DirectorySeparatorChar
-  $info = [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant() }
+  $info = [pscustomobject]@{ Top = ($top -replace '/', $ds); Common = ($common -replace '/', $ds); Name = $name.ToLowerInvariant(); Sha = $sha }
   $script:RepoInfoCache[$key] = $info
   $info
 }

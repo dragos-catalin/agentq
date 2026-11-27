@@ -6,6 +6,21 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- `agentq land` refuses a topic whose merge resolution would silently revert `origin/<onto>`. The class is real
+  and was an inch from landing on 2026-11-27: a branch whose tip is a merge of a base already inside main, hand
+  resolved back to the old content - it deleted `ps/tests/test-agentq-gate-machine.ps1` (143 lines) and cut
+  `run-all.ps1` by 12, `guard-tooluse.ps1` by 18/-3, `install.ps1` by 4, `CHANGELOG.md` by 13. The precheck that
+  existed only sees `merge-tree` CONFLICTS, so a clean merge that drops main's bytes was invisible to it. The
+  rule is deliberately **not** "the topic merged a base that is already in main" - merging `origin/main` into
+  your branch is a legitimate workflow and that naive rule refuses it (fixture B pins that). It fires only when
+  the merged tree loses content `origin/<onto>` still has, on a path whose origin side is unchanged since the
+  merge base, where the tip's resolution deviates from the clean auto-merge of its own parents. Bounded to a
+  handful of git calls, only when the tip is a merge, and none of them on the `lease`/`status`/`since` paths;
+  escape hatch `AGENTQ_LAND_NO_STALEBASE=1`, named in the refusal and journaled as `land-stale-base`. Suite:
+  `ps/tests/test-land-stale-base.ps1` - four fixtures (reverting branch refused and naming the path; a
+  legitimate merge of main allowed; an intentional deletion allowed; a real two-sided merge allowed), and
+  mutation-tested: disabling the check turns fixture A green, so it is not decorative.
+
 - MCP: the whole surface is reachable through the server, not only the daemon. 23 new tools - `agentq_since`/`_status`/`_run`/`_note`/`_break`/`_propose`/`_workspace`, `agentq_lease`/`_unlease`/`_land`/`_publish`/`_sweep`, `job_start`/`job_wait`/`job_list` and `cloud_submit`/`cloud_status`/`cloud_workspaces`/`cloud_suspend`/`cloud_resume`/`cloud_reset`/`cloud_log`/`cloud_result` - each wrapping the script a person would call, with named parameters, the script's own exit codes, and a required reason on the destructive ones. Spawning goes through the new `src/pws.ts` (argv arrays, captured pipes, `pwsh` with a `powershell.exe` fallback, a timeout that reports code 124). 30 tools in total; `buildMcpServer` is exported so a test can register against an in-memory transport.
 
 - `-Lane interactive|quick|gate|heavy|batch` and `-Priority` on `run` / run-build: waiters are ranked by priority with aging instead of strict FIFO.
@@ -60,6 +75,13 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
 ### Fixed
+
+- A hung child in `ps/tests/test-lease-spawns.ps1` can no longer hang a gate. Every fixture child now has a
+  bounded wait (override `AGENTQ_TEST_CHILD_BOUND_SEC`); on timeout the child is KILLED, its stdout, stderr and
+  elapsed time are printed, the suite FAILS, and its `%TEMP%\aqspawn-*` tree is still removed (retried, and then
+  asserted gone). Before this, the suite produced no verdict for hours while the 15-minute re-lease wait was
+  live, so a red test looked like a wedged gate. Proven by pointing a child at `Start-Sleep 600`: 18 s to a red
+  verdict with the diagnostic, instead of a hang.
 
 - **A re-lease that NAMES a slot my own session already holds waited out the whole scratch staleness bound
   (15 min).** `-Slot scratch-N` skipped D5's reuse-before-renting fast path, which only fired for an UNNAMED
@@ -121,6 +143,15 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   unchanged, and docs/plan/markdown/.copilot-tmp stay writable in the shared clone.
 
 ### Changed
+
+- `agentq lease` resolves its result with one git spawn fewer per arm: `head` is taken from the repo
+  resolution's existing combined `rev-parse` (which now also asks for `--short HEAD`) instead of a second
+  `rev-parse` of its own. Measured in `ps/tests/test-lease-spawns.ps1` on the same slot in the same session:
+  **fresh 8 -> 7, reuse 4 -> 3**. `head` is the short HEAD of the repo the lease was resolved against: it is
+  display-only - no machine reader, and not a field of the on-disk lease record - but a caller that leases from
+  OUTSIDE a slot it already holds now sees its own HEAD there rather than that slot's. `Get-RepoInfo` also
+  decides "is this a repo" by the number of output lines rather than `$LASTEXITCODE`, because an unborn HEAD
+  makes the new directive exit 128 while still printing the lines it always printed.
 
 - `agentq status`, `log`, `metrics` and `doctor` only read the state folder; dead tickets are reaped by working verbs and by `sweep`.
 - The guard honours `sharedCloneMode` under Windows PowerShell 5.1 (it was ignored in the editor).
