@@ -3139,7 +3139,7 @@ function Invoke-Land {
   try { Update-Ticket $t @{ landBranch = $Branch; landOnto = $Onto; landGate = "$Gate"; claims = $tc; leaseCreated = $(if ($srcLease) { "$(P $srcLease 'created' '')" } else { '' }) } } catch {}
   Write-Journal @{ event = 'queued'; resource = $res; ticket = $t.id; purpose = $why; repo = $repo.Name }
   $landQueuedAt = Now
-  $lease = $null; $hb = $null; $set = @(); $peersDone = $false; $mergeLock = $null
+  $lease = $null; $hb = $null; $hbTicket = $null; $set = @(); $peersDone = $false; $mergeLock = $null
   $bdir = Join-Path (Join-Path $Root 'batches') $repo.Name
   $myResult = Join-Path $bdir "$($t.id).json"
   $script:LandExit = 1
@@ -3163,13 +3163,19 @@ function Invoke-Land {
       $tl = Format-LandTiming $landQueuedAt $landAcquiredAt; if ($tl) { Write-Output $tl }
       $script:LandExit = $x; return
     }
-    # The ticket heartbeat starts BEFORE the merge mutex below, because waiting for the mutex can take
-    # minutes and a ticket whose `.hb` stops moving is reaped as STALE (Get-Live) - the land would lose its
-    # own lock to the wedge reaper while it was queued behind a sibling. The lease file does not exist yet,
-    # so it is passed by its (known) path: New-Lease writes the record and the heartbeat file later, and
-    # SetLastWriteTimeUtc on a missing path is caught and ignored until then.
-    $leaseHb = "$(Get-LeaseFile $repo.Name 'land').hb"
-    $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", $leaseHb)) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
+    # TASK 1: a land that waits for the per-repo merge mutex below must keep its TICKET heartbeat moving, or
+    # the wedge reaper takes the lock it already holds (Get-Live judges the ticket by this file's mtime).
+    # ONLY the ticket is heartbeated before New-Lease: the `land` LEASE heartbeat file carries the exact
+    # mtime the slot take-over decision reads, so renewing it here made a DEAD land lease look alive and the
+    # land then waited out New-Lease's own 10 min for a holder that was already gone instead of reclaiming
+    # the slot (measured 2026-11-27: test-land-reclaim red on exactly those two checks, and the suite itself
+    # took 609 s ~= that 10 min wait - before the change the lease heartbeat started only AFTER New-Lease had
+    # taken the slot over). The lease's own heartbeat resumes below, once the lease exists. At the default
+    # capacity 1 there is no mutex to wait for, so no early job is started and the path stays the old one.
+    $hbTicket = $null
+    if ((Get-LandCapacity) -gt 1) {
+      $hbTicket = Start-ThreadJob -ArgumentList (, @("$($t.file).hb")) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
+    }
     # TASK 1: only ONE land may be in its merge/push phase per repo, whatever `land:<repo>` capacity says.
     # At the default capacity 1 the ticket is already exclusive, so nothing is taken and the path is
     # byte-for-byte the old one. At capacity 2 the second land waits here (bounded) instead of racing the
@@ -3185,7 +3191,9 @@ function Invoke-Land {
       }
       Write-Journal @{ event = 'land-merge-enter'; resource = $res; branch = $Onto; ticket = $t.id; repo = $repo.Name }
     }
+    if ($hbTicket) { Stop-Job $hbTicket -ErrorAction SilentlyContinue; Remove-Job $hbTicket -Force -ErrorAction SilentlyContinue; $hbTicket = $null }
     $lease = New-Lease $repo 'land' 'land' $why '' $PID 10 $false
+    $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", "$($lease.file).hb")) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
     $wt = $lease.path
     & git -C $main fetch -q origin 2>$null
@@ -3255,6 +3263,7 @@ function Invoke-Land {
     $script:WaitPoll = $null
     # A holder that dies mid-batch hands every absorbed waiter back to the queue.
     if (-not $peersDone) { foreach ($tp in @($set | Where-Object { -not $_.own })) { try { Update-Ticket $tp.ticket @{ batchedBy = '' } } catch {} } }
+    if ($hbTicket) { Stop-Job $hbTicket -ErrorAction SilentlyContinue; Remove-Job $hbTicket -Force -ErrorAction SilentlyContinue; $hbTicket = $null }
     if ($hb) { Stop-Job $hb -ErrorAction SilentlyContinue; Remove-Job $hb -Force -ErrorAction SilentlyContinue }
     if ($lease) {
       $l = (Read-Leases $repo.Name | Where-Object { $_.slot -eq 'land' -and $_.leaseId -eq $lease.leaseId } | Select-Object -First 1)

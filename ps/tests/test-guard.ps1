@@ -225,18 +225,30 @@ try {
     ConvertTo-Json | Set-Content (Join-Path $aqHome 'marks\deploy_codai_gateway.json')
   $rb = 'pwsh -NoProfile -File C:\Users\vladu\.copilot\hooks\run-build.ps1 -Command "pnpm build"'
   $dc = 'pwsh -NoProfile -File C:\Users\vladu\.copilot\hooks\deploy-clean.ps1 -Command "pwsh -File scripts/ops/deploy-service-direct.ps1 -Service '
-  Push-Location E:\gh\codai
+  # 2026-11-27: the guard resolves the marked repo from `git rev-parse --git-common-dir` in the hook
+  # process's CWD, taking the leaf of its PARENT (guard-tooluse.ps1:684-686). This section used to
+  # Push-Location into E:\gh\codai / E:\gh\brivio - real checkouts that exist only on this workstation -
+  # so the whole suite died with "Cannot find drive. A drive with the name 'E' does not exist" on the
+  # devcloud pool, where the land gate runs it (ps/devcloud/gate.ps1 -> ws-agentq). Two throwaway
+  # `git init` repos with those leaves exercise the same code path and work on any machine.
+  $fxRoot = Join-Path $aqHome 'repos'
+  foreach ($leaf in 'codai', 'brivio') {
+    $d = Join-Path $fxRoot $leaf
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    $null = & git -C $d init -q 2>$null
+  }
+  Push-Location (Join-Path $fxRoot 'codai')
   $fBlock = @($rb, ($dc + 'gateway"'))
   $fPass = @(($dc + 'auth"'), 'git status', 'pnpm lint')
   # D-40: a frozen resource warns (exit 0 + "WARNING (allowed)"), it does not hard-block.
   $mHoles = @($fBlock | Where-Object { -not (Invoke-GuardStop $_).stopped })
   $mFalse = @($fPass | Where-Object { (Invoke-GuardStop $_).code -eq 2 })
   Pop-Location
-  Push-Location E:\gh\brivio
+  Push-Location (Join-Path $fxRoot 'brivio')
   if ((Invoke-GuardStop $rb).code -eq 2) { $mFalse += 'brivio build blocked by a codai freeze' }
   Pop-Location
   Remove-Item (Join-Path $aqHome 'marks\*.json')
-  Push-Location E:\gh\codai
+  Push-Location (Join-Path $fxRoot 'codai')
   if ((Invoke-GuardStop $rb).code -eq 2) { $mFalse += 'build still blocked after mark cleared' }
   Pop-Location
   Write-Host ("frozen resources stopped      : {0} / {1}" -f ($fBlock.Count - $mHoles.Count), $fBlock.Count)
