@@ -150,6 +150,13 @@ $map = [ordered]@{
   # fair share (D4). `test-land-default-gate.ps1` was in run-all but not in this map, so the installed
   # copy never carried it - the install gate could not run what it never installed.
   'tests\test-agentq-recover.ps1' = 'bin\test-agentq-recover.ps1'; 'tests\test-agentq-commit-fast.ps1' = 'bin\test-agentq-commit-fast.ps1'
+  # 2026-11-26 (queue-time slice): land capacity + the bounded per-repo merge mutex, the per-CHAT
+  # take-over note, and the comma-joined single-value argument guard. Paired with the run-all.ps1 entries
+  # in this same slice and with gateSuites.agentq in bin\agentq-config.json - 'install wiring' pins all
+  # three lists together.
+  'tests\test-land-capacity.ps1' = 'bin\test-land-capacity.ps1'
+  'tests\test-slot-takeover-chat.ps1' = 'bin\test-slot-takeover-chat.ps1'
+  'tests\test-agentq-args-comma.ps1' = 'bin\test-agentq-args-comma.ps1'
   'tests\test-agentq-fairshare.ps1' = 'bin\test-agentq-fairshare.ps1'; 'tests\test-agentq-slotshare.ps1' = 'bin\test-agentq-slotshare.ps1'; 'tests\test-land-default-gate.ps1' = 'bin\test-land-default-gate.ps1'
   # 2026-11-26 (owner-ticked wave 20): the gate input-selection MODULE (a suite resolves it as ..\bin\<x>,
   # so an installed suite without it cannot run), the timings reader, and the proof-based reclaim verb -
