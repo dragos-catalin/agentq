@@ -204,6 +204,17 @@ if ($chatId -and $env:AGENTQ_NO_CHAT_KEEPALIVE -ne '1') {
   try {
     $utf8G = New-Object Text.UTF8Encoding $false
     $nowG = [DateTime]::UtcNow
+    # TASK 2 (agentq side): record WHICH chat this tool call belongs to, immediately before it runs. agentq
+    # has no chat id on its command line, and a slot take-over has to tell a SIBLING chat of the same session
+    # (a different worker, which can lose the other chat's unsaved tree) from the chat that actually held it -
+    # the suppression used to key on the session, so a sibling chat re-leased a slot over another chat's
+    # unsaved work with no announcement. agentq reads this one-line file (Get-CurrentChatId) and treats it as
+    # fresh for `chatNowSec` seconds (default 30); without it agentq NEVER suppresses a take-over note.
+    try {
+      $chatDir0 = Join-Path $script:CoordG 'chats'
+      [void][IO.Directory]::CreateDirectory($chatDir0)
+      [IO.File]::WriteAllText((Join-Path $chatDir0 '.last.json'), (@{ chatId = $chatId; at = $nowG.ToString('o') } | ConvertTo-Json -Compress), $utf8G)
+    } catch { }
     $chatDir = Join-Path $script:CoordG 'chats'
     $chatFile = Join-Path $chatDir (($chatId -replace '[^A-Za-z0-9._-]', '_') + '.json')
     $bound = @{}   # lease file -> lease id

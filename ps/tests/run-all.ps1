@@ -151,6 +151,18 @@ $suites = [ordered]@{
   # 2026-11-21 (ADR 0014): take-over + `recover` safety net, the commit/push split (D1), the
   # per-session fair share of a resource (D4). Without these lines the suites existed and never ran.
   'recover'         = @('-File', (Join-Path $PSScriptRoot 'test-agentq-recover.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-26 (queue-time slice): the three suites behind it. Each is registered here AND in install.ps1
+  # in the same slice - 'install wiring' pins the two lists, so a suite the installed gate cannot run is
+  # impossible by construction.
+  #  - land capacity: two lands at once behind `landCapacity` (default 1 = unchanged) with the merge/push
+  #    phase still serialised by a bounded per-repo mutex, which REFUSES instead of deadlocking.
+  'land capacity'   = @('-File', (Join-Path $PSScriptRoot 'test-land-capacity.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  #  - slot takeover chat: a take-over is announced per CHAT, not per session, so a sibling chat of the
+  #    same session can no longer reset a slot over another chat's unsaved work in silence.
+  'takeover chat'   = @('-File', (Join-Path $PSScriptRoot 'test-slot-takeover-chat.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  #  - args comma: `pwsh -File agentq.ps1 -Repo a,b` binds ONE comma-containing string, so a filter built
+  #    from it matches nothing and reads as "no such work"; the single-value parameters now refuse it.
+  'args comma'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args-comma.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'commit fast'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-commit-fast.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'fair share'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-fairshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-26 (D5, ADR 0014): the slot-side twin of the queue's fair share - REUSE BEFORE RENTING a clean
