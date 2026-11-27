@@ -322,8 +322,37 @@ try {
 # ---------------------------------------------------------------------------
 $srcGuard = Join-Path $PSScriptRoot '..\hooks\guard-tooluse.ps1'
 if (Test-Path $srcGuard) {
-  $sharedRepo = 'E:\gh\codai'          # a real SharedCloneMode=refuse clone with slots
-  $sharedSlot = 'E:\gh\.wt\codai\task-99'
+  # 2026-11-27: this block named the REAL workstation clone (E:\gh\codai) and one of its slots. That is true
+  # only here - in a cloud pool checkout E:\gh does not exist, so the guard resolved nothing, warned nothing
+  # and the suite reported 5 / 7 with Rules A and B as HOLES: `guard forms` exited 1 (pool: exit=1 pass=0
+  # fail=0 sec=59) and the agentq land gate was structurally impassable for EVERY repo. The predicate
+  # (ps/hooks/guard-tooluse.ps1 Get-GuardSharedClone) is env-driven - AGENTQ_CONFIG, CODAI_WT_ROOT,
+  # CODAI_GH_ROOT - so the fixture below declares its OWN fleet root, clone and config: the same seven
+  # checks stay real on every machine instead of only on the workstation.
+  $scRoot = Join-Path ([IO.Path]::GetTempPath()) ('gfsc-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+  $sharedRepo = Join-Path $scRoot 'codai'            # main worktree of a refuse clone
+  $sharedSlot = Join-Path $scRoot 'wt\codai\slot-1'  # a LINKED worktree = a leased slot
+  $otherRepo = Join-Path $scRoot 'vitals'            # a sibling with NO slots: advisory only
+  New-Item -ItemType Directory -Force -Path $sharedRepo, $otherRepo, (Join-Path $scRoot 'wt\codai') | Out-Null
+  foreach ($r in @($sharedRepo, $otherRepo)) {
+    & git -C $r init -q 2>&1 | Out-Null
+    & git -C $r -c user.email=guard@fixture -c user.name=fixture commit -q --allow-empty -m init 2>&1 | Out-Null
+  }
+  & git -C $sharedRepo worktree add -q --detach $sharedSlot 2>&1 | Out-Null
+  $scCfg = Join-Path $scRoot 'agentq-config.json'
+  [IO.File]::WriteAllText($scCfg, (@{ sharedCloneMode = 'refuse'; sharedCloneModeRepos = @{ codai = 'refuse' } } | ConvertTo-Json -Compress))
+  $prevAqCfg = $env:AGENTQ_CONFIG
+  $prevAqWt = $env:CODAI_WT_ROOT
+  $prevAqGh = $env:CODAI_GH_ROOT
+  $env:AGENTQ_CONFIG = $scCfg
+  $env:CODAI_WT_ROOT = (Join-Path $scRoot 'wt')
+  $env:CODAI_GH_ROOT = $scRoot
+  function Restore-GuardScEnv {
+    $env:AGENTQ_CONFIG = $prevAqCfg
+    $env:CODAI_WT_ROOT = $prevAqWt
+    $env:CODAI_GH_ROOT = $prevAqGh
+    Remove-Item -LiteralPath $scRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
   function Invoke-SrcGuard([string]$tool, [hashtable]$toolInput) {
     $json = @{ hook_event_name = 'PreToolUse'; tool_name = $tool; tool_input = $toolInput } | ConvertTo-Json -Compress -Depth 5
     $out = $json | pwsh -NoProfile -File $srcGuard 2>&1
@@ -344,14 +373,16 @@ if (Test-Path $srcGuard) {
   if (-not ($r.code -eq 0 -and $r.out -match 'SHARED clone' -and $r.out -notmatch '"deny"')) { $scWarn += 'Rule B: a plan/*.csv write in the shared clone did not warn' }
   $r = Invoke-SrcGuard 'create_file' @{ filePath = "$sharedSlot\plan\x.csv"; content = 'a' }
   if ($r.out -match 'SHARED clone') { $scWarn += 'Rule B: warned for a plan CSV in a leased slot' }
-  $r = Invoke-SrcGuard 'create_file' @{ filePath = 'E:\gh\vitals\plan\x.csv'; content = 'a' }
+  $r = Invoke-SrcGuard 'create_file' @{ filePath = "$otherRepo\plan\x.csv"; content = 'a' }
   if ($r.out -match 'SHARED clone') { $scWarn += 'Rule B: warned outside a refuse shared clone' }
   Write-Host ("shared-clone warn rules   : {0} / {1}" -f (7 - $scWarn.Count), 7)
   if ($scWarn) {
     Write-Host 'HOLES (shared-clone warn rules):' -ForegroundColor Red
     $scWarn | ForEach-Object { Write-Host "  $_" }
+    Restore-GuardScEnv
     exit 1
   }
+  Restore-GuardScEnv
 }
 
 Write-Host 'guard OK' -ForegroundColor Green
