@@ -168,6 +168,14 @@ function killTree(p) {
     }
 }
 
+// Both child streams are piped (stdio: ["ignore", "pipe", "pipe"]) and appended to the SAME
+// jobs/<id>/log, so a suite's stderr used to be indistinguishable from its stdout - a failure whose
+// only evidence was on stderr read as "the process printed nothing". Tag every stderr LINE with a
+// prefix so the two streams can be told apart in the log. Chunk boundaries are unrelated to line
+// boundaries, so a line split across two chunks can carry the tag twice; that is cosmetic, never
+// lossy. The per-chunk append+flush below is unchanged.
+const tagStderr = (s) => s.replace(/^(?=[^\r\n])/gm, "[devcloud:stderr] ");
+
 // Shas this workspace has (and therefore all their ancestors): the client picks its bundle base from
 // these via merge-base, so only the commits the workspace lacks travel.
 async function publishKnown(repo, dir, sha) {
@@ -318,7 +326,7 @@ async function runJob(spec) {
                 void flush();
             });
             p.stderr.on("data", (d) => {
-                append(d.toString());
+                append(tagStderr(d.toString()));
                 void flush();
             });
             // The step ends when the process ends, not when its streams close. A tool that
