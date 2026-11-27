@@ -162,7 +162,8 @@
       "agentq reclaim",
       "agentq approve",
       "takeover chat",
-      "args comma"
+      "args comma",
+      "lease spawns"
     ]
   },
   "sharedCloneMode": "warn",
