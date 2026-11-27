@@ -194,6 +194,12 @@ $map = [ordered]@{
   # unversioned file in ~\.copilot\bin, so a reinstall could not restore it and no gate could reach it.
   # Paired with the run-all.ps1 entry in this same slice - 'install wiring' pins the two lists together.
   'bin\stray-reaper.ps1' = 'bin\stray-reaper.ps1'; 'tests\test-stray-reaper.ps1' = 'bin\test-stray-reaper.ps1'
+  # 2026-11-27: the other half of the same sweeper - the task (re)registration. It lived only in
+  # ~\.copilot\bin too, so a lost codai-stray-reaper definition had no way back (the original was a
+  # hand-typed schtasks line and the hidden-run.vbs wrapper is not recoverable from the reaper itself).
+  # Pinned by the same suite, which checks it byte-for-byte against the live copy and that it still
+  # declares the task name, the wrapper and a read-back of the registration.
+  'bin\install-stray-reaper-task.ps1' = 'bin\install-stray-reaper-task.ps1'
   # 2026-11-22: static guard for the script-scope clobber class (a top-level `$null` reset after a real
   # value). A suite in run-all belongs in this map too, or the install gate cannot run what it never
   # installed - the same gap `test-land-default-gate.ps1` had (see the note above).

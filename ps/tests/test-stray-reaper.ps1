@@ -13,6 +13,10 @@
 #       being reaped, so a loosened pattern must go red;
 #   (4) the task name and log path the file declares are CONSISTENT with the live copy it was taken
 #       from - a drift between the two is how a reinstall restores a sweeper that logs somewhere else.
+#   (5) section 2c holds its two invariants: _orphans\_bundles are the ONLY thing under E:\gh\.wt it
+#       deletes and on a three-day window (owner call 2026-11-27), and a directory that is not a git
+#       worktree is only NAMED - reading "git rev-parse fails" as "it is dead" is how a sibling chat's
+#       live scratch slot (3 426 entries, written seconds earlier) gets deleted.
 # The tool path is a parameter so run-all.ps1 can point at the staged copy; the default is this checkout.
 [CmdletBinding()]
 param([string]$Tool = (Join-Path $PSScriptRoot '..\bin\stray-reaper.ps1'))
@@ -114,6 +118,59 @@ if (Test-Path -LiteralPath $live) {
   Check 'the tracked copy is byte-identical to the live copy' ($hRepo -ceq $hLive) "repo $hRepo vs live $hLive"
 } else {
   Write-Host "  note  live copy absent ($live) - only the repo copy's own declaration was checked" -ForegroundColor DarkGray
+}
+
+# --- (5) section 2c: the worktree bookkeeping under E:\gh\.wt --------------------------------------
+$lines = [IO.File]::ReadAllLines($Tool)
+$wtLine = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+  if ($lines[$i] -match [regex]::Escape('$wtRoot = ''E:\gh\.wt''')) { $wtLine = $i; break }
+}
+Check 'the file still has the E:\gh\.wt section (2c)' ($wtLine -ge 0)
+if ($wtLine -ge 0) {
+  # The section ends at the first line-closing brace at column 0 - i.e. the if block that owns it.
+  $end = $lines.Count - 1
+  for ($i = $wtLine + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -ceq '}') { $end = $i; break } }
+  $section = $lines[$wtLine..$end]
+  Check 'the section covers _orphans and _bundles' (($section | Where-Object { $_ -match [regex]::Escape("foreach (`$sub in @('_orphans', '_bundles'))") }).Count -eq 1)
+  # The window itself, read off the file (not a literal in this suite): a widened keep window - the
+  # one mutation that costs space without any visible error - must fail here.
+  $orphan = @($section | Where-Object { $_ -match 'ForEach-Object \{ Remove-Junk \$_\.FullName \$now\.AddDays\(-\d+\)' })
+  Check 'the _orphans/_bundles pass exists exactly once' ($orphan.Count -eq 1) "got $($orphan.Count): $($orphan -join ' | ')"
+  Check 'the _orphans/_bundles window is three days' (($orphan.Count -eq 1) -and ($orphan[0] -match 'AddDays\(-3\)')) "got: $($orphan -join ' | ')"
+  # The safety invariant: the section may not delete anything else. Add a Remove-Junk to the
+  # non-worktree branch and this count becomes 2, which is the whole point.
+  $removals = @($section | Where-Object { $_ -match 'Remove-Junk|Remove-Item' })
+  Check 'the section deletes nothing except _orphans/_bundles' ($removals.Count -eq 1) "found $($removals.Count) removal line(s): $($removals -join ' | ')"
+  # ... and that the surviving branch records a NOTE rather than acting.
+  Check 'the non-worktree branch only records a NOTE' (($section | Where-Object { $_ -match '\$script:notes\+\+' }).Count -eq 1)
+  Check 'the non-worktree branch reads the directory own LastWriteTime, never a recursive walk' (($section | Where-Object { $_ -match '\$_\.LastWriteTime -lt \$now\.AddHours\(-6\)' }).Count -eq 1)
+}
+
+# --- (6) the task installer: the half that puts the sweeper on a schedule -------------------------
+# The reaper is useless without its registration, and the registration was the part with no copy
+# anywhere: the original codai-stray-reaper was a hand-typed schtasks command whose hidden-run.vbs
+# wrapper cannot be reconstructed from the sweeper. So the installer is pinned the same way.
+$installerRepo = Join-Path $PSScriptRoot '..\bin\install-stray-reaper-task.ps1'
+$installerLive = Join-Path $HOME '.copilot\bin\install-stray-reaper-task.ps1'
+Check 'the task installer is tracked next to the reaper' (Test-Path -LiteralPath $installerRepo) "missing: $installerRepo"
+if (Test-Path -LiteralPath $installerRepo) {
+  $insRaw = Get-Content -LiteralPath $installerRepo -Raw
+  # A console exe launched directly by a scheduled task flashes a window on every run under an
+  # Interactive logon, even with -WindowStyle Hidden. The wrapper is the reason this file exists.
+  Check 'the installer still routes the task through wscript + hidden-run.vbs' (($insRaw -match 'wscript\.exe') -and ($insRaw -match 'hidden-run\.vbs'))
+  Check 'the installer still names the task codai-stray-reaper' ($insRaw -match '/TN\s+codai-stray-reaper')
+  # A /Create that reports SUCCESS says nothing about what was stored - the read-back is the proof.
+  Check 'the installer still reads the registration back' (($insRaw -match '/query\s+/tn\s+codai-stray-reaper') -and ($insRaw -match 'read-back'))
+  # The nightly slot the sweeper is documented to run in (04:50) is a default, not incidental.
+  Check 'the installer still defaults to 04:50' ($insRaw -match "Time\s*=\s*'04:50'")
+  if (Test-Path -LiteralPath $installerLive) {
+    $hInsRepo = (Get-FileHash -LiteralPath $installerRepo -Algorithm SHA256).Hash
+    $hInsLive = (Get-FileHash -LiteralPath $installerLive -Algorithm SHA256).Hash
+    Check 'the tracked installer is byte-identical to the live one' ($hInsRepo -ceq $hInsLive) "repo $hInsRepo vs live $hInsLive"
+  } else {
+    Write-Host "  note  live installer absent ($installerLive) - only the tracked copy was checked" -ForegroundColor DarkGray
+  }
 }
 
 Write-Host "stray-reaper: $script:Pass passed, $script:Fail failed" -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

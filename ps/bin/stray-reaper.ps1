@@ -232,6 +232,46 @@ if (Test-Path -LiteralPath 'E:\gh\.scratch') {
     ForEach-Object { Remove-Junk $_.FullName $now.AddDays(-3) @() $_ }
 }
 
+# 2c. Worktree bookkeeping under E:\gh\.wt (measured 2026-11-27).
+#     _orphans\ and _bundles\ are where agentq parks a slot's contents before it frees the slot: five
+#     entries, 795 MB on 2026-11-27, the oldest from 23.11, none of which anything reads again. They
+#     are deliberate backups, so the window is longer than the fast cut but not a week: the owner
+#     chose three days on 2026-11-27 to let space come back sooner (the 519 MB mmo pair then ages out
+#     on 29.11 instead of 03.12). Anything a live session still needs is younger than three days.
+#     The second pass only NAMES a slot directory that is not a git worktree, and must never delete
+#     one. E:\gh\.wt\codai\scratch-6 had no .git at all, 3 426 entries, and its newest file had been
+#     written seconds earlier by a sibling chat staging a checkout into it. "git rev-parse fails" is
+#     NOT evidence that a directory is dead - only an unanswered age is, and a directory that someone
+#     is writing to has no age. The same lesson applies to a lease agentq refuses to release because
+#     the worktree has "no valid HEAD": inspect the contents before calling it stale.
+$wtRoot = 'E:\gh\.wt'
+if (Test-Path -LiteralPath $wtRoot) {
+  foreach ($sub in @('_orphans', '_bundles')) {
+    $p = Join-Path $wtRoot $sub
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue |
+      ForEach-Object { Remove-Junk $_.FullName $now.AddDays(-3) @() $_ }
+  }
+  Get-ChildItem -LiteralPath $wtRoot -Force -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notin @('_orphans', '_bundles') } |
+    ForEach-Object {
+      $repo = $_.Name
+      Get-ChildItem -LiteralPath $_.FullName -Force -Directory -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-Path -LiteralPath (Join-Path $_.FullName '.git')) } |
+        ForEach-Object {
+          # The directory's OWN LastWriteTime, never a recursive walk: a leased slot holds a full
+          # working tree (node_modules and target/), so one -Recurse per slot would cost minutes a
+          # night for a note nobody deletes anything from. NTFS moves the parent's stamp when a direct
+          # child is added or removed, which is all this pass needs as a liveness proxy - and a false
+          # NOTE costs one log line, which is why the pass is not allowed to delete.
+          if ($_.LastWriteTime -lt $now.AddHours(-6)) {
+            $script:notes++
+            $script:actions.Add("NOTE   (not a git worktree, dir untouched for 6 h - a dead slot directory, NOT deleted) $repo\$($_.Name)")
+          }
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------------------------
 # 3. %TEMP%: named rules first, then a generic age catch-all for everything else.
 #    Every named rule records WHY it exists; do not add one without that reason.
