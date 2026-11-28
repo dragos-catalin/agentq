@@ -6,6 +6,16 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- **New suite `text encoding`** - registered in `run-all.ps1`, `install.ps1` and `gateSuites.agentq`, so it runs in
+  every land's pre-gate - decodes every source file in the tree strictly as UTF-8 and fails on a run of two or more
+  consecutive non-ASCII characters that contains the CP437 render of a UTF-8 lead byte. That is the shape a
+  captured-then-rewritten file takes, and it reached main inside a landed commit and survived a diff review, because
+  the terminal renders the mojibake with the shapes of the characters it replaced. The fixtures are built from
+  codepoints (an ASCII-only source, so the guard can never be the reason it fails) and the two arms against real
+  revisions are mutation controls: `2767d4c:CHANGELOG.md` is RED with 8 findings and their codepoints, this file is
+  GREEN. A line may opt out with the escape marker the suite documents; exactly one line in the tree does
+  (`agentq-flakes.mjs`, whose patterns are ABOUT the mangled marks) and that count is an assertion. The same slice
+  removes a duplicated fragment the round-4 changelog union left in the Unreleased Added section.
 - The hook cost ledger names the agentq **verb**, not only the tool: a row is now
   `{ts, ms, startMs, tool, verb, deny, session}` and `sat-report.ps1` sums the day per verb. The question a
   per-verb budget cannot answer today is "what does one `status` cost beside one `land`" - a measured day held
@@ -17,7 +27,6 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   flag precedes the verb (`agentq.ps1 -Purpose x land` records nothing rather than guessing `x`); its value is
   bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry a quote or a backslash into the JSON
   line. `sat-report.ps1` prints the per-verb table (calls, served, spawned, avg ms) plus
-  `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
   `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
   `agentq-prune.ps1` needed no change (`JSON.parse` by name, and a file-NAME match). Guards: `sat-report` 16/16
   with the three `status` fixture rows in three different cost classes, and `hook-pre` gains 11 cases - the six
