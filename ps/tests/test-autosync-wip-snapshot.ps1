@@ -147,7 +147,19 @@ try {
 
   # --- 4. MUTATION: the pre-fix copy must NOT create the ref -------------------------------------
   if (-not $oldScript) {
-    Bad 'MUTATION: pre-edit copy available' "no *.prefix.bak in $bakDir"
+    # The baseline now comes from HISTORY (the parent of the commit that introduced Save-LocalSnapshot), so
+    # it needs that file's full log. A shallow checkout (actions/checkout defaults to fetch-depth: 1) makes
+    # `git log -S` find nothing and the control cannot run - a FAIL, never a silent skip, but it has to SAY
+    # why: the message used to blame a missing *.prefix.bak, which stopped being the source when the
+    # baseline moved out of a machine-local backup. This is exactly what was red on the CI runner
+    # 2026-11-27 ('MUTATION: pre-edit copy available' with nothing else to go on).
+    $shallow = (GitOne $repoRoot @('rev-parse', '--is-shallow-repository')) -ceq 'true'
+    $why = if ($shallow) {
+      "this checkout is SHALLOW ($repoRoot): the mutation baseline needs full history of ps/bin/git-autosync.ps1 - set fetch-depth: 0 for this job"
+    } else {
+      "no commit touching ps/bin/git-autosync.ps1 with 'Save-LocalSnapshot' in $repoRoot (git log -S), and no *.prefix.bak in $bakDir"
+    }
+    Bad 'MUTATION: pre-edit copy available' $why
   } else {
     $b2 = Join-Path $base 'mutation'
     New-Item -ItemType Directory -Force $b2 | Out-Null

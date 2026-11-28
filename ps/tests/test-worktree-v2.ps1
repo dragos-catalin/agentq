@@ -90,10 +90,21 @@ try {
   $fsw = [IO.File]::Open("$fx\.wt\repo\task-7\blob.bin", 'Create'); $fsw.SetLength(51MB); $fsw.Dispose()   # >50MB: excluded from the backup -> verify must fail
   $expA3 = git -C "$fx\.wt\repo\task-3" hash-object --path=a.txt -- "$fx\.wt\repo\task-3\a.txt"; $expA3 = "$expA3".Trim()
   $expU3 = git -C "$fx\.wt\repo\task-3" hash-object --path=untracked3.txt -- "$fx\.wt\repo\task-3\untracked3.txt"; $expU3 = "$expU3".Trim()
-  'Start-Sleep -Seconds 120' | Set-Content "$fx\sleeper.ps1"
-  $sleeper = Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$fx\sleeper.ps1", "$fx\.wt\repo\task-6" -PassThru -WindowStyle Hidden
-  $dl = (Get-Date).AddSeconds(15)
-  do { Start-Sleep -Milliseconds 300; $scmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($sleeper.Id)" -ErrorAction SilentlyContinue).CommandLine } while (-not ($scmd -and $scmd -match 'task-6') -and (Get-Date) -lt $dl)
+  # Readiness handshake the process itself performs. The old wait polled Get-CimInstance for the child's
+  # CommandLine, which is the SAME facility the park guard uses to see it - so on a runner where CIM is
+  # slow or unavailable the fixture proceeded with no live process AND the guard saw none either, and the
+  # slot was parked (2026-11-27). The sleeper now proves it is running by writing a marker; the slot path
+  # still has to appear in its command line, which is what makes it visible to the guard.
+  $marker = "$fx\sleeper-ready.txt"
+  @"
+param(`$slot, `$marker)
+Set-Content -LiteralPath `$marker -Value "pid=`$PID slot=`$slot"
+Start-Sleep -Seconds 120
+"@ | Set-Content "$fx\sleeper.ps1"
+  $sleeper = Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$fx\sleeper.ps1", "$fx\.wt\repo\task-6", $marker -PassThru -WindowStyle Hidden
+  $dl = (Get-Date).AddSeconds(30)
+  do { Start-Sleep -Milliseconds 250 } while (-not (Test-Path -LiteralPath $marker) -and -not $sleeper.HasExited -and (Get-Date) -lt $dl)
+  Check 'park fixture: the sleeper is up before prune runs' ((Test-Path -LiteralPath $marker) -and -not $sleeper.HasExited) ((Get-Content -LiteralPath $marker -Raw -ErrorAction SilentlyContinue))
   foreach ($s in 'task-3', 'task-5', 'task-6', 'task-7') { Age-Slot "$fx\.wt\repo\$s" 5 }
   $o = Run -File $Tool prune -Repo "$fx\repo" -OlderThanHours 0 -ParkedIdleDays 3
   $ref3 = ([regex]::Match($o, 'refs/backup/wt/repo/task-3/\S+')).Value
@@ -103,7 +114,10 @@ try {
   Check 'park: a thin bundle was written under ~/.codai/parked' ($o -match 'bundle=' -and (Get-ChildItem "$env:AGENTQ_PARK_ROOT\repo\task-3\bundles" -Filter '*.bundle' -ErrorAction SilentlyContinue)) $o
   Check 'park: same slot idle < bound is kept' (Test-Path "$fx\.wt\repo\task-4\a.txt") $o
   Check 'park: LEASED dirty slot is never removed' (Test-Path "$fx\.wt\repo\task-5\a.txt") $o
-  Check 'park: slot with a live process is never removed' (Test-Path "$fx\.wt\repo\task-6\a.txt") $o
+  # Two ways this can pass, and both must: the guard finds the live process, OR it cannot read the process
+  # table at all - in which case it refuses to park (fail closed) and the slot stays. What must never
+  # happen is the slot being removed, which is what the assertion pins.
+  Check 'park: slot with a live process is never removed' ((Test-Path "$fx\.wt\repo\task-6\a.txt") -and ($o -match 'task-6')) ($o + "`n--- sleeper marker: " + (Get-Content -LiteralPath $marker -Raw -ErrorAction SilentlyContinue))
   Check 'park: backup-verify failure keeps the slot' ((Test-Path "$fx\.wt\repo\task-7\a.txt") -and $o -match 'backup not proven: verify failed for blob\.bin') $o
   Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
 
