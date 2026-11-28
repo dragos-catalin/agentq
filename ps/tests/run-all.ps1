@@ -135,6 +135,15 @@ $suites = [ordered]@{
   'devbox tools'   = @('-File', (Join-Path $PSScriptRoot 'test-devbox-tools.ps1'), '-Bin', $bin)
   'devbox teams'   = @('-Command', "python '$(Join-Path $PSScriptRoot 'test-devbox-teams.py')' '$(Join-Path $bin 'devbox-teams.py')' 2>&1; if (`$LASTEXITCODE) { 'FAIL devbox-teams planner'; exit `$LASTEXITCODE } else { 'PASS devbox-teams planner (16)' }")
   'slo'            = @('-Command', "node '$(Join-Path $PSScriptRoot 'test-slo.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo selftest' }")
+  # 2026-11-28: OQ-004's SECOND red (probe-bucket share + lost live chats) is a ratchet against the
+  # frozen floor in tests\slo-second-red-baseline.json, because a red that lives only in the row's prose
+  # is a red nothing enforces. Paired with install.ps1 map entries in this same slice - 'install wiring'
+  # pins the two lists, so a suite the installed gate cannot run is impossible.
+  'slo second red' = @('-Command', "node '$(Join-Path $PSScriptRoot 'slo-second-red.test.mjs')'; if (`$LASTEXITCODE) { exit `$LASTEXITCODE } else { 'PASS slo second red selftest' }")
+  # 2026-11-28: the resident acceptance check must never measure a live copy that is not this checkout's
+  # copy - that is how a fixed verifier "passed" against the old one. The suite drives it with
+  # -CheckSource only, so it spawns and kills no host and is safe on any machine.
+  'resident freshness' = @('-File', (Join-Path $PSScriptRoot 'test-verify-resident-freshness.ps1'))
   # ADR 0009 (tracker OQ-*): a suite whose file is not there yet is a SKIP, not a failure
   'lease chat'      = @('-File', (Join-Path $PSScriptRoot 'test-lease-chat.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'lease liveness' = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease-liveness.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))

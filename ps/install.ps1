@@ -159,6 +159,13 @@ $map = [ordered]@{
   # run-all.ps1 entry in this same slice - 'install wiring' pins the two.
   'tests\test-agentq-cloud-heal.ps1' = 'bin\test-agentq-cloud-heal.ps1'
   'tests\test-slo.mjs' = 'bin\test-slo.mjs'
+  # 2026-11-28: OQ-004's second red as a ratchet (the floor file travels WITH the suite - the suite
+  # resolves it beside itself, so an installed suite without it cannot run), and the freshness gate that
+  # stops verify-resident.ps1 measuring a live copy other than this checkout's. Paired with the
+  # run-all.ps1 entries in this same slice; 'install wiring' pins the two lists together.
+  'tests\slo-second-red.test.mjs' = 'bin\slo-second-red.test.mjs'
+  'tests\slo-second-red-baseline.json' = 'bin\slo-second-red-baseline.json'
+  'tests\test-verify-resident-freshness.ps1' = 'bin\test-verify-resident-freshness.ps1'
   # 2026-11-23: `bump -Id|-Session` (a waiter can target its OWN ticket) + the `== MINE session ...` line
   # in `status`. Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
   'tests\test-agentq-bump.ps1' = 'bin\test-agentq-bump.ps1'

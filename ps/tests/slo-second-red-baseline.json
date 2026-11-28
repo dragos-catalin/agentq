@@ -1,0 +1,22 @@
+{
+  "_note": "Ratchet floor for OQ-004's SECOND red (probe-bucket share + lost live chats). ps/tests/slo-second-red.test.mjs fails when the OQ-004 row in docs/TRACKER.csv reports a WORSE number than this floor: startProbeBucketsPct below it, slotsLostLiveChat above it. An improvement is never punished, so a floor looser than reality is not itself a failure - but tighten it deliberately on the next re-freeze (the suite prints a note when the row beats it).",
+  "_caveat24h": "The 24h window is NOISY on an unchanged machine: the same 1-day metric read 81.3 % (windows ending 05:24Z), 92.7 % (a 03:15Z window) and 85.2 % minutes later, because a handful of 5-minute buckets dominate it. Re-measure before believing a red on this window. The 168h and 336h windows move by fractions of a point and are where a real regression shows up first.",
+  "_caveatLost": "slotsLostLiveChat is a COUNT over the window, not a rate: it grows as events accrue and falls as old ones roll out, so a red here means the row now states a worse number than the floor, not necessarily that behaviour got worse. Clear it by explaining the change in the row - that is what this suite reads - not by raising this file. The owner-proven-dead fix is expected to make it fall over time, and ownerGoneExcluded in the same output block states how much of the count is not a steal.",
+  "frozen": "2026-11-28",
+  "measuredWith": "bin/agentq-slo.mjs --days 1 | 7 | 14 (windows ending on the freeze date)",
+  "windows": ["24h", "168h", "336h"],
+  "targets": {
+    "startProbeBucketsPct": 95,
+    "slotsLostLiveChat": 0
+  },
+  "startProbeBucketsPct": {
+    "24h": 85.2,
+    "168h": 90.6,
+    "336h": 91.5
+  },
+  "slotsLostLiveChat": {
+    "24h": 15,
+    "168h": 62,
+    "336h": 82
+  }
+}
