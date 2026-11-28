@@ -1,5 +1,6 @@
 # Focused acceptance check for the resident hook (run after ANY change to hookc4/resident-server).
-#   powershell -NoProfile -File verify-resident.ps1 [-N 5] [-BindMs 30000]
+#   powershell -NoProfile -File verify-resident.ps1 [-N 5] [-BindMs 30000] [-CheckSource]
+#       [-SourceRoot <resident dir|repo root>] [-AllowUnprovenSource]
 # Prints ONE verdict block and writes verify-resident.out.txt. Asserts, in this order:
 #   0. CORPUS parity: every guard path returns the same DECISION (and stderr) in both paths, with
 #      fellBack=False on every call - a byte-identical answer that fell back proves nothing;
@@ -11,9 +12,20 @@
 #      instead of printing a verdict a reader would take for a client regression (2026-11-28).
 #      The refusal also names the surviving holders of the pipe; until 2026-11-28 that line printed a
 #      CommandNotFoundException instead, because the helper it called (`Procs`) did not exist here.
-#   6. the concurrency case is judged against the pool size the HOST reports, never against the burst:
-#      burst > pool forces a queue, so a burst-relative threshold reports a loaded machine as a
-#      regression (measured 2026-11-28: healthy host, 4/6 at 21.7 busy cores of 32).
+#   6. the concurrency case demands (a) the host advertises a pool of at least two instances and
+#      (b) at least two callers are served without a spawn. Never against the burst, and not against the
+#      pool count either: both those shapes report a loaded machine as a regression (measured 2026-11-28:
+#      the same healthy copy served 2/6 at 21.7 busy cores and 5/6 twenty minutes later, against a pool
+#      of 4). A pool of one serves 1/6 - and 2/6 on a second run - so the CLAIM is what catches it and
+#      `served >= 2` only corroborates that a claimed pool is used in parallel.
+#      A call that FELL BACK no longer counts as a parity difference: the client's own notice is 71
+#      characters, over the 40-character window, so it used to turn one busy instance into two reds.
+#
+# BEFORE all of the above a FRESHNESS gate runs (2026-11-28). It hashes THIS script and the copy in the
+# source root and REFUSES (non-zero, one line, no host spawned and no process killed) when they differ -
+# otherwise a stale install would publish a verdict about a revision nobody has. Finding no source copy
+# at all is a refusal too, unless -AllowUnprovenSource says to run anyway (loudly). -CheckSource runs only
+# this gate, so a suite (or an installer) can assert freshness without starting a host.
 #
 # Parity is SEMANTIC on purpose. The resident path runs the guard under PowerShell 7 (the server is a
 # pwsh process) whereas the classic path spawns powershell.exe 5.1, and ConvertTo-Json serializes the
@@ -21,12 +33,137 @@
 # decision - not the byte layout - is the contract. Byte equality is still required where the client
 # must reproduce the classic command: with the server down (it literally runs it).
 [CmdletBinding()]
-param([int]$N = 5, [int]$TimeoutMs = 10000, [int]$DeadlineMs = 3000, [int]$BindMs = 30000)
+param([int]$N = 5, [int]$TimeoutMs = 10000, [int]$DeadlineMs = 3000, [int]$BindMs = 30000,
+    [string]$SourceRoot = '', [switch]$AllowUnprovenSource, [switch]$CheckSource)
 $ErrorActionPreference = 'Continue'
 $here = $PSScriptRoot
 $out  = Join-Path $here 'verify-resident.out.txt'
 $L = [System.Collections.Generic.List[string]]::new()
 function W($s) { $L.Add([string]$s) }
+
+# ---- FRESHNESS: the live copy must BE the source copy, or nothing measured here means anything ------
+# This script is installed into ~/.copilot/hooks/resident and normally run FROM there, while the source
+# of truth is the repo copy beside it. Until 2026-11-28 it measured whatever the LIVE directory happened
+# to contain, so a stale install could print a green verdict about a revision nobody has - the exact
+# "configured != installed != the code that runs" trap this whole file exists to catch elsewhere. The
+# gate is FAIL CLOSED: hashes differ -> refuse; no source copy found at all -> refuse as well, unless the
+# caller passes -AllowUnprovenSource (one loud line, then it continues).
+#
+# The client is resolved by its INSTALLED name (`hookc.exe`) first and the build product name
+# (`hookc4.exe`) second, and a client older than hookc4.c earns a WARNING line in the verdict (2026-11-28:
+# asking only for the build name made the check abort with no verdict on every normally installed
+# machine, and the installed binary predates its source by two days).
+#
+# It runs BEFORE the first Stop-Matched (which kills hosts) and the first Start-Process (which spawns
+# one), so a refusal can never leave a half-started run behind. It costs two Get-FileHash calls plus a
+# few Test-Path probes - no node, no network, no git - and reports its own cost under -CheckSource.
+#
+# The source copy is looked for in this order (first hit wins); a candidate may be the resident directory
+# itself OR a repo root that contains one:
+#   1. -SourceRoot                    (explicit)
+#   2. $env:AGENTQ_REPO_ROOT          (a repo root; an installer may export it)
+#   3. a .source-root marker beside the live files (first non-blank, non-# line is a path)
+#   4. <dir>\ps\hooks\resident for the caller's directory and each of its parents - the repo an agent is
+#      standing in when it runs this
+# The LIVE directory is deliberately NOT a candidate: comparing the live copy with itself would always
+# pass and would prove nothing.
+# Hashing directly with .NET rather than Get-FileHash is not a micro-optimisation: the cmdlet's FIRST
+# call in a fresh process costs ~110 ms just loading its assembly (measured 2026-11-28), which alone
+# blows the gate's ~50 ms budget. SHA256::HashData is 9 ms cold, and the Create()/ComputeHash fallback
+# covers Windows PowerShell 5.1, where HashData does not exist. Probing the overload once and caching
+# the answer keeps the fast path free of a per-call try/catch.
+function Get-FileSha256([string]$p) {
+    if (-not [IO.File]::Exists($p)) { return $null }
+    try { $bytes = [IO.File]::ReadAllBytes($p) } catch { return $null }
+    try {
+        if ($null -eq $script:hashDataOk) {
+            try { [void][Security.Cryptography.SHA256]::HashData([byte[]]@()); $script:hashDataOk = $true } catch { $script:hashDataOk = $false }
+        }
+        if ($script:hashDataOk) {
+            $hash = [Security.Cryptography.SHA256]::HashData($bytes)
+        } else {
+            $alg = [Security.Cryptography.SHA256]::Create()
+            try { $hash = $alg.ComputeHash($bytes) } finally { $alg.Dispose() }
+        }
+        return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+    } catch { return $null }
+}
+# One candidate -> a resident directory, tried as itself and as a repo root. Returns the resolved
+# directory or $null. Probed LAZILY (first hit wins) because the parent-chain walk is the expensive step
+# and this gate has a ~50 ms budget.
+function Test-ResidentSourceCandidate([string]$c, [string]$Leaf) {
+    $base = [IO.Path]::GetFullPath([IO.Path]::Combine($PWD.Path, $c))
+    if ([IO.File]::Exists([IO.Path]::Combine($base, $Leaf))) { return $base }
+    $sub = [IO.Path]::Combine($base, 'ps', 'hooks', 'resident')
+    if ([IO.File]::Exists([IO.Path]::Combine($sub, $Leaf))) { return $sub }
+    return $null
+}
+function Resolve-ResidentSourceDir([string]$Explicit, [string]$Leaf) {
+    if ($Explicit) { $hit = Test-ResidentSourceCandidate $Explicit $Leaf; if ($hit) { return $hit } }
+    if ($env:AGENTQ_REPO_ROOT) { $hit = Test-ResidentSourceCandidate $env:AGENTQ_REPO_ROOT $Leaf; if ($hit) { return $hit } }
+    $marker = [IO.Path]::Combine($PSScriptRoot, '.source-root')
+    if ([IO.File]::Exists($marker)) {
+        $m = Get-Content -LiteralPath $marker -EA SilentlyContinue |
+            ForEach-Object { "$_".Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -First 1
+        if ($m) { $hit = Test-ResidentSourceCandidate $m $Leaf; if ($hit) { return $hit } }
+    }
+    $d = $PWD.Path
+    for ($i = 0; $i -lt 8 -and $d; $i++) {
+        $hit = Test-ResidentSourceCandidate $d $Leaf
+        if ($hit) { return $hit }
+        $parent = [IO.Path]::GetDirectoryName($d)
+        if (-not $parent -or $parent -eq $d) { break }
+        $d = $parent
+    }
+    return $null
+}
+# Returns an object and never throws or exits, so the CALLER decides and a suite can exercise every branch
+# without the process dying. Message is the SAME single line a refusal prints.
+function Test-ResidentFreshness([string]$Explicit, [string]$LivePath) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $leaf = if ($LivePath) { [IO.Path]::GetFileName($LivePath) } else { '' }
+    $liveHash = if ($leaf) { Get-FileSha256 $LivePath } else { $null }
+    if (-not $liveHash) {
+        return [pscustomobject]@{ Ok=$false; Unproven=$true; LiveHash=$null; SourceHash=$null; SourceDir=$null; Ms=$sw.ElapsedMilliseconds
+            Message = "verify-resident: CANNOT PROVE the live copy is current - cannot read a live copy at '$LivePath' (run this as a FILE, not dot-sourced). Pass -AllowUnprovenSource to run anyway." }
+    }
+    $srcDir = Resolve-ResidentSourceDir -Explicit $Explicit -Leaf $leaf
+    if (-not $srcDir) {
+        return [pscustomobject]@{ Ok=$false; Unproven=$true; LiveHash=$liveHash; SourceHash=$null; SourceDir=$null; Ms=$sw.ElapsedMilliseconds
+            Message = "verify-resident: CANNOT PROVE the live copy is current - no source copy of $leaf found (looked at -SourceRoot, `$env:AGENTQ_REPO_ROOT, a .source-root marker beside the live files, and <dir>\ps\hooks\resident up from $($PWD.Path)). Pass -AllowUnprovenSource to run anyway." }
+    }
+    $srcPath = [IO.Path]::Combine($srcDir, $leaf)
+    $srcHash = Get-FileSha256 $srcPath
+    if ($liveHash -ne $srcHash) {
+        return [pscustomobject]@{ Ok=$false; Unproven=$false; LiveHash=$liveHash; SourceHash=$srcHash; SourceDir=$srcDir; Ms=$sw.ElapsedMilliseconds
+            Message = "verify-resident: STALE live copy - refusing to measure: live $leaf sha256=$liveHash  source $srcPath sha256=$srcHash" }
+    }
+    return [pscustomobject]@{ Ok=$true; Unproven=$false; LiveHash=$liveHash; SourceHash=$srcHash; SourceDir=$srcDir; Ms=$sw.ElapsedMilliseconds
+        Message = "verify-resident: live copy matches its source ($srcDir) sha256=$liveHash" }
+}
+$fresh = Test-ResidentFreshness -Explicit $SourceRoot -LivePath $PSCommandPath
+if (-not $fresh.Ok) {
+    if ($fresh.Unproven -and $AllowUnprovenSource) {
+        Write-Host ("verify-resident: WARNING - " + $fresh.Message + " (continuing because -AllowUnprovenSource was passed; gate took $($fresh.Ms) ms)")
+    } else {
+        Write-Host $fresh.Message
+        exit 9
+    }
+}
+if ($CheckSource) {
+    # Only when the gate actually proved freshness: the -AllowUnprovenSource branch above already printed
+    # its one loud line and must not gain a second one.
+    if ($fresh.Ok) {
+        # A second, warm call: the first one pays for type loading and the JIT of this file's own
+        # functions, which is a one-off in a fresh process and not the cost of the CHECK. Reporting both
+        # keeps the budget claim honest instead of hiding the warm-up behind a single number (measured
+        # 2026-11-28: ~45-55 ms cold vs 1-2 ms warm).
+        $warm = Test-ResidentFreshness -Explicit $SourceRoot -LivePath $PSCommandPath
+        Write-Host ("{0} (source gate took {1} ms cold / {2} ms warm)" -f $fresh.Message, $fresh.Ms, $warm.Ms)
+    }
+    exit 0
+}
+
 # The corpus budget is deliberately GENEROUS. It measures the DECISION, not latency, and this machine's
 # load swings by ~10x: the same guard was measured at 350 ms one moment and 3315 ms the next (server.log,
 # 2026-11-25 - read as `total 3.402 ms` because N0 renders thousands with '.' in ro-RO). A tight budget
@@ -35,7 +172,7 @@ function W($s) { $L.Add([string]$s) }
 $env:HOOKC_TIMEOUT_MS = "$TimeoutMs"
 $hooks  = Join-Path $env:USERPROFILE '.copilot\hooks'
 $guard  = Join-Path $hooks 'hook-pre.ps1'
-$client = Join-Path $here 'hookc4.exe'
+# `$client` is resolved further down, once the pipe name is known: it may legitimately carry either name.
 # 2026-11-28: this pointed at server4.ps1, which no longer exists (the host lives in
 # resident-server.ps1 since it moved into the repo), so the suite could not run at all and the
 # pool change went in untested. A path here IS the test's precondition: assert it.
@@ -47,7 +184,43 @@ if (-not (Test-Path $server)) { throw "missing $server - the host lives in this 
 # log pid must equal the process this script started, or the script refuses to measure.
 $pipe   = 'codai-hookc'
 
-if (-not (Test-Path $client)) { throw "missing $client - compile it first" }
+# 2026-11-28: this used to be the single line `$client = Join-Path $here 'hookc4.exe'`, the BUILD product
+# name, while everything else in this subsystem calls the client `hookc.exe`: it is the bare command the
+# harness runs (hookc4.c's own header, README.md, install.ps1's map comment) and it is the file
+# resident-ensure.ps1 refuses to start a server without. On a normally installed machine there is no
+# `hookc4.exe`, so the acceptance check aborted with "missing ... hookc4.exe - compile it first" and
+# printed NO verdict at all - measured on the installed copy 2026-11-28: exit 1, empty stdout, 6.9 s,
+# thrown before the first process kill (which is also how we know the freshness gate is ordered right).
+# Take the installed name first, keep the build name as a fallback for a dev tree, and fail with a
+# message that names BOTH and the builder.
+$client = @((Join-Path $here 'hookc.exe'), (Join-Path $here 'hookc4.exe')) |
+    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+# The FRESHNESS gate above covers the SCRIPT; nothing covers the BINARY, and the two drift separately.
+# Measured 2026-11-28: the installed hookc.exe was built 2026-11-25 02:06 while hookc4.c was modified
+# 2026-11-27, so a run would exercise an older client than the source it is being judged against - and
+# only the source is reproducible (`build-client.ps1 -Check` compiles to a temp name and byte-compares).
+# This is a WARNING, not a refusal: the installed binary IS what the harness runs, and refusing would
+# make the check unrunnable until someone rebuilds. It is a fact the verdict has to carry, though,
+# because a green verdict about the wrong binary is exactly the trap this file exists to catch.
+$csrc = Join-Path $here 'hookc4.c'
+if ($client -and (Test-Path -LiteralPath $csrc)) {
+    $cTime = (Get-Item -LiteralPath $client).LastWriteTimeUtc
+    $sTime = (Get-Item -LiteralPath $csrc).LastWriteTimeUtc
+    if ($cTime -lt $sTime) {
+        $cWarn = "verify-resident: WARNING - $(Split-Path -Leaf $client) predates hookc4.c " +
+            "(client $($cTime.ToString('yyyy-MM-dd HH:mm'))Z, source $($sTime.ToString('yyyy-MM-dd HH:mm'))Z); " +
+            "the verdict below describes THAT binary. Rebuild with build-client.ps1 (or -Check to prove a " +
+            "rebuild is byte-identical)."
+        Write-Host $cWarn
+        W "WARNING $cWarn"
+    }
+}
+
+if (-not $client) {
+    throw ("missing the resident client - looked for hookc.exe and hookc4.exe in $here. " +
+        "Build it with build-client.ps1 (needs gcc on PATH, e.g. mingw-w64).")
+}
 
 # The name is deliberate. **`Kill` is a built-in ALIAS for Stop-Process, and aliases OUTRANK
 # functions**, so `function Kill` was never called: `Kill '*x*'` ran `Stop-Process '*x*'`, bound the
@@ -211,7 +384,15 @@ foreach ($c in $corpus) {
     # ORDER (permissionDecision before/after hookEventName), which is not a decision difference.
     $dCl = ($sCl -split '\|')[0]; $dRs = ($sRs -split '\|')[0]
     $rCl = ($sCl -split '\|', 2)[1]; $rRs = ($sRs -split '\|', 2)[1]
-    $eCl = FoldText $cl.err; $eRs = FoldText $rs.err
+    # A FALLBACK IS THE CLIENT EXPLAINING ITSELF, NOT A DECISION. The notice it writes is 71 characters
+    # ("hookc: server busy past the connect budget (win32 121) - falling back"), which is over DiffSize's
+    # 40-character window, so its sentinel 999 came back and ONE busy instance produced TWO reds
+    # (`parity` AND `pipeUsed`) plus a line that contradicts itself: `classic ALLOW resident ALLOW
+    # same=False`. Measured 2026-11-28 on a machine at 20.3/32 busy cores. The notice is therefore
+    # excluded from the comparison, and `pipeUsed` stays the single owner of "the resident path was not
+    # used" - drop this exclusion and a loaded machine reports a decision difference that does not exist.
+    $eCl = FoldText $cl.err
+    $eRs = FoldText (("$($rs.err)" -replace '(?m)^hookc:.*falling back.*$', ''))
     # Decision-bearing keys, taken from the DECODED reason and from stderr (not from JSON text: the raw
     # form carries \u0027 escapes that make the token sets differ for no reason).
     $kCl = Keys ($rCl + ' ' + $eCl); $kRs = Keys ($rRs + ' ' + $eRs)
@@ -229,7 +410,7 @@ foreach ($c in $corpus) {
     W ("{0,-19} classic {1}{2,-9} resident {3}{4,-9} same={5} fell={6}" -f `
             $c.n, $(if ($cl.rc -eq 2) { 'CLI ' } else { '' }), (($sCl -split '\|')[0]), $(if ($rs.rc -eq 2) { 'CLI ' } else { '' }), (($sRs -split '\|')[0]), $same, $fell)
     if (-not $same) {
-        W "  rc $($cl.rc)/$($rs.rc)  decision $dCl/$dRs  span $spanOut (out) $spanErr (err)"
+        W ("  rc {0}/{1}  decision {2}/{3}  span {4} (out) {5} (err){6}" -f $cl.rc, $rs.rc, $dCl, $dRs, $spanOut, $spanErr, $(if ($fell) { '  [client fallback notice excluded]' } else { '' }))
         W "  keys classic : $($kCl.Substring(0,[Math]::Min(160,$kCl.Length)))"
         W "  keys resident: $($kRs.Substring(0,[Math]::Min(160,$kRs.Length)))"
         W "  reason classic : $($rCl.Substring(0,[Math]::Min(160,$rCl.Length)))"
@@ -307,7 +488,12 @@ $brkAfter = & $brkLine $logPath
 $rd2 = Call $client @($guard,$pipe) $allowJson 'rude.post'
 $reqAfter = & $reqLine $logPath
 $alive = [bool](Get-Process -Id $srvPidBefore -EA SilentlyContinue)
-$rudeOk = (-not ($rd1.err -match 'falling back')) -and (-not ($rd2.err -match 'falling back')) -and `
+# The FIRST rude call is the one that vanishes mid-request, so IT must be served resident - that is what
+# exercises the recovery path. The follow-up call is allowed to fall back on a loaded box (the connect
+# budget is 900 ms) and that is reported rather than disqualifying: the facts this case owns are that the
+# server is alive, that it counted the broken writes, and that the answer still matches. Requiring both
+# calls to be resident made a red out of a busy instance (2026-11-28), which `pipeUsed` already reports.
+$rudeOk = (-not ($rd1.err -match 'falling back')) -and `
           ((Sem $rd1.out) -eq (Sem $rd2.out)) -and $alive -and `
           ($brkAfter -gt $brkBefore) -and ($reqAfter -ge ($reqBefore + 2))
 W ("rude client: before fell={0} | broken writes {1}->{2} | req lines {3}->{4} | after fell={5} same={6} | server pid {7} alive={8}" -f `
@@ -318,15 +504,21 @@ W ("rude client: before fell={0} | broken writes {1}->{2} | req lines {3}->{4} |
 # later callers see ERROR_PIPE_BUSY and pay the spawn instead. The host states its own pool size in the
 # log (`instances=N`), and `HOOKC_POOL=1` can ask for the broken shape on purpose.
 #
-# The assertion is anchored on the POOL, not on the burst (rewritten 2026-11-28). Until then it demanded
-# 5 of 6 served, which cannot see the difference it exists for: at a burst of 6 against a pool of 4, TWO
-# callers MUST queue, and a client waits only 900 ms for a busy instance (hookc4.c: min(budget, 900)), so
-# on a loaded box - measured 2026-11-28 at 21.7 busy cores of 32 - the HEALTHY host reported 4/6 and the
-# run went red against the machine. That is the same failure mode as the 8 s bind budget and the abort
-# that measured anyway. What the case must protect is the host honouring its own claim, so: the claim
-# must be a pool at all (a single instance IS the regression - the server's own comment records 16 % of
-# calls falling back), and at least `instances` callers must be served without a spawn. Callers beyond
-# the pool may queue and fall back - that is the queue doing its job, not a defect.
+# The assertion is anchored on measurements taken on this machine, not on the burst and not on the pool
+# count (rewritten 2026-11-28). Until then it demanded 5 of 6 served, which cannot see the difference it
+# exists for: at a burst of 6 against a pool of 4, TWO callers MUST queue, and a client waits only 900 ms
+# for a busy instance (hookc4.c: min(budget, 900)), so a loaded box goes red against the machine.
+# A pool-anchored version (`served >= instances`) was tried next and failed the SAME way: the healthy
+# host served 2/6 at 21.7 busy cores, then 5/6 twenty minutes later on an unchanged copy. What the case
+# must protect is: (a) the host advertises a pool at all, because ONE instance IS the regression - the
+# server's own comment records 16 % of calls falling back, and (b) the pool is real, i.e. more than one
+# caller is served without a spawn. Measured on this machine, four runs:
+#   HOOKC_POOL=1 -> served 1/6 and 2/6  <-- a single instance CAN serve a second caller once the first is
+#                                           done, so `served >= 2` alone is NOT the discriminator
+#   pool as advertised (4) -> 5/6, 5/6, and 2/6 on the loaded run
+# The CLAIM is what catches the regression; `served >= 2` only corroborates that the pool it claims is
+# really used in parallel. Neither depends on how slow the box is. Callers beyond the pool may queue and
+# fall back - that is the queue doing its job, not a defect.
 $cc = 6
 $ccIn = Join-Path $here 'v.conc.in'
 Set-Content -LiteralPath $ccIn -Value $allowJson -NoNewline -Encoding utf8
@@ -340,8 +532,8 @@ $concServed = 0; $concFall = 0
 for ($i = 0; $i -lt $cc; $i++) {
     if ((Get-Content (Join-Path $here "v.conc.$i.err") -Raw -Encoding utf8 -EA SilentlyContinue) -match 'falling back') { $concFall++ } else { $concServed++ }
 }
-$concOk = ($poolN -ge 2) -and ($concServed -ge $poolN)
-W ("concurrent burst ({0} at once): served by the resident {1}/{0}, fell back {2} | pool instances={3} (must be >= 2 and all of them served)" -f $cc, $concServed, $concFall, $poolN)
+$concOk = ($poolN -ge 2) -and ($concServed -ge 2)
+W ("concurrent burst ({0} at once): served by the resident {1}/{0}, fell back {2} | pool instances={3} (claim must be >= 2, and at least TWO callers served without a spawn)" -f $cc, $concServed, $concFall, $poolN)
 
 # 4. server down -> classic answer with the SAME payload (byte-for-byte stdout)
 Stop-Matched '*resident-server.ps1*'; Start-Sleep -Milliseconds 400
