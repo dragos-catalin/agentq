@@ -3808,6 +3808,15 @@ function Invoke-Publish {
       $raw = (& git -C $top -c core.quotepath=off ls-files -s -z 2>$null) -join "`n"
       foreach ($e in ($raw -split "`0")) { $tab = $e.IndexOf("`t"); if ($tab -gt 0) { $wtModes[$e.Substring($tab + 1).TrimStart("`n")] = ($e.Substring(0, $tab).Trim() -split '\s+')[0] } }
     }
+    if ($absent.Count -and -not $Force) {
+      # -Paths names the FILES TO PUBLISH, never a set whose complement is deleted. Before 2026-11-28 a
+      # listed path that Test-Path could not read was silently turned into an index deletion, and the
+      # resulting commit DROPPED that file from the target branch with PUBLISH_EXIT=0 (data loss, twice
+      # on 2026-11-26). Refusing is always safe: the caller fixes the path or asks for the removal.
+      Write-Journal @{ event = 'publish-refused'; resource = "commit:$($repo.Name)"; purpose = $Purpose; paths = $absent; reason = 'listed path(s) not readable on disk'; repo = $repo.Name }
+      [Console]::Error.WriteLine("publish: REFUSED - $($absent.Count) listed path(s) are NOT readable on disk under $top - " + ($absent -join ', ') + " - so publishing them would DELETE them. Fix the path/base, or pass -Force if the removal is intended.")
+      exit 4
+    }
     $lines = [Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $present.Count; $i++) {
       $p = $present[$i]
@@ -3826,6 +3835,17 @@ function Invoke-Publish {
   # base did not have, and that our result drops, would be someone else's landed work being undone.
   $baseMap = if ($base -eq $tip) { $tipMap } else { Get-PubTreeMap $top $base }
   $oursMap = Get-PubTreeMap $top $tree
+  # Belt and braces: a commit whose tree lacks a listed path IS a deletion of that path. Refuse it
+  # unless the caller said the removal is intended, so no future change to the index building above
+  # can ever publish a silent delete again.
+  if (-not $Force) {
+    $missing = @($plist | Where-Object { -not $oursMap.ContainsKey($_) })
+    if ($missing.Count) {
+      Write-Journal @{ event = 'publish-refused'; resource = "commit:$($repo.Name)"; purpose = $Purpose; paths = $missing; reason = 'result tree drops a listed path'; repo = $repo.Name }
+      [Console]::Error.WriteLine("publish: REFUSED - the commit would DROP $($missing.Count) listed path(s) - " + ($missing -join ', ') + " - which is a deletion. Pass -Force if the removal is intended.")
+      exit 4
+    }
+  }
   $blobOf = { param($m, $p) if ($m.ContainsKey($p)) { ($m[$p] -split ' ')[1] } else { '' } }
   foreach ($p in $plist) {
     $onTip = & $blobOf $tipMap $p
