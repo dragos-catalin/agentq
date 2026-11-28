@@ -2788,6 +2788,13 @@ $script:AqHelp = [ordered]@{
   'scale' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'scale [-Json]'; d = 'why N/N is not a small pool: the machine-wide slot room, its formula and the live numbers'; e = 'agentq scale' }
   'flakes' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'flakes [-Id <test key or substring> -Reason "why"]'; d = 'quarantine report; -Id lifts a quarantine' }
   'store' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]'; d = 'SQLite index of the journal + job registry (the JSONL stays the source of truth)' }
+  # 2026-11-28: the tracking/resume verbs. Each is a ONE-LINE pass-through to tools/track.mjs, the single
+  # implementation of the tracking store (the module resolves it as <root>\tools\track.mjs and never
+  # reimplements a query), so `agentq trackers` prints the same bytes and returns the same exit code as
+  # `node tools/track.mjs status`. Arguments arrive after `--`, the only channel this parser leaves alone.
+  'trackers' = @{ g = 'Tracking'; u = 'trackers [-- --json]'; d = 'tracker index: repo/item counts and drift (tools/track.mjs status)'; e = 'agentq trackers -- --json' }
+  'plan' = @{ g = 'Tracking'; u = 'plan -- set|show [--session <id>] [--goal s] [--json]'; d = 'the per-session plan record: goal, done means, next step, roster, jobs, todos'; e = 'agentq plan -- show --session $env:AGENTQ_SESSION' }
+  'task' = @{ g = 'Tracking'; u = 'task -- add|claim|next|block|done|show|list [flags]'; d = 'a claimable task; claim is atomic across agents, next skips open dependencies'; e = 'agentq task -- list --json' }
   'help' = @{ g = 'Help'; u = 'help [<verb>]'; d = 'this index, or one verb''s usage and an example'; e = 'agentq help land' }
 }
 function Show-AgentqHelp([string]$For) {
@@ -2966,6 +2973,12 @@ switch ($Verb.ToLowerInvariant()) {
   # ADR 0006: SQLite index of the journal + job registry (rebuildable; JSONL stays the source of truth).
     # agentq store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]
     'store' { $sub = if ($State) { "$State" } else { 'status' }; $sa = @((Join-Path $PSScriptRoot 'agentq-store.mjs'), $sub, '--home', $Root); if ($Id) { $sa += @('--event', $Id) }; if ($Repo) { $sa += @('--repo', (Split-Path -Leaf $Repo)) }; if ($sub -eq 'query') { $sa += @('--hours', "$Hours") }; & node @sa; exit $LASTEXITCODE }
+  # THREE explicit cases, not one `{ $_ -in 'trackers','plan','task' }` clause: test-agentq-help.ps1 parses
+  # this switch for `'<name>' {` and refuses a help key with no matching case (a verb an agent can read
+  # about but not run), so a shared clause would leave all three checking as orphans.
+  'trackers' { . (Join-Path $PSScriptRoot 'agentq-trackers.ps1'); Invoke-AgentqTrackerVerb -Verb 'trackers' -Arguments $Rest; exit $script:AgentqTrackExit }
+  'plan' { . (Join-Path $PSScriptRoot 'agentq-trackers.ps1'); Invoke-AgentqTrackerVerb -Verb 'plan' -Arguments $Rest; exit $script:AgentqTrackExit }
+  'task' { . (Join-Path $PSScriptRoot 'agentq-trackers.ps1'); Invoke-AgentqTrackerVerb -Verb 'task' -Arguments $Rest; exit $script:AgentqTrackExit }
     # An unknown verb is an agent guessing. Teach it instead of dumping the 148-line header and exiting
     # 2 with no hint (the `land` 7-turn waste, 2026-11-20). Same content, one screen, exit 2 = usage.
     default {
