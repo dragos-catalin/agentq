@@ -197,7 +197,9 @@ $map = [ordered]@{
   # so the installed suite went red looking for a file nobody shipped (found 2026-11-28).
   'hooks\user-prompt-resume.ps1' = 'hooks\user-prompt-resume.ps1'
   'tests\test-agentq-trackers.ps1' = 'bin\test-agentq-trackers.ps1'
-  'tests\test-user-prompt-resume.ps1' = 'bin\test-user-prompt-resume.ps1'
+  # A suite for a REGISTERED hook installs beside it in hooks\ - test-config-integrity.ps1 reads the
+  # hook suites that sit there, so a suite parked in bin\ leaves the hook counted as untested.
+  'tests\test-user-prompt-resume.ps1' = 'hooks\test-user-prompt-resume.ps1'
   'tests\test-agentq-approve.ps1' = 'bin\test-agentq-approve.ps1'
   # 2026-11-21: `agentq run` runs its child at the resolved repo root when the caller is OUTSIDE the
   # repo, and keeps the caller's nested directory when INSIDE (commit 37fdf67, "a brand-new slot
