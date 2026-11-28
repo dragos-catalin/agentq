@@ -315,6 +315,44 @@ function summarizeRepo(r) {
     return { items, drift };
 }
 
+// A repo can carry a committed `.agentq/trackers.json` and still be ABSENT from
+// the index - tracker-lint only ever writes entries for the directories it is
+// HANDED, so a repo nobody named is invisible to every consumer (the Tracking
+// page, the cloud mirror) and nothing says so. This finds those siblings: the
+// immediate children of each distinct parent of an indexed root are the only
+// places a neighbouring repo can sit, so a child that carries a mapping but has
+// no index entry is a "mapping not indexed". Cost is one readdir per distinct
+// parent - never a tree walk, never git, never a CSV.
+function findMappingsNotIndexed(repos) {
+    const norm = (p) => resolve(String(p));
+    const indexed = new Set();
+    const parents = new Set();
+    for (const r of repos) {
+        if (!r || !r.root) continue;
+        const root = norm(r.root);
+        indexed.add(root);
+        parents.add(dirname(root));
+    }
+    const found = new Set();
+    for (const parent of parents) {
+        let children;
+        try {
+            children = readdirSync(parent, { withFileTypes: true });
+        } catch {
+            continue; // a parent we cannot read is not a finding
+        }
+        for (const child of children) {
+            if (!child.isDirectory()) continue;
+            const dir = norm(join(parent, child.name));
+            // A sibling that IS an indexed root (a worktree slot beside its
+            // peers) must not be reported twice.
+            if (indexed.has(dir)) continue;
+            if (existsSync(join(dir, ".agentq", "trackers.json"))) found.add(dir);
+        }
+    }
+    return [...found].sort();
+}
+
 function cmdStatus(flags) {
     if (!existsSync(INDEX)) {
         console.error(`track: no tracker index at ${INDEX}`);
@@ -339,9 +377,10 @@ function cmdStatus(flags) {
     }
     // A root issue is a finding too: a harness that reads the exit code must see
     // a broken root even when the trackers under it happen to be drift-free.
+    const mappingNotIndexed = findMappingsNotIndexed(repos);
     const rc = Math.min(totalDrift + totalIssues, 255);
     if (flags.json) {
-        process.stdout.write(JSON.stringify(index, null, 2) + "\n");
+        process.stdout.write(JSON.stringify({ ...index, mappingNotIndexed }, null, 2) + "\n");
         return rc;
     }
     console.log(`trackers: ${repos.length} repo(s), ${totalItems} item(s)  (generated ${index.generatedAt || "?"})`);
@@ -354,6 +393,15 @@ function cmdStatus(flags) {
     // tracked at all.
     for (const r of repos) {
         if (r.rootIssue) console.log(`  root [${r.repo}] ${r.root} - ${r.rootIssue}`);
+    }
+    // A repo that committed its mapping yet was never scanned has no card at
+    // all: name it and the exact command that indexes it, so the gap heals.
+    if (mappingNotIndexed.length > 0) {
+        const roots = repos.map((r) => r.root).filter(Boolean).join(" ");
+        for (const dir of mappingNotIndexed)
+            console.log(
+                `mapping not indexed: ${dir} (has .agentq/trackers.json, absent from the index)  fix: node tools/tracker-lint.mjs --scan ${roots} ${dir}`,
+            );
     }
     console.log(`total drift: ${totalDrift}${totalIssues ? `, ${totalIssues} root issue(s)` : ""}`);
     return rc;
