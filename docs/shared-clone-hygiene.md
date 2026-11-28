@@ -42,5 +42,27 @@ A commit made in the shared clone is worse: an unpushed commit blocks the same f
 - `ps/hooks/guard-tooluse.ps1` **WARNS** (warn tier, not deny) on a raw `git commit` in a shared clone and
   on writing a `plan/*.csv` in a shared clone — it names the verb to use instead.
 - `ps/bin/shared-clone-janitor.ps1` can **salvage** an unowned dirty set: back it up, `agentq publish` it,
-  then path-scoped clean. **Dry-run by default**; act with `-Apply`. It never discards anything it did not
-  publish, and it skips a repo with a live writer, an active `commit:`/`land:` ticket or a rebase in flight.
+  push it to a durable well-known ref, drop a machine-readable manifest, then path-scoped clean.
+  **Dry-run by default**; act with `-Apply`. It never discards anything it did not publish, and it skips a
+  repo with a live writer, an active `commit:`/`land:` ticket or a rebase in flight.
+
+### Salvaged work is always recoverable
+
+A salvage must never land **only** on the session-scoped `publish/<session>-<ts>` topic — that topic is
+reaped and is not on `refs/heads/`, so from the agent's point of view the work "vanished". Every salvage
+also writes the durable surfaces below (additive, idempotent, never a force-push):
+
+- **ref** — `refs/heads/salvage/<repo>/<yyyyMMdd-HHmmss>` on `origin`: a durable branch holding the
+  salvage commit, verified with `git ls-remote`; a failed push is journaled `salvage-ref-failed` and warned.
+- **manifest** — `~/.codai/parked/<repo>/<ts>/SALVAGE.json`: `repo`, `tree`, `head`, `topic`,
+  `salvageRef`, `sha`, `paths[]`, `reason`, `backup`, `restored_with` (park root overridable with
+  `SHARED_CLONE_JANITOR_PARK`).
+- **journal** — one `salvaged` record per salvage in `~/.codai/coord/journal.jsonl`.
+
+**The one command a future agent runs:**
+
+```powershell
+agentq recover -Repo <repo>                                     # lists a "salvaged / parked OUT of the
+                                                                # shared clone" section: ref, sha, paths, backup
+agentq recover -Repo <repo> -Ref <sha|ref> -To <slot> -Apply    # restore it into a leased slot
+```

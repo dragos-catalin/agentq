@@ -497,6 +497,47 @@ function Get-CurrentChatId {
     return $id
   } catch { return $null }
 }
+# D6 (owner 2026-11-28, proposal SHAREPERCHAT): the fair-share KEY must be MY chat, and `.last.json` alone
+# cannot say which chat that is - the guard rewrites it on EVERY tool call of EVERY chat, so it usually
+# names a SIBLING chat of the same window. Measured 2026-11-28 04:33Z: `.last.json` carried
+# `394e4227-...` (a chat holding codai/task-2 AND the land slot) while this chat was `0182c24f-...`, and the
+# value changed again three minutes later. Feeding that straight into Get-SlotShare would charge one chat's
+# slots to another and hand out a refusal (or a free slot) at random - the same land allowed or refused
+# depending on which sibling spoke last.
+# So the candidate is CONFIRMED against the per-chat registry the same hook writes on every tool call of
+# that chat (<Root>/chats/<chatId>.json): accept it only when it is the ONE chat of MY session that is
+# fresh right now. Anything else -> $null, and Get-SlotShare treats $null as session keying, i.e. exactly
+# the pre-D6 behaviour. An explicit $env:AGENTQ_CHAT_ID is taken as given (scripts and the suite state their
+# identity that way). BOUND, measured in the guard (guard-tooluse.ps1:288 writes <chat>.json only when the
+# binding set changed, :292 only touches it while the chat HOLDS a lease, and it is DELETED when the last
+# binding goes): the registry is a per-chat record only for chats that hold something, so the chat key is
+# provable exactly when this chat already holds a lease - which is also the only case where it changes the
+# verdict (its own slots, not its siblings'). A chat holding nothing falls back to session keying, and D5
+# then refuses it BEFORE the cap-1 land ticket, in seconds rather than after a 10-minute wait.
+# RESIDUAL, stated rather than hidden: this is a confirmation, not a proof. If the hint names a SIBLING of
+# my session that happens to be the only fresh chat, that sibling's live leases are charged to this call.
+# The window is the few hundred ms between the hook's write and this process (the guard writes .last.json
+# immediately before the tool call), and the charge is bounded by ONE chat of my own session instead of the
+# whole session - which is the proposal's intent either way (one chat, one slot, never a guess about a chat
+# of another session).
+function Get-ShareChatId($leases) {
+  $cand = "$(Get-CurrentChatId)"
+  if (-not $cand) { return $null }
+  if ($env:AGENTQ_CHAT_ID) { return $cand }
+  try {
+    $win = [double](P (Get-Config) 'chatNowSec' 30)
+    $nowD = Now; $dir = Join-Path $Root 'chats'; $fresh = @()
+    $mine = @(@($leases) | Where-Object { $_ -and -not [bool](P $_ 'stale' $false) -and "$(P $_ 'session' '')" -eq "$Session" })
+    foreach ($id in @($mine | ForEach-Object { @(P $_ 'chats' @()) } | ForEach-Object { "$_" } | Where-Object { $_ } | Sort-Object -Unique)) {
+      $cf = Join-Path $dir (($id -replace '[^A-Za-z0-9._-]', '_') + '.json')
+      if (-not [IO.File]::Exists($cf)) { continue }
+      if (($nowD - [IO.File]::GetLastWriteTimeUtc($cf)).TotalSeconds -le $win) { $fresh += $id }
+    }
+    if (@($fresh).Count -ne 1) { return $null }
+    if ("$($fresh[0])" -ne $cand) { return $null }
+    return $cand
+  } catch { return $null }
+}
 # OQ-001 / ADR 0009 stage 0: the chat side of a lease, computed in ONE place so `unlease` and the journal
 # cannot drift apart (they did: the reaper's 20-min chat grace sat INSIDE the SLO's 30-min live window, so
 # a slot could be expired while the SLO still called its chat live).
@@ -512,6 +553,59 @@ function Get-LeaseChatFacts($l) {
   $live = ($null -ne $idle) -and ($idle -le 30) -and (-not $byChat) -and (-not (@($ch.chats) -contains $Session))
   [pscustomobject]@{ chats = @($ch.chats); idle = $idle; byChat = $byChat; live = $live }
 }
+# D7 (owner 2026-11-28): WHOSE lease this is - the one predicate for every decision that used to test the
+# SESSION alone. `$Session` is `term-<AgentHostPid>`: it survives a terminal closing (the pid does not
+# change), but it DOES change when the editor window reloads - and that is the whole point. A chat that
+# still held a slot came back under a new session id and could then neither REUSE it (plain `lease` rented
+# a SECOND slot instead: measured 2026-11-28 with an isolated probe - same chat, new session,
+# `same slot = False`, while the old slot stayed leased and chat-bound, so the chat could not even name it)
+# nor RECOVER it (`recover -To` threw "do not write into another session's slot") nor give it back
+# (`unlease` demanded -Reason, and refused outright with exit 3 while its own chat was live).
+# The lease already records the CHATS that worked in it (<lease>.json.chat, written by the guard hook),
+# so the two questions are answered by TWO predicates - they are not the same question, and only one of
+# them may be answered from a chat id:
+#   Test-LeaseMine     - my SESSION holds it. Every classification that ends up in the journal asks this
+#                        (`unlease` decides lease-break vs unlease, the -LeaseId hint decides whether
+#                        -Reason is demanded). A chat id must NOT decide those: `.chats` remembers a chat
+#                        that worked in the slot once, so a wrong 'mine' there would record a real loss as
+#                        a benign release. Measured 2026-11-28: the suite's "released by its own chat from
+#                        another shell -> lease-break with byChat=true" case turned into a silent `unlease`
+#                        when the chat key was allowed into this predicate.
+#   Test-LeaseChatMine - my CHAT worked in it AND its recorded owner HOST is gone. This is the RECOVERY
+#                        question: `Get-DefaultOwner` records the harness pid, and a window reload restarts
+#                        it, so the slot the chat was working in is free again while the chat's session id
+#                        is new - the facts the chat key is FOR. The `-not alive` half keeps it honest:
+#                        without it my chat could take back a slot ANOTHER LIVE host has since leased, a
+#                        real cross-session clobber.
+#   Test-LeaseOurs     - mine, or recoverable by my chat: what the RECOVERY paths ask (leasing a slot back,
+#                        reusing it, `recover`, the land pre-gate standing in one).
+# A chat id is ONE conversation, so the chat key is narrower than the old session key: two sibling chats of
+# one window stop counting as each other's owner (the fair-share D6 key).
+# RESIDUAL, stated rather than hidden: agentq has no chat id of its own, so the chat is read from the hint
+# the guard writes (<Root>/chats/.last.json, accepted only within chatNowSec) - and that hint usually names
+# whichever chat of the window spoke LAST. Two sibling chats that BOTH came back after a reload can therefore
+# recover each other's slot, and the hint names the wrong chat at random in exactly that window. Bounded, not
+# fixed: the hint must be fresh (30 s) AND the lease's recorded owner host must be gone, so a LIVE host is
+# never clobbered and no slot of a live session is ever taken; the slot is backed up on take-over either way.
+# A per-SESSION hint (chats/.last-<agentHostPid>.json, written by the same guard) would remove the ambiguity,
+# but the guard lives on the trust surface (~/.copilot/hooks) and an install of it needs an owner ticket.
+# Do NOT confirm this key against Get-ShareChatId (D6): that helper enumerates MY SESSION's leases, and a
+# slot to recover is by construction one whose recorded session is the DEAD pre-reload one - the set would be
+# empty and recovery would silently stop working (the reason the two chat keys are computed separately).
+function Test-LeaseMine($l) { if (-not $l) { return $false }; "$(P $l 'session' '')" -eq "$Session" }
+function Test-LeaseChatMine($l) {
+  if (-not $l) { return $false }
+  if ([bool](P $l 'alive' $true)) { return $false }
+  # ONE chat lookup per process: every ownership decision over a repo's leases asks this, and behind it are
+  # <Root>/chats/.last.json and the env. Get-Variable, because Set-StrictMode 3 makes READING an unset
+  # $script: variable a terminating error.
+  if (-not (Get-Variable -Name MineChat -Scope Script -ErrorAction SilentlyContinue)) { $script:MineChat = @{ v = "$(Get-CurrentChatId)" } }
+  $me = "$($script:MineChat.v)"
+  if (-not $me) { return $false }
+  if (@($l.PSObject.Properties.Name) -contains 'chats') { return (@(P $l 'chats' @()) -contains $me) }
+  try { return (@((Read-LeaseChat (P $l 'file' '')).chats) -contains $me) } catch { return $false }
+}
+function Test-LeaseOurs($l) { if (-not $l) { return $false }; (Test-LeaseMine $l) -or (Test-LeaseChatMine $l) }
 # PERF (2026-11-26). `status`, `since` and `show-scale` each read the ALL-repos lease view several
 # times per command (Get-V2Status, Get-TaskSlotBudget -> Get-ScratchLeaseCount, Get-TaskLeaseCount,
 # Show-SlotShare, Test-SlotShareRefusal), and one read used to cost ~0.6 s over 19 lease records, each
@@ -1343,6 +1437,7 @@ function Invoke-Claim {
 
 function Invoke-Lease {
   $script:TakeoverNote = ''
+  $script:ReuseMine = $null
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
   if (-not $repo) { throw 'agentq lease: not in a git repo (pass -Repo)' }
@@ -1357,11 +1452,27 @@ function Invoke-Lease {
   # ~160 leases/day against a pool of 11 per repo. A second task lease from the same session is refused
   # with the two sanctioned alternatives; -Slot task-N is the deliberate override.
   if ((-not $Slot) -and "$Role" -in '', 'task' -and -not $Wait) {
-    $mine = @(Read-Leases $repo.Name | Where-Object { (P $_ 'role') -eq 'task' -and (P $_ 'session') -eq $Session -and -not $_.stale })
+    # D7: chat-aware, so a chat that comes back after a window reload is measured against the slots IT
+    # holds, not against a session id that no longer exists.
+    $mine = @(Read-Leases $repo.Name | Where-Object { (P $_ 'role') -eq 'task' -and (Test-LeaseOurs $_) -and -not $_.stale })
+    # D7: holding the slot is not the only reason to fall through. My own CLEAN task slot, asked for without
+    # -Slot, is a RECOVERY - the chat wants its slot BACK, not a second one - so hand THAT slot back. It has
+    # to be forced here rather than left to the D5 reuse below: D5 matches on the ROLE and a plain `lease`
+    # carries no -Role, so the match comes back empty and the caller rents a second slot - measured
+    # 2026-11-28, after the chat key was in place: S1 held task-1, S2 (same chat, owner pid gone) rented
+    # task-2. Anything else still refuses with the two sanctioned alternatives.
     if ($mine.Count) {
-      $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
-      [Console]::Error.WriteLine("agentq: this session already holds a task slot in $($repo.Name): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path instead of leasing. For isolated one-off work use a scratch slot: agentq lease -Role scratch -Purpose '<why>' (not counted against the caps, reclaimed after 15 min without work). To take a second task slot on purpose, name it: -Slot task-N.")
-      exit 3
+      # D7 ordering: a slot my CHAT was working in (recorded owner host gone) is handed back AS IT IS, dirty
+      # tree included - that tree IS this conversation's own work, and a recovery that reset or refused it
+      # would be worse than renting a new slot. The cleanliness rule below stays for the ordinary D5 case
+      # (a slot this session still owns): handing it back mid-edit would silently lose that work.
+      $ownRecover = $mine | Where-Object { $p = Norm-Dir "$(P $_ 'path')"; $p -and (Test-Path -LiteralPath $p) -and (Test-LeaseChatMine $_) } | Select-Object -First 1
+      $ownClean = if ($ownRecover) { $ownRecover } else { $mine | Where-Object { $p = Norm-Dir "$(P $_ 'path')"; $p -and (Test-Path -LiteralPath $p) -and (Test-GitClean $p) } | Select-Object -First 1 }
+      if ($ownClean -and (Get-FairShare).enabled) { $script:ReuseMine = $ownClean } else {
+        $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+        [Console]::Error.WriteLine("agentq: this session already holds a task slot in $($repo.Name): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path instead of leasing. For isolated one-off work use a scratch slot: agentq lease -Role scratch -Purpose '<why>' (not counted against the caps, reclaimed after 15 min without work). To take a second task slot on purpose, name it: -Slot task-N. If that slot is the SAME chat coming back after a reload, name it to get it back once its tree is clean: agentq lease -Slot <slot> -Purpose '<why>'.")
+        exit 3
+      }
     }
   }
   # D5 (ADR 0014) REUSE BEFORE RENTING - the slot-side twin of the queue's fair share. A session that
@@ -1377,11 +1488,32 @@ function Invoke-Lease {
   # whole bound out: measured 905-906 s in ps/tests/test-lease-spawns.ps1, i.e. 87% of the devcloud pool
   # gate (1044 s) and of every land pre-gate. `-Wait` stays excluded, so the pre-gate is unaffected and
   # Test-GitClean still refuses to hand back a dirty slot.
+  # D7: the owner (harness pid) is resolved BEFORE the reuse block, because a hand-back records it on the
+  # lease it takes over. One Get-DefaultOwner per lease, exactly as before.
+  $owner = Get-DefaultOwner
   if (-not $Wait) {
     $reuseRole = $Role
     if ($Slot -and -not $reuseRole) { $reuseRole = Get-SlotRole $repo.Name $Slot }
-    $reuse = if ($Slot) { Get-SlotReuse $repo.Name $reuseRole $Slot } else { Get-SlotReuse $repo.Name $Role }
+    $reuse = if ($script:ReuseMine) { $script:ReuseMine } elseif ($Slot) { Get-SlotReuse $repo.Name $reuseRole $Slot } else { Get-SlotReuse $repo.Name $Role }
     if ($reuse) {
+      # D7: a hand-back (recovery) does not go through Get-SlotReuse, which is what normally journals
+      # `slot-reuse`; record it here too so a recovery is visible in the journal next to ordinary reuse.
+      if ($script:ReuseMine) { Write-Journal @{ event = 'slot-reuse'; resource = "slot:$($repo.Name):$($reuse.slot)"; ticket = "$(P $reuse 'leaseId' '')"; session = $Session; role = "$(P $reuse 'role')"; slot = "$($reuse.slot)"; repo = $repo.Name; purpose = "$(P $reuse 'purpose')"; recovery = $true } }
+      # D7: a HAND-BACK moves the lease to THIS session and host - it is a transfer of the slot, not a peek.
+      # Leaving the record as the reload left it made the recovery half-done: `status` named a holder that no
+      # longer exists, `alive=false` kept the slot on the dead-owner threshold (45 min) while the returning
+      # chat was working in it, and handing the slot back still counted as a FOREIGN break (it needed
+      # -Reason, and while its chat was fresh it could be refused outright with exit 3).
+      if ($script:ReuseMine) {
+        try {
+          $rf = "$(P $reuse 'file' '')"
+          $rawL = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json -AsHashtable
+          $stL = Get-ProcStart $owner
+          $rawL['session'] = "$Session"; $rawL['pid'] = $owner; $rawL['procStart'] = $(if ($stL) { Iso $stL } else { $null }); $rawL['host'] = $env:COMPUTERNAME
+          Write-JsonAtomic $rf $rawL
+          Touch-Lease ([pscustomobject]@{ file = $rf })
+        } catch { [Console]::Error.WriteLine("agentq: the hand-back could not record the new holder: $($_.Exception.Message)") }
+      }
       $rp = "$(P $reuse 'path')"
       # `head` is the short HEAD the repo resolution above ALREADY computed (its one combined rev-parse
       # carries `--short HEAD`), so the reuse arm adds no git spawn of its own; '' when HEAD is unborn.
@@ -1394,7 +1526,6 @@ function Invoke-Lease {
     }
   }
   $main = Get-MainTop $repo
-  $owner = Get-DefaultOwner
   $l = New-Lease $repo $Slot $Role $Purpose $Branch $owner $TimeoutMin $NoWait $Wait $MaxMin $MaxMinGiven
   # -Hold: an explicit, bounded, journalled claim that the holder runs a long job OUTSIDE the slot.
   if ($Hold -and $l) {
@@ -1461,10 +1592,17 @@ function Invoke-Unlease {
   if (-not $l) { Write-Output "no lease on $repoName/$Slot"; return }
   # Releasing a lease needs its exact id (break-by-id, ADR 0001 section 2); a foreign one also a reason.
   if ($LeaseId -ne $l.leaseId) {
-    [Console]::Error.WriteLine("agentq: $repoName/$Slot is leased by $($l.session) ($($l.leaseId), '$($l.purpose)', idle $($l.idleMin)m, alive=$($l.alive)). Pass -LeaseId $($l.leaseId)$(if ($l.session -ne $Session) { " -Reason '...'" })")
+    [Console]::Error.WriteLine("agentq: $repoName/$Slot is leased by $($l.session) ($($l.leaseId), '$($l.purpose)', idle $($l.idleMin)m, alive=$($l.alive)). Pass -LeaseId $($l.leaseId)$(if (-not (Test-LeaseMine $l)) { " -Reason '...'" })")
     exit 2
   }
-  $foreign = ($l.session -ne $Session)
+  # D7 (owner 2026-11-28): what decides a BREAK stays the SESSION, deliberately. A chat id must not decide a
+  # lease-break vs unlease: `.chats` remembers a chat that worked in the slot ONCE, so a wrong "mine" here
+  # would record a real loss as a benign release (the suite's "released by its own chat from another shell ->
+  # lease-break with byChat=true" case becomes a silent `unlease` if the chat key is allowed in). What D7
+  # fixes is the RECOVERY half - the chat gets its slot BACK (Test-LeaseOurs in Invoke-Lease / Invoke-Recover
+  # / the land pre-gate) and, because that hand-back records the new session on the lease, it can then give
+  # that slot back as a normal release.
+  $foreign = -not (Test-LeaseMine $l)
   if ($foreign -and -not $Reason) { [Console]::Error.WriteLine("agentq: lease belongs to $($l.session); breaking it needs -Reason"); exit 2 }
   # OQ-001 / ADR 0009 stage 0: the one loss the SLO drives to 0 is a lease ended while its holder's chat was
   # still live (`slotsLostLiveChat` - 3 lease-break + 1 lease-expire in the 24 h to 2026-11-20, reasons like
@@ -1562,7 +1700,77 @@ function Resolve-BackupRef([string]$repoName, [string]$what) {
     $obj = "$(& git -C $main rev-parse --verify -q $cand 2>$null)".Trim()
     if ($obj) { return [pscustomobject]@{ Ref = $cand; Sha = $obj } }
   }
+  # 2026-11-28: a well-known SALVAGE ref (refs/heads/salvage/<repo>/<ts>) lives on origin, not under
+  # refs/backup/*; fetch that namespace, then accept the ref itself, its refs/salvage mirror, a bare
+  # <ts>, or the commit sha recorded in a SALVAGE.json.
+  & git -C $main fetch -q origin "refs/heads/salvage/${repoName}/*:refs/salvage/${repoName}/*" 2>$null | Out-Null
+  $mirror = if ($what -match '^refs/heads/salvage/(.+)$') { "refs/salvage/$($Matches[1])" } else { $null }
+  foreach ($cand in @($what, $mirror, "refs/salvage/$repoName/$what")) {
+    if (-not $cand) { continue }
+    $obj = "$(& git -C $main rev-parse --verify -q $cand 2>$null)".Trim()
+    if ($obj) { return [pscustomobject]@{ Ref = $cand; Sha = $obj } }
+  }
   $null
+}
+
+# The root shared-clone-janitor (SALVAGE.json) and git-autosync (MANIFEST.tsv / bundles) write under.
+function Get-ParkRoot {
+  if ($env:AGENTQ_PARK) { return $env:AGENTQ_PARK }
+  if ($env:GIT_AUTOSYNC_PARK) { return $env:GIT_AUTOSYNC_PARK }
+  Join-Path $HOME '.codai\parked'
+}
+
+# 2026-11-28: an unowned shared-clone file is MOVED out (shared-clone-janitor publishes it to a salvage
+# ref; git-autosync parks a colliding one), and the commit/backup lands somewhere a later agent cannot
+# guess - the file READ as vanished. These readers surface every such record so `agentq recover` (list
+# mode) always points at the salvaged work, whatever tool moved it.
+function Get-SalvageRecords([string]$repoName) {
+  $rows = [Collections.Generic.List[object]]::new()
+  $park = Join-Path (Get-ParkRoot) $repoName
+  if (Test-Path -LiteralPath $park) {
+    # 1. shared-clone-janitor SALVAGE.json - the salvage commit for unowned shared-clone debris.
+    foreach ($f in @(Get-ChildItem -LiteralPath $park -Recurse -Filter 'SALVAGE.json' -File -ErrorAction SilentlyContinue)) {
+      try {
+        $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+        $rows.Add([pscustomobject]@{
+            Kind = 'salvage'; At = "$(P $j 'at')"; Ref = "$(P $j 'salvageRef')"; Topic = "$(P $j 'topic')"
+            Sha = "$(P $j 'sha')"; Paths = @(@(P $j 'paths') | ForEach-Object { "$_" } | Where-Object { $_ })
+            Backup = "$(P $j 'backup')"; Source = $f.FullName
+          })
+      } catch { }
+    }
+    # 2. git-autosync park MANIFEST.tsv - a colliding file parked before a fast-forward (backup_ref last col).
+    foreach ($f in @(Get-ChildItem -LiteralPath $park -Recurse -Filter 'MANIFEST.tsv' -File -ErrorAction SilentlyContinue)) {
+      try {
+        $paths = [Collections.Generic.List[string]]::new(); $ref = ''
+        foreach ($ln in @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() } | Select-Object -Skip 1)) {
+          $c = "$ln" -split "`t"
+          if ($c.Count -ge 1 -and $c[0]) { $paths.Add($c[0]) }
+          if ($c.Count -ge 8 -and $c[7]) { $ref = $c[7] }
+        }
+        $rows.Add([pscustomobject]@{
+            Kind = 'park'; At = (Split-Path $f.Directory -Leaf); Ref = $ref; Topic = ''; Sha = ''
+            Paths = @($paths); Backup = $f.DirectoryName; Source = $f.FullName
+          })
+      } catch { }
+    }
+  }
+  # 3. shared-clone-janitor backup manifests - byte copies kept even when the ref push failed.
+  $bkRoot = if ($env:SHARED_CLONE_JANITOR_BACKUP) { $env:SHARED_CLONE_JANITOR_BACKUP } else { Join-Path $HOME '.codai\backups\shared-clone' }
+  $bk = Join-Path $bkRoot $repoName
+  if (Test-Path -LiteralPath $bk) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $bk -Recurse -Filter 'manifest.json' -File -ErrorAction SilentlyContinue)) {
+      try {
+        $j = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+        $rows.Add([pscustomobject]@{
+            Kind = 'backup'; At = "$(P $j 'at')"; Ref = ''; Topic = ''; Sha = ''
+            Paths = @(@(P $j 'paths') | ForEach-Object { "$(P $_ 'path')" } | Where-Object { $_ })
+            Backup = $f.DirectoryName; Source = $f.FullName
+          })
+      } catch { }
+    }
+  }
+  @($rows | Sort-Object At -Descending)
 }
 # A take-over is loud now: journal + slot history + a notice to the previous holder + the note the new
 # holder reads on stdout. The note is also printed when the lease FAILS after the backup, so it cannot be lost.
@@ -1618,16 +1826,34 @@ function Invoke-Recover {
   $what = if ($Sha) { $Sha } elseif ($Ref) { $Ref } else { $null }
   if (-not $what) {
     $rows = @(Get-SlotBackups $repoName $Slot -Fetch)
-    if ($Json) { @{ repo = $repoName; slot = $Slot; backups = $rows } | ConvertTo-Json -Depth 4; return }
-    if (-not $rows.Count) { Write-Output "no backups for $repoName$(if ($Slot) { "/$Slot" }) - a reset is always preceded by one, so there is nothing to recover"; return }
-    Write-Output "backups for $repoName$(if ($Slot) { "/$Slot" })$(if (-not $Slot) { ' (every slot)' }), newest first. A reset is always preceded by one of these - nothing here was discarded."
-    foreach ($b in $rows) { Write-Output ("  {0,-58} {1,-9} {2,-25} {3,-8} {4}" -f $b.Ref, $b.Sha.Substring(0, 8), $b.At, $b.Kind, $b.Subject) }
+    # A file moved out of a shared clone (janitor salvage / autosync park) is exactly the work an agent
+    # fears "vanished"; list it here too so `agentq recover` is the one place to look.
+    $salv = @(Get-SalvageRecords $repoName)
+    if ($Json) { @{ repo = $repoName; slot = $Slot; backups = $rows; salvage = $salv } | ConvertTo-Json -Depth 6; return }
+    if (-not $rows.Count -and -not $salv.Count) { Write-Output "no backups for $repoName$(if ($Slot) { "/$Slot" }) - a reset is always preceded by one, so there is nothing to recover"; return }
+    if ($rows.Count) {
+      Write-Output "backups for $repoName$(if ($Slot) { "/$Slot" })$(if (-not $Slot) { ' (every slot)' }), newest first. A reset is always preceded by one of these - nothing here was discarded."
+      foreach ($b in $rows) { Write-Output ("  {0,-58} {1,-9} {2,-25} {3,-8} {4}" -f $b.Ref, $b.Sha.Substring(0, 8), $b.At, $b.Kind, $b.Subject) }
+    }
     $h = @(Get-SlotHistory $repoName $Slot 12)
     if ($h.Count) {
       Write-Output "who was there (slot history - outlives the lease record):"
       foreach ($x in $h) {
         $rf = "$(P $x 'ref')"; if ($rf.Length -gt 44) { $rf = $rf.Substring(0, 44) }
         Write-Output ("  {0}  {1,-16} holder={2,-13} by={3,-13} {4}  {5}" -f (P $x 'ts'), (P $x 'event'), (P $x 'holder'), (P $x 'by'), $rf, (P $x 'why'))
+      }
+    }
+    if ($salv.Count) {
+      Write-Output "salvaged / parked OUT of the shared clone (the work is NOT gone - it is here):"
+      foreach ($s in $salv) {
+        $label = if ($s.Ref) { $s.Ref } elseif ($s.Topic) { $s.Topic } else { '(local backup)' }
+        Write-Output ("  {0,-8} {1,-15} {2,-46} {3} path(s)" -f $s.Kind, $s.At, $label, $s.Paths.Count)
+        foreach ($p in @($s.Paths | Select-Object -First 6)) { Write-Output "           $p" }
+        if ($s.Sha) {
+          Write-Output ("           sha {0}   restore: agentq recover -Repo {1} -Ref {0}" -f $s.Sha.Substring(0, [math]::Min(10, $s.Sha.Length)), $repoName)
+          Write-Output "           or copy the file(s) from $($s.Backup)"
+        }
+        else { Write-Output "           copy the file(s) from: $($s.Backup)" }
       }
     }
     Write-Output "restore: agentq recover -Repo $repoName -Ref <ref|sha|slot/stamp> [-To <path of your own slot> -Apply]"
@@ -1652,7 +1878,9 @@ function Invoke-Recover {
     throw "agentq recover: -To '$To' is the SHARED clone - restoring there mixes another session's draft into shared state. Restore into a leased slot (agentq lease -Purpose recover), or pass -Force."
   }
   $lease = Find-LeaseForPath $rt.Top
-  if ($lease -and (P $lease 'session') -ne $Session -and -not $Force) {
+  # D7: my CHAT's slot counts as mine, so a chat can restore its own tree after a window reload (the session
+  # id is new; the lease still records the chat). Another LIVE session's slot is still refused.
+  if ($lease -and -not (Test-LeaseOurs $lease) -and -not $Force) {
     throw "agentq recover: '$To' is leased by $($lease.session) ('$($lease.purpose)') - do not write into another session's slot. Lease your own: agentq lease -Purpose recover"
   }
   if (-not $Apply) { Write-Output "dry run - nothing written. Re-run with -Apply to restore $($res.Sha.Substring(0, 8)) into $($rt.Top)"; return }
@@ -2481,7 +2709,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   # This IS the "from the shared clone" path, so `landPregateFromMain` gates it exactly as it gates the
   # scratch rental below: a repo with the flag off must not pre-gate from outside its own slot at all.
   if (-not $slot -and (Get-LandPregateFromMain $repo.Name)) {
-    $mine = @(Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned', 'scratch' -and -not $_.stale -and (P $_ 'session') -eq $Session })
+    $mine = @(Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned', 'scratch' -and -not $_.stale -and (Test-LeaseOurs $_) })
     $slot = @($mine | Where-Object { Test-GitClean (Norm-Dir "$(P $_ 'path')") }) | Select-Object -First 1
     if ($slot) { Write-Output "land: pre-gate in the slot this session already holds ($($repo.Name)/$(P $slot 'slot'), role $(P $slot 'role')) - the gate does not need the queue" }
   }
@@ -2532,7 +2760,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     # "the slot has uncommitted or untracked files" AFTER the rental had already failed, hiding it), and
     # each one ran the whole 5-40 min repo gate (p90 ~30 min) INSIDE the cap-1 land mutex.
     if (-not $script:PregateUntracked.Count -and (Test-GitCleanTracked $sp)) {
-      $standHere = @(Read-Leases $repo.Name | Where-Object { -not $_.stale -and (P $_ 'session') -eq $Session -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) })
+      $standHere = @(Read-Leases $repo.Name | Where-Object { -not $_.stale -and (Test-LeaseOurs $_) -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) })
       if ($standHere.Count) {
         $script:PregateUntracked = @(Get-UntrackedPaths $sp)
         if ($script:PregateUntracked.Count) {
@@ -3237,10 +3465,58 @@ function Invoke-Land {
       }
     }
   }
+  # D6 (owner 2026-11-28, proposal LANDTICKETBEFORESLOT): PROBE THE FAIR SHARE BEFORE TAKING THE CAP-1 LAND
+  # TICKET. The share refusal used to surface inside New-Lease - i.e. AFTER `land:<repo>` (cap 1) was taken -
+  # and New-Lease waits its own bound first (10 min for a land): measured 2026-11-28 a land held the repo's
+  # only land ticket for 10 min 34 s to then push nothing, and every sibling land of that window serialised
+  # behind it. The verdict cannot improve by waiting - `held` counts THIS caller's own leases and the share
+  # only moves when other sessions go away - so the refusal is honest at once. Same function, same lease read
+  # as New-Lease uses, so the two can never disagree. Nothing is queued, no slot is taken, and the pre-gate's
+  # green ledger entry survives, so the re-run after the share frees skips the gate.
+  # (e) owner 2026-11-28: a LAND is charged per repo - the only scope in which it can take a slot. The share's
+  # divisor stays machine-wide, so the machine task budget is unchanged; what changes is that a land is no
+  # longer billed for leases this session holds in OTHER repos. Measured 2026-11-28: 12 leases across four repos
+  # (agentq/brivio/marcai/codai) against a share of 4 refused a codai land that needed one codai scratch.
+  $swLand = Test-SlotShareRefusal $repo.Name 'land' -PerRepo
+  # (c) owner 2026-11-28: `land -WaitShare` waits for the share to ADMIT instead of refusing at once. The
+  # share only moves when a competing unit goes away, and a land's whole cost is the cap-1 ticket plus a slot,
+  # so a caller that is willing to wait should not have to re-run the land by hand (and lose the pre-gate's
+  # green ledger entry it just paid for). Opt-in and BOUNDED: on the bound the old refusal is returned
+  # verbatim, so nothing that relied on "refuse fast" changes unless it asks for the wait.
+  if ($swLand -and $WaitShare) {
+    $wsStart = Now
+    Write-Journal @{ event = 'land-share-wait'; resource = $res; branch = $Onto; boundMin = [int]$WaitShareMin; held = "$swLand"; reason = 'land -WaitShare: waiting for the fair share to admit a land slot instead of refusing'; repo = $repo.Name }
+    [Console]::Error.WriteLine("land: the fair share refuses a land slot - waiting up to $([int]$WaitShareMin) min for it to free (nothing queued, no ticket held yet): $swLand")
+    $wsLast = "$swLand"
+    $wsDeadline = $wsStart.AddMinutes([double]$WaitShareMin)
+    while ($swLand -and (Now) -lt $wsDeadline) {
+      Start-Sleep -Seconds 10
+      $swLand = Test-SlotShareRefusal $repo.Name 'land' -PerRepo
+      # one line per CHANGE, never one per poll (a 15 min wait would otherwise print 90 identical lines)
+      if ($swLand -and "$swLand" -ne $wsLast) {
+        $wsLast = "$swLand"
+        [Console]::Error.WriteLine("land: still waiting for the share - $swLand")
+      }
+    }
+    if (-not $swLand) {
+      $wsWaited = [int]((Now) - $wsStart).TotalSeconds
+      Write-Journal @{ event = 'land-share-admitted'; resource = $res; branch = $Onto; waitedSec = $wsWaited; reason = 'the fair share admitted a land slot while waiting (-WaitShare)'; repo = $repo.Name }
+      Write-Output "land: the share admitted a land slot after ${wsWaited}s - continuing"
+    } else {
+      Write-Journal @{ event = 'land-share-refused'; resource = $res; branch = $Onto; waitedSec = [int]((Now) - $wsStart).TotalSeconds; boundMin = [int]$WaitShareMin; reason = "the fair share refused for the whole -WaitShare bound ($([int]$WaitShareMin) min) before the cap-1 land ticket was taken"; repo = $repo.Name }
+      [Console]::Error.WriteLine("land: REFUSED after waiting $([int]$WaitShareMin) min (-WaitShare) - $swLand`n  Nothing queued, nothing pushed and no ticket held. Re-run the land once a slot is free: this refusal is not a retry loop. AGENTQ_NO_FAIRSHARE=1 lands anyway; agentq status shows the share.")
+      $script:LandExit = 3; return
+    }
+  }
+  if ($swLand) {
+    Write-Journal @{ event = 'land-share-refused'; resource = $res; branch = $Onto; reason = 'the fair share refuses a land slot before the cap-1 land ticket is taken'; repo = $repo.Name }
+    [Console]::Error.WriteLine("land: REFUSED before taking the cap-1 land ticket - $swLand`n  Nothing queued, nothing pushed and no ticket held. Re-run the land once a slot is free: this refusal is not a retry loop. AGENTQ_NO_FAIRSHARE=1 lands anyway; agentq status shows the share.")
+    $script:LandExit = 3; return
+  }
   $t = New-Ticket $res $why "land $Branch -> $Onto" $main
   $cwdN = Norm-Dir (Get-Location).Path
     $srcLease = Read-Leases $repo.Name | Where-Object { $_.role -in 'task', 'pinned' -and $cwdN.StartsWith((Norm-Dir "$(P $_ 'path')")) } | Select-Object -First 1
-  if (-not $srcLease) { $srcLease = Read-Leases $repo.Name | Where-Object { $_.session -eq $Session -and $_.role -in 'task', 'pinned' } | Sort-Object { "$(P $_ 'created' '')" } | Select-Object -First 1 }
+  if (-not $srcLease) { $srcLease = Read-Leases $repo.Name | Where-Object { (Test-LeaseOurs $_) -and $_.role -in 'task', 'pinned' } | Sort-Object { "$(P $_ 'created' '')" } | Select-Object -First 1 }
   $script:LandSrcSlot = if ($srcLease) { "$(P $srcLease 'path')" } else { $null }
   $tc = if ($srcLease) { @(P $srcLease 'claims' @()) } else { @() }
   # Branches a working slot is on - the caller's cwd and its registered source slot - so the reap after a

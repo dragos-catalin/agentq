@@ -117,6 +117,29 @@ try {
   $env:AGENTQ_SESSION = 'owner-C'
   $o2 = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId
   Check '5 clean unlease says nothing to back up' ($o2 -match 'nothing to back up') $o2
+
+  # ---- 6. a file MOVED out of the shared clone (2026-11-28): a shared-clone-janitor salvage commit lands
+  # on a well-known ref + a SALVAGE.json manifest, and `agentq recover` must LIST and RESOLVE it, so an
+  # agent whose deliverable was salvaged never reads "the work vanished".
+  $env:AGENTQ_SESSION = 'owner-E'
+  $env:AGENTQ_PARK = Join-Path $tmp 'parked'
+  $ts = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+  [IO.File]::WriteAllText((Join-Path $repo 'vanished.md'), "salvaged content`n")
+  git -C $repo add vanished.md; git -C $repo commit -qm 'chore(shared-clone): salvage unowned edits in repo (1 path(s))'
+  $ssha = "$(git -C $repo rev-parse HEAD)".Trim()
+  git -C $repo push -q --no-verify origin "${ssha}:refs/heads/salvage/repo/$ts" 2>$null
+  $pd = Join-Path $env:AGENTQ_PARK "repo\$ts"; New-Item -ItemType Directory -Force $pd | Out-Null
+  $sj = [ordered]@{ repo = 'repo'; at = $ts; session = 'scj-x'; tree = $repo; head = ''; topic = 'refs/heads/publish/x'
+    salvageRef = "refs/heads/salvage/repo/$ts"; sha = $ssha; paths = @('vanished.md')
+    reason = 'shared-clone-janitor salvaged unowned edits so the shared clone could fast-forward'
+    backup = $pd; restored_with = 'agentq recover -Repo repo' }
+  [IO.File]::WriteAllText((Join-Path $pd 'SALVAGE.json'), ($sj | ConvertTo-Json -Depth 6))
+  $sal = AQ recover -Repo repo
+  Check '6 recover shows the salvage section' ($sal -match 'salvaged / parked') $sal
+  Check '6 recover lists the salvage ref' ($sal -match [regex]::Escape("refs/heads/salvage/repo/$ts")) $sal
+  Check '6 recover names the salvaged path' ($sal -match 'vanished\.md') $sal
+  $res = AQ recover -Repo repo -Ref "refs/heads/salvage/repo/$ts"
+  Check '6 recover resolves the salvage ref (fetches the namespace)' ($script:code -eq 0 -and $res -match 'vanished') $res
 } finally { Pop-Location; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'ALL OK'
