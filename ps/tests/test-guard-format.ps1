@@ -129,6 +129,23 @@ function Hook([string]$g, [string]$cwd, [string]$command, [string]$tool = 'run_i
 function HookDenies([string]$out) { $out -match '"permissionDecision":"deny"' }
 function Blocks([string]$g, [string]$cwd, [string]$command) { HookDenies (Hook $g $cwd $command) }
 function Warns([string]$g, [string]$cwd, [string]$command) { (Hook $g $cwd $command) -match 'WARNING \(guard-command\)' }
+# A case IS a spawn, and a spawn can FAIL - which is not the same thing as a rule saying nothing.
+# `& $Exe` raises a TERMINATING error (CommandNotFoundException / Win32Exception) when the child cannot
+# be started, and the `$ErrorActionPreference = 'Continue'` that Hook restores for the call does not
+# cover it: the worker dies mid-shard, its `finally` writes a PARTIAL id file, and the orchestrator
+# reports `required check not exercised` - a red gate with no failing assertion behind it. Measured in
+# the cloud land-gate pool on 2026-11-28: the run that took 14 s (against 6 s for the two green pool
+# runs either side of it) reported `guard format exit=1 pass=53 fail=2` with exactly that pair of
+# FAILs. Retry ONCE - a real regression throws on both attempts, a resource hiccup does not - and
+# report a second throw as the case's FAIL so the id is still exercised and the message is visible.
+function Hook-Case([string]$cwd, [string]$cmd) {
+  $err = ''
+  for ($i = 1; $i -le 2; $i++) {
+    try { return @{ Out = (Hook $Guard $cwd $cmd); Err = '' } }
+    catch { $err = "$($_.Exception.GetType().Name): $($_.Exception.Message)" }
+  }
+  return @{ Out = ''; Err = $err }
+}
 
 # The case table lives in ONE place; the worker shards are DERIVED from it (Get-BlockShards), so a new
 # case can never be dropped by the split. The cwd values are the fixture variables the WORKER assigns
@@ -209,7 +226,15 @@ function Invoke-BlockGroup([string]$g, [string]$fx) {
     $c = $cases[$k]
     # ONE spawn per case: the block verdict and the advisory are read off the SAME output (the
     # pre-parallel suite spawned twice per warn case - same verdict, twice the wait).
-    $out = Hook $Guard $c.cwd $c.cmd
+    $h = Hook-Case $c.cwd $c.cmd
+    if ($h.Err) {
+      # Report BOTH ids of the case: a case whose spawn failed must still exercise its ids, otherwise a
+      # warn case would fail twice over (its own FAIL and the ratchet's "required check not exercised").
+      Check (BlockId $c.block $k) $false ("spawn failed on both attempts - " + $h.Err)
+      if ($c.warn) { Check (WarnId $k) $false ("spawn failed on both attempts - " + $h.Err) }
+      continue
+    }
+    $out = $h.Out
     # A BLANK capture is not a verdict. The guard writes its refusal/advisory to stderr and exits 0,
     # so an empty result means the child never ran (or lost its stdin payload - guard-tooluse.ps1:38
     # `catch { Flush-Stderr; exit 0 }` on an unparseable payload), NOT that the rule said nothing.
@@ -218,7 +243,15 @@ function Invoke-BlockGroup([string]$g, [string]$fx) {
     # Re-run it ONCE, and only for a case that MUST produce output (`block` writes the deny JSON on
     # stdout, `warn` the advisory on stderr): a real regression always produces output, so the retry
     # cannot hide one, and the ~15 cases whose CORRECT answer is silence pay no extra spawn.
-    if (-not "$out".Trim() -and ($c.block -or $c.warn)) { $out = Hook $Guard $c.cwd $c.cmd }
+    if (-not "$out".Trim() -and ($c.block -or $c.warn)) {
+      $h = Hook-Case $c.cwd $c.cmd
+      if ($h.Err) {
+        Check (BlockId $c.block $k) $false ("spawn failed on the retry - " + $h.Err)
+        if ($c.warn) { Check (WarnId $k) $false ("spawn failed on the retry - " + $h.Err) }
+        continue
+      }
+      $out = $h.Out
+    }
     $b = HookDenies $out
     Check (BlockId $c.block $k) ($b -eq $c.block) "(got block=$b)"
     if ($c.warn) { Check (WarnId $k) ($out -match 'WARNING \(guard-command\)') ("took: " + ((("$out").Trim() -split '\r?\n' | Where-Object { $_ } | Select-Object -First 1) -join '')) }
