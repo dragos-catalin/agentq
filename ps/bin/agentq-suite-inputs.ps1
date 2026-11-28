@@ -72,6 +72,12 @@ $script:AqSuiteInputMap = [ordered]@{
     # the SPAWN SHAPE of a lease (round 2/3 of the spawn cut): the repo resolution and Initialize-Slot
     # spawns live in agentq.ps1 (Get-RepoInfo) + agentq-v2.ps1 (Initialize-Slot).
     'lease spawns'            = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-lease-spawns.ps1')
+        # D7 (2026-11-28): the two suites that guard lease RECOVERY by chat. They were in run-all.ps1 but in
+        # NO gate list at all, so neither could ever run in a land gate (an unknown suite always runs; a suite
+        # nobody lists never does). `lease chat` is the D7 regression suite - it spawns the guard, hence the
+        # hook in its inputs.
+        'lease chat'              = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/hooks/guard-tooluse.ps1', 'ps/tests/test-lease-chat.ps1')
+        'recover'                 = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-recover.ps1')
     'prewarm verb'            = @('ps/bin/**', 'ps/tests/test-agentq-prewarm-verb.ps1')
     'prewarm cloud'           = @('ps/bin/prewarm-cloud.ps1', 'ps/bin/agentq-cloud.ps1', 'ps/tests/test-prewarm-cloud.ps1')
     'shared janitor'          = @('ps/bin/shared-clone-janitor.ps1', 'ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-shared-clone-janitor.ps1')
