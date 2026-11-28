@@ -204,6 +204,10 @@ pass=53 fail=2 sec=14` where the two failures were the group's own exit code and
   Measured in the cloud land-gate pool on 2026-11-28: the run that took `sec=14` (against `sec=6` for the two
   green pool runs either side of it) reported `guard format exit=1 pass=53 fail=2` as `FAIL group block-3
 exited non-zero exit=1` plus `FAIL required check not exercised: case prettier --write --config (no cfg)` -
+- **A `guard format` worker could die mid-shard and leave the gate red with no failing assertion behind it.**
+  Measured in the cloud land-gate pool on 2026-11-28: the run that took `sec=14` (against `sec=6` for the two
+  green pool runs either side of it) reported `guard format exit=1 pass=53 fail=2` as `FAIL group block-3
+  exited non-zero exit=1` plus `FAIL required check not exercised: case prettier --write --config (no cfg)` -
   one check short of 54, and the missing one was the LAST case of the last shard. A worker writes its id file
   from its own `finally`, so a case that never runs is a check the coverage ratchet can never see, and the
   gate goes red for something that was never asserted. The shape is a spawn that never happened: `& $Exe`
@@ -214,6 +218,10 @@ exited non-zero exit=1` plus `FAIL required check not exercised: case prettier -
     the ratchet. Mutation-checked in a copy: forcing both attempts to throw gives 43 FAIL lines naming
     `RuntimeException: synthetic spawn failure` with **zero** `required check not exercised` lines, and forcing
     only the first attempt to throw still gives `checks=54 pass=54 fail=0`.
+  that case with the exception type and message**, reporting BOTH of its ids so a warn case cannot also trip
+  the ratchet. Mutation-checked in a copy: forcing both attempts to throw gives 43 FAIL lines naming
+  `RuntimeException: synthetic spawn failure` with **zero** `required check not exercised` lines, and forcing
+  only the first attempt to throw still gives `checks=54 pass=54 fail=0`.
 
 - **The `PowerShell suites` job was red on `main` for four independent reasons, none of them a defect in the
   code it judged.** Baseline run 46080801888 finished `suites=92 failed=4` on a commit whose tooling was fine,
@@ -248,6 +256,11 @@ test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is 
 list") and GREEN at`pass=19 fail=0`once the file was mapped. The suite resolves its subject as`$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
 test are mapped together. Proven by running the three suites through the sanctioned runner
 (`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre`60/60,`sat report`16/16,`install wiring`19/19,`RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
+  list") and GREEN at `pass=19 fail=0` once the file was mapped. The suite resolves its subject as
+  `$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
+  test are mapped together. Proven by running the three suites through the sanctioned runner
+  (`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre` 60/60, `sat report` 16/16,
+  `install wiring` 19/19, `RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
 - **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
   them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
   gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,
