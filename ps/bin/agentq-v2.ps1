@@ -48,6 +48,16 @@ function Get-Config {
     machineCap = 2; quickBurst = 1; agingMin = 5; idleYieldMin = 5; idleCpuSec = 10
     bumpMax = 50; burstMax = 2; burstMaxMin = 60; overridesPerHour = 6; runBuildTimeoutMin = 240
     journalRotateMB = 64
+    # gitNetTimeoutSec: the wall-clock bound on a NETWORK git verb (fetch/push/ls-remote). Local git is
+    # instant; a network verb is not, and git has NO transfer timeout of its own, so a wedged child
+    # holds the caller for tens of minutes with no output. Measured 2026-11-28: a `git fetch -q origin
+    # main` inside `agentq land` sat 10 minutes (2.9 s from another shell at the same moment) and an
+    # earlier one sat 55 minutes - both holding a serialized resource the whole time. See Invoke-GitNet.
+    gitNetTimeoutSec = 180
+    # gitPushTimeoutSec: same, for `push`. A push runs the repo's pre-push hook, which is legitimately
+    # slow (codai gate:platform 145-182 s per member), so this is a safety net against a wedged
+    # transport, not a performance bound. Keep it an order of magnitude above gitNetTimeoutSec.
+    gitPushTimeoutSec = 1800
   }
   $f = if ($env:AGENTQ_CONFIG) { $env:AGENTQ_CONFIG } else { Join-Path $PSScriptRoot 'agentq-config.json' }
   if (Test-Path -LiteralPath $f) {
@@ -734,11 +744,11 @@ function Backup-Slot([string]$path, [string]$repoName, [string]$slot, [string]$w
     # --no-verify: a backup ref is not a release; pre-push gates (minutes) would make expiry unusable.
     # Output is CAPTURED (it used to go to $null): a refused push (GitHub GH001 on a >100 MB blob,
     # 2026-10-15) then surfaced only as "could not be verified (got '')" and wedged every later land.
-    $pushOut = @(& git -C $path push --no-verify origin "${commit}:$ref" 2>&1 | ForEach-Object { "$_" })
+    $pushOut = @(Invoke-GitNet @('-C', $path, 'push', '--no-verify', 'origin', "${commit}:$ref"))
     $pushCode = $LASTEXITCODE
     $remote = ''
     for ($try = 1; $try -le 3 -and -not $pushCode; $try++) {
-      $remote = "$((& git -C $path ls-remote origin $ref 2>$null) | Select-Object -First 1)" -split '\s+' | Select-Object -First 1
+      $remote = "$((Invoke-GitNet @('-C', $path, 'ls-remote', 'origin', $ref)) | Select-Object -First 1)" -split '\s+' | Select-Object -First 1
       if ($remote -eq $commit) { break }
       Start-Sleep -Milliseconds (500 * $try)
     }
@@ -1386,7 +1396,7 @@ function Invoke-Lease {
     # lease BOOKKEEPING (unit suites, probes) paid 700-1800 ms per lease for it - measured 2026-11-27, the
     # single largest item in 46 leases of one suite (197 s total). `@{u}` still resolves from the local
     # remote-tracking ref, so the slot ref is chosen exactly as before.
-    if ($env:AGENTQ_NO_FETCH -ne '1') { & git -C $main fetch -q origin 2>$null }
+    if ($env:AGENTQ_NO_FETCH -ne '1') { Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin') | Out-Null }
     $refToUse = if ($Ref) { $Ref } else { $up = (& git -C $main rev-parse --abbrev-ref '@{u}' 2>$null); if ($up) { $up } else { 'HEAD' } }
     # Anything still unique in the dir (previous holder crashed between backup and release, a legacy
     # tree) is backed up before the reset. A failed backup aborts the lease: nothing is discarded.
@@ -1506,7 +1516,7 @@ function Get-RepoMainFor([string]$repoName) {
 function Get-SlotBackups([string]$repoName, [string]$slot, [int]$last = 8, [switch]$Fetch) {
   $main = Get-RepoMainFor $repoName
   if (-not $main) { return @() }
-  if ($Fetch) { & git -C $main fetch -q origin 'refs/backup/wt/*:refs/backup/wt/*' 2>$null | Out-Null }
+  if ($Fetch) { Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin', 'refs/backup/wt/*:refs/backup/wt/*') | Out-Null }
   # `for-each-ref` matches with FNM_PATHNAME, so a single `*` never crosses a `/`: `refs/backup/wt/<repo>/*`
   # matches 0 refs (measured 2026-11-21 - 1607 refs under codai, 0 hits) while `<repo>/<slot>/*` works by
   # accident. `/**` crosses the slash; the slot is then selected in PowerShell.
@@ -2477,7 +2487,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   # diagnosis chased a defect the slice did not have - while the same slice passed in the land slot, which
   # had fetched everything and merged the real tip. A pre-gate verdict about a tree the land will not merge
   # is worse than no pre-gate, so mirror the land: refresh every ref before resolving the topic.
-  & git -C $main fetch -q origin 2>$null
+  Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin') | Out-Null
   $topicSha = "$(& git -C $main rev-parse --verify -q "$topicRef^{commit}" 2>$null)".Trim()
   if (-not $topicSha) { & $skip 'the topic does not resolve to a commit'; return }
   # 2026-11-23: a dirty tree was the TOP cause of the gate running INSIDE the cap-1 land mutex - measured
@@ -2525,7 +2535,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
   $c = Get-Config
   $rounds = if ($c.ContainsKey('landPregateRounds')) { [math]::Max(1, [int]$c['landPregateRounds']) } else { 2 }
   for ($round = 1; $round -le $rounds; $round++) {
-    & git -C $main fetch -q origin $Onto 2>$null
+    Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin', $Onto) | Out-Null
     $tip = "$(& git -C $main rev-parse "origin/$Onto" 2>$null)".Trim()
     $mt = @(& git -C $main merge-tree --write-tree --no-messages "origin/$Onto" $topicSha 2>$null | ForEach-Object { "$_" })
     if ($LASTEXITCODE -or -not $mt.Count) { & $skip 'the merge onto the tip needs the land resolver'; return }
@@ -2598,7 +2608,7 @@ function Invoke-LandPregate($repo, [string]$main, [string]$topicRef) {
     Set-GreenTree $repo.Name $tree $Gate $script:GateSec 'pre-gate'
     Write-Journal @{ event = 'land-pregate-ok'; resource = $res; branch = $Branch; tree = $tree; durSec = $script:GateSec; cached = $false; reason = $Gate; repo = $repo.Name }
     $script:PregateResult = 'ok'
-    & git -C $main fetch -q origin $Onto 2>$null
+    Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin', $Onto) | Out-Null
     if ("$(& git -C $main rev-parse "origin/$Onto" 2>$null)".Trim() -eq $tip) { return }
     if ($round -lt $rounds) { Write-Output "land: origin/$Onto moved while the pre-gate ran - checking the new tip" }
   }
@@ -2800,7 +2810,7 @@ function Invoke-LandSet([object[]]$set) {
   $active = @($set)
   $label = ($set | ForEach-Object { $_.branch }) -join '+'
   for ($round = 1; $round -le 3; $round++) {
-    & git -C $main fetch -q origin $Onto 2>$null
+    Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin', $Onto) | Out-Null
     if (Test-Path -LiteralPath $wt) { [void](Backup-Slot $wt $repo.Name 'land' 'leftover in land slot') }
     Initialize-Slot $main $wt "origin/$Onto" '' $true
     $baseRev = "$(& git -C $wt rev-parse HEAD)".Trim()
@@ -2921,7 +2931,7 @@ function Invoke-LandSet([object[]]$set) {
     # which tree just passed which gate so it can skip a second run of the same check on the SAME tree. A
     # finalize commit changes the tree, so the hook compares HEAD^{tree} and gates anything else.
     if ($greenForPush) { $env:AGENTQ_LAND_GREEN_TREE = $greenForPush; $env:AGENTQ_LAND_GREEN_GATE = (Resolve-HookGateName $repo.Name $Gate) }
-    $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+    $out = @(Invoke-GitNet @('-C', $wt, 'push', 'origin', "HEAD:$Onto") -TimeoutSec (Get-GitPushTimeoutSec))
     if (-not $LASTEXITCODE) { $pushed = $true } else {
       $isRace = [bool]($out -match $LandRaceRe)
       if (-not $isRace -and -not $flakeRetried) {
@@ -2932,7 +2942,7 @@ function Invoke-LandSet([object[]]$set) {
           $flakeRetried = $true
           Write-Journal @{ event = 'flake'; resource = $res; exit = 7; branch = $Onto; reason = "pre-push failure, retrying once ($retryWhy)"; repo = $repo.Name }
           Write-Output "land: pre-push failed ($retryWhy) - retrying the push once"
-          $out = @(& git -C $wt push origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+          $out = @(Invoke-GitNet @('-C', $wt, 'push', 'origin', "HEAD:$Onto") -TimeoutSec (Get-GitPushTimeoutSec))
           if (-not $LASTEXITCODE) { $pushed = $true } else {
             $isRace = [bool]($out -match $LandRaceRe)
             if (-not $isRace) {
@@ -2940,7 +2950,7 @@ function Invoke-LandSet([object[]]$set) {
               if ($fr2 -and $fr2.allQuarantined) {
                 Write-Journal @{ event = 'flake-quarantined'; resource = $res; exit = 7; branch = $Onto; paths = @($fr2.failed); reason = 'pre-push failed twice on quarantined tests only; pushed with --no-verify'; repo = $repo.Name }
                 Write-Output "land: only quarantined tests failed again ($(@($fr2.failed) -join '; ')) - landing without the hook (agentq flakes lists them)"
-                $out = @(& git -C $wt push --no-verify origin "HEAD:$Onto" 2>&1 | ForEach-Object { "$_" })
+                $out = @(Invoke-GitNet @('-C', $wt, 'push', '--no-verify', 'origin', "HEAD:$Onto") -TimeoutSec (Get-GitPushTimeoutSec))
                 if (-not $LASTEXITCODE) { $pushed = $true; $noVerify = $true } else { $isRace = [bool]($out -match $LandRaceRe) }
               }
             }
@@ -3053,7 +3063,7 @@ function Reap-LandedBranch {
   if ($BranchName -notmatch '^publish/') { Write-Output "kept ${BranchName}: not auto-generated"; return }
   if ($BranchName -eq $Target) { Write-Output "kept ${BranchName}: is the land target"; return }
   if (@($Occupied) -contains $BranchName) { Write-Output "kept ${BranchName}: a working slot is on it"; return }
-  $out = @(& git -C $Top push --no-verify -q origin --delete $BranchName 2>&1 | ForEach-Object { "$_" })
+  $out = @(Invoke-GitNet @('-C', $Top, 'push', '--no-verify', '-q', 'origin', '--delete', $BranchName) -TimeoutSec (Get-GitPushTimeoutSec))
   if ($LASTEXITCODE) {
     Write-Journal @{ event = 'land-reap-failed'; resource = "land:$RepoName"; branch = $BranchName; onto = $Target; reason = ((@($out) | Select-Object -Last 4) -join ' | ').Trim(); repo = $RepoName }
     Write-Output "kept ${BranchName}: delete failed - $((@($out) | Select-Object -Last 1))"
@@ -3129,7 +3139,7 @@ function Invoke-Land {
   # here refused exactly the correctly-rebased branch (brivio 2026-11-21, docs/DEV_PERFORMANCE.md) and
   # told the user to rebase what they had already rebased. Judging a ref land does not merge is worse than
   # no precheck: it either false-refuses (this bug) or false-passes and still ends in exit 5 in the slot.
-  & git -C $main fetch -q origin $Onto 2>$null
+  Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin', $Onto) | Out-Null
   $preRef = Resolve-LandRef $main $Branch
   if ($preRef -and -not $env:AGENTQ_LAND_NO_PRECHECK) {
     $preWhere = if ($preRef -like 'refs/heads/*') { 'local tip' } else { 'pushed tip' }
@@ -3284,7 +3294,7 @@ function Invoke-Land {
     $hb = Start-ThreadJob -ArgumentList (, @("$($t.file).hb", "$($lease.file).hb")) -ScriptBlock { param($fs) while ($true) { foreach ($f in $fs) { try { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow) } catch {} }; Start-Sleep -Seconds 20 } }
     $env:AGENTQ_HELD = (@($env:AGENTQ_HELD, $res) | Where-Object { $_ }) -join ','
     $wt = $lease.path
-    & git -C $main fetch -q origin 2>$null
+    Invoke-GitNet @('-C', $main, 'fetch', '-q', 'origin') | Out-Null
     $topicRef = Resolve-LandRef $main $Branch
     if (-not $topicRef) { throw "land: branch $Branch not found locally or on origin" }
     $set = @(@{ branch = $Branch; ref = $topicRef; own = $true; session = $Session; purpose = $why; ticket = $null })
@@ -3415,6 +3425,58 @@ function Invoke-GitStdin([string]$top, [string[]]$gitArgs, [string[]]$lines) {
   if ($pr.ExitCode) { throw "git $($gitArgs -join ' ') failed ($($pr.ExitCode)): $($errTask.Result)" }
   @($outTask.Result -split "`n" | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ })
 }
+# ---- bounded NETWORK git (2026-11-28) ----------------------------------------------------
+# Local git is instant; a NETWORK verb (fetch/push/ls-remote) is not, and git has no wall-clock timeout
+# for the transfer. Measured here: `git -C <main> fetch -q origin main` inside `agentq land` sat 10
+# minutes with the child alive and ~0 CPU (the same command from another shell took 2.9 s at that
+# moment), and an earlier one sat 55 minutes - the land held `land:<repo>` for the whole time, so every
+# other agent waited behind a job whose log was 126 bytes and could not be told apart from a hung job.
+# curl's http.lowSpeedLimit/http.lowSpeedTime do not cover a child that wedges on its own pipes, so the
+# bound has to be ours. Every network verb in this file and in agentq.ps1 goes through Invoke-GitNet.
+function Get-GitNetTimeoutSec {
+  $v = 0
+  try { $v = [int]((Get-Config)['gitNetTimeoutSec']) } catch { }
+  if ($v -le 0) { $v = 180 }
+  $v
+}
+function Get-GitPushTimeoutSec {
+  # A push may legitimately run the repo's pre-push hook (codai's `pnpm gate:platform`: 145-182 s per
+  # member under load, and a land can legitimately take many minutes), so its bound is a SAFETY NET
+  # against a wedged transport, not a performance target. Never set it as low as gitNetTimeoutSec.
+  $v = 0
+  try { $v = [int]((Get-Config)['gitPushTimeoutSec']) } catch { }
+  if ($v -le 0) { $v = 1800 }
+  $v
+}
+function Invoke-GitNet {
+  # Run a network git verb under a hard wall-clock bound. On timeout the child (and its remote helper)
+  # is killed and $LASTEXITCODE is 124, so every existing `if ($LASTEXITCODE)` / `-eq 1` check keeps its
+  # meaning: a wedged fetch is a FAILED fetch, never an unbounded wait. The lines of stdout and stderr
+  # are returned merged, so `$out = @(Invoke-GitNet ...)` replaces `@(& git ... 2>&1 | ForEach-Object)`.
+  param([string[]]$GitArgs, [int]$TimeoutSec = 0)
+  if (-not $TimeoutSec -or $TimeoutSec -le 0) { $TimeoutSec = Get-GitNetTimeoutSec }
+  $psi = [Diagnostics.ProcessStartInfo]::new('git')
+  # Belt and braces: even inside the bound, make the child itself abandon a stalled transfer (-c guards
+  # travel with the call, so this holds even where the machine-wide gitconfig was never installed).
+  foreach ($a in @('-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=30') + $GitArgs) { $psi.ArgumentList.Add($a) }
+  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  # There is nobody to answer a credential prompt in a job; it would consume the whole bound.
+  $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
+  $pr = [Diagnostics.Process]::Start($psi)
+  $errTask = $pr.StandardError.ReadToEndAsync()
+  $outTask = $pr.StandardOutput.ReadToEndAsync()
+  if (-not $pr.WaitForExit($TimeoutSec * 1000)) {
+    try { $pr.Kill($true) } catch { }
+    try { [void]$pr.WaitForExit(5000) } catch { }
+    [Console]::Error.WriteLine("agentq: 'git $($GitArgs -join ' ')' did not finish in ${TimeoutSec}s - killed. A wedged network git must never hold a land, a commit or a build: it now fails like any other git error. Raise or lower gitNetTimeoutSec in agentq-config.json to change the bound.")
+    Write-Journal @{ event = 'git-net-timeout'; args = @($GitArgs); timeoutSec = $TimeoutSec }
+    $global:LASTEXITCODE = 124
+    return @()
+  }
+  $global:LASTEXITCODE = $pr.ExitCode
+  @((($outTask.Result + "`n" + $errTask.Result) -split "`n") | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ })
+}
 function Invoke-Publish {
   $repo = Get-RepoInfo $RepoArg
   Assert-ExpectedRepo $repo
@@ -3424,7 +3486,7 @@ function Invoke-Publish {
   if (-not $plist) { throw 'agentq publish: -Paths a,b,c is required' }
   $top = $repo.Top
   $onto = if ($Onto) { $Onto } else { $b = "$(& git -C $top rev-parse --abbrev-ref '@{u}' 2>$null)".Trim(); if ($b -match '^[^/]+/(.+)$') { $Matches[1] } else { 'main' } }
-  & git -C $top fetch -q origin $onto 2>$null
+  Invoke-GitNet @('-C', $top, 'fetch', '-q', 'origin', $onto) | Out-Null
   if ($LASTEXITCODE) { throw "agentq publish: git fetch origin $onto failed" }
   $tip = "$(& git -C $top rev-parse "origin/$onto")".Trim()
   # Base = the commit the caller edited on top of; default HEAD. Used only for the revert guard.
@@ -3500,8 +3562,8 @@ function Invoke-Publish {
   Write-Journal @{ event = 'publish'; resource = "commit:$($repo.Name)"; sha = $sha; branch = $onto; purpose = $Purpose; message = $Message; paths = $changed; repo = $repo.Name }
   if ($NoPush) { Write-Output "publish: -NoPush, commit $sha exists only locally"; return }
   $topic = if ($Branch) { $Branch } else { "publish/$(($Session -replace '[^A-Za-z0-9-]', '-').ToLowerInvariant())-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))" }
-  $out = @(& git -C $top push -q --no-verify origin "$($sha):refs/heads/$topic" 2>&1 | ForEach-Object { "$_" })
-  $remote = "$(& git -C $top ls-remote origin "refs/heads/$topic")".Trim() -split '\s+' | Select-Object -First 1
+  $out = @(Invoke-GitNet @('-C', $top, 'push', '-q', '--no-verify', 'origin', "$($sha):refs/heads/$topic") -TimeoutSec (Get-GitPushTimeoutSec))
+  $remote = "$((Invoke-GitNet @('-C', $top, 'ls-remote', 'origin', "refs/heads/$topic")) -join "`n").Trim()" -split '\s+' | Select-Object -First 1
   if ($remote -ne $sha) { $out | Select-Object -Last 10 | ForEach-Object { [Console]::Error.WriteLine($_) }; throw "publish: push of $topic not verified on origin (got '$remote')" }
   Write-Output "publish: pushed origin/$topic = $(Short $sha 12)"
   if (-not $DoLand) { Write-Output "publish: land it with: agentq land -Branch $topic -Onto $onto -Purpose `"$Purpose`""; return }

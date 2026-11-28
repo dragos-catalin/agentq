@@ -2142,7 +2142,7 @@ function Invoke-Commit {
         $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
         $pushed = $false
         for ($i = 1; $i -le 4 -and -not $pushed; $i++) {
-          $pushOut = @(& git push -q origin "HEAD:$branch" 2>&1 | ForEach-Object { "$_" })
+          $pushOut = @(Invoke-GitNet @('-C', $repo.Top, 'push', '-q', 'origin', "HEAD:$branch") -TimeoutSec (Get-GitPushTimeoutSec))
           if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
           # Only a lost race (remote moved) is worth fetch+merge+retry. A pre-push hook
           # rejection (failing gates) would re-run the gates 4x in silence and look frozen.
@@ -2156,7 +2156,7 @@ function Invoke-Commit {
             Write-Journal @{ event = 'push-failed'; resource = $res; sha = $sha; branch = $branch; repo = $repo.Name }
             throw "push failed (not a race: pre-push hook or remote refused; output above). Commit $sha is local - fix and push again."
           }
-          & git fetch -q origin $branch
+          Invoke-GitNet @('-C', $repo.Top, 'fetch', '-q', 'origin', $branch) | Out-Null
           # A merge in a shared clone must never touch another agent's uncommitted files.
           # Distinguish a real content conflict from "incoming change overlaps a dirty file".
           $incoming = @(& git diff --name-only "HEAD...origin/$branch")
@@ -2453,7 +2453,7 @@ function Show-Since {
   # (test-agentq-prewarm-verb.ps1, 2026-11-25).
   Show-PrewarmHint $repo.Name
   Write-Output "== git log origin (last $Hours h)"
-  & git -C $repo.Top fetch -q 2>$null
+  Invoke-GitNet @('-C', $repo.Top, 'fetch', '-q') | Out-Null
   # ONE log spawn, not two: `@{u}` asks git for the upstream itself and the separate
   # `rev-parse --abbrev-ref '@{u}'` existed only to choose the NEXT spawn's argument -- a whole process
   # whose output was never printed. The fallback keeps the no-upstream case at the same two spawns as

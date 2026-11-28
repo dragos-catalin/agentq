@@ -74,6 +74,22 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   before, unchanged. New suite `tests/test-agentq-cloud-status.ps1` pins the shape, the null rule (a
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
+- A NETWORK git verb is now bounded by WALL CLOCK. git has no transfer timeout of its own, and on 2026-11-28 a
+  `git -C <main> fetch -q origin main` inside `agentq land` sat for 10 minutes with the child alive and ~0 CPU -
+  the same command from another shell took 2.9 s at that moment - while an earlier one sat 55 minutes. Both held
+  `land:<repo>`, so every other agent waited behind a job whose log was 126 bytes and which could not be told apart
+  from a hung one. `Invoke-GitNet` (`agentq-v2.ps1`) runs a `fetch`/`push`/`ls-remote` under `gitNetTimeoutSec`
+  (default 180 s), kills the child and its remote helper on expiry, prints the exact command that was killed,
+  journals a `git-net-timeout` event and sets `$LASTEXITCODE=124` - so a wedged fetch reads as a FAILED fetch its
+  caller already handles, never as an unbounded wait. Every network verb in `agentq.ps1`, `agentq-v2.ps1` and
+  `git-autosync.ps1` goes through it; `git-autosync` bounds ONLY the network verbs, so the local verbs whose exact
+  bytes its callers parse (`ls-tree`, `diff-tree`, `cat-file`) are untouched. `push` has its own, much larger
+  `gitPushTimeoutSec` (default 1800 s) because a pre-push hook is legitimately slow (codai `gate:platform`:
+  145-182 s per member) - it is a safety net against a wedged transport, not a performance bound. New suite
+  `tests/test-git-net-timeout.ps1` pins all of it with a deterministic wedge (an `ext::` remote whose helper
+  sleeps, so it needs no network): the kill happens at the bound, is journaled with the verb it killed, the caller
+  carries on, and a healthy fetch is neither killed nor journaled.
+
 ### Fixed
 
 - **The install gate could be held for hours by a wedge, silently.** `ps/install.ps1` took

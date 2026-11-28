@@ -94,6 +94,10 @@ $map = [ordered]@{
   'tests\test-land-stale-base.ps1' = 'bin\test-land-stale-base.ps1'
   # ADR 0008 (2026-11-11): post-land hook (agentq-v2.ps1 runs the landed tree's scripts/post-land.ps1 after the push)
   'tests\test-post-land.ps1' = 'bin\test-post-land.ps1'
+  # 2026-11-28: the wall-clock bound on a network git verb (Invoke-GitNet / Invoke-GitBounded). A wedged
+  # `git fetch` held a land for 10 minutes (and an earlier one 55) with no way to tell it from a hung job.
+  # Registered in run-all.ps1 in the same slice; 'install wiring' pins the two together.
+  'tests\test-git-net-timeout.ps1' = 'bin\test-git-net-timeout.ps1'
   # 2026-10-18: Ctrl+C + exit before any force-kill of a terminal
   'bin\console-signal.ps1' = 'bin\console-signal.ps1'
   # 2026-10-18: stop a stuck command, keep the terminal (Ctrl+C -> Y -> Ctrl+Break -> kill children)
