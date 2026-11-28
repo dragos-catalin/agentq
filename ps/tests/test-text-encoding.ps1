@@ -185,8 +185,12 @@ function Get-TargetFiles([string]$TheRoot, [string]$TheDir) {
     return @(Get-WalkFiles $TheDir)
   }
   $rel = @()
-  $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue
-  if ($git) { $rel = @(& $git.Source -C $TheRoot ls-files 2>$null | Where-Object { $_ }) }
+  # ONE executable, named with its extension. Get-Command returns EVERY git on PATH (a CI runner has three:
+  # bin, cmd and ucrt64) and `& $git.Source` over that list joins it with $OFS into a single bogus command
+  # name, so this suite exited 1 after 22 of its 26 checks on the runner only, while a machine whose PATH
+  # offers one git passed. The other suites in this directory already take the first candidate this way.
+  $git = (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+  if ($git) { $rel = @(& $git -C $TheRoot ls-files 2>$null | Where-Object { $_ }) }
   if ($rel.Count -gt 0) {
     $script:ListSource = "the git index ($($rel.Count) tracked files)"
     $out = @()
