@@ -124,6 +124,25 @@ try {
     $s3 = Select-AqSuites -Suites @('demo suite', 'other suite') -Base $c2 -Head $c3 -RepoRoot $repo -Map $map -GlobalGlobs $globals
     Check 'Select: a global-input change widens to every suite (not Proved)' ((-not $s3.Proved) -and (@($s3.Skip).Count -eq 0)) "proved=$($s3.Proved) skip=$($s3.Skip -join ',')"
 
+    # ---- the GLOBAL classification: HARNESS widens to EVERY suite, SCOPED narrows to its declarers ----
+    # The real map must classify only gate MACHINERY as harness. `ps/install.ps1` is an INSTALLER: it runs
+    # no suite, so an edit to it must select the suites that declare it (install / script scope / install
+    # wiring), never widen the whole gate to 43 suites.
+    $gm = Get-AqGlobalInputMap
+    $expectedHarness = @('ps/tests/run-all.ps1', 'ps/bin/agentq-config.json', 'ps/devcloud/pool-suites.ps1', 'ps/bin/agentq-suite-inputs.ps1', 'ps/devcloud/gate.ps1')
+    $harnessKeys = @($gm.Keys | Where-Object { "$($gm[$_])" -eq 'harness' })
+    $missingHarness = @($expectedHarness | Where-Object { $harnessKeys -notcontains $_ })
+    Check 'global map: the runner, suite table, pool half, this module and the caller are HARNESS' (@($missingHarness).Count -eq 0) "missing=$($missingHarness -join ',') harness=$($harnessKeys -join ',')"
+    Check 'global map: ps/install.ps1 is an installer (SCOPED), never a widening harness file' ("$($gm['ps/install.ps1'])" -eq 'scoped') "kind=$($gm['ps/install.ps1'])"
+
+    # A SCOPED global change is NOT machinery: the narrow per-suite selection survives (demo runs, other skips).
+    $sScoped = Select-AqSuites -Suites @('demo suite', 'other suite') -Base $c1 -Head $c2 -RepoRoot $repo -Map $map -GlobalMap @{ 'ps/bin/tool.ps1' = 'scoped' }
+    Check 'Select: a SCOPED global change keeps the narrow selection (runs its declarer only)' ($sScoped.Proved -and ($sScoped.Run -contains 'demo suite') -and ($sScoped.Skip -contains 'other suite')) "proved=$($sScoped.Proved) run=$($sScoped.Run -join ',') skip=$($sScoped.Skip -join ',')"
+
+    # The SAME change classified HARNESS widens to every suite -> not Proved. The discriminating pair.
+    $sHarness = Select-AqSuites -Suites @('demo suite', 'other suite') -Base $c1 -Head $c2 -RepoRoot $repo -Map $map -GlobalMap @{ 'ps/bin/tool.ps1' = 'harness' }
+    Check 'Select: the SAME change classified HARNESS widens to every suite (not Proved)' ((-not $sHarness.Proved) -and (@($sHarness.Skip).Count -eq 0)) "proved=$($sHarness.Proved) skip=$($sHarness.Skip -join ',')"
+
     # -Force runs everything unconditionally.
     $s4 = Select-AqSuites -Suites @('demo suite', 'other suite') -Base $c2 -Head $c2 -RepoRoot $repo -Map $map -GlobalGlobs $globals -Force
     Check 'Select: -Force runs everything (not Proved)' (-not $s4.Proved) "proved=$($s4.Proved)"
