@@ -291,8 +291,5 @@
       "zone": "europe-west4-a"
     }
   },
-  "cloudWarmPool": false,
-  "cloudWarmIdleMin": 30,
-  "cloudShardCount": 1,
   "cloudAutoMinSec": 240
 }

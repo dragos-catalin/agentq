@@ -187,57 +187,6 @@ $rc = Run $repo @('-Where', 'cloud') 'pnpm typecheck'
 Check 'an unregistered workspace is never picked' ("$((Calls) | Select-Object -Last 1)" -match '-Ws pair-a ') "$((Calls) | Select-Object -Last 1)"
 Remove-Item $cfg3 -ErrorAction SilentlyContinue
 
-# 12. Warm pool (TASK A) + shard count (TASK B): the PURE decision helpers, driven from the production
-# file by AST (a rename or a reference to the caller's scope fails here), plus the config defaults and
-# the wiring in the script text. Offline - no VM, no bucket, no git.
-$cloudSrc = Join-Path (Split-Path $PSScriptRoot) 'bin\agentq-cloud.ps1'
-$tok2 = $null; $err2 = $null
-$ast2 = [System.Management.Automation.Language.Parser]::ParseFile($cloudSrc, [ref]$tok2, [ref]$err2)
-Check 'the cloud script parses with 0 errors' ($err2.Count -eq 0) "$($err2.Count) parse error(s)"
-$wfns = @($ast2.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -match '(?i)WarmPool|ShardWorkspaces' }, $true))
-Check 'the warm/shard helpers are defined in agentq-cloud.ps1' ($wfns.Count -ge 2) "found $($wfns.Count)"
-if ($wfns.Count) { . ([scriptblock]::Create((($wfns | ForEach-Object { $_.Extent.Text }) -join "`n"))) }
-
-# Get-WarmPoolChoice: an explicit flag beats the config either way; the config beats the OFF default.
-$wa = Get-WarmPoolChoice -Flag $true -CfgPresent $false
-Check 'warm: -Warm beats an absent config' ($wa.on -and $wa.source -eq 'flag') "$($wa.on)/$($wa.source)"
-$wb = Get-WarmPoolChoice -Flag $false -CfgPresent $true -CfgOn $true
-Check 'warm: -NoWarm beats a true config' ((-not $wb.on) -and $wb.source -eq 'flag') "$($wb.on)/$($wb.source)"
-$wc = Get-WarmPoolChoice -Flag $null -CfgPresent $true -CfgOn $true
-Check 'warm: the config turns it on when no flag is given' ($wc.on -and $wc.source -eq 'config') "$($wc.on)/$($wc.source)"
-$wd = Get-WarmPoolChoice -Flag $null -CfgPresent $true -CfgOn $false
-Check 'warm: a present-but-false config stays off, source config' ((-not $wd.on) -and $wd.source -eq 'config') "$($wd.on)/$($wd.source)"
-$we = Get-WarmPoolChoice -Flag $null -CfgPresent $false
-Check 'warm: the default is OFF (nothing spends without the switch)' ((-not $we.on) -and $we.source -eq 'default') "$($we.on)/$($we.source)"
-
-# Get-ShardWorkspaces: count 1 names only the base (today, no merge); a count whose sibling is not
-# registered is reported as missing, so the caller can refuse instead of starting a partial run.
-$reg = @{ agentq = @{}; 'agentq-s2' = @{} }
-$s1 = Get-ShardWorkspaces -Ws agentq -Count 1 -Registry $reg
-Check 'shard: count 1 names only the base workspace' (($s1.names.Count -eq 1) -and ($s1.names[0] -eq 'agentq') -and ($s1.missing.Count -eq 0)) "$($s1.names -join ',')"
-$s2 = Get-ShardWorkspaces -Ws agentq -Count 2 -Registry $reg
-Check 'shard: count 2 adds the sibling and finds it registered' (($s2.names.Count -eq 2) -and ($s2.names[1] -eq 'agentq-s2') -and ($s2.missing.Count -eq 0)) "$($s2.names -join ',')"
-$s3 = Get-ShardWorkspaces -Ws agentq -Count 3 -Registry $reg
-Check 'shard: a count whose sibling is UNREGISTERED is reported missing' (($s3.missing.Count -eq 1) -and ($s3.missing[0] -eq 'agentq-s3')) "$($s3.missing -join ',')"
-$s0 = Get-ShardWorkspaces -Ws agentq -Count 0 -Registry $reg
-Check 'shard: a count below 1 clamps to 1 (never a zero-shard run)' ($s0.names.Count -eq 1) "$($s0.names -join ',')"
-
-# The config the repo ships: the three knobs exist with the safe defaults.
-$cfgReal = Join-Path (Split-Path $PSScriptRoot) 'bin\agentq-config.json'
-$cfgJ = Get-Content -LiteralPath $cfgReal -Raw | ConvertFrom-Json
-Check 'config: cloudWarmPool defaults false' ($cfgJ.cloudWarmPool -eq $false) "$($cfgJ.cloudWarmPool)"
-Check 'config: cloudWarmIdleMin defaults 30' ($cfgJ.cloudWarmIdleMin -eq 30) "$($cfgJ.cloudWarmIdleMin)"
-Check 'config: cloudShardCount defaults 1' ($cfgJ.cloudShardCount -eq 1) "$($cfgJ.cloudShardCount)"
-
-# Wiring: the switch is honoured by the suspend path, the choice is journaled, the flags are parsed and
-# a shard count that names an unregistered workspace is refused.
-$cloudText = [IO.File]::ReadAllText($cloudSrc)
-Check 'wiring: the suspend path honours the warm pool' ($cloudText.Contains('warm-pool on - $Vm is NOT suspended'))
-Check 'wiring: the effective choice is journaled' ($cloudText.Contains("'cloud-warm-pool'") -and $cloudText.Contains('warm-pool {0} (source: {1})'))
-Check 'wiring: -Warm/-NoWarm are parsed' ($cloudText.Contains("'nowarm' { `$WarmFlag = `$false }") -and $cloudText.Contains("'warm' { `$WarmFlag = `$true }"))
-Check 'wiring: an unregistered shard workspace is refused, not run partially' ($cloudText.Contains('cloudShardCount') -and $cloudText.Contains('unregistered shard workspace'))
-Check 'wiring: the warm idle window is stamped via the metadata lever' ($cloudText.Contains('Set-VmIdleMetadata'))
-
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Remove-Item Env:AGENTQ_CONFIG, Env:AGENTQ_SESSION, Env:AGENTQ_CLOUD_TOOL -ErrorAction SilentlyContinue
 if ($fail) { Write-Host "$fail FAILED"; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

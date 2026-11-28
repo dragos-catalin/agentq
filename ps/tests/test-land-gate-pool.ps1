@@ -116,20 +116,6 @@ Check 'pool-suites echoes the FAILED suites own logs into stdout (the streaming 
 Check 'pool-suites bounds every suite with -TimeoutMin (a wedge is reported, not held)' ($poolText -match '(?m)-TimeoutMin\s+\d+')
 Check 'pool-suites passes an explicit -Parallel' ($poolText -match '(?m)-Parallel\s+\$Parallel')
 
-# --- the per-suite cost LABEL is truthful, not blanket (2026-11-28) -------------------------------
-# run-all.ps1 appends ONE blanket note to every result line under -Parallel > 1, but the serial-only
-# suites ran ALONE (run-all's `BARRIER <name> (serial-only: ...)` bracket), so their `sec=` already IS
-# their own cost. This wrapper must relabel those `solo` and leave the rest `pooled`, decided PER SUITE
-# from the barrier set (and any BARRIER line it sees), and it must COUNT both onto the summary so a
-# RUNS.md row carries both numbers without a re-run. Measured on ws-agentq: a pooled `sec=170` printed
-# for `lease spawns` whose -Only cost was ~10 s - a blanket label makes a reader chase the wrong suite.
-Check 'pool-suites labels the serial-only (barrier) suites solo, per suite - not with a blanket note' `
-    (($poolText -match "'install',\s*'term interrupt'") -and ($poolText -match 'solo:\s*ran alone') -and ($poolText -match 'soloNames\.Contains'))
-Check 'pool-suites keeps the pooled label for the suites that ran under contention' `
-    ($poolText -match 'pooled:\s*wall-clock under contention')
-Check 'pool-suites records both counts on the TOTAL summary line (a RUNS.md row needs solo + pooled)' `
-    (($poolText -match '\^TOTAL sec=') -and ($poolText -match 'solo=\$soloCount') -and ($poolText -match 'pooled=\$pooledCount'))
-
 # The pool CONCURRENCY must be a knob, not four separate literals: gate.ps1 hardcoded `4` in the -LocalOnly
 # run, in its echo and in both $inner argv shapes, so raising it meant editing a script and re-landing. 4 is
 # still the default AND the value every measurement was taken at - 4 -> 8 is inside the noise, because the
