@@ -205,6 +205,11 @@ $suites = [ordered]@{
   'gate input selection' = @('-File', (Join-Path $PSScriptRoot 'test-gate-input-selection.ps1'))
   'agentq timings'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-timings.ps1'))
   'agentq reclaim'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-reclaim.ps1'))
+  # 2026-11-28 (round 4): sat-report.ps1's classifier suite existed and ran NOWHERE - it was in neither
+  # this map nor install.ps1's, so the verb-coverage assertions that came with the per-verb ledger could
+  # never fail. The load-bearing case is a null startMs ("no measurement") that must never be read as 0,
+  # which would turn an unmeasured call into a resident-host hit.
+  'sat report'      = @('-File', (Join-Path $PSScriptRoot 'test-sat-report.ps1'))
   #  - agentq approve: the edit-ticket approval path. Hermetic: AGENTQ_HOME in a temp dir, the human
   #    replaced by a stub window script and the mint by a stub ticket script, plus a mutation check on the
   #    verdict comparison - so an undetected regression there cannot pass as green.

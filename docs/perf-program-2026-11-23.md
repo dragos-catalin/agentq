@@ -203,6 +203,22 @@ which is why the round-3 numbers were re-measured this way and why the numbers b
 | `who`, `metrics`, `scale`, `probe`, `slo`, `lease-check`, `renew`   | 0     | 0 each                      |
 | `backup`, `unlease` (refused: nothing to do)                        | 1     | 1 each                      |
 | `eval`, `claim` (refused path)                                      | 2 / 1 | 0 / 0                       |
+| `help`, `timings` (the two read-only verbs nothing had counted yet) | 0     | 0 each                      |
+| `recover` (nothing to recover - a dry run)                          | 0     | 2                           |
+| `doctor` (no flag - the full check, for contrast)                   | 1     | **159**                     |
+
+**The read-only surface is now measured in full.** `$script:ReadOnly` is `status, log, since, lessons, metrics,
+doctor, help, timings`; six of the eight had a number and the sweep above added the last two: `help` prints the
+usage and `timings` reads the job result files, both **0 spawns**. So on that surface git is spawned only by the
+verbs that read the repository itself (one `rev-parse --show-toplevel` each), never by the ones that print.
+
+**`doctor -Quiet` is not a style preference.** Plain `doctor` asks the machine 159 questions - **159 git
+spawns** and 9.3 KB of report - against **1** for `-Quiet`. The flag is the difference between a one-spawn
+health read and the most expensive read-only verb in the tool, and it is why the earlier row was measured with
+the flag (and says so).
+
+**`recover`'s 2 spawns are the floor for a verb that must look.** One is the repo resolution and one lists the
+backup refs; with nothing to recover it prints 91 bytes, so the cost is not the output.
 
 The one-spawn rows are the repo resolution (`rev-parse --show-toplevel`); the zero-spawn rows take the repo
 from the cwd, so they are already at the floor. A lease pays one `status` per slot it considers, which is the
@@ -232,3 +248,53 @@ member, so the read-only fix is what keeps the gate green, not an optional tidy-
 `gateSuites.agentq` names, 0 missing, 0 extra**, and `Select-AqSuites` on a real commit range reports
 `Proved=True run=2 skip=42`. The proof run asserts, per newly-added name, that touching its own glob selects
 the suite (`pass=18 fail=0`), so the coverage is measured rather than inferred from the map's size.
+
+### Instrumentation — the ledger now names the verb (target 3)
+
+Target 3 asked for the cost **per verb** and explicitly refused retroactive analysis: the ledger
+(`coord\hooks\cost-*.jsonl`) recorded the VS Code TOOL and nothing else, so a day file held 10 463
+`run_in_terminal` rows and still could not say what one `status` cost beside one `land`. The table above was
+therefore collected by hand, with a `git.cmd` shim first on PATH and one arm at a time.
+
+A row is now `{ts, ms, startMs, tool, verb, deny, session}`, written by `ps/hooks/hook-pre.ps1`.
+
+- **No new cost.** One regex over the raw payload, and only for the tools that carry a command
+  (`run_in_terminal`, `Bash`, `bash`, `sh`, `shell`, `execute`, `execute_command`, `run_command`, `terminal`).
+  No `ConvertFrom-Json` - the file already documents why (an 88 ms parse of a megabyte `apply_patch` payload) -
+  and **no process spawn**: the metric of this round IS the spawn count, so instrumentation that spawned would
+  erase its own measurement.
+- **One shape, never a guess.** The field is always present and empty when the command runs no agentq, when the
+  tool runs no command at all, and when a flag precedes the verb (`agentq.ps1 -Purpose x land` records nothing
+  rather than guessing `x`). The value is bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry
+  a quote or a backslash into the JSON line.
+- **Visible where the numbers are read.** `sat-report.ps1` sums the SAME single pass of the day file into a new
+  table `== AGENTQ VERB COST` (verb, calls, served, spawned, avg ms) plus a `VERB COVERAGE rows=… with-verb=…`
+  line - a second read of the file would have been a second cost, so it is filled inside the existing loop.
+- **Field order is not a contract for the other reader.** `agentq-slo.mjs` parses each line with `JSON.parse`
+  (`agentq-slo.mjs:220`, `:435`) and reads `ms`/`startMs` by name, so nothing there moved; `agentq-prune.ps1`
+  matches the file NAME only. The only readers that had to move are the report and its two suites.
+
+Guards: `sat-report` **16/16** - the fixture's three `status` rows sit in three DIFFERENT classes (served,
+spawned, junk), so a table that counted one path, or that read a row's tool instead of its verb, moves. And
+`hook-pre` **+11 cases**: the verb after the installed path, after the repo path, after a QUOTED path (escaped
+quotes in the payload), the `-v2` copy, the node CLI (`cli.mjs`), uppercase normalised, and three negatives that
+must stay EMPTY (another tool's command, the script named but not run, a flag before the verb), plus "a read
+tool carries the field, empty" and "EVERY line of the run carries the field".
+
+### What the first real day file says (measured, not inferred)
+
+The new table, run against the live ledger (`ps\bin\sat-report.ps1`, 2026-11-28), prints
+`VERB COVERAGE rows=5607 with-verb=0 (0.0%)` above the line `(no line names a verb: none of the calls ran
+agentq, or the hook predates 2026-11-28)`. That 0 % is the honest starting point, not a defect: the ledger is
+written by the INSTALLED hook (`~/.copilot/hooks/hook-pre.ps1`), which only carries the field once it is
+re-installed. **Until that copy moves, the per-verb table is empty by construction** - the mechanism is proven
+by its suites (16/16 and 60/60), not by a non-zero row, and saying otherwise would be reading a count as
+evidence. Re-installing is a machine-wide action owned by other live sessions, so it is an open item here
+rather than something this round forced.
+
+While wiring the table, its classifier suite turned out to be a **dead suite**: `test-sat-report.ps1` was in
+neither the `run-all.ps1` map nor the `install.ps1` map, so the coverage assertions that ship with the table
+could not fail. Adding it to `run-all.ps1` alone turned `install wiring` red on three checks (the missing
+install-map entry, the orphan `-File`, and the `gateSuites.agentq` completeness check); mapping the script and
+its test together turned it green again (`pass=19 fail=0`). The guard caught the omission exactly as designed,
+which is the only reason the round found it at all.
