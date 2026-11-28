@@ -25,6 +25,18 @@
   workspace from cwd/cwdPath/workingDirectory/workspace/workspaceFolder (falling back to $PWD). A
   harness that renames a field then degrades to SILENT, never to a wrong injection.
 
+  It ALSO injects the session PLAN when one belongs to this workspace -- the record the resume protocol
+  (docs/tracking-and-resume.md, layer "The resume protocol") says a resume must read: goal + doneMeans +
+  the next[] steps with their status, written by `node tools/track.mjs plan set ...` into the agentq
+  state dir (spec: spec/plan.schema.json, when present). A plan has NO workspace field and the resuming
+  chat has a NEW session id, so a plan cannot be matched by session; its only link to a workspace is
+  handoffPath, which points into that workspace's `memory-tool\memories\repo\handoffs\` -- the SAME
+  directory Resolve-HandoffDir returns. So a plan is injected ONLY when its handoffPath resolves INSIDE
+  this workspace's handoff directory, and the newest such plan by updatedAt wins. A plan from ANY OTHER
+  workspace is ignored: injecting a foreign plan would resume the turn onto the wrong work, which is
+  exactly the wrong injection this hook holds to be worse than no hook at all. The plan section is
+  omitted (never an error) when no such plan exists or the file is malformed.
+
   Output: VS Code / Copilot UserPromptSubmit JSON, hookSpecificOutput.additionalContext. The note is
   bounded to $maxChars characters -- the proposal fixes no bound, and additionalContext is re-sent and
   billed on every later model call, so a whole multi-kilobyte note must not ride along unmetered.
@@ -71,6 +83,113 @@ function Resolve-HandoffDir([string]$workspace) {
     }
   }
   return $null
+}
+
+# Resolve the agentq state directory EXACTLY as tools/track.mjs does: $env:AGENTQ_HOME, else
+# ~/.codai/coord (in track.mjs, `process.env.AGENTQ_HOME || join(homedir(), ".codai", "coord")`). The
+# plan records live in <state>/chats/, one <session>.plan.json per chat -- the same files `track plan
+# set` writes and `loadAllPlans` reads. Returns the chats directory path (which may not exist).
+function Get-PlanChatsDir {
+  $state = $env:AGENTQ_HOME
+  if (-not $state) {
+    # NOT $home: PowerShell variable names are case-insensitive, and $HOME is a read-only automatic
+    # variable, so assigning to it throws. Use a distinct name.
+    $userHome = $env:USERPROFILE
+    if (-not $userHome) { $userHome = $HOME }
+    if (-not $userHome) { return $null }
+    $state = Join-Path $userHome '.codai\coord'
+  }
+  return (Join-Path $state 'chats')
+}
+
+# Read ONE plan JSON defensively: a malformed, empty or unreadable file is $null, never an error.
+function Read-PlanFile([string]$file) {
+  try {
+    $raw = [IO.File]::ReadAllText($file)
+    if (-not $raw) { return $null }
+    return ($raw | ConvertFrom-Json)
+  } catch { return $null }
+}
+
+# The bounded digest of the plan that belongs to THIS workspace, or $null. Ownership is decided ONLY by
+# handoffPath (see the header): the record has no workspace field, and the chat resuming it has a NEW
+# session id, so the session cannot be matched by construction. A plan is ours iff its handoffPath
+# resolves strictly inside $handoffDir; ANY other plan -- a foreign workspace's -- is IGNORED, because
+# injecting it would resume the turn onto the wrong work. Among ours, the newest by updatedAt wins (the
+# file's mtime when updatedAt is absent or unparseable). Dependency-free: reads the JSON directly.
+function Get-WorkspacePlanDigest([string]$handoffDir) {
+  $chats = Get-PlanChatsDir
+  if (-not $chats) { return $null }
+  if (-not [IO.Directory]::Exists($chats)) { return $null }
+  $root = ''
+  try { $root = [IO.Path]::GetFullPath($handoffDir).TrimEnd('\', '/') } catch { return $null }
+  if (-not $root) { return $null }
+
+  $best = $null
+  $bestAt = [DateTimeOffset]::MinValue
+  foreach ($file in [IO.Directory]::GetFiles($chats)) {
+    if (-not $file.EndsWith('.plan.json')) { continue }
+    $plan = Read-PlanFile $file
+    if (-not $plan) { continue }
+    $hp = "$($plan.handoffPath)"
+    if (-not $hp) { continue }
+    $hpFull = ''
+    try { $hpFull = [IO.Path]::GetFullPath($hp) } catch { continue }
+    # Strictly inside: longer than the root, sharing it, and separated by a slash.
+    if ($hpFull.Length -le $root.Length) { continue }
+    if ($hpFull.Substring(0, $root.Length) -ine $root) { continue }
+    $sep = $hpFull[$root.Length]
+    if ($sep -ne '\' -and $sep -ne '/') { continue }
+
+    $at = [DateTimeOffset]::MinValue
+    $known = $false
+    if ($plan.updatedAt) {
+      $dto = [DateTimeOffset]::MinValue
+      if ([DateTimeOffset]::TryParse("$($plan.updatedAt)", [ref]$dto)) { $at = $dto; $known = $true }
+    }
+    if (-not $known) {
+      try { $at = [DateTimeOffset](Get-Item -LiteralPath $file).LastWriteTimeUtc } catch { $at = [DateTimeOffset]::MinValue }
+    }
+    if ($best -eq $null -or $at -gt $bestAt) { $best = $plan; $bestAt = $at }
+  }
+  if ($best -eq $null) { return $null }
+  return (Format-PlanDigest $best)
+}
+
+# The text injected for a plan: its goal, its done-means, and every next[] entry with its status, plus
+# the handoff path it came from and the session id that names it. Not the roster/jobs/todos -- the
+# resume protocol reads goal + next[0..] off the plan, and additionalContext is re-sent and billed on
+# every later model call, so the digest is bounded like the note.
+function Format-PlanDigest($plan) {
+  $lines = New-Object System.Collections.ArrayList
+  $sid = "$($plan.sessionId)"
+  if ($sid) {
+    [void]$lines.Add("Resumed effort. The session plan recorded for this workspace (session '$sid') says to resume at:")
+  } else {
+    [void]$lines.Add("Resumed effort. The session plan recorded for this workspace says to resume at:")
+  }
+  if ($plan.goal) { [void]$lines.Add("goal: $($plan.goal)") }
+  $done = @()
+  if ($plan.doneMeans) { $done = @($plan.doneMeans) }
+  if ($done.Count) {
+    [void]$lines.Add("done means:")
+    foreach ($d in $done) { [void]$lines.Add("  - $d") }
+  }
+  $next = @()
+  if ($plan.next) { $next = @($plan.next) }
+  if ($next.Count) {
+    [void]$lines.Add("next:")
+    foreach ($n in $next) {
+      $title = "$($n.title)"
+      $status = "$($n.status)"
+      if ($status) { [void]$lines.Add("  - $title [$status]") } else { [void]$lines.Add("  - $title") }
+    }
+  }
+  if ($plan.handoffPath) { [void]$lines.Add("handoff: $($plan.handoffPath)") }
+  $digest = ($lines -join "`n").TrimEnd()
+  $maxPlan = 4000
+  if ($digest.Length -gt $maxPlan) { $digest = $digest.Substring(0, $maxPlan) + "`n... (plan truncated)" }
+  return $digest
 }
 
 try {
@@ -121,23 +240,33 @@ try {
   if (-not $handoffDir) { exit 0 }
   if (-not [IO.Directory]::Exists($handoffDir)) { exit 0 }
 
+  # The plan for THIS workspace, if any, is injected BEFORE the handoff note: a resume should first read
+  # what the previous chat said it would do next, then the state it recorded. Absent, foreign or
+  # malformed => an empty section, and the note alone is injected exactly as it was before this existed.
+  $planSection = ''
+  $planDigest = Get-WorkspacePlanDigest $handoffDir
+  if ($planDigest) { $planSection = "$planDigest`n`n" }
+
+  $noteSection = ''
   $notes = @(Get-ChildItem -LiteralPath $handoffDir -File -Filter '*.md' -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime -Descending)
-  if (-not $notes.Count) { exit 0 }
-
-  $newest = $notes[0]
-  $content = ''
-  try { $content = [IO.File]::ReadAllText($newest.FullName) } catch { exit 0 }
-  if (-not $content) { exit 0 }
-
-  $maxChars = 8000
-  if ($content.Length -gt $maxChars) {
-    $content = $content.Substring(0, $maxChars) + "`n... (handoff truncated here; open '$($newest.Name)' for the rest)"
+  if ($notes.Count) {
+    $newest = $notes[0]
+    $content = ''
+    try { $content = [IO.File]::ReadAllText($newest.FullName) } catch { $content = '' }
+    if ($content) {
+      $maxChars = 8000
+      if ($content.Length -gt $maxChars) {
+        $content = $content.Substring(0, $maxChars) + "`n... (handoff truncated here; open '$($newest.Name)' for the rest)"
+      }
+      $noteSection = "Resumed effort. This workspace's newest repository handoff note is '$($newest.Name)' " +
+        "($($newest.LastWriteTime.ToString('yyyy-MM-dd'))). Resume from the state recorded there instead of " +
+        "re-deriving it:`n`n$content"
+    }
   }
 
-  $ctx = "Resumed effort. This workspace's newest repository handoff note is '$($newest.Name)' " +
-    "($($newest.LastWriteTime.ToString('yyyy-MM-dd'))). Resume from the state recorded there instead of " +
-    "re-deriving it:`n`n$content"
+  if (-not $planSection -and -not $noteSection) { exit 0 }
+  $ctx = $planSection + $noteSection
 
   @{ hookSpecificOutput = @{ hookEventName = 'UserPromptSubmit'; additionalContext = $ctx } } |
     ConvertTo-Json -Compress -Depth 5

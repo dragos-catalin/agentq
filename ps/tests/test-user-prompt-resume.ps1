@@ -8,6 +8,13 @@
 # turn is worse than no hook at all. Hermetic: APPDATA is redirected to a throwaway workspaceStorage,
 # so the hook resolves the TEMP workspace's handoff directory and touches nothing on the real machine.
 #
+# It also injects the session PLAN that belongs to this workspace, if any. A plan's ONLY link to a
+# workspace is its handoffPath (it has no workspace field and the resuming chat's session id is new), so
+# a plan is ours iff its handoffPath resolves inside this workspace's handoff directory. AGENTQ_HOME is
+# redirected too, so the plan cases are hermetic and the real machine's plans (other workspaces) can
+# never leak in. The plan section is prepended to the note; with no plan the output is byte-identical to
+# the note alone.
+#
 # Non-vacuous by construction: "injects the NEWEST note" and "a longer sentence is silent" are the
 # assertions an ascending sort or a substring match turns red (mutation proved in the tracker entry).
 # Exit 1 on any failure.
@@ -37,6 +44,13 @@ $want = ($ws -replace '\\', '/').TrimEnd('/')
 
 $oldAppData = $env:APPDATA
 $env:APPDATA = $store
+
+# The hook resolves the agentq state dir exactly as tools/track.mjs does: $env:AGENTQ_HOME else
+# ~/.codai/coord. Redirect it to the throwaway store so the plan cases are hermetic.
+$state = Join-Path $store 'agentq-state'
+$chats = Join-Path $state 'chats'
+$oldAqHome = $env:AGENTQ_HOME
+$env:AGENTQ_HOME = $state
 
 function Invoke-Hook([string]$stdin) {
   $tmp = Join-Path $env:TEMP ("upr-in-{0}.json" -f [guid]::NewGuid().ToString('N'))
@@ -80,6 +94,60 @@ try {
   Injects 'case does not matter' (Invoke-Hook (Payload 'DONE')) 'NEW-STATE-SENTINEL'
   Injects 'surrounding whitespace is trimmed before matching' (Invoke-Hook (Payload '  gata  ')) 'NEW-STATE-SENTINEL'
 
+  # --- plan cases: the hook also injects THIS workspace's session plan (state dir redirected above) ---
+  # (a) no plan at all -> today's behaviour: the note, and nothing about a plan. Captured as the baseline
+  # every plan scenario is compared against byte for byte.
+  $noPlan = Invoke-Hook (Payload 'continue')
+  Injects 'with no plan the note is injected and nothing about a plan appears' $noPlan 'NEW-STATE-SENTINEL' 'session plan'
+  $baseOut = "$($noPlan.Out)"
+
+  $null = New-Item -ItemType Directory -Force -Path $chats | Out-Null
+
+  # (b) a plan whose handoffPath points into ANOTHER workspace's handoff dir must be IGNORED: adding it
+  # leaves the output byte-identical, so a foreign plan can never resume this turn onto the wrong work.
+  $foreignHandoff = Join-Path $env:TEMP ("upr-foreign-" + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Force -Path $foreignHandoff | Out-Null
+  $foreignPlan = Join-Path $chats 'aaaaaaaa.plan.json'
+  [IO.File]::WriteAllText($foreignPlan, (@{ version = 1; sessionId = 'aaaaaaaa'; goal = 'FOREIGN-GOAL-SENTINEL'; doneMeans = @('FOREIGN-DONE-SENTINEL'); next = @(@{ title = 'FOREIGN-NEXT-SENTINEL'; status = 'todo' }); handoffPath = (Join-Path $foreignHandoff 'note.md'); updatedAt = '2030-01-01T00:00:00.000Z' } | ConvertTo-Json -Compress -Depth 6), [Text.UTF8Encoding]::new($false))
+  $withForeign = Invoke-Hook (Payload 'continue')
+  Injects 'a plan for another workspace is ignored, not injected' $withForeign 'NEW-STATE-SENTINEL' 'FOREIGN-GOAL-SENTINEL'
+  Ok ("$($withForeign.Out)" -ceq $baseOut) 'a foreign plan leaves the output byte-identical to no-plan' ''
+
+  # (c) a plan for THIS workspace (handoffPath inside $handoffDir) is injected before the note: its goal,
+  # its next[] steps with their status, its doneMeans, its handoff path, and the session id that names it.
+  $ourPlan = Join-Path $chats 'bbbbbbbb.plan.json'
+  [IO.File]::WriteAllText($ourPlan, (@{ version = 1; sessionId = 'bbbbbbbb'; goal = 'OUR-GOAL-SENTINEL'; doneMeans = @('OUR-DONE-SENTINEL'); next = @(@{ title = 'OUR-NEXT-ONE'; status = 'in-progress' }, @{ title = 'OUR-NEXT-TWO'; status = 'todo' }); handoffPath = (Join-Path $handoffDir '2026-11-27-new.md'); updatedAt = '2025-01-01T00:00:00.000Z' } | ConvertTo-Json -Compress -Depth 6), [Text.UTF8Encoding]::new($false))
+  $withPlan = Invoke-Hook (Payload 'continue')
+  Injects 'a plan for this workspace is injected' $withPlan 'OUR-GOAL-SENTINEL' 'FOREIGN-GOAL-SENTINEL'
+  Injects 'the injected plan carries a next[] step with its status' $withPlan 'OUR-NEXT-ONE [in-progress]'
+  Injects 'the injected plan carries its doneMeans' $withPlan 'OUR-DONE-SENTINEL'
+  Injects 'the injected plan names itself by session id' $withPlan 'bbbbbbbb'
+  Injects 'the injected plan carries its handoff path' $withPlan 'handoff:'
+  Injects 'the handoff note is still injected alongside the plan' $withPlan 'NEW-STATE-SENTINEL'
+
+  # (d) two plans BOTH owned by this workspace: only the newest by updatedAt is injected.
+  Remove-Item $ourPlan -Force -ErrorAction SilentlyContinue
+  $planOld = Join-Path $chats 'cccccccc.plan.json'
+  $planNew = Join-Path $chats 'dddddddd.plan.json'
+  [IO.File]::WriteAllText($planOld, (@{ version = 1; sessionId = 'cccccccc'; goal = 'OLD-PLAN-GOAL-SENTINEL'; next = @(@{ title = 'x'; status = 'todo' }); handoffPath = (Join-Path $handoffDir '2026-11-27-new.md'); updatedAt = '2024-01-01T00:00:00.000Z' } | ConvertTo-Json -Compress -Depth 6), [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($planNew, (@{ version = 1; sessionId = 'dddddddd'; goal = 'NEW-PLAN-GOAL-SENTINEL'; next = @(@{ title = 'x'; status = 'todo' }); handoffPath = (Join-Path $handoffDir '2026-11-27-new.md'); updatedAt = '2026-01-01T00:00:00.000Z' } | ConvertTo-Json -Compress -Depth 6), [Text.UTF8Encoding]::new($false))
+  $newest = Invoke-Hook (Payload 'continue')
+  Injects 'only the newest plan for this workspace is injected' $newest 'NEW-PLAN-GOAL-SENTINEL' 'OLD-PLAN-GOAL-SENTINEL'
+
+  # (e) a malformed plan file is ignored (no error, note still injected, output byte-identical to no-plan).
+  [IO.File]::WriteAllText($planOld, '{ this is not json', [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($planNew, 'null', [Text.UTF8Encoding]::new($false))
+  $badPlan = Invoke-Hook (Payload 'continue')
+  Injects 'a malformed plan is ignored and the note is still injected' $badPlan 'NEW-STATE-SENTINEL' 'PLAN-GOAL-SENTINEL'
+  Ok ("$($badPlan.Out)" -ceq $baseOut) 'a malformed plan leaves the output byte-identical to no-plan' ''
+
+  # (f) with every plan gone the output is byte-identical to the no-plan baseline: the plan logic does not
+  # touch the no-plan path.
+  Remove-Item $foreignPlan, $planOld, $planNew -Force -ErrorAction SilentlyContinue
+  Remove-Item $foreignHandoff -Recurse -Force -ErrorAction SilentlyContinue
+  $restored = Invoke-Hook (Payload 'continue')
+  Ok ("$($restored.Out)" -ceq $baseOut) 'with every plan gone the output is byte-identical to the baseline' "out=$("$($restored.Out)".Trim())"
+
   # --- case 3: a non-matching prompt is silent ---
   Silent 'a non-matching prompt is silent' (Invoke-Hook (Payload 'add a disk metric'))
 
@@ -96,6 +164,7 @@ try {
 }
 finally {
   if ($null -eq $oldAppData) { Remove-Item Env:APPDATA -ErrorAction SilentlyContinue } else { $env:APPDATA = $oldAppData }
+  if ($null -eq $oldAqHome) { Remove-Item Env:AGENTQ_HOME -ErrorAction SilentlyContinue } else { $env:AGENTQ_HOME = $oldAqHome }
   Remove-Item $store -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item $ws -Recurse -Force -ErrorAction SilentlyContinue
 }
