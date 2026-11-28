@@ -111,6 +111,11 @@ $map = [ordered]@{
   # read-only status; hook-pre.ps1 now lives in this repository (OQ-010).
   'bin\agentq-probe.ps1' = 'bin\agentq-probe.ps1'; 'bin\agentq-prune.ps1' = 'bin\agentq-prune.ps1'; 'bin\agentq-doctor.ps1' = 'bin\agentq-doctor.ps1'
   'hooks\hook-pre.ps1' = 'hooks\hook-pre.ps1'; 'tests\test-hook-pre.ps1' = 'hooks\test-hook-pre.ps1'
+  # 2026-11-28 (P0): bin\agentq.ps1 dot-sources bin\agentq-perf.ps1 UNCONDITIONALLY (agentq.ps1:2943), so an
+  # install that ships agentq.ps1 without this module produces an agentq that dies on its first statement
+  # (`The term '...\bin\agentq-perf.ps1' is not recognized`) - measured on a fresh install of main. The map
+  # entry is what makes the pair installable; the suite is deliberately NOT mapped here (it is still red).
+  'bin\agentq-perf.ps1' = 'bin\agentq-perf.ps1'
   # 2026-11-26: the resident hook host finally has a home in the repo (it used to exist ONLY in
   # ~\.copilot\hooks\resident\, which is how the `startMs` defect outlived a fix). hookc.exe is a
   # compiled artifact (build-client.ps1), so only the text files travel here; resident-ensure.ps1 is the
