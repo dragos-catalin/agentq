@@ -18,7 +18,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry a quote or a backslash into the JSON
   line. `sat-report.ps1` prints the per-verb table (calls, served, spawned, avg ms) plus
   `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
-  `VERB COVERAGE rows=ΓÇª with-verb=ΓÇª` from the same single pass over the file; `agentq-slo.mjs` and
+  `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
   `agentq-prune.ps1` needed no change (`JSON.parse` by name, and a file-NAME match). Guards: `sat-report` 16/16
   with the three `status` fixture rows in three different cost classes, and `hook-pre` gains 11 cases - the six
   shapes that must be recognised (installed path, repo path, quoted path, `-v2`, the node CLI, uppercase) and
@@ -46,8 +46,8 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - Atomic multi-resource grant: a run waiting for `build:machine` no longer holds `build:<repo>`.
 - Soft slots: quick-lane burst slots; non-batch jobs run beside batch holders (batch runs at Idle priority).
 - Idle-yield watchdog: a holder whose process tree is idle stops counting against the machine cap (`idle-yield` / `idle-resume` events).
-- `agentq bump`, `agentq burst`, `agentq propose` overrides ΓÇö reason required, journaled, rate-limited.
-- `agentq metrics` (wait/hold p50/p90 per resource ├ù lane ├ù kind) and `agentq rotate` (journal archive; automatic in sweep).
+- `agentq bump`, `agentq burst`, `agentq propose` overrides — reason required, journaled, rate-limited.
+- `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
 - Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
 - Config knobs in `agentq-config.json` (machineCap, gateMachineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
 - Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
@@ -84,7 +84,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq-cloud.ps1 -Status -Json`: a **read-only** JSON surface for every devcloud workspace in the
   registry (`{"v":1,"at":<ISO>,"workspaces":[{ws,vm,project,zone,state,heartbeatAt,heartbeatAgeSec,
 idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - the verb Vitals waits
-  for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md ┬º6.3). `state` folds the VM
+  for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md §6.3). `state` folds the VM
   status (`suspended`/`stopped`/`suspending`) with the heartbeat (`idle`/`busy`); a figure that cannot be
   measured is `null`, NEVER `0`, and a workspace with no readable heartbeat is `null` there and named in
   `unavailable` with the reason. Only `gcloud compute instances describe` and `gcloud storage cat|ls` -
@@ -185,7 +185,7 @@ v2`** read the process table with `-ErrorAction SilentlyContinue`, so a failed o
   `exit 3` to 1 (measured: the same script gives 3 through `-File` and 1 through `-Command`, while an `exit 0`
   script gives 0 both ways), so the assertion was unfalsifiable for the one verdict it exists to accept - on a
   hosted runner, which has no scheduled task, the doctor legitimately reports FAIL. It now uses `-File`, and the
-  doctor itself wraps its report so a terminating error becomes `FAIL doctor could not complete: ΓÇª` and exit 3
+  doctor itself wraps its report so a terminating error becomes `FAIL doctor could not complete: …` and exit 3
   instead of PowerShell's default 1; new control 13g forces exactly that line to throw in a copy and requires
   `DOCTOR:` and an exit code of 0 or 3. (4) **`autosync wip snapshot`** builds its mutation baseline from
   history (`git log -S`), which `actions/checkout`'s default `fetch-depth: 1` hides, and the red blamed a
@@ -365,7 +365,7 @@ test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is 
   CI - was red on main. Measurement trap behind the miss: prettier 3 honours `.gitignore`, so a `--check` run on
   a path under `.copilot-tmp/` prints "All matched files use Prettier code style!" for _any_ content; the verdict
   needed `--ignore-path` pointing at an empty file AND a control file that must fail.
-- run-build default `-TimeoutMin` 25 ΓåÆ 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
+- run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
 - agentq-sync publishes v3 holders first so the hub's position model stays correct.
 - **One measured budget for task and scratch slots, instead of two independent ones.** `Get-SlotRoom`
