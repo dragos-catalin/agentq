@@ -1999,7 +1999,10 @@ function Get-LandWaitMin {
 # Opt-in per repo (config landBatch { repo: true }; defaults codai + brivio; AGENTQ_LAND_BATCH=0 off).
 # The land holder absorbs up to landBatchMax-1 waiting land tickets for the same -Onto and the same
 # -Gate whose topic merges cleanly onto origin/<onto> (merge-tree, no working tree), picks all topics
-# in queue order, runs ONE gate and ONE push. A failed batch (gate 6, push 7, oversize 8, finalize 9)
+# in queue order, runs ONE gate and ONE push. landBatchMax defaults to 3 (2026-11-27): one holder
+# absorbs up to TWO waiters, so two extra 43-suite land gates (~11 min of pool wall-clock each) fold
+# into the holder's single gate instead of running back to back; an explicit `landBatchMax` in the
+# config still wins (clamped 2..4). A failed batch (gate 6, push 7, oversize 8, finalize 9)
 # is bisected: each half is rebuilt on the then-current tip and gated again, so a half that passes is
 # accepted (optimistic) and only the culprit fails. A topic that conflicts with an earlier topic of
 # the batch is dropped back to the queue and lands on its own turn. Absorbed waiters learn their
@@ -2013,7 +2016,7 @@ function Get-LandBatchOn([string]$repoName) {
 }
 function Get-LandBatchSize([string]$repoName) {
   $c = Get-Config
-  $max = if ($c.ContainsKey('landBatchMax')) { [int]$c.landBatchMax } else { 4 }
+  $max = if ($c.ContainsKey('landBatchMax')) { [int]$c.landBatchMax } else { 3 }
   $max = [math]::Max(2, [math]::Min(4, $max))
   $recent = @(Get-Content -LiteralPath (Get-JournalFor @{ repo = $repoName }) -Tail 4000 -ErrorAction SilentlyContinue | Where-Object { $_ -like '*"land-batch"*' } |
       ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ -and $_.event -eq 'land-batch' -and "$($_.repo)" -eq $repoName } | Select-Object -Last 10)
