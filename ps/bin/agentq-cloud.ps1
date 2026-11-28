@@ -8,6 +8,10 @@ agentq-cloud — run one command on a devcloud warm workspace (DC-037). Job cont
   agentq-cloud.ps1 -Ws codai -Purpose 'why' -AsyncResume -- <cmd>   opt-in: FILE the wake and build the
           delta while it warms; the one wait kept is at the queue point (see FLOW). Also cloudAsyncResume:true
           in bin/agentq-config.json. Default OFF = the wake is awaited before the bundle, exactly as before.
+  agentq-cloud.ps1 -Ws codai -Warm -- <cmd>     keep the workspace VM up between jobs (warm pool).
+          -Warm / -NoWarm beat the config. Default OFF (see WARM POOL) - a warm workspace is a recurring
+          spend, so nothing keeps a VM up unless the switch is set.
+  agentq-cloud.ps1 -Ws codai -ShardCount 2 -- <cmd>   refuse unless a 2nd workspace is registered (SHARDS).
 
 WHAT TRAVELS (git delta, never the whole tree)
   base  = HEAD of the local repo. The workspace publishes the shas it has (ws/<ws>/repos/<repo>.json);
@@ -15,6 +19,21 @@ WHAT TRAVELS (git delta, never the whole tree)
           lacks travel (`git bundle create <id> <known>..HEAD`). No usable known sha -> full HEAD bundle.
   patch = working tree vs HEAD, untracked included, built in a TEMP index (GIT_INDEX_FILE) so the
           shared index is never touched: read-tree HEAD; add -A; diff --cached --binary HEAD.
+WARM POOL  `cloudWarmPool` (default false) / `-Warm` / `-NoWarm`. A cold workspace pays a
+  `gcloud resume` before every job (measured 2026-11-27: `queue->claim 220 s` on ws-agentq because the
+  VM had suspended between gates). A RESIDENT workspace removes that wait, but a VM up continuously
+  (16 vCPU) is a recurring spend the OWNER chooses - so the default is OFF and an explicit `-NoWarm`
+  always wins. When ON the client (a) never suspends the workspace itself (`-Suspend` becomes a no-op
+  with a clear message) and (b) stamps the VM's `devcloud-idle-min` metadata (spec/job.md §Idle and
+  suspend) to `cloudWarmIdleMin` (default 30) so the runner's OWN idle self-suspend waits that window.
+  The runner reads that metadata at start (cloud/runner-agent.mjs), so the window applies from its next
+  start; the client's suspend path is gated unconditionally. Off (default) = byte-for-byte today.
+SHARDS  `cloudShardCount` (default 1) / `-ShardCount`. A count > 1 names the base workspace plus
+  siblings `<ws>-s2`..`<ws>-sN`; the client REFUSES (exit 2) when any of them is not in the registry,
+  rather than start a partial run. Default 1 = exactly today (one workspace, no merge). A correct merge
+  also needs a per-suite result format that partitions disjointly and merges deterministically, failing
+  LOUDLY when a shard is missing; that is a documented precondition, not implemented here (see the
+  cloudShardCount validation in the body and spec/job.md).
 FLOW  resume VM if SUSPENDED/TERMINATED -> upload bundle/patch -> queue spec (written LAST) ->
   stream jobs/<id>/log -> result.json -> exit with the remote exit code.
   With -AsyncResume (cloudAsyncResume) the wake is FILED without waiting and the bundle/patch/upload
@@ -65,6 +84,15 @@ $WakeFirstHealMin = 0.5
 # the bundle, exactly as before). ON (-AsyncResume or cloudAsyncResume:true) files the wake and lets the
 # delta build while the VM warms, with the only wait moved to the acceptance point (see Wait-VmWake).
 $AsyncResume = $false; $AsyncResumeWaitSec = 600
+# Warm pool (WARM POOL in the header). $WarmFlag is tri-state: $null = follow the config, $true = -Warm,
+# $false = -NoWarm (an explicit flag beats the config either way). $WarmPool/$WarmSource are the resolved
+# effective choice, journaled once per run so a warm decision is auditable. $WarmIdleMin is the window the
+# VM's `devcloud-idle-min` metadata is stamped with when warm. OFF by default - see the cost note above.
+$WarmFlag = $null; $WarmPool = $false; $WarmSource = 'default'; $WarmIdleMin = 30
+$warmCfgPresent = $false; $warmCfgOn = $false
+# Shard count (SHARDS in the header). 0 = follow the config; a count > 1 is refused unless its workspaces
+# are registered. Default 1 = one workspace, today's behaviour, no merge.
+$ShardFlag = 0; $ShardCount = 1
 $argv = @($args); $Rest = @()
 $dd = [array]::IndexOf($argv, '--')
 if ($dd -ge 0) { $Rest = @($argv | Select-Object -Skip ($dd + 1)); $argv = @($argv | Select-Object -First $dd) }
@@ -78,12 +106,40 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     'staleclaimmin' { $StaleClaimMin = [int](& $val) } 'noheal' { $NoHeal = $true }
     'wakefirsthealmin' { $WakeFirstHealMin = [double](& $val) }
     'asyncresume' { $AsyncResume = $true } 'asyncresumewaitsec' { $AsyncResumeWaitSec = [int](& $val) }
+    'warm' { $WarmFlag = $true } 'nowarm' { $WarmFlag = $false }
+    'shardcount' { $ShardFlag = [int](& $val) }
     'project' { $Project = & $val } 'zone' { $Zone = & $val } 'ctlproject' { $CtlProject = & $val }
     default { [Console]::Error.WriteLine("agentq-cloud: unknown argument '$a' (put the command after --)"); exit 2 }
   }
 }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
+
+# ---- warm pool + shards (pure: ps/tests/test-agentq-cloud.ps1 drives these directly) --------------
+function Get-WarmPoolChoice {
+  # TASK A: the effective warm-pool choice (WARM POOL in the header). An explicit flag (-Warm/-NoWarm)
+  # beats the config either way; the config beats the OFF default. `source` names which decided, so the
+  # journal line is auditable: flag | config | default. Pure: it reads only what it is handed, so the
+  # whole rule is provable offline.
+  param($Flag = $null, [bool]$CfgPresent = $false, [bool]$CfgOn = $false)
+  if ($null -ne $Flag) { return @{ on = [bool]$Flag; source = 'flag' } }
+  if ($CfgPresent) { return @{ on = [bool]$CfgOn; source = 'config' } }
+  return @{ on = $false; source = 'default' }
+}
+function Get-ShardWorkspaces {
+  # TASK B (SHARDS in the header): the workspaces a shard count implies for a base workspace - the base
+  # itself plus suffixed siblings '<ws>-s2'..'<ws>-sN'. Count 1 (the default) names ONLY the base, so the
+  # caller keeps today's single-workspace behaviour byte-for-byte. A name not present in the registry is
+  # returned in `missing`, and the caller REFUSES rather than start a partial run: a shard set that
+  # silently reruns the whole suite, or drops a shard's result, is a gate that lies.
+  param([Parameter(Mandatory = $true)][string]$Ws, [int]$Count = 1, $Registry = $null)
+  if ($Count -lt 1) { $Count = 1 }
+  $names = @($Ws)
+  for ($i = 2; $i -le $Count; $i++) { $names += ('{0}-s{1}' -f $Ws, $i) }
+  $missing = @()
+  if ($null -ne $Registry) { foreach ($n in $names) { if (-not $Registry.ContainsKey($n)) { $missing += $n } } }
+  [pscustomobject]@{ names = @($names); missing = @($missing) }
+}
 
 # Workspace registry: where each warm workspace lives (VM project/zone). Control plane = $CtlProject.
 # Built-ins + config `cloudRegistry` ({ "<ws>": { "project": "..", "zone": ".." } }) so a new
@@ -103,11 +159,39 @@ try {
     if ($aw -and "$($aw.Value)" -match '^\d+$') { $AsyncResumeWaitSec = [int]$aw.Value }
     $wf = $cfgObj.PSObject.Properties['cloudWakeFirstHealMin']
     if ($wf -and "$($wf.Value)" -match '^\d+(\.\d+)?$') { $WakeFirstHealMin = [double]$wf.Value }
+    # Warm pool + shards (TASK A/B). `cloudWarmPool` is a switch read exactly like cloudAsyncResume; its
+    # PRESENCE is remembered so an explicit -Warm/-NoWarm can beat it and the journal can name the source.
+    $wp = $cfgObj.PSObject.Properties['cloudWarmPool']
+    if ($wp) { $warmCfgPresent = $true; if ($wp.Value -eq $true -or "$($wp.Value)" -match '^(?i)true|1$') { $warmCfgOn = $true } }
+    $wi = $cfgObj.PSObject.Properties['cloudWarmIdleMin']
+    if ($wi -and "$($wi.Value)" -match '^\d+$') { $WarmIdleMin = [int]$wi.Value }
+    $sc = $cfgObj.PSObject.Properties['cloudShardCount']
+    if ($sc -and "$($sc.Value)" -match '^\d+$') { $ShardCount = [int]$sc.Value }
   }
 } catch { [Console]::Error.WriteLine("agentq-cloud: cloudRegistry ignored ($($_.Exception.Message))") }
 if (-not $Registry.ContainsKey($Ws) -and -not ($Project -and $Zone)) { [Console]::Error.WriteLine("agentq-cloud: unknown workspace '$Ws' (known: $($Registry.Keys -join ', '); or pass -Project/-Zone)"); exit 2 }
 if (-not $Project) { $Project = $Registry[$Ws].project }
 if (-not $Zone) { $Zone = $Registry[$Ws].zone }
+
+# TASK A: resolve the effective warm-pool choice (flag beats config beats the OFF default). The -ShardCount
+# flag, when given, beats the config. Both are resolved here, after the registry is known.
+if ($ShardFlag -gt 0) { $ShardCount = $ShardFlag }
+if ($ShardCount -lt 1) { $ShardCount = 1 }
+$wc = Get-WarmPoolChoice -Flag $WarmFlag -CfgPresent $warmCfgPresent -CfgOn $warmCfgOn
+$WarmPool = [bool]$wc.on; $WarmSource = "$($wc.source)"
+
+# TASK B: a shard count > 1 needs its workspaces registered. Refuse LOUDLY (exit 2) rather than start a
+# partial run. On the -Status surface this is skipped: that path is read-only and must never exit on a
+# config value. Today no '<ws>-s2' sibling exists, so a count > 1 always refuses here - which is correct.
+if (-not $Status -and $ShardCount -gt 1) {
+  $shardPlan = Get-ShardWorkspaces -Ws $Ws -Count $ShardCount -Registry $Registry
+  if (@($shardPlan.missing).Count) {
+    [Console]::Error.WriteLine("agentq-cloud: cloudShardCount $ShardCount needs a second registered workspace; unregistered shard workspace(s): $((@($shardPlan.missing)) -join ', '). Register them in cloudRegistry (known: $($Registry.Keys -join ', ')) or set cloudShardCount 1. A shard set also needs a per-suite result merge that fails loudly on a missing shard (SHARDS in the header) - a partial run is never started.")
+    exit 2
+  }
+  Out-Line "[agentq-cloud] cloudShardCount ${ShardCount}: workspaces $((@($shardPlan.names)) -join ', ') (all registered)"
+}
+
 $Vm = "ws-$Ws"; $Bucket = "gs://$CtlProject-devcloud-jobs"
 $Root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
 $Journal = Join-Path $Root 'journal.jsonl'
@@ -121,6 +205,14 @@ function Write-Journal([hashtable]$e) {
   $m = [Threading.Mutex]::new($false, "Global\agentq-journal$(if ($env:AGENTQ_HOME) { '-' + ($env:AGENTQ_HOME.ToLowerInvariant() -replace '[^a-z0-9]', '_') })")
   try { try { [void]$m.WaitOne(5000) } catch [Threading.AbandonedMutexException] {}; [IO.File]::AppendAllText($Journal, $line + "`n", [Text.UTF8Encoding]::new($false)) }
   finally { try { $m.ReleaseMutex() } catch {}; $m.Dispose() }
+}
+# TASK A: the ONE place the effective warm-pool choice is announced - a greppable stdout line plus a
+# journal row, so a run's warm decision is auditable afterwards. Reads the script-scope values resolved
+# above ($WarmPool/$WarmSource/$WarmIdleMin/$Ws), never its own arguments. Never called on -Status.
+function Write-WarmChoice {
+  $choice = 'warm-pool {0} (source: {1})' -f $(if ($WarmPool) { 'on' } else { 'off' }), $WarmSource
+  Out-Line "[agentq-cloud] $choice"
+  Write-Journal @{ event = 'cloud-warm-pool'; resource = "cloud:$Ws"; ws = $Ws; on = $WarmPool; source = $WarmSource; idleMin = $WarmIdleMin; choice = $choice }
 }
 # ---- evidence in the target repo (the run's own log, in the repo, forever) ----------------------
 # A gate result lived only in gs://<ctl>-devcloud-jobs/jobs/<id>/log and in a terminal buffer, so it was
@@ -383,6 +475,32 @@ function Write-Obj([string]$name, [string]$file, [string]$type = 'application/oc
 $VmUrl = "https://compute.googleapis.com/compute/v1/projects/$Project/zones/$Zone/instances/$Vm"
 function Get-VmStatus { $r = Invoke-Api GET "$VmUrl`?fields=status"; if ($r.code -ne 200) { throw "compute GET $Vm -> $($r.code) $($r.body)" }; ($r.body | ConvertFrom-Json).status }
 function Invoke-VmOp([string]$op) { $r = Invoke-Api POST "$VmUrl/$op"; if ($r.code -ne 200) { throw "compute $op $Vm -> $($r.code) $($r.body)" } }
+# TASK A (warm pool): the runner's idle self-suspend is driven by the VM's `devcloud-idle-min` metadata
+# (spec/job.md §Idle and suspend; cloud/runner-agent.mjs reads it at start). `0` means the runner NEVER
+# self-suspends. The client stamps the warm window here so a warm workspace is not suspended between
+# nearby jobs. BEST-EFFORT and NON-FATAL: a setMetadata that fails (a stale fingerprint, no permission)
+# is reported, never fatal - a green gate must not turn red because a cost lever could not be written.
+# setMetadata is read-modify-write: the current fingerprint + the existing items are preserved, only
+# `devcloud-idle-min` is replaced, so no other metadata is clobbered.
+function Set-VmIdleMetadata([int]$IdleMin) {
+  try {
+    $r = Invoke-Api GET "$VmUrl`?fields=metadata"
+    if ($r.code -ne 200) { return [pscustomobject]@{ ok = $false; reason = "compute GET metadata $Vm -> $($r.code) $($r.body)" } }
+    $md = $r.body | ConvertFrom-Json
+    $items = @()
+    $fp = ''
+    if ($md.PSObject.Properties['metadata'] -and $md.metadata) {
+      if ($md.metadata.fingerprint) { $fp = "$($md.metadata.fingerprint)" }
+      if ($md.metadata.items) { $items = @($md.metadata.items | Where-Object { $_.key -ne 'devcloud-idle-min' } | ForEach-Object { [ordered]@{ key = "$($_.key)"; value = "$($_.value)" } }) }
+    }
+    $items += [ordered]@{ key = 'devcloud-idle-min'; value = "$IdleMin" }
+    $body = ([ordered]@{ fingerprint = $fp; items = $items } | ConvertTo-Json -Depth 6 -Compress)
+    $content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
+    $w = Invoke-Api POST "$VmUrl/setMetadata" $content
+    if ($w.code -ne 200) { return [pscustomobject]@{ ok = $false; reason = "compute setMetadata $Vm -> $($w.code) $($w.body)" } }
+    return [pscustomobject]@{ ok = $true; idleMin = $IdleMin }
+  } catch { return [pscustomobject]@{ ok = $false; reason = "$($_.Exception.Message)" } }
+}
 # FILE a VM lifecycle op (resume/start) without waiting for the response, so the delta build and the
 # uploads run while the VM warms. The request is in flight the moment SendAsync returns; the caller parks
 # the handle and awaits it once, at the acceptance point (Wait-VmWake). Used only by -AsyncResume.
@@ -441,10 +559,20 @@ function Get-DevcloudWorkspaceRow([string]$ws, [string]$project, [string]$zone) 
 
   # VM state, read-only. A describe that fails (unknown ws, no permission) leaves the state UNKNOWN and
   # is reported in `unavailable` rather than being guessed from the heartbeat.
-  $vst = ''
+  $vst = ''; $idleMinMd = $null
   try {
     $vj = @(& gcloud compute instances describe $vm --project $project --zone $zone --format=json 2>$null) -join "`n"
-    if ("$vj".Trim()) { $vst = [string](($vj | ConvertFrom-Json).status) } else { $why += "VM $vm was not described in $project/$zone" }
+    if ("$vj".Trim()) {
+      $vjo = $vj | ConvertFrom-Json
+      $vst = [string]$vjo.status
+      # TASK A: the runner's idle window lives in the VM's `devcloud-idle-min` metadata (spec/job.md
+      # §Idle and suspend) - read here, read-only, to name whether the workspace is WARM. Unmeasurable
+      # -> $null, never 0: an absent window and a window of 0 min are different facts.
+      if ($vjo.PSObject.Properties['metadata'] -and $vjo.metadata -and $vjo.metadata.items) {
+        $mi = @($vjo.metadata.items | Where-Object { $_.key -eq 'devcloud-idle-min' } | Select-Object -First 1)
+        if ($mi.Count -and "$($mi[0].value)" -match '^\d+$') { $idleMinMd = [int]$mi[0].value }
+      }
+    } else { $why += "VM $vm was not described in $project/$zone" }
   } catch { $why += "VM describe failed: $($_.Exception.Message)" }
 
   $heartbeatAt = $null; $heartbeatAgeSec = $null; $idleSec = $null
@@ -468,8 +596,15 @@ function Get-DevcloudWorkspaceRow([string]$ws, [string]$project, [string]$zone) 
   elseif ($vst -eq 'SUSPENDING') { $state = 'suspending' }
   elseif ($hbState -in @('idle', 'busy', 'suspending')) { $state = $hbState }
 
+  # WARM (TASK A): RUNNING with an idle window at or above the pool's ($WarmIdleMin) is a workspace that
+  # will not self-suspend between nearby jobs. A suspended/stopped VM is definitively NOT warm ($false);
+  # an unmeasurable idle window leaves it $null (unknown), never a false "no".
+  $warm = $null
+  if ($state -in @('suspended', 'stopped')) { $warm = $false }
+  elseif ($null -ne $idleMinMd -and $state -in @('idle', 'busy')) { $warm = ($idleMinMd -ge $WarmIdleMin) }
+
   $row = [ordered]@{ ws = $ws; vm = $vm; project = $project; zone = $zone; state = $state
-    heartbeatAt = $heartbeatAt; heartbeatAgeSec = $heartbeatAgeSec; idleSec = $idleSec; queueDepth = (Get-DevcloudQueueDepth $ws) }
+    heartbeatAt = $heartbeatAt; heartbeatAgeSec = $heartbeatAgeSec; idleSec = $idleSec; queueDepth = (Get-DevcloudQueueDepth $ws); idleMin = $idleMinMd; warm = $warm }
   [pscustomobject]@{ row = $row; why = @($why) }
 }
 function Get-DevcloudStatusDoc {
@@ -505,12 +640,43 @@ if ($Status) {
       else { Out-Line "agent: ok (${hbAge}s ago, state '$($hb.state)')" }
     } elseif ($vst -ne 'RUNNING') { Out-Line "agent: n/a ($Vm is $vst)" }
   } catch { Out-Line "agent: unknown ($($_.Exception.Message))" }
+  # TASK A: whether this workspace is WARM and for how long it has been idle - read-only. The idle
+  # window is the VM metadata the runner reads; the idle seconds come from the heartbeat's own `idleSec`
+  # (never guessed here). An unmeasurable window reports 'unknown', never 'no'.
+  try {
+    $mdo = @(& gcloud compute instances describe $Vm --project $Project --zone $Zone --format=json 2>$null) -join "`n"
+    $im = $null
+    if ("$mdo".Trim()) {
+      $mio = ($mdo | ConvertFrom-Json)
+      if ($mio.PSObject.Properties['metadata'] -and $mio.metadata -and $mio.metadata.items) {
+        $d = @($mio.metadata.items | Where-Object { $_.key -eq 'devcloud-idle-min' } | Select-Object -First 1)
+        if ($d.Count -and "$($d[0].value)" -match '^\d+$') { $im = [int]$d[0].value }
+      }
+    }
+    $hb2 = $null; try { $hb2 = $hbRaw | ConvertFrom-Json } catch { $hb2 = $null }
+    $idleS = if ($hb2 -and $hb2.PSObject.Properties['idleSec'] -and $null -ne $hb2.idleSec) { [int]$hb2.idleSec } else { $null }
+    $warmS = if ($null -eq $im) { 'unknown' } elseif ($im -ge $WarmIdleMin) { 'yes' } else { 'no' }
+    Out-Line ("warm: {0} (idle-min {1}; idle {2})" -f $warmS, $(if ($null -ne $im) { "$im" } else { '?' }), $(if ($null -ne $idleS) { "${idleS}s" } else { '?' }))
+  } catch { Out-Line "warm: unknown ($($_.Exception.Message))" }
   & gcloud storage ls "$Bucket/ws/$Ws/queue/" 2>$null | ForEach-Object { Out-Line "queued: $_" }
   exit 0
 }
-if ($Suspend) { Invoke-VmOp suspend; Out-Line "suspend requested for $Vm"; exit 0 }
+if ($Suspend) {
+  # TASK A: the pool's whole point is to keep the workspace up, so a WARM workspace is NOT suspended by
+  # this path - the switch beats the verb. An explicit -NoWarm (source: flag) turns the pool off for this
+  # call, so `-Suspend -NoWarm` suspends exactly as today. The effective choice is journaled either way.
+  Write-WarmChoice
+  if ($WarmPool) {
+    Out-Line "[agentq-cloud] warm-pool on - $Vm is NOT suspended (a warm workspace stays up between jobs; pass -NoWarm to suspend anyway)"
+    exit 0
+  }
+  Invoke-VmOp suspend; Out-Line "suspend requested for $Vm"; exit 0
+}
 if (-not $Rest.Count) { [Console]::Error.WriteLine('agentq-cloud: no command (put it after --)'); exit 2 }
 if (-not $Purpose -or $Purpose.Length -lt 3) { [Console]::Error.WriteLine('agentq-cloud: -Purpose is required'); exit 2 }
+# TASK A: announce + journal the effective warm-pool choice once, before any network work. Off by default,
+# so a normal run prints `warm-pool off (source: ...)` and changes nothing about how the job is placed.
+Write-WarmChoice
 
 # ---- repo + delta ---------------------------------------------------------------------------
 $repoDir = if ($RepoArg) { $RepoArg } else { (Get-Location).Path }
@@ -592,6 +758,16 @@ try {
   # The acceptance point: with an async wake in flight, confirm the VM can actually take the job before
   # the queue entry lands. $wake is $null when OFF (or a SUSPENDING VM), so the default path is untouched.
   if ($wake) { Wait-VmWake -wake $wake -TimeoutSec $AsyncResumeWaitSec }
+  # TASK A (warm pool): with the VM up, stamp its idle window so the runner's OWN idle self-suspend waits
+  # cloudWarmIdleMin instead of the default - the workspace stays up between nearby jobs. Best-effort, and
+  # only when the pool is ON: the default path (OFF) makes no metadata call, byte-for-byte as before. The
+  # runner reads this at start, so it applies from its next start; the client's suspend path is gated
+  # unconditionally (see -Suspend).
+  if ($WarmPool) {
+    $wm = Set-VmIdleMetadata -IdleMin $WarmIdleMin
+    if ($wm.ok) { Out-Line "[agentq-cloud] warm-pool: $Vm idle window set to $WarmIdleMin min (stays up between jobs)" }
+    else { Out-Line "[agentq-cloud] warm-pool: could not set the idle window ($($wm.reason))" }
+  }
   Write-Obj "ws/$Ws/queue/$id.json" $sf 'application/json'
   $submitted = $true
   Remove-Item -LiteralPath $DownFile -ErrorAction SilentlyContinue

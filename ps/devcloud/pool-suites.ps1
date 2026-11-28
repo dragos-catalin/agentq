@@ -80,8 +80,50 @@ $poolLogDir = Join-Path ([IO.Path]::GetTempPath()) ('aq-pool-logs-' + [guid]::Ne
 # and a final `FAILED: <names>`. That names the suites that FAILED, which is what lets a failure whose
 # .log carries no `FAIL` token still be echoed below. $rc remains run-all's exit code, unchanged.
 $runLines = [System.Collections.Generic.List[string]]::new()
+#
+# ---- per-suite COST LABELS (2026-11-28) ---------------------------------------------------------
+# run-all.ps1 prints one result line per suite and, under -Parallel > 1, appends a BLANKET note
+# `(pooled: wall-clock under contention; -Only '<name>' for its own cost)` to EVERY line. That is a
+# LIE for the serial-only suites: run-all drains the pool and runs each of them ALONE (its
+# `BARRIER <name> (serial-only: ...)` bracket), so their `sec=` already IS that suite's own cost, not
+# a contended wall-clock. Measured on ws-agentq tonight: `lease spawns` printed `sec=170` pooled while
+# `-Only 'lease spawns'` alone took ~10 s, so a reader optimising from `sec=` chases the wrong suite.
+# We KEEP run-all's number (the pooled wall-clock is real) but make the label truthful PER SUITE -
+# `solo` where the suite really ran alone, `pooled` otherwise - and COUNT both so the summary line
+# carries them and a RUNS.md row can state both without re-running. $serialOnly mirrors run-all.ps1's
+# own barrier set; a `BARRIER <name> (serial-only` line seen in the stream ALSO marks a suite solo, so
+# the two cannot silently disagree. The `exit=/pass=/fail=/sec=` fields keep their position and only
+# the trailing parenthetical changes, so the line stays readable by the same fields as before. The
+# run's own totals are NOT recomputed - the summary keeps run-all's `sec=`, `suites=`, `failed=`,
+# `skipped=` verbatim and appends the two counts.
+$serialOnly = @('install', 'term interrupt', 'reap terminals', 'git-autosync', 'guard cloud', 'deploy guard')
+$soloNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($n in $serialOnly) { [void]$soloNames.Add($n) }
+$poolActive = $Parallel -gt 1                          # -Parallel 1 runs every suite alone: all solo
+$soloCount = 0; $pooledCount = 0
+$suiteRx = [regex]'^\s*(?<name>.+?)\s+exit=-?\d+\s+pass=\d+\s+fail=\d+\s+sec=\d+\s*$'
+$barrierRx = [regex]'^BARRIER\s+(?<name>.+?)\s+\(serial-only\b'
 & pwsh -NoProfile -File $runAll -Only ($gateList -join ',') -Parallel $Parallel -TimeoutMin 20 -LogDir $poolLogDir |
-  ForEach-Object { $runLines.Add("$_"); $_ }
+  ForEach-Object {
+    $line = "$_"
+    $runLines.Add($line)   # the UNCHANGED line: the FAILED-detection below reads exactly what run-all printed
+    $b = $barrierRx.Match($line)
+    if ($b.Success) { [void]$soloNames.Add($b.Groups['name'].Value.Trim()) }
+    if ($line -match '^TOTAL sec=\d+ suites=\d+ failed=\d+ skipped=\d+') {
+      "$line solo=$soloCount pooled=$pooledCount"
+      "AGENTQ-POOL-SUITES: cost labels - solo=$soloCount suite(s) ran ALONE (sec= IS their own cost); pooled=$pooledCount ran under contention (sec= is a wall-clock shared with the suites beside them)"
+      return
+    }
+    $stripped = $line -replace '\s*\([^)]*\)\s*$', ''
+    $m = $suiteRx.Match($stripped)
+    if (-not $m.Success) { $line; return }
+    $name = $m.Groups['name'].Value.Trim()
+    $solo = (-not $poolActive) -or $soloNames.Contains($name)
+    if ($solo) { $soloCount++ } else { $pooledCount++ }
+    $note = if ($solo) { " (solo: ran alone - this IS its own cost)" }
+            else { " (pooled: wall-clock under contention; -Only '$name' for its own cost)" }
+    "$stripped$note"
+  }
 $rc = $LASTEXITCODE
 # A log file per suite that RAN, named by run-all's own Get-SuiteLog sanitisation ([^A-Za-z0-9._-]+ -> '-'),
 # so run-all's suite KEY maps onto the file name exactly. Collect the FAILED ones by name (with exit code
