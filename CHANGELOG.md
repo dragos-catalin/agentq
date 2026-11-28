@@ -243,13 +243,11 @@ v2`** read the process table with `-ErrorAction SilentlyContinue`, so a failed o
   README's "each `test-*` file in this folder is one suite" is a description, not a check), and the suite had
   never been reachable by name either. Registering it in one list and not the other is the same defect one step
   over, which is how it was caught: `install wiring` went RED on all three of its checks (`1 missing:
-  test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is a valid, fully installed gate
 test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is a valid, fully installed gate
-  list") and GREEN at `pass=19 fail=0` once the file was mapped. The suite resolves its subject as
-  `$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
-  test are mapped together. Proven by running the three suites through the sanctioned runner
-  (`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre` 60/60, `sat report` 16/16,
-  `install wiring` 19/19, `RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
+  test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq`is a valid, fully installed gate
+list") and GREEN at`pass=19 fail=0`once the file was mapped. The suite resolves its subject as`$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
+test are mapped together. Proven by running the three suites through the sanctioned runner
+(`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre`60/60,`sat report`16/16,`install wiring`19/19,`RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
 - **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
   them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
   gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,
