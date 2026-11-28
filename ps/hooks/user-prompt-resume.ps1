@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  UserPromptSubmit: when the submitted prompt is a resumed-effort word ("continue", "continuă",
+  UserPromptSubmit: when the submitted prompt is a resumed-effort word ("continue", "continua",
   "gata", ...), re-inject THIS workspace's newest repository handoff note so the new turn starts from
   the state the previous chat recorded instead of re-deriving it blind.
 
 .DESCRIPTION
-  Why this exists: when a chat stops and the user types "continue" / "continuă" / "try again", nothing
+  Why this exists: when a chat stops and the user types "continue" / "continua" / "try again", nothing
   re-injects where the work had reached. The agent re-derives the next step from the transcript, does
   not re-dispatch its subagents and does not re-attach to in-flight jobs. This hook re-attaches the
   turn to the newest handoff note the previous chat left under the workspace's
@@ -195,7 +195,7 @@ function Format-PlanDigest($plan) {
 try {
   # Read stdin as raw UTF-8 BYTES, not via [Console]::In. Windows PowerShell 5.1 (which VS Code
   # invokes as `powershell.exe`) decodes a REDIRECTED stdin with the console code page, so a UTF-8
-  # payload carrying a diacritic ("Continuă") arrives mangled and the whole-prompt match would miss
+  # payload carrying a diacritic ("Continua") arrives mangled and the whole-prompt match would miss
   # the very word this hook exists for. Bytes + an explicit UTF-8 decode are code-page independent.
   $raw = ''
   try {
@@ -224,7 +224,7 @@ try {
   if (-not $prompt) { exit 0 }
 
   # Whole-prompt match, not a substring: collapse whitespace runs, then require EQUALITY with one of
-  # the resume words. "please continue" therefore does NOT match; "Continuă" folds to "continua" and does.
+  # the resume words. "please continue" therefore does NOT match; "Continua" folds to "continua" and does.
   $norm = ((ConvertTo-Folded $prompt) -replace '\s+', ' ').Trim()
   $resumeWords = @('continua', 'continue', 'try again', 'gata', 'da', 'go', 'done')
   if ($resumeWords -notcontains $norm) { exit 0 }
