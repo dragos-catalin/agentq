@@ -92,13 +92,7 @@ describe("argument vectors", () => {
 
     it("filters lessons by repo and caps with -Limit", () => {
         expect(mcpArgv.lessons({})).toEqual(["lessons"]);
-        expect(mcpArgv.lessons({ repo: "codai", limit: 10 })).toEqual([
-            "lessons",
-            "-Repo",
-            "codai",
-            "-Limit",
-            "10",
-        ]);
+        expect(mcpArgv.lessons({ repo: "codai", limit: 10 })).toEqual(["lessons", "-Repo", "codai", "-Limit", "10"]);
     });
 
     it("builds `agentq run` with the command after --", () => {

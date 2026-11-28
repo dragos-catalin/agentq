@@ -508,8 +508,26 @@ try {
     // on main from that commit until here. The fixture carries no such line, so the count is 0 - the
     // shape is what this pins; the increment itself is covered by the emitter's own badLines path.
     assert.deepEqual(hc.days, [
-        { day: "2026-10-17", calls: 5, totalHours: 7400 / 3.6e6, p50Ms: 1000, p90Ms: 3600, startP50Ms: 800, denies: 2, implausible: 0 },
-        { day: "2026-10-18", calls: 2, totalHours: 300 / 3.6e6, p50Ms: 100, p90Ms: 200, startP50Ms: 150, denies: 0, implausible: 0 },
+        {
+            day: "2026-10-17",
+            calls: 5,
+            totalHours: 7400 / 3.6e6,
+            p50Ms: 1000,
+            p90Ms: 3600,
+            startP50Ms: 800,
+            denies: 2,
+            implausible: 0,
+        },
+        {
+            day: "2026-10-18",
+            calls: 2,
+            totalHours: 300 / 3.6e6,
+            p50Ms: 100,
+            p90Ms: 200,
+            startP50Ms: 150,
+            denies: 0,
+            implausible: 0,
+        },
     ]);
     assert.equal(hc.calls, 7);
     assert.equal(hc.totalHours, 7700 / 3.6e6);

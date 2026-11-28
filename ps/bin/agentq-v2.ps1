@@ -21,7 +21,7 @@ $script:LandSrcSlot = $null
 $script:SlotWorkCache = $null
 # `$script:ReadOnly` is NOT reset here: agentq.ps1 computes it (from the verb) at its line ~295 and only
 # dot-sources this file at ~1922, so `$script:ReadOnly = $null` here wiped it and turned every READ-ONLY
-# verb (status/log/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
+# verb (status/log/since/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
 # comment in agentq.ps1 says was fixed. Verified by ps/tests/test-status-readonly.ps1 (2026-11-22).
 $script:GateExit = $null
 $script:GateFailedMembers = @()
@@ -1357,7 +1357,9 @@ function Invoke-Lease {
     $reuse = if ($Slot) { Get-SlotReuse $repo.Name $reuseRole $Slot } else { Get-SlotReuse $repo.Name $Role }
     if ($reuse) {
       $rp = "$(P $reuse 'path')"
-      $res = [pscustomobject]@{ leaseId = "$(P $reuse 'leaseId')"; repo = $repo.Name; slot = "$($reuse.slot)"; role = "$(P $reuse 'role')"; path = $rp; branch = "$(P $reuse 'branch')"; head = "$(& git -C $rp rev-parse --short HEAD 2>$null)".Trim(); reused = $true }
+      # `head` is the short HEAD the repo resolution above ALREADY computed (its one combined rev-parse
+      # carries `--short HEAD`), so the reuse arm adds no git spawn of its own; '' when HEAD is unborn.
+      $res = [pscustomobject]@{ leaseId = "$(P $reuse 'leaseId')"; repo = $repo.Name; slot = "$($reuse.slot)"; role = "$(P $reuse 'role')"; path = $rp; branch = "$(P $reuse 'branch')"; head = "$(P $repo 'Sha' '')"; reused = $true }
       if ($Json) { $res | ConvertTo-Json -Compress } else {
         Write-Output "reusing $($res.repo)/$($res.slot) ($($res.leaseId)) -> $rp @ $($res.head) - this session already holds a clean $(if ($Role) { $Role } else { 'slot' }) slot in this repo, so no second one is rented (D5, ADR 0014)"
         Write-Output "release when done: pwsh -NoProfile -File `"$(Join-Path $PSScriptRoot 'agentq.ps1')`" unlease -Repo `"$rp`" -LeaseId $($res.leaseId)"
@@ -1413,7 +1415,9 @@ function Invoke-Lease {
     Remove-LeaseRecord $l 'lease-failed' "$($_.Exception.Message)" ''
     throw
   }
-  $res = [pscustomobject]@{ leaseId = $l.leaseId; repo = $l.repo; slot = $l.slot; role = $l.role; path = $l.path; branch = "$Branch"; head = "$(& git -C $l.path rev-parse --short HEAD)".Trim() }
+  # Same as the reuse arm: `head` comes from the repo resolution's one combined rev-parse (`--short HEAD`),
+  # so the fresh lease no longer spawns a second `git rev-parse --short HEAD`. '' when HEAD is unborn.
+  $res = [pscustomobject]@{ leaseId = $l.leaseId; repo = $l.repo; slot = $l.slot; role = $l.role; path = $l.path; branch = "$Branch"; head = "$(P $repo 'Sha' '')" }
   if ($Json) { $res | ConvertTo-Json -Compress } else {
     Write-Output "leased $($l.repo)/$($l.slot) ($($l.leaseId)) -> $($l.path) @ $($res.head)$(if ($Branch) { " on $Branch" })"
     if ($script:TakeoverNote) { Write-Output $script:TakeoverNote }
@@ -3136,6 +3140,54 @@ function Invoke-Land {
         Write-Journal @{ event = 'land-precheck-conflict'; resource = $res; branch = $Onto; ref = $preRef; paths = $hard; reason = "$Branch ($preWhere) conflicts with origin/$Onto before queueing"; repo = $repo.Name }
         [Console]::Error.WriteLine("land: $Branch ($preWhere $preRef) does not merge onto origin/$Onto (conflicts: $($hard -join ', ')). Nothing queued. Resolve those files on $Branch (rebase it onto origin/$Onto if origin/$Onto moved) and land again.")
         $script:LandExit = 5; return
+      }
+    }
+    # 2026-11-27: a topic whose TIP is a merge of origin/<onto> back into itself can carry a hand
+    # resolution that silently REVERTS origin/<onto>'s content (dropped a file, or rolled a file back to
+    # an older version) with NO conflict for the check above to see - `merge-tree` reports a clean merge
+    # and the branch would land and undo origin. The naive rule - "the topic contains a merge whose parent
+    # is already an ancestor of origin/<onto>" - is a FALSE POSITIVE generator: merging origin/main into a
+    # branch and later letting main advance is legitimate and `merge-base --is-ancestor` is true for it.
+    # Refined signal: scrutinise ONLY a merge tip; ONLY paths where origin/<onto> still agrees with the
+    # merge base (main did not move that path since the two sides diverged); ONLY a RESOLUTION that
+    # DEVIATED from the clean auto-merge of the tip's own parents (so an ordinary forward edit the topic
+    # carried in, which the auto-merge reproduces, is not accused); and ONLY where the resolution actually
+    # DROPPED origin's bytes (every line origin has is gone). AGENTQ_LAND_NO_STALEBASE=1 escapes it.
+    if (-not $env:AGENTQ_LAND_NO_STALEBASE) {
+      $tipLine = @(& git -C $main rev-list --no-walk --parents -1 $preRef 2>$null | ForEach-Object { "$_" })
+      $tipTokens = @("$($tipLine -join ' ')".Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($tipTokens.Count -ge 3) {
+        $par = @($tipTokens | Select-Object -Skip 1)
+        $onMain = @(); foreach ($q in $par) { & git -C $main merge-base --is-ancestor $q "origin/$Onto" 2>$null; if ($LASTEXITCODE -eq 0) { $onMain += $q } }
+        if ($onMain.Count -ge 1) {
+          $baseSha = @(& git -C $main merge-base "origin/$Onto" $preRef 2>$null | ForEach-Object { "$_" } | Select-Object -First 1)
+          $cleanTree = @(& git -C $main merge-tree --write-tree --no-messages $par[0] $par[1] 2>$null | ForEach-Object { "$_" } | Select-Object -First 1)
+          $offend = @()
+          foreach ($ln in @(& git -C $main diff-tree -r --name-status "origin/$Onto" $mt[0] 2>$null | ForEach-Object { "$_" })) {
+            $f = $ln -split "`t"
+            if ($f.Count -lt 2) { continue }
+            $st = "$($f[0])".Trim(); $p = "$($f[1])".Trim()
+            if ($st -ne 'M' -and $st -ne 'D') { continue }
+            if ($p -match '(^|/)(CHANGELOG\.md|package\.json)$' -or $p -match '^changes/') { continue }
+            $oP = "$(& git -C $main rev-parse --verify -q "origin/${Onto}:$p" 2>$null)".Trim()
+            if (-not $oP) { continue }
+            $bP = "$(& git -C $main rev-parse --verify -q "${baseSha}:$p" 2>$null)".Trim()
+            if ($bP -ne $oP) { continue }
+            $rP = "$(& git -C $main rev-parse --verify -q "${preRef}:$p" 2>$null)".Trim()
+            if ($rP -eq $oP) { continue }
+            if ($cleanTree) { $cP = "$(& git -C $main rev-parse --verify -q "${cleanTree}:$p" 2>$null)".Trim(); if ($cP -eq $rP) { continue } }
+            $rLines = @{}; foreach ($l in @(& git -C $main cat-file -p $rP 2>$null)) { $rLines["$_".Trim()] = $true }
+            $kept = $true; foreach ($l in @(& git -C $main cat-file -p $oP 2>$null)) { $t = "$l".Trim(); if ($t -and -not $rLines.ContainsKey($t)) { $kept = $false; break } }
+            if ($kept) { continue }
+            $offend += $p
+          }
+          $offend = @($offend | Select-Object -Unique)
+          if ($offend.Count) {
+            Write-Journal @{ event = 'land-stale-base'; resource = $res; branch = $Onto; ref = $preRef; paths = $offend; reason = "$Branch ($preWhere) is a merge of origin/$Onto into itself whose resolution drops content origin/$Onto still has"; repo = $repo.Name }
+            [Console]::Error.WriteLine("land: REFUSED - $Branch ($preWhere $preRef) merges origin/$Onto back into itself but its resolution drops content origin/$Onto still has: $($offend -join ', '). Nothing queued. That merge reverted origin/$Onto; re-merge origin/$Onto and keep its bytes on those paths (or rebase $Branch onto origin/$Onto), then land again. To land it as-is anyway, set AGENTQ_LAND_NO_STALEBASE=1.")
+            $script:LandExit = 5; return
+          }
+        }
       }
     }
   }

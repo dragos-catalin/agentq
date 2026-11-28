@@ -11,7 +11,7 @@ Today every tool invents its own lock file. Those locks are poll-and-race, carry
 
 ## 2. Model
 
-- **Resource**: a lowercase string of `:`-separated segments matching `^[a-z0-9][a-z0-9._/-]*(:[a-z0-9._/-]+)*$`. Conventions: `build:<repo>`, `build:machine`, `install:<repo>`, `commit:<repo>`, `deploy:<repo>:<target>`. `<repo>` SHOULD be the name of the repository's common git directory parent, so every worktree of a repository shares its resources.
+- **Resource**: a lowercase string of `:`-separated segments matching `^[a-z0-9][a-z0-9._/-]*(:[a-z0-9._/-]+)*$`. Conventions: `build:<repo>`, `build:machine`, `gate:machine`, `install:<repo>`, `commit:<repo>`, `deploy:<repo>:<target>`. `<repo>` SHOULD be the name of the repository's common git directory parent, so every worktree of a repository shares its resources.
 - **Capacity**: how many tickets may hold a resource at once. Default 1. Set on acquire; the last value set wins.
 - **Ticket**: one request for a resource. Fields: `id`, `resource`, `seq`, `owner`, `created`, `expires`, `leaseMs`. Tickets are ordered by `seq`, a counter that only increases (per coordinator). The first `capacity` live tickets of a resource **hold** it; the rest **wait**. Order MUST be FIFO: a later ticket never overtakes an earlier live one.
 - **Owner**: `{ session, purpose, pid?, host? }`. `purpose` is REQUIRED and non-empty; other agents read it to decide whether to wait, ask or break.

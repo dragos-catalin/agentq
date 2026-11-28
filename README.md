@@ -14,7 +14,7 @@ agentq is the coordinator I have run on my own machine since September 2026 acro
 
 ## Approach
 
-- **Resources** are plain strings: `build:<repo>`, `build:machine` (capacity 2), `install:<repo>`, `commit:<repo>` (index + commit only), `push:<repo>` (the fetch/merge/push phase, capacity 2, so one agent's pre-push gate does not hold another agent's commit), `deploy:<repo>:<target>`, `slot:<repo>:<slot>`.
+- **Resources** are plain strings: `build:<repo>`, `build:machine` (capacity 2), `gate:machine` (capacity 3, taken beside its repo's `verify:<repo>` by a heavy gate/verify run, so N repos cannot saturate the machine with N turbo gates), `install:<repo>`, `commit:<repo>` (index + commit only), `push:<repo>` (the fetch/merge/push phase, capacity 2, so one agent's pre-push gate does not hold another agent's commit), `deploy:<repo>:<target>`, `slot:<repo>:<slot>`.
 - **Tickets** with a capacity per resource, scheduled by lane + priority + aging (PowerShell v3, [ADR 0002](docs/adr/0002-v3-scheduler-lanes-overrides-watchdog.md)); the TypeScript ACP-Lock daemon below is still FIFO.
 - **Leases**: a ticket expires unless it heartbeats. A holder whose process died is released at once. Waiting extends the lease, so a long queue never looks stale.
 - **Freeze marks**: `agentq mark -r deploy:web:prod --state frozen --reason "incident: 500s since 08:12Z"`. New tickets are refused with the reason; current holders finish.

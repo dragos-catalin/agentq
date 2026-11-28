@@ -36,11 +36,21 @@ All-history reason distribution (432 skips) is the same two causes: 238 dirty sl
 `~/.codai/coord/leases/codai/scratch-5.json`:
 
 ```json
-{ "leaseId": "95a1e6a7", "repo": "codai", "slot": "scratch-5", "role": "scratch",
-  "path": "E:\\gh\\.wt\\codai\\scratch-5", "branch": "",
+{
+  "leaseId": "95a1e6a7",
+  "repo": "codai",
+  "slot": "scratch-5",
+  "role": "scratch",
+  "path": "E:\\gh\\.wt\\codai\\scratch-5",
+  "branch": "",
   "purpose": "DSC-0061 land pre-gate (topic publish/term-31060-20261123135601)",
-  "session": "term-31060", "pid": 31060, "procStart": "2026-11-23T04:12:50.7987170Z",
-  "created": "2026-11-23T15:08:09.9957617Z", "host": "DRAGOS", "claims": [] }
+  "session": "term-31060",
+  "pid": 31060,
+  "procStart": "2026-11-23T04:12:50.7987170Z",
+  "created": "2026-11-23T15:08:09.9957617Z",
+  "host": "DRAGOS",
+  "claims": []
+}
 ```
 
 - **Its pre-gate is gone.** No running process lands `publish/term-31060-20261123135601` (running lands:
@@ -89,7 +99,7 @@ if ($pg) {
 unchanged; only an abandoned one becomes reapable. Sweep then frees it and the pool recovers by itself.
 
 **(b) Optional, wanted, smaller:** when the pre-gate cannot rent a slot, say so once per land with the
-*number* of scratch slots leased and their oldest `created` (`landPregateScratchWhy` currently reports only
+_number_ of scratch slots leased and their oldest `created` (`landPregateScratchWhy` currently reports only
 `lease exit 7`), so a saturated pool is visible in the log instead of looking like bad luck.
 
 Config: `landPregateLeaseMin` (default 30 — comfortably above `gate:platform` p50 7.2 min and its 888 s p95).
@@ -107,11 +117,11 @@ Config: `landPregateLeaseMin` (default 30 — comfortably above `gate:platform` 
 Measured over all repos (`pool-audit.ps1`, 18:18 local — every lease file under `~/.codai/coord/leases/`
 plus the journal's `land-pregate-slot-released` events):
 
-| repo | scratch slots leased | pre-gate leases released | leak pattern |
-|---|---|---|---|
-| codai | **8 / 8** | 0 | **yes — `scratch-5`, age 71 min, no release event** |
-| brivio | 0 | 7 | no |
-| agentq | 0 | 7 | no |
+| repo   | scratch slots leased | pre-gate leases released | leak pattern                                        |
+| ------ | -------------------- | ------------------------ | --------------------------------------------------- |
+| codai  | **8 / 8**            | 0                        | **yes — `scratch-5`, age 71 min, no release event** |
+| brivio | 0                    | 7                        | no                                                  |
+| agentq | 0                    | 7                        | no                                                  |
 
 So state it precisely: the rented-pre-gate design and the 60-min waiter cap are machine-wide, and brivio /
 agentq exercise it correctly (14 releases in the journal), but the only repo where the pool is saturated —
@@ -132,7 +142,7 @@ scratch-8   22 min   sessions list audit: morphing transitions + customisation
 ```
 
 Six of the eight are long-lived work trees (one has been held for **15.5 h**), not gates borrowing a tree for
-a minute. `scratchSlots*` was designed as an elastic pool for *borrowed* trees; in practice it is used as a
+a minute. `scratchSlots*` was designed as an elastic pool for _borrowed_ trees; in practice it is used as a
 second tier of task slots, so the pre-gate is starved by design and only the leak makes it fatal. Consequences
 for the fix:
 
@@ -140,8 +150,7 @@ for the fix:
 - part (a) below (a self-expiring pre-gate lease) recovers the leaked slot and prevents recurrence, but a
   saturated pool still forces `land-pregate-skipped`;
 - so the durable pair is **(a)** + **(b')**: log/refuse loudly when the pre-gate cannot rent because the pool
-  is *fully* occupied by non-pre-gate leases (naming the oldest holder), instead of the opaque
+  is _fully_ occupied by non-pre-gate leases (naming the oldest holder), instead of the opaque
   `lease exit 7`. That turns a silent tax into an operator decision.
 
 Config: `landPregateLeaseMin` (default 30 — comfortably above `gate:platform` p50 7.2 min and its 888 s p95).
-

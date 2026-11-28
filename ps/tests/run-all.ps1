@@ -100,6 +100,10 @@ $suites = [ordered]@{
   'land finalize'  = @('-File', (Join-Path $PSScriptRoot 'test-land-finalize.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'post-land hook' = @('-File', (Join-Path $PSScriptRoot 'test-post-land.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land precheck'  = @('-File', (Join-Path $PSScriptRoot 'test-land-precheck.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-27: the sibling the precheck cannot see - a topic whose merge RESOLUTION reverts origin
+  # content with no conflict (the `publish/agentq-spawn-round2` incident). Isolated in %TEMP% with its
+  # own bare origins; paired with the install.ps1 map entry in this same slice ('install wiring' pins it).
+  'land stale base' = @('-File', (Join-Path $PSScriptRoot 'test-land-stale-base.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land reclaim'   = @('-File', (Join-Path $PSScriptRoot 'test-land-reclaim.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
   # 2026-11-25: (a) a journal write that loses a race must never abort the operation it describes - a

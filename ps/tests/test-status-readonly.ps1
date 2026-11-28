@@ -105,6 +105,27 @@ try {
   Check '1 status from inside a slot does not renew its lease' (([DateTime]::UtcNow - (Get-Item "$lf.hb").LastWriteTimeUtc).TotalMinutes -gt 19)
   Check '1 load probe not sampled' (-not (Get-ChildItem $ld -Filter 'probe-*.jsonl'))
 
+  # --- 1b. `since` resolves the upstream in ONE spawn, not two (agentq round 4) -------------------
+  # It used to run `rev-parse --abbrev-ref '@{u}'` in its own process, purely to choose the NEXT
+  # spawn's argument -- a whole pwsh->git round trip whose output was never printed, on the first call
+  # of nearly every task boot. A `git.cmd` first on PATH counts the calls; the POSITIVE control (the
+  # single `log` call MUST be observed) is what stops the "no probe" assertion passing on an empty log.
+  $shimDir = Join-Path $tmp 'shim'; New-Item -ItemType Directory -Force $shimDir | Out-Null
+  $glog = Join-Path $tmp 'gitcalls.txt'
+  $realGit = (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+  [IO.File]::WriteAllText((Join-Path $shimDir 'git.cmd'), ("@echo off`r`n>>`"$glog`" echo %*`r`n`"$realGit`" %*`r`nexit /b %ERRORLEVEL%`r`n"), [Text.ASCIIEncoding]::new())
+  $beforeSince = Snapshot
+  $oldPath = $env:PATH; $env:PATH = "$shimDir;$oldPath"
+  try { Remove-Item $glog -Force -ErrorAction SilentlyContinue; $s8 = AQ since -Hours 24; $c8 = $code } finally { $env:PATH = $oldPath }
+  $gcalls = @(Get-Content $glog -ErrorAction SilentlyContinue)
+  $gprobe = @($gcalls | Where-Object { $_ -match 'rev-parse .*--abbrev-ref' })
+  $glogc = @($gcalls | Where-Object { $_ -match ' log ' })
+  Check '1b since exits 0' ($c8 -eq 0) "$c8"
+  Check '1b the shim captured the calls (positive control)' ($gcalls.Count -ge 2) ("calls=" + $gcalls.Count)
+  Check '1b since makes NO separate upstream probe' ($gprobe.Count -eq 0) ("probe=" + $gprobe.Count + ' ' + ($gprobe -join '|'))
+  Check '1b since resolves the upstream in ONE log spawn' ($glogc.Count -eq 1) ("logs=" + $glogc.Count)
+  Check '1b since is read-only too' ((Diff $beforeSince (Snapshot)).Count -eq 0)
+
   # --- 2. and status still tells the truth -------------------------------------------------------
   Check '2 a dead ticket is not shown as a holder' ($s2 -notmatch 'crashed build')
   Check '2 the dead release is reported as FAILED' ($s2 -match 'repo/web\s+FAILED') $s2

@@ -6,6 +6,21 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- `agentq land` refuses a topic whose merge resolution would silently revert `origin/<onto>`. The class is real
+  and was an inch from landing on 2026-11-27: a branch whose tip is a merge of a base already inside main, hand
+  resolved back to the old content - it deleted `ps/tests/test-agentq-gate-machine.ps1` (143 lines) and cut
+  `run-all.ps1` by 12, `guard-tooluse.ps1` by 18/-3, `install.ps1` by 4, `CHANGELOG.md` by 13. The precheck that
+  existed only sees `merge-tree` CONFLICTS, so a clean merge that drops main's bytes was invisible to it. The
+  rule is deliberately **not** "the topic merged a base that is already in main" - merging `origin/main` into
+  your branch is a legitimate workflow and that naive rule refuses it (fixture B pins that). It fires only when
+  the merged tree loses content `origin/<onto>` still has, on a path whose origin side is unchanged since the
+  merge base, where the tip's resolution deviates from the clean auto-merge of its own parents. Bounded to a
+  handful of git calls, only when the tip is a merge, and none of them on the `lease`/`status`/`since` paths;
+  escape hatch `AGENTQ_LAND_NO_STALEBASE=1`, named in the refusal and journaled as `land-stale-base`. Suite:
+  `ps/tests/test-land-stale-base.ps1` - four fixtures (reverting branch refused and naming the path; a
+  legitimate merge of main allowed; an intentional deletion allowed; a real two-sided merge allowed), and
+  mutation-tested: disabling the check turns fixture A green, so it is not decorative.
+
 - MCP: the whole surface is reachable through the server, not only the daemon. 23 new tools - `agentq_since`/`_status`/`_run`/`_note`/`_break`/`_propose`/`_workspace`, `agentq_lease`/`_unlease`/`_land`/`_publish`/`_sweep`, `job_start`/`job_wait`/`job_list` and `cloud_submit`/`cloud_status`/`cloud_workspaces`/`cloud_suspend`/`cloud_resume`/`cloud_reset`/`cloud_log`/`cloud_result` - each wrapping the script a person would call, with named parameters, the script's own exit codes, and a required reason on the destructive ones. Spawning goes through the new `src/pws.ts` (argv arrays, captured pipes, `pwsh` with a `powershell.exe` fallback, a timeout that reports code 124). 30 tools in total; `buildMcpServer` is exported so a test can register against an in-memory transport.
 
 - `-Lane interactive|quick|gate|heavy|batch` and `-Priority` on `run` / run-build: waiters are ranked by priority with aging instead of strict FIFO.
@@ -16,7 +31,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq bump`, `agentq burst`, `agentq propose` overrides — reason required, journaled, rate-limited.
 - `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
 - Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
-- Config knobs in `agentq-config.json` (machineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
+- Config knobs in `agentq-config.json` (machineCap, gateMachineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
 - Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
 - Orchestrator stage 0 ([ADR 0009](docs/adr/0009-orchestrator-daemon-tasks-control-plane.md), tracker OQ-001 to OQ-012; details in [docs/orchestrator-stage-0.md](docs/orchestrator-stage-0.md)): chat keep-alive for slot leases, land pre-gate in the slot and a green ledger, admission by load and by owner presence, `agentq probe`, `prune` and `doctor`, more numbers in `agentq slo`, `hook-pre.ps1` installed from this repository, an installer that merges the config, and the suites in CI.
 - `git-autosync -ParkConflictingCommits` (fleet config `autosync.parkConflictingCommits`): a local commit
@@ -60,6 +75,61 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
 ### Fixed
+
+- **The install gate could be held for hours by a wedge, silently.** `ps/install.ps1` took
+  `Global\agentq-install-gate` and then printed nothing: on 2026-11-28 a holder left over from a shell whose
+  lease had expired 18 h earlier (2 h 40 m of wall-clock, 2.1 s of CPU) blocked three installs at once with no
+  line from any of them, and a holder that dies mid-hold leaves the mutex abandoned - every later install then
+  waited the full 45-minute cap and failed. The gate now writes `bin/agentq-install-gate.holder.json`
+  (`{pid, at, src}`) on acquire and removes it in `finally`, prints
+  `install gate: waiting up to N min - held by pid X since Y` BEFORE it waits (or `no holder published a
+  marker`), caps the wait at **12 min** instead of 45, reports how long it actually waited, and ACQUIRES an
+  abandoned mutex with a named line instead of stalling until the cap. `ps/tests/test-install.ps1` pins the
+  protocol in 8a-8g (45 checks, was 38).
+
+- **A change to `ps/install.ps1` widened the land gate to every suite.** The pool's global-input map treated
+  every mapped path as machinery, so an edit to the installer - which runs no suite itself - forced the full
+  pooled gate instead of selecting the handful of suites that declare it. Each global input is now classified
+  **HARNESS** (the runner, the suite table, the pool half, the selection module, this gate caller: a change
+  alters which suites exist or how they run, so it still widens to every suite and the refusal NAMES the file)
+  or **SCOPED** (`ps/install.ps1`: narrows to its declarers). `ps/tests/test-gate-input-selection.ps1` pins
+  both sides with a discriminating pair - the same synthetic change classified the two ways selects
+  differently.
+
+- **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
+  them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
+  gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,
+  `takeover chat`, `args comma`, `gate input selection` and `agentq timings` no matter what had actually
+  changed. The map now has **44 entries for the 44 suite names (0 missing, 0 extra)**, each pointing at the
+  module its suite actually drives, and the proof run reports `Proved=True run=2 skip=42`: **nine suites moved
+  from "always runs" to "skippable"**, measured per name by touching each glob and asserting the suite is
+  selected (`pass=18 fail=0`).
+
+- **`since` reaped dead tickets and ate the caller's lease-loss notice, although the brief calls it
+  READ-ONLY.** It ends in `Show-Status`, and it was not in the `$script:ReadOnly` set, so it ran as a working
+  verb: `Get-Live` dropped every dead ticket before `agentq sweep` could report it, and `Show-LeaseNotices` /
+  `Show-MessageNotices` consumed the notice the caller was supposed to see on its next working call. The verb
+  is the FIRST call of nearly every task boot, so the loss was fleet-wide and silent - and `Register-Agent`
+  already excluded `since`, i.e. the code was half-way to the documented contract. `since` is now in the
+  read-only set, which also stops it rewriting the machine capacity, sampling the adaptive cap, dropping an
+  expired burst and sampling the load probe. Session liveness is unchanged (line ~2674 renews the session for
+  `since` explicitly). Found by the new guard in `ps/tests/test-status-readonly.ps1`, not by reading the code:
+  the suite went 3 FAILED with the verb as it was and ALL PASS with it moved, on the same fixture.
+
+- **`agentq since` spawned git twice to do one log.** `rev-parse --abbrev-ref '@{u}'` existed only to pick the
+  NEXT spawn's argument, and its output was never printed. The log now asks git for the upstream itself
+  (`log '@{u}'`), with the `HEAD` fallback keeping the no-upstream case at the same two spawns as before, so
+  the change only ever removes one. Measured with a `git.cmd` shim first on PATH on the same fixture:
+  **4 spawns before, 3 after** (`rev-parse` to resolve the repo + `rev-parse --abbrev-ref '@{u}'` + `fetch` +
+  `log` -> `rev-parse` + `fetch` + `log`), with
+  byte-identical output in both the has-upstream and the no-upstream case.
+
+- A hung child in `ps/tests/test-lease-spawns.ps1` can no longer hang a gate. Every fixture child now has a
+  bounded wait (override `AGENTQ_TEST_CHILD_BOUND_SEC`); on timeout the child is KILLED, its stdout, stderr and
+  elapsed time are printed, the suite FAILS, and its `%TEMP%\aqspawn-*` tree is still removed (retried, and then
+  asserted gone). Before this, the suite produced no verdict for hours while the 15-minute re-lease wait was
+  live, so a red test looked like a wedged gate. Proven by pointing a child at `Start-Sleep 600`: 18 s to a red
+  verdict with the diagnostic, instead of a hang.
 
 - **Landing into the cloud pool waited the full three-minute staleness window on the first job after a
   suspend.** A resumed VM does not re-run its startup script, so a runner frozen across the suspend looks
@@ -169,6 +239,22 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Changed
 
+- **`landBatchMax` defaults to 3 (was 4): one holder absorbs up to TWO waiters.** With `agentq` in
+  `landBatch`, two extra 43-suite land gates (~11 min of pool wall-clock each) now fold into the holder's
+  single gate instead of running back to back, and the batch path and `Get-LandBatchSize` finally agree on one
+  literal. An explicit `landBatchMax` in `agentq-config.json` still wins (clamped 2..4);
+  `ps/tests/test-land-wait.ps1` pins the literal default AND proves both overrides, by loading only that
+  function's definition into its own scope with `Get-Config` and `Get-JournalFor` stubbed.
+
+- `agentq lease` resolves its result with one git spawn fewer per arm: `head` is taken from the repo
+  resolution's existing combined `rev-parse` (which now also asks for `--short HEAD`) instead of a second
+  `rev-parse` of its own. Measured in `ps/tests/test-lease-spawns.ps1` on the same slot in the same session:
+  **fresh 8 -> 7, reuse 4 -> 3**. `head` is the short HEAD of the repo the lease was resolved against: it is
+  display-only - no machine reader, and not a field of the on-disk lease record - but a caller that leases from
+  OUTSIDE a slot it already holds now sees its own HEAD there rather than that slot's. `Get-RepoInfo` also
+  decides "is this a repo" by the number of output lines rather than `$LASTEXITCODE`, because an unborn HEAD
+  makes the new directive exit 128 while still printing the lines it always printed.
+
 - `agentq status`, `log`, `metrics` and `doctor` only read the state folder; dead tickets are reaped by working verbs and by `sweep`.
 - The guard honours `sharedCloneMode` under Windows PowerShell 5.1 (it was ignored in the editor).
 - A chat that releases its own slot from a script file is recorded as the releasing chat (`byChat`); before, only an `unlease` typed in the command counted.
@@ -238,6 +324,9 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   must admit the same command, and a hand-written `queues\gate_machine\capacity` of 9 must be ignored
   (3 FAILED, exit 1) - while the floor-1 case stays green, so the arm is a semantic mutation, not a syntax
   break.
+- `gateMachineCap` is pinned explicitly in the shipped `agentq-config.json` (3, the value that was
+  previously only the code default), and `gate:machine` is listed in the README's resource list and in
+  `spec/acp-lock.md`'s resource conventions, so the resource is discoverable outside the source tree.
 
 ### Security
 
