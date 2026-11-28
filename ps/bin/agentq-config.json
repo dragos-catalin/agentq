@@ -138,6 +138,7 @@
       "shared commit",
       "publish",
       "lease liveness",
+      "lease chat",
       "land precheck",
       "land stale base",
       "land capacity",
@@ -170,6 +171,7 @@
       "agentq reclaim",
       "agentq approve",
       "takeover chat",
+      "recover",
       "args comma",
       "lease spawns",
       "text encoding"

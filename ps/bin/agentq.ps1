@@ -164,6 +164,10 @@ $TimingsExtra = @()
 $Wait = $false; $MaxMin = $null; $MaxMinGiven = $false
 # v2 (ADR 0001): slots/leases, release runs, landing (implemented in agentq-v2.ps1).
 $Slot = $null; $Role = $null; $WtPath = $null; $Branch = $null; $Onto = $null; $Gate = $null
+# (c) owner 2026-11-28: `land -WaitShare [-WaitShareMin n]` waits (bounded, 15 min default) for the fair
+# share to admit a land slot instead of refusing at once. The refusal itself is unchanged: on the bound it
+# is still exit 3, nothing queued and no ticket held. Opt-in, so a land without the flag behaves as before.
+$WaitShare = $false; $WaitShareMin = 15
 # -RebaseOnConflict (2026-11-23): a land pick conflict normally means "rebase the topic and land again",
 # but the merge is computed when the ticket reaches the head of the queue, so that advice cannot be
 # followed while the ticket is still queued. With this flag land rebases the topic onto origin/<onto> in
@@ -282,6 +286,9 @@ while ($i -lt $argv.Count) {
     'branch' { $Branch = & $next }
     'onto' { $Onto = & $next }
     'gate' { $Gate = & $next }
+    # (c) `land -WaitShare`: wait for the share to admit instead of refusing at once.
+    'waitshare' { $WaitShare = $true }
+    'waitsharemin' { $WaitShare = $true; $WaitShareMin = [double](& $next) }
     'rebaseonconflict' { $RebaseOnConflict = $true }
     'phase' { $Phase = & $next }
     'unsafe' { $Unsafe = $true }
@@ -932,17 +939,45 @@ function Get-FairShare {
 #       competing sessions) floored at 1. Over it: a bounded wait, then a refusal naming the held slots and
 #       both recipes.
 # $leases is a lease array (Read-Leases), $sess a session id, $taskCap the machine task-slot cap.
-function Get-SlotShare($leases, [string]$sess, [int]$taskCap) {
+function Get-SlotShare($leases, [string]$sess, [int]$taskCap, [string]$chat, [string]$repoFilter = '') {
   $fs = Get-FairShare
   $live = @($leases | Where-Object { $_ -and -not [bool](P $_ 'stale' $false) })
-  $sessions = @($live | ForEach-Object { "$(P $_ 'session' '')" } | Where-Object { $_ } | Sort-Object -Unique)
-  $held = @($live | Where-Object { "$(P $_ 'session' '')" -eq "$sess" }).Count
+  # (e) owner 2026-11-28 "charge lands per REPO, not across repos": WHAT IS CHARGED is not the same question as
+  # WHAT COMPETES. The divisor stays machine-wide ($units -> share, unchanged, so the machine task-slot budget
+  # is respected exactly as before); only the numerator ($held) narrows to one repo when the caller passes
+  # $repoFilter, and ONLY the land path does (a land can only ever take a slot of its own repo). Measured
+  # 2026-11-28: this window's chats held 12 leases across agentq/brivio/marcai/codai against a share of 4, so a
+  # land OF codai - which needed ONE codai scratch - was refused, billed for other repos' work. The task/scratch
+  # rental path passes '' and is byte-identical to before (no behaviour change for a lone session either way).
+  $charged = if ($repoFilter) { @($live | Where-Object { "$(P $_ 'repo' '')" -ceq "$repoFilter" }) } else { $live }
+  # D6 (owner 2026-11-28, proposal SHAREPERCHAT): the share KEY is the CHAT when the caller's chat id is
+  # known AND at least one live lease carries a chat binding, else the session (one VS Code window) exactly
+  # as before. The window key charged every chat of a window as ONE holder: measured 2026-11-28 this
+  # window's chats held 14 -> 17 slots against a share of 6 while each chat's own work was 1-2 slots, so a
+  # window with several chats could not land at all, and each attempt burned the cap-1 land ticket for
+  # 10 min before the refusal. A lease with NO chat binding is its own unit keyed by session: it still
+  # competes (it cannot be free), it simply cannot be charged to me. Chat mode is never entered on a guess -
+  # an unknown chat id falls back to the session, so a lone session keeps the old behaviour byte for byte.
+  $chat = "$chat"
+  $bound = @($live | Where-Object { @(P $_ 'chats' @()).Count -gt 0 }).Count
+  $chatMode = [bool]($chat -and $bound -gt 0)
+  $units = @()
+  foreach ($l in $live) {
+    if ($chatMode) {
+      $cs = @(P $l 'chats' @())
+      if ($cs.Count) { $units += @($cs) } else { $units += ('session:' + [string](P $l 'session' '')) }
+    } else { $units += [string](P $l 'session' '') }
+  }
+  $units = @(@($units | Where-Object { $_ }) | Sort-Object -Unique)
+  $held = if ($chatMode) { @($charged | Where-Object { @(P $_ 'chats' @()) -contains $chat }).Count } else { @($charged | Where-Object { "$(P $_ 'session' '')" -eq "$sess" }).Count }
   $pin = [int](P $fs 'slotsPerSession' 0)
-  $derived = [int][math]::Ceiling([double][math]::Max(0, [int]$taskCap) / [double][math]::Max(1, $sessions.Count))
+  $derived = [int][math]::Ceiling([double][math]::Max(0, [int]$taskCap) / [double][math]::Max(1, $units.Count))
   $share = if ($pin -gt 0) { $pin } else { [math]::Max(1, $derived) }
   [pscustomobject]@{
-    enabled = [bool]$fs.enabled; competing = ($sessions.Count -gt 1); sessions = $sessions.Count
+    enabled = [bool]$fs.enabled; competing = ($units.Count -gt 1); sessions = $units.Count
     held = [int]$held; share = [int]$share; slotsPerSession = $pin; taskCap = [int]$taskCap
+    mode = $(if ($chatMode) { 'chat' } else { 'session' }); chat = $chat
+    chargedIn = $repoFilter; chargedCount = @($charged).Count
   }
 }
 # (1) REUSE BEFORE RENTING: the CLEAN slot of $role this session already holds in $repoName, else $null.
@@ -960,48 +995,91 @@ function Get-SlotReuse([string]$repoName, [string]$role, [string]$slot) {
     # slot keeps the old wait-then-take-over path (nothing is lost).
     if ($slot -and "$(P $l 'slot' '')" -cne "$slot") { continue }
     if ("$(P $l 'role' '')" -ne "$role") { continue }
-    if ("$(P $l 'session' '')" -ne "$Session") { continue }
+    # D7 (owner 2026-11-28): OURS, not "the same session" - the whole point of the reuse is that a chat gets
+    # its OWN slot back, and its session id is NEW after a window reload. Test-LeaseOurs is the recovery
+    # predicate (my session, or my chat with the recorded owner host gone): a chat id is one conversation,
+    # and a lease another LIVE session holds is never ours.
+    if (-not (Test-LeaseOurs $l)) { continue }
     $p = Norm-Dir "$(P $l 'path' '')"
     if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
-    if (-not (Test-GitClean $p)) { continue }
-    Write-Journal @{ event = 'slot-reuse'; resource = "slot:${repoName}:$($l.slot)"; ticket = "$(P $l 'leaseId' '')"; session = $Session; role = $role; slot = "$($l.slot)"; repo = $repoName; purpose = "$(P $l 'purpose' '')" }
+    # D7: a slot my CHAT was working in (recorded owner host gone) is handed back AS IT IS, dirty tree
+    # included - that tree IS this conversation's own work, and a recovery that reset or refused it would be
+    # worse than renting a new slot. The cleanliness rule stays for every other reuse: handing a slot back
+    # while its holder is still writing in it would silently lose that work.
+    $recover = Test-LeaseChatMine $l
+    if (-not $recover -and -not (Test-GitClean $p)) { continue }
+    $jr = @{ event = 'slot-reuse'; resource = "slot:${repoName}:$($l.slot)"; ticket = "$(P $l 'leaseId' '')"; session = $Session; role = $role; slot = "$($l.slot)"; repo = $repoName; purpose = "$(P $l 'purpose' '')" }
+    if ($recover) { $jr.recovery = $true }
+    Write-Journal $jr
     return $l
   }
   $null
 }
 # (2) PER-SESSION SHARE: $null while this session may still rent, else the refusal text (journaled ONCE).
-function Test-SlotShareRefusal([string]$repoName, [string]$role) {
+function Test-SlotShareRefusal([string]$repoName, [string]$role, [switch]$PerRepo) {
   $fs = Get-FairShare
-  if (-not $fs.enabled) { return $null }
   if (-not (Get-Variable -Name SlotShareSaid -Scope Script -ErrorAction SilentlyContinue)) { $script:SlotShareSaid = $false }
   # NOTE the $cap local: the literal call below is pinned by test-agentq-slotshare.ps1 (A9), that IS the shape.
   $cap = [int](Get-TaskSlotBudget).cap
-  $sh = Get-SlotShare (Read-Leases $null) $Session $cap
+  # D6: ONE read of the all-repos view, each lease carrying its chat binding (Read-LeaseChat reads the
+  # sidecar only). A COPY, not Add-Member: Read-Leases memoizes its records in-process, so writing to them
+  # would leak a `chats` key into every other view that reads the same list (status -Json, the SLO report).
+  # The chat id is best effort - Get-ShareChatId returns $null for a call that is not under a live hook
+  # payload (a script, a scheduled task) and whenever the hook's candidate cannot be CONFIRMED against the
+  # per-chat registry (see its D6 note); '' then keys the share by session, exactly as before.
+  $all = @(Read-Leases $null | ForEach-Object { if ($_) { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } })
+  $chat = "$(Get-ShareChatId $all)"
+  $sh = Get-SlotShare $all $Session $cap $chat $(if ($PerRepo) { $repoName } else { '' })
+  # (a) owner 2026-11-28: an override that CHANGED THE OUTCOME is journaled - once per invocation, with the
+  # numbers it overrode. Without this AGENTQ_NO_FAIRSHARE leaves no trace anywhere, and a fleet where every
+  # caller quietly opts out looks exactly like a fleet with no contention. An override UNDER the share journals
+  # nothing (it overrode nothing), and the read above is the price of knowing which of the two happened: it is
+  # paid only while the override is set.
+  if (-not $fs.enabled) {
+    if (-not $script:SlotShareSaid -and $sh.competing -and $sh.held -ge $sh.share) {
+      $script:SlotShareSaid = $true
+      Write-Journal @{ event = 'fair-share-override'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; keyBy = $sh.mode; chat = $sh.chat; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; perRepo = [bool]$PerRepo; repo = $repoName; reason = "AGENTQ_NO_FAIRSHARE=1 admitted a call the share refused ($($sh.held)/$($sh.share) slot(s), $($sh.sessions) unit(s) competing)" }
+    }
+    return $null
+  }
   if (-not $sh.competing -or $sh.held -lt $sh.share) { return $null }
-  $mine = @(Read-Leases $null | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
+  # Who is "mine" follows the SAME key as `held`, or the message would name slots the refusal never counted.
+  $isMine = { param($l) if ($sh.mode -eq 'chat') { @(P $l 'chats' @()) -contains $chat } else { "$(P $l 'session' '')" -eq "$Session" } }
+  $mine = @($all | Where-Object { $_ -and -not $_.stale -and (& $isMine $_) })
+  # the message lists what was CHARGED, or it would name slots the refusal never counted
+  if ($PerRepo) { $mine = @($mine | Where-Object { "$(P $_ 'repo' '')" -ceq "$repoName" }) }
   # repo/slot, not the bare slot: this list is built from Read-Leases $null (EVERY repo), and the same
   # slot NAME lives in each repo (`codai/scratch-1` beside `marcai/scratch-1`), so a bare name read as one
   # duplicate lease held twice (the same 2026-11-27 display defect fixed in Show-SlotShare).
   $heldTxt = ($mine | ForEach-Object { "$($_.repo)/$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+  $keyTxt = if ($sh.mode -eq 'chat') { "chat $chat" } else { "session $Session" }
+  $unitTxt = if ($sh.mode -eq 'chat') { 'chats' } else { 'sessions' }
   if (-not $script:SlotShareSaid) {
     $script:SlotShareSaid = $true
-    Write-Journal @{ event = 'slot-fair-share'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; slots = @($mine | ForEach-Object { "$($_.slot)" }); repo = $repoName; reason = "this session already holds $($sh.held) slot(s); its share of the machine task cap $($sh.taskCap) is $($sh.share) while $($sh.sessions) sessions compete" }
+    Write-Journal @{ event = 'slot-fair-share'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; keyBy = $sh.mode; chat = $sh.chat; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; slots = @($mine | ForEach-Object { "$($_.slot)" }); repo = $repoName; reason = "this $keyTxt already holds $($sh.held) slot(s); its share of the machine task cap $($sh.taskCap) is $($sh.share) while $($sh.sessions) $unitTxt compete" }
   }
-  "this session ($Session) already holds $($sh.held) of the $($sh.sessions) competing sessions' share of $($sh.share) slot(s) (machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession)): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path. You may reuse a slot this session already holds; or give one back first: agentq unlease -Repo <path> -LeaseId <id>; or wait for another session to finish."
+  "this $keyTxt already holds $($sh.held) of the $($sh.sessions) competing $unitTxt' share of $($sh.share) slot(s) (machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession), keyed by $($sh.mode)): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path. You may reuse a slot this session already holds; or give one back first: agentq unlease -Repo <path> -LeaseId <id>; or wait for another $unitTxt to finish."
 }
 # The `SLOT SHARE` line of `status` (both halves of D5 in one line: the share and what it is derived from).
 function Show-SlotShare {
   $fs = Get-FairShare
   if (-not $fs.enabled) { Write-Output 'SLOT SHARE off (fairShare.enabled = false)'; return }
-  $leases = @(Read-Leases $null)
+  # D6: the status line shows the SAME key the refusal uses, or the two would disagree (the reader would see
+  # 17 held by the window while the refusal charged 1 to the chat). Copies, never Add-Member: Read-Leases
+  # memoizes its records in-process (see Test-SlotShareRefusal).
+  $leases = @(Read-Leases $null | ForEach-Object { if ($_) { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } })
   $cap = [int](Get-TaskSlotBudget).cap
-  $sh = Get-SlotShare $leases $Session $cap
-  $mine = @($leases | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
+  $chat = "$(Get-ShareChatId $leases)"
+  $sh = Get-SlotShare $leases $Session $cap $chat
+  $isMine = { param($l) if ($sh.mode -eq 'chat') { @(P $l 'chats' @()) -contains $chat } else { "$(P $l 'session' '')" -eq "$Session" } }
+  $mine = @($leases | Where-Object { $_ -and -not $_.stale -and (& $isMine $_) })
   # repo/slot, not the bare slot: the same slot NAME lives in every repo (`codai\scratch-1` next to
   # `marcai\scratch-1`), so a bare name made two sessions in different repos read as one duplicate lease
   # (2026-11-27: a "duplicate leases" report that was two repos, the display was the only thing wrong).
   $held = ($mine | ForEach-Object { " [$($_.repo)/$($_.slot) $(P $_ 'role' '')]" }) -join ''
-  Write-Output ("SLOT SHARE {0}{1} held by my session {2}{3}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) sessions compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (no other session competes)' }), $Session, $held)
+  $unitTxt = if ($sh.mode -eq 'chat') { 'chats' } else { 'sessions' }
+  $keyId = if ($sh.mode -eq 'chat') { $chat } else { $Session }
+  Write-Output ("SLOT SHARE {0}{1} held by my {2} {3}{4}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) $unitTxt compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (nothing else competes)' }), $sh.mode, $keyId, $held)
 }
 # Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one
 # session's block of five waiters cannot sit in front of another session's single waiter. Grouping
@@ -2221,10 +2299,23 @@ function Show-Status {
   $dirs = @($qidx.Keys)
   $rows = @()
   $landEta = @{}
+  # (b) owner 2026-11-28: a read verb must NEVER throw on ticket churn. A live `agentq status` died with
+  # "Could not find file '...\queues\gate_machine\00000119-*.json'" because the sample Get-QueueSample picked
+  # was claimed/reaped by another agent before the read - i.e. the ordinary, healthy case, not corruption.
+  # Re-pick a FRESH sample (up to 3 picks) and read through Read-JsonFile (retrying, returns $null instead of
+  # throwing); a resource that still fails is SKIPPED and COUNTED, and the count is printed below - never
+  # swallowed, because a silent skip is how a queue quietly disappears from the reader's view.
+  $churn = @()
   foreach ($k in $dirs) {
-    $sample = Get-QueueSample @($qidx[$k])
-    if (-not $sample) { continue }
-    $res = ([IO.File]::ReadAllText($sample.FullName) | ConvertFrom-Json -DateKind String).resource
+    $raw = $null
+    for ($a = 1; $a -le 3 -and -not $raw; $a++) {
+      $sample = Get-QueueSample @($qidx[$k])
+      if (-not $sample) { break }
+      $raw = Read-JsonFile $sample.FullName
+      if ($raw -is [string]) { $raw = $null }
+    }
+    if (-not $raw) { if ("$k") { $churn += "$k" }; continue }
+    $res = $raw.resource
     if (-not $All -and $repo -and $res -notmatch "(^|:)$([regex]::Escape($repo.Name))(:|$)" -and $res -notin 'build:machine', 'gate:machine') { continue }
     # B) the negative ledger for this land queue (branch -> {at,tree,reason}), read once per resource.
     $qmap = if ($res -like 'land:*') { Get-LandQuarantine (Get-ResourceRepo $res) } else { $null }
@@ -2342,6 +2433,8 @@ function Show-Status {
   if ($mine) { Write-Output ("== MINE session {0}: {1}" -f $Session, (($mine | ForEach-Object { "$($_.id) on $($_.resource)" }) -join '; ')) }
   else { Write-Output ("== MINE session {0}: no waiting ticket" -f $Session) }
   foreach ($b in $bursts) { Write-Output ("== BURST {0} +{1} until {2} by {3}: {4}" -f $b.resource, $b.by, $b.until, $b.session, $b.reason) }
+  # (b) 2026-11-28: a skipped resource is a fact about the fleet, not noise. One line, only when it happened.
+  if ($churn.Count) { Write-Output ("== QUEUE CHURN {0} resource(s) skipped: a sample vanished mid-read (re-picked up to 3x): {1}" -f $churn.Count, ($churn -join ', ')) }
   # Discoverability (2026-11-20): an agent that only ever reads `status` must still learn where the rest
   # of the tool is. One line, always last, never in -Json (that path returned above, parsers).
   Write-Output '== HELP every verb + group: agentq help | usage + example for one: agentq help <verb> (e.g. agentq help land)'
