@@ -19,6 +19,7 @@ pwsh -NoProfile -File "$b\job-start.ps1" -Label gate -File .copilot-tmp\gate.ps1
 
 # bounded wait (exit 0 DONE, 1 FAILED, 2 STALLED + diagnostics, 3 TIMEOUT = still running)
 pwsh -NoProfile -File "$b\wait-job.ps1" -JobId <id>
+pwsh -NoProfile -File "$b\wait-job.ps1" -Log <path> -Placement 'cloud:<ws>'   # a cloud-placed run: silence is not a stall
 pwsh -NoProfile -File "$b\wait-job.ps1" -Log <path> -Done 'RB_EXIT=|DONE|EXIT=' -Fail 'Traceback|BUILD FAILED' [-Pid <n>] [-MaxMin 10] [-StallMin 5] [-EveryS 15]
 pwsh -NoProfile -File "$b\wait-job.ps1" -Pid <n>
 
@@ -32,6 +33,11 @@ pwsh -NoProfile -File "$b\jobs.ps1" orphans [-Kill]
 
 - `-Done` / `-Fail` are pipe-separated **literal** substrings (ordinal). `^RB_EXIT` matches the text
   `^RB_EXIT`; it is not a regex. A line `EXIT=<n>` / `RB_EXIT=<n>` with n ≠ 0 means FAILED.
+- **A cloud-placed run is never STALLED.** When the placement is `cloud:<ws>` (an explicit `-Placement`,
+  or the job record's own `placement`), the run's real work is on a VM and its LOCAL log is silent by
+  construction, so silence is not a stall. `wait-job` says so explicitly (`cloud — NOT local: …`,
+  with the workspace heartbeat `state` from `agentq-cloud.ps1 -Status -Json`) and keeps waiting to the
+  bound. A local run's silence is unchanged (still STALLED/exit 2).
 - `-MaxMin` is capped at 10. STALLED prints the last 30 log lines, the pid's process tree with CPU
   seconds and working set, flags `Terminate batch job (Y/N)`, and shows `agentq status -All` when the
   log mentions a queue.

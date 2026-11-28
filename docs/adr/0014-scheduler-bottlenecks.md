@@ -169,6 +169,16 @@ numbers still agree. The **values are deliberately unchanged** (queue 6 / burst 
 them to one number decides which builds start, and that is the owner's scheduling policy, not a refactor.
 The row now reports honestly — see the two defects below.
 
+**D3 decided (2026-11-28): the floor is 12 GB.** The owner picked the conservative number: commit headroom,
+not free physical RAM, is what produced `memory allocation failed` with RAM free (`Test-FreeRam`'s own note).
+The three config keys that carry the floor — `minFreeCommitGB` and `machineCapAdaptive.minFreeRamGB` /
+`minFreeCommitGB` — are all 12 GB, and a `_why_memoryFloorGB` line in `agentq-config.json` records it. The
+`queue 6 / burst 12` pair is **not** config-driven: `$MinFreeGB` is a CODE default (`agentq.ps1`,
+`-MinFreeGB`, default 6) with no config reader (verified 2026-11-28 — adding a `minFreeGB` key to the config
+left the doctor's queue floor at 6) and the burst is its inline `× 2`, so the `machine-memory` row keeps
+reporting two floors until that default and the `× 2` are raised in code. Collapsing them is a code change,
+deliberately not made here.
+
 **D4 — per-session fair share.** Implemented in `Test-Admissible`, active only while **≥ 2 sessions
 compete** on a resource with **cap ≥ 2** (so a single session, or cap 1, behaves exactly as before):
 
