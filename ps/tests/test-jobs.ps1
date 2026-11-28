@@ -115,7 +115,12 @@ $reg = Get-Content $jf -Raw | ConvertFrom-Json
 Check 'registry has pid, pidStart, log, host, ownerPid, state running' ($reg.pid -gt 0 -and $reg.pidStart -and $reg.log.StartsWith("$cwd\.copilot-tmp\jobs\", [StringComparison]::OrdinalIgnoreCase) -and $reg.host -and $reg.ownerPid -gt 0 -and $reg.state -eq 'running') (($reg | ConvertTo-Json -Compress) + " cwd=$cwd")
 $lst = (& pwsh -NoProfile -File $jobs list -Json) | ConvertFrom-Json
 Check 'jobs list shows the running job' (@($lst | Where-Object { $_.id -eq $o.id -and $_.state -in 'running', 'starting' }).Count -eq 1) (($lst | ConvertTo-Json -Compress))
-$r = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60')
+# The bound below is a HANG GUARD, not a latency assertion, and it must clear a saturated machine's
+# spawn: measured 2026-11-28 on a box at 100 % CPU (300+ pwsh) this fixture's job was still `running`
+# at 60 s, which reddened four cascade checks here while CI was green. The pool runs this suite UNDER
+# contention, so the bound is 180 s - a wait returns the moment the registry says done, so a healthy
+# run pays nothing, and a job that truly never finishes still fails (just later).
+$r = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180')
 Check 'wait-job -JobId DONE' ($r.code -eq 0) "code=$($r.code) $($r.out)"
 Start-Sleep -Milliseconds 800
 $reg = Get-Content $jf -Raw | ConvertFrom-Json
@@ -131,17 +136,17 @@ Check 'jobs show prints json + tail' ($show -match '"label": "unit ok"' -and $sh
 # --- priority: the job's command runs below normal by default, so it yields to interactive work ------
 $pcmd = '"prio=" + (Get-Process -Id $PID).PriorityClass'
 $o = (& pwsh -NoProfile -File $start -Label 'prio default' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180'); Start-Sleep -Milliseconds 500
 $pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
 Check 'job command inherits BelowNormal priority by default' ($pl -match 'prio=BelowNormal') $pl
 $o = (& pwsh -NoProfile -File $start -Label 'prio normal' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Priority Normal -Json) | ConvertFrom-Json
-$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180'); Start-Sleep -Milliseconds 500
 $pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
 Check 'job-start -Priority Normal runs the command at Normal' ($pl -match 'prio=Normal') $pl
 
 # failing job -> failed + wait-job exit 1
 $o2 = (& pwsh -NoProfile -File $start -Label 'unit fail' -Command '"boom"; exit 7' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o2.id, '-EveryS', '0.3', '-MaxSec', '60')
+$r = Run-Wait @('-JobId', $o2.id, '-EveryS', '0.3', '-MaxSec', '180')
 Start-Sleep -Milliseconds 800
 $reg2 = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o2.id).json") -Raw | ConvertFrom-Json
 Check 'failing job: wait-job FAILED and registry failed/7' ($r.code -eq 1 -and $reg2.state -eq 'failed' -and $reg2.exitCode -eq 7) "code=$($r.code) state=$($reg2.state) exit=$($reg2.exitCode)"
@@ -149,11 +154,11 @@ Check 'failing job: wait-job FAILED and registry failed/7' ($r.code -eq 1 -and $
 # -File mode with args
 # a job that PRINTS 'EXIT=0' mid-run must not end a -JobId wait (completion comes from the registry)
 $o5 = (& pwsh -NoProfile -File $start -Label 'unit echo' -Command '"EXIT=0"; "DONE"; Start-Sleep 4; "really finished"' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o5.id, '-EveryS', '0.3', '-MaxSec', '60')
+$r = Run-Wait @('-JobId', $o5.id, '-EveryS', '0.3', '-MaxSec', '180')
 Check 'wait-job -JobId ignores EXIT=/DONE printed by the job itself' ($r.code -eq 0 -and (Get-Content $o5.log -Raw) -match 'really finished' -and $r.out -match 'finished \(exit 0\)') "code=$($r.code) $($r.out)"
 $scr = Join-Path $cwd 'echo.ps1'; Set-Content -LiteralPath $scr -Value 'param($a, $b) "args=$a,$b"'
 $o3 = (& pwsh -NoProfile -File $start -Label 'unit file' -File $scr -Cwd $cwd -ExpectedMin 1 -Json x1 'y 2') | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o3.id, '-EveryS', '0.3', '-MaxSec', '60')
+$r = Run-Wait @('-JobId', $o3.id, '-EveryS', '0.3', '-MaxSec', '180')
 Check 'job-start -File with args' ($r.code -eq 0 -and (Get-Content $o3.log -Raw) -match 'args=x1,y 2') "code=$($r.code)"
 
 # --- jobs kill + SUSPECT/DEAD computed states --------------------------------------------------------
@@ -278,7 +283,9 @@ $env:AGENTQ_GIT_AUTOSYNC = $fakeDaemon
 $d = (& pwsh -NoProfile -File $sync -Once -DryRun) -join ' '
 $body = Get-Content $env:AGENTQ_SYNC_DUMP -Raw | ConvertFrom-Json
 $sj = @($body.jobs | Where-Object { $_.id -eq $o.id })
-$keys = 'id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,startedAt,endedAt,lastOutputAt,log' -split ','
+# placement names where the job ran (cloud:<ws> / local / an empty string that must NOT be read as
+# local). It is part of the frozen sync contract since 2026-11-25, so the exact-field check owns it.
+$keys = 'id,label,command,cwd,repo,host,placement,pid,state,exitCode,expectedMin,startedAt,endedAt,lastOutputAt,log' -split ','
 Check 'agentq-sync -DryRun counts jobs' ($d -match 'jobs=\d+') $d
 Check 'sync jobs[] entry has exactly the contract fields' ($sj.Count -eq 1 -and -not (Compare-Object $keys @($sj[0].PSObject.Properties.Name))) (($sj | ConvertTo-Json -Compress))
 Check 'sync jobs[] carries computed state (dead/suspect)' (@($body.jobs | Where-Object { $_.id -eq $deadId -and $_.state -eq 'dead' }).Count -eq 1)
