@@ -29,6 +29,22 @@ $script:AgentqTrackModuleRoot = $PSScriptRoot
 $script:AgentqTrackExit = 0
 
 function Get-AgentqTrackCliPath {
+    # TWO shapes, one rule. Installed, the module sits in <dst>\bin (one level under the install root,
+    # where ~\.copilot is the root), so two levels up leaves the tree entirely - `C:\Users\<user>\tools`
+    # instead of `<dst>\tools`. The tool is therefore looked for
+    #   1. BESIDE the module - ps\bin\track.mjs in a checkout, <dst>\bin\track.mjs once installed, which
+    #      is the same place agentq-store.mjs and agentq-slo.mjs already live - and
+    #   2. at the repository root, tools\track.mjs, where the canonical copy lives in a checkout.
+    # Order matters: an installed engine must never depend on a checkout being present, and a checkout
+    # copy must not shadow the installed one. The candidate is built from AgentqTrackModuleRoot, not
+    # $PSScriptRoot: that variable is the module's own directory by definition, and a caller (the tracker
+    # suite's mutation harness) may re-point it at the module's real directory while the code runs from a
+    # copy in %TEMP%. Reading $PSScriptRoot there looked for track.mjs in %TEMP% and reported "store not
+    # found" - a mutation control that fails for the wrong reason is worse than no control.
+    # The fallback is returned even when neither exists, so the caller's error names the path a reader can
+    # actually find and edit.
+    $sibling = Join-Path $script:AgentqTrackModuleRoot 'track.mjs'
+    if (Test-Path -LiteralPath $sibling) { return $sibling }
     $root = Split-Path -Parent (Split-Path -Parent $script:AgentqTrackModuleRoot)
     Join-Path (Join-Path $root 'tools') 'track.mjs'
 }

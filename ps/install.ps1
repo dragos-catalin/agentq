@@ -188,6 +188,16 @@ $map = [ordered]@{
   # ticket (it owns a real console, which is exactly what `rules-ticket.ps1 -Issue` requires).
   'bin\agentq-approve.ps1' = 'bin\agentq-approve.ps1'
   'bin\agentq-approve-gui.ps1' = 'bin\agentq-approve-gui.ps1'
+  # 2026-11-28 (tracking/resume slice): the module agentq.ps1 dot-sources for `trackers|plan|task`, the
+  # hook that injects the plan record on a new user prompt, and their two suites. The module resolves its
+  # CLI as <install root>\tools\track.mjs, and track.mjs imports tracker-lint.mjs beside it, so a missing
+  # tools entry kills the verb on a missing import while the checkout still looks complete.
+  'bin\agentq-trackers.ps1' = 'bin\agentq-trackers.ps1'
+  # The hook itself: without this line the module and its suites install and the resume hook never does,
+  # so the installed suite went red looking for a file nobody shipped (found 2026-11-28).
+  'hooks\user-prompt-resume.ps1' = 'hooks\user-prompt-resume.ps1'
+  'tests\test-agentq-trackers.ps1' = 'bin\test-agentq-trackers.ps1'
+  'tests\test-user-prompt-resume.ps1' = 'bin\test-user-prompt-resume.ps1'
   'tests\test-agentq-approve.ps1' = 'bin\test-agentq-approve.ps1'
   # 2026-11-21: `agentq run` runs its child at the resolved repo root when the caller is OUTSIDE the
   # repo, and keeps the caller's nested directory when INSIDE (commit 37fdf67, "a brand-new slot
@@ -365,7 +375,26 @@ foreach ($k in $map.Keys) {
   if ($k -eq $cfgKey -and (Test-Path $b)) { if ($null -ne (Get-MergedConfig $a $b)) { $drift += $k }; continue }
   if (-not (Test-Path $b) -or (Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash) { $drift += $k }
 }
-if ($Check) { if ($drift) { "DRIFT: $($drift -join ', ')"; exit 1 }; 'in sync'; exit 0 }
+# Two files the tracking verbs need live OUTSIDE ps\: tools\track.mjs, and the tools\tracker-lint.mjs it
+# imports, sit at the REPOSITORY root. That is where ps\bin\agentq-trackers.ps1 finds them in a checkout,
+# but the installed module looks beside itself, so they are installed to <dst>\bin - the same place
+# agentq-store.mjs and agentq-slo.mjs already live. The map cannot carry them: every map source must
+# exist under ps\, which is exactly what this installer's own suite copies into a throwaway tree. So they
+# get this explicit arm, kept out of $map (the manifest count is pinned to that map) and out of $drift
+# (whose ordering step indexes $map). A source that is absent is SKIPPED in silence - the suite's
+# snapshot legitimately lacks the repository root, and a warning there would read as a defect.
+$outMap = [ordered]@{ '..\tools\track.mjs' = 'bin\track.mjs'; '..\tools\tracker-lint.mjs' = 'bin\tracker-lint.mjs' }
+$outDrift = @()
+foreach ($k in $outMap.Keys) {
+  $a = Join-Path $src $k
+  if (-not (Test-Path -LiteralPath $a)) { continue }
+  $b = Join-Path $dst $outMap[$k]
+  if (-not (Test-Path -LiteralPath $b) -or (Get-FileHash -LiteralPath $a).Hash -ne (Get-FileHash -LiteralPath $b).Hash) { $outDrift += $k }
+}
+if ($Check) {
+  if ($drift -or $outDrift) { "DRIFT: $((@($drift) + @($outDrift | ForEach-Object { "out:$_" })) -join ', ')"; exit 1 }
+  'in sync'; exit 0
+}
 if (-not $SkipTests) {
   if ($RepoSuites -and $Suites) { throw 'install: pass either -Suites or -RepoSuites, not both' }
   # Serialize with other installs (2026-11-25). Three installs ran the FULL suite at once, each with
@@ -472,6 +501,17 @@ foreach ($k in $drift) {
   Unblock-File -LiteralPath $b -ErrorAction SilentlyContinue
   "installed $($map[$k])"
 }
+# The out-of-map tools, same atomic replace and the same backup rule. They go LAST on purpose: the module
+# agentq.ps1 dot-sources is already in place above, so an agentq call in the gap between them cannot see a
+# module without its tool.
+foreach ($k in $outDrift) {
+  $a = Join-Path $src $k; $b = Join-Path $dst $outMap[$k]
+  if (Test-Path -LiteralPath $b) { $t = Join-Path $bk $outMap[$k]; New-Item -ItemType Directory -Force (Split-Path $t) | Out-Null; Copy-Item $b $t }
+  New-Item -ItemType Directory -Force (Split-Path $b) | Out-Null
+  Copy-Item $a "$b.new" -Force; Move-Item "$b.new" $b -Force
+  Unblock-File -LiteralPath $b -ErrorAction SilentlyContinue
+  "installed $($outMap[$k])"
+}
 # What was installed, for `agentq doctor` (a hand edit of an installed file shows up as a hash mismatch).
 $files = [ordered]@{}
 foreach ($k in $map.Keys) { if ($k -ne $cfgKey) { $files[$map[$k]] = (Get-FileHash -LiteralPath (Join-Path $dst $map[$k]) -Algorithm SHA256).Hash } }
@@ -480,7 +520,7 @@ $dirty = [bool]@(& git -C $src status --porcelain -- . 2>$null | Where-Object { 
 $manifest = [ordered]@{ src = $src; sha = $sha; dirty = $dirty; at = [DateTime]::UtcNow.ToString('o'); files = $files }
 $mf = Join-Path $dst 'bin\agentq-install.json'
 [IO.File]::WriteAllText("$mf.new", ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false)); Move-Item "$mf.new" $mf -Force
-if ($env:AGENTQ_INSTALL_DIR) { "install: $($drift.Count) file(s) into $dst; backup in $bk"; exit 0 }
+if ($env:AGENTQ_INSTALL_DIR) { "install: $($drift.Count + $outDrift.Count) file(s) into $dst; backup in $bk"; exit 0 }
 # The sync loop is a long-running process: it keeps running the OLD code until restarted (2026-10-12).
 if ($drift | Where-Object { $_ -in 'bin\agentq-sync.ps1', 'bin\agentq-probe.ps1', 'bin\agentq-jobs-lib.ps1' }) {
   try {

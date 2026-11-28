@@ -199,6 +199,12 @@ $suites = [ordered]@{
   #  - args comma: `pwsh -File agentq.ps1 -Repo a,b` binds ONE comma-containing string, so a filter built
   #    from it matches nothing and reads as "no such work"; the single-value parameters now refuse it.
   'args comma'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-args-comma.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-28 (tracking/resume slice): the module's suite dot-sources ps/bin/agentq-trackers.ps1 and
+  # compares it BYTE-FOR-BYTE with `node tools/track.mjs` (so a reimplementation cannot pass), and the
+  # hook's suite pins the plan injection on a new user prompt. Both are mapped in install.ps1 in the same
+  # slice - 'install wiring' pins the two lists, so a suite the installed gate cannot run is impossible.
+  'trackers'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-trackers.ps1'))
+  'resume hook'     = @('-File', (Join-Path $PSScriptRoot 'test-user-prompt-resume.ps1'))
   'commit fast'     = @('-File', (Join-Path $PSScriptRoot 'test-agentq-commit-fast.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'fair share'      = @('-File', (Join-Path $PSScriptRoot 'test-agentq-fairshare.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   # 2026-11-26 (D5, ADR 0014): the slot-side twin of the queue's fair share - REUSE BEFORE RENTING a clean

@@ -62,7 +62,10 @@ function ModuleRun([string]$Verb, [string[]]$TrackArgs) {
 
 try {
     # ---- 0. the root is resolved, not hardcoded ----------------------------------------------------
-    Check '0 the CLI path is <repo>\tools\track.mjs and exists' ((Test-Path -LiteralPath $cli) -and $cli -like '*\tools\track.mjs') $cli
+    # Shape-agnostic on purpose: the module resolves the tool BESIDE itself (<dst>\bin\track.mjs once
+    # installed, which is where run-all.ps1 runs this suite too) or at the repository root
+    # (<repo>\tools\track.mjs in a checkout). Pinning one layout made the installed gate red.
+    Check '0 the CLI path is a resolved track.mjs that exists' ((Test-Path -LiteralPath $cli) -and (Split-Path -Leaf $cli) -eq 'track.mjs') $cli
 
     # ---- 1. trackers == `node track.mjs status` ----------------------------------------------------
     $d = DirectRun @('status'); $m = ModuleRun 'trackers' @()
