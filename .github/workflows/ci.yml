@@ -45,7 +45,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          # FULL history on purpose, not the default fetch-depth: 1: suite "autosync wip snapshot" builds
+          # its mutation control from the parent of the commit that introduced Save-LocalSnapshot
+          # (`git log -S` over ps/bin/git-autosync.ps1). A shallow checkout hides that commit, so the
+          # control could not run and the suite was red on every run while the fix it guards was fine
+          # (2026-11-27). The repo is small; the full fetch costs a few seconds.
+          fetch-depth: 0
           persist-credentials: false
       # flakes, store and slo are node scripts; store needs node:sqlite (Node 22.5 or newer).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

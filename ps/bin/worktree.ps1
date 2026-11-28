@@ -131,13 +131,35 @@ $WtRoot = if ($env:CODAI_WT_ROOT) { $env:CODAI_WT_ROOT } else { 'E:\gh\.wt' }
     $null
   }
 $script:ProcLines = $null
-function Test-InUseByProcess([string]$p) {
+$script:ProcListError = $null
+function Get-ProcLineMap {
   # Exclude this process: its own command line carries `-Path <wt>` and would always match.
-  if ($null -eq $script:ProcLines) { $script:ProcLines = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -ne $PID } | ForEach-Object { "$($_.CommandLine)$($_.ExecutablePath)" } | Where-Object { $_ }) }
+  if ($null -ne $script:ProcLines) { return $script:ProcLines }
+  try {
+    $script:ProcLines = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID } | ForEach-Object { "$($_.CommandLine)$($_.ExecutablePath)" } | Where-Object { $_ })
+    # An empty result without an exception is the same lie as a swallowed one: it is read as "no process
+    # references this slot". A real machine always has processes, so zero rows means the query degraded.
+    if ($script:ProcLines.Count -eq 0) { $script:ProcListError = 'Get-CimInstance Win32_Process returned no rows' }
+  } catch {
+    # FAIL CLOSED. Deleting a slot on a guess loses work that only a ref makes recoverable; keeping one
+    # costs disk. This read used to be -ErrorAction SilentlyContinue, so a failed CIM query (busy runner,
+    # WMI hiccup) produced an EMPTY list - "no process references this slot" for every slot - and a slot
+    # whose process was very much alive got parked (GitHub runner 2026-11-27, suite "worktree v2":
+    # 'park: slot with a live process is never removed'). An unreadable process table now means IN USE.
+    $script:ProcListError = $_.Exception.Message
+    $script:ProcLines = @()
+  }
+  return $script:ProcLines
+}
+function Test-InUseByProcess([string]$p) {
+  $lines = @(Get-ProcLineMap)
+  if ($script:ProcListError) { return $true }
   $needles = @($p, $p.Replace('\', '/'))
-  foreach ($l in $script:ProcLines) { foreach ($n in $needles) { if ($l.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } } }
+  foreach ($l in $lines) { foreach ($n in $needles) { if ($l.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } } }
   return $false
 }
+# One wording for the one situation, so a report never claims to have seen a process it could not look for.
+function InUseReason([string]$base) { if ($script:ProcListError) { "the process table could not be read ($($script:ProcListError)) - treated as in use" } else { $base } }
 
 function Get-MainRoot([string]$dir) {
   $common = git -C $dir rev-parse --path-format=absolute --git-common-dir 2>$null
@@ -193,7 +215,7 @@ function Get-Assessment($wt, [string]$main) {
     catch [System.IO.IOException] { $r.Reason = 'deploy slot lock held (deploy running)'; return [pscustomobject]$r }
   }
   if ($null -ne $r.IdleHours -and $r.IdleHours -lt $OlderThanHours) { $r.Reason = "active $($r.IdleHours)h ago (< $OlderThanHours h)"; return [pscustomobject]$r }
-  if (Test-InUseByProcess $wt.Path) { $r.Reason = 'a running process references this path'; return [pscustomobject]$r }
+  if (Test-InUseByProcess $wt.Path) { $r.Reason = (InUseReason 'a running process references this path'); return [pscustomobject]$r }
   # Standard slots are reused, not deleted: release/land always kept; task/pinned after 7 days idle.
   $leaf = Split-Path -Leaf $wt.Path
   $role = Get-SlotRoleLocal (Split-Path -Leaf $main) $leaf
@@ -221,7 +243,10 @@ function Get-ParkDecision($wt, [string]$main, [double]$IdleDays) {
   $d.IdleHours = Get-WtIdleHours $wt.Path
   if ($null -eq $d.IdleHours) { $d.Reason = 'idle unknown'; return [pscustomobject]$d }
   if ($d.IdleHours -lt ($IdleDays * 24)) { $d.Reason = "idle $($d.IdleHours) h (< $([math]::Round($IdleDays * 24, 1)) h)"; return [pscustomobject]$d }
-  if (Test-InUseByProcess $wt.Path) { $d.Reason = 'a running process references this path'; return [pscustomobject]$d }
+  if (Test-InUseByProcess $wt.Path) {
+    $d.Reason = (InUseReason 'a running process references this path')
+    return [pscustomobject]$d
+  }
   $d.Park = $true
   $d.Reason = "$($tracked.Count) tracked / $($untracked.Count) untracked change(s), idle $($d.IdleHours) h"
   return [pscustomobject]$d
@@ -377,7 +402,7 @@ function Get-OrphanDirs([string]$main) {
     $o = [ordered]@{ Path = $d.FullName; IdleHours = $idle; Removable = $false; Reason = '' }
     if ($unique.Count) { $o.Reason = "orphan, $($unique.Count)+ file(s) not on $upstream (e.g. $($unique[0]))" }
     elseif ($idle -lt $OlderThanHours) { $o.Reason = "orphan, active $idle h ago (< $OlderThanHours h)" }
-    elseif (Test-InUseByProcess $d.FullName) { $o.Reason = 'orphan, a running process references this path' }
+    elseif (Test-InUseByProcess $d.FullName) { $o.Reason = (InUseReason 'orphan, a running process references this path') }
     else { $o.Removable = $true; $o.Reason = "orphan ($note, all on $upstream), idle" }
     $out += [pscustomobject]$o
   }
@@ -428,7 +453,7 @@ switch ($Action) {
         $inRoot = ([IO.Path]::GetFullPath($wt.Path).ToLowerInvariant()).StartsWith(([IO.Path]::GetFullPath((Join-Path $WtRoot $repoName)).TrimEnd('\') + '\').ToLowerInvariant())
         if ($inRoot -and (Get-SlotRoleLocal $repoName $leaf)) { continue }   # standard slot: prune's job
         $holder = Get-LeaseHolder $wt.Path
-        $why = if ($holder) { "LEASED by $holder" } elseif ($wt.Locked) { 'locked' } elseif (-not (Test-Path -LiteralPath $wt.Path)) { '' } elseif (Test-InUseByProcess $wt.Path) { 'a running process references it' } else { $null }
+        $why = if ($holder) { "LEASED by $holder" } elseif ($wt.Locked) { 'locked' } elseif (-not (Test-Path -LiteralPath $wt.Path)) { '' } elseif (Test-InUseByProcess $wt.Path) { (InUseReason 'a running process references it') } else { $null }
         if ($null -eq $why) {
           $ct = git -C $wt.Path log -g -1 --format=%ct 2>$null
           $idle = if ($ct) { ((Get-Date) - [DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours } else { 999 }
@@ -557,7 +582,7 @@ switch ($Action) {
         $a = Get-Assessment $wt $main
         if ($a.Removable) { continue }   # prune handles clean+pushed+idle ones
         $blocking = $a.Reason -match '^(active|deploy slot lock|a running process)'
-        if (-not $blocking -and (Test-InUseByProcess $wt.Path)) { $blocking = $true; $a.Reason = 'a running process references this path' }
+        if (-not $blocking -and (Test-InUseByProcess $wt.Path)) { $blocking = $true; $a.Reason = (InUseReason 'a running process references this path') }
         if ($blocking) { $waiting++; Write-Host ("wait    {0,-55} {1}" -f $wt.Path, $a.Reason); continue }
         $name = ((Split-Path -Leaf $wt.Path).TrimStart('.') -replace "^$([regex]::Escape($repoName))-", '' -replace '-wt$', '')
         if (-not $name) { $name = 'wt' }
