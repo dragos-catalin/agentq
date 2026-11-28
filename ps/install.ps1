@@ -132,6 +132,11 @@ $map = [ordered]@{
   # the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
   'tests\test-agentq-orphan-broken-slot.ps1' = 'bin\test-agentq-orphan-broken-slot.ps1'
   'tests\test-agentq-admission.ps1' = 'bin\test-agentq-admission.ps1'; 'tests\test-status-readonly.ps1' = 'bin\test-status-readonly.ps1'
+  # 2026-11-28 (round 4): sat-report.ps1 and its classifier suite were in NEITHER list, so the suite ran
+  # nowhere and could not fail. It resolves its subject as `$PSScriptRoot\..\bin\sat-report.ps1`, which is
+  # exactly the installed layout once both are mapped to bin\. Paired with the run-all.ps1 entry in this
+  # same commit - 'install wiring' pins the two (it failed on all three of its checks before this line).
+  'bin\sat-report.ps1' = 'bin\sat-report.ps1'; 'tests\test-sat-report.ps1' = 'bin\test-sat-report.ps1'
   # 2026-11-27: the machine-wide gate bound (gate:machine) - the bound, its config knob, its floor and
   # its separation from build:machine. Paired with the run-all.ps1 entry in this same commit - 'install
   # wiring' pins the two, so a suite the installed gate cannot run is impossible.

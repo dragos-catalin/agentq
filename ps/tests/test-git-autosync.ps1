@@ -26,7 +26,11 @@ $env:GIT_AUTOSYNC_MUTEX = 'Local\gas-test-' + [guid]::NewGuid().ToString('N')
 $env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'core.safecrlf'; $env:GIT_CONFIG_VALUE_0 = 'false'
 $env:GIT_AUTHOR_NAME = 't'; $env:GIT_AUTHOR_EMAIL = 't@t'; $env:GIT_COMMITTER_NAME = 't'; $env:GIT_COMMITTER_EMAIL = 't@t'
 $fail = 0
-function Ok([bool]$c, [string]$m) { if ($c) { "PASS $m" } else { "FAIL $m"; $script:fail++ } }
+function Ok([bool]$c, [string]$m, [string]$d = '') {
+  # $d is printed only on failure: a red line that does not carry the value it judged cannot be acted on
+  # from a CI log (the 13 -Doctor failure on 2026-11-27 said only that the code was not 0 or 3).
+  if ($c) { "PASS $m" } elseif ($d) { "FAIL $m`n        $d"; $script:fail++ } else { "FAIL $m"; $script:fail++ }
+}
 function W([string]$f, [string]$t) { [IO.File]::WriteAllText($f, $t) }
 function Fresh {
   $o = Join-Path $root ("o" + [guid]::NewGuid().ToString('N').Substring(0, 6)); git init -q --bare -b main $o
@@ -263,9 +267,29 @@ Ok ($keys -contains 'ghost2') '12 single-repo run kept the other keys'
 # 13 -Doctor must never crash and must print a verdict (exit 0 ok/warn, 3 problem - both accepted, the
 #    task may legitimately not be installed on the machine running the suite); -Explain is read-only.
 $r = Fresh; Push-B $r 'x.txt' "d`n"
-$doc = (& pwsh -NoProfile -Command "& '$tool' -Repo '$($r.a)' -Doctor" 2>&1 | Out-String); $docRc = $LASTEXITCODE
-Ok ($docRc -in @(0, 3)) '13 -Doctor exits 0 or 3'
+# -File, NOT -Command "& '<script>'": a script that calls `exit 3` reaches the caller as exit code 1 through
+# the -Command wrapper (measured 2026-11-28 on pwsh 7: same script, -File -> 3, -Command -> 1, while an
+# `exit 0` script gives 0 both ways). So this assertion used to be unfalsifiable for the one verdict it
+# exists to accept: on a machine where the doctor legitimately reports FAIL - the hosted runner, which has no
+# scheduled task - the code arrived as 1 and the suite was red on main with nothing wrong with the tool.
+$doc = (& pwsh -NoProfile -File $tool -Repo $r.a -Doctor 2>&1 | Out-String); $docRc = $LASTEXITCODE
+Ok ($docRc -in @(0, 3)) '13 -Doctor exits 0 or 3' "rc=$docRc; tail: $(($doc -split "`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | ')"
 Ok ($doc -match 'DOCTOR:') '13 -Doctor prints a verdict line'
+# 13g MUTATION on the guard itself: a crash inside the report path must still come out as a verdict.
+#     The copy below is the real tool with the one line that computes the report forced to throw. Without
+#     the try/catch in git-autosync.ps1 this exits 1 with no DOCTOR line - which is what the hosted runner
+#     reported; with it, the failure is REPORTED (exit 3) instead of being a mystery exit code.
+$crashCopy = Join-Path $root 'doctor-crash.ps1'
+$srcText = Get-Content -LiteralPath $tool -Raw
+$forced = $srcText -replace [regex]::Escape('try { $d = Invoke-AutosyncDoctor }'), "try { throw 'forced doctor failure' }"
+if ($forced -ceq $srcText) {
+  Ok $false '13g a doctor crash is reported, not a crash code' 'the copy could not be mutated (the line that computes the report changed) - this control would be vacuous'
+} else {
+  [IO.File]::WriteAllText($crashCopy, $forced)
+  $crashDoc = (& pwsh -NoProfile -File $crashCopy -Repo $r.a -Doctor 2>&1 | Out-String); $crashRc = $LASTEXITCODE
+  $crashWhy = "rc=$crashRc; tail: $(($crashDoc -split "`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | ')"
+  Ok (($crashRc -in @(0, 3)) -and ($crashDoc -match 'DOCTOR:') -and ($crashDoc -match 'forced doctor failure')) '13g a crash inside the report becomes a verdict, never a crash code' $crashWhy
+}
 $hBefore = (git -C $r.a rev-parse HEAD)
 $ex = (& pwsh -NoProfile -Command "& '$tool' -Explain '$($r.a)'" 2>&1 | Out-String)
 Ok ($ex -match 'explain .*(read-only)') '13 -Explain prints its banner'

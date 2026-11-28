@@ -230,6 +230,33 @@ try {
   Remove-Item Env:AGENTQ_NO_HOOK_COST
   Ok ((Compare-Object $with $without).Count -eq 0) 'cost log on vs off: decision, exit code and stdout are identical for allow / hard deny / rules-surface deny / CLI deny' (($with + '---' + $without) -join "`n")
   Ok (@(Cost-Lines).Count -eq $n0 + $probe.Count) 'AGENTQ_NO_HOOK_COST=1 writes no line (and with it on, exactly one per call)' "now=$(@(Cost-Lines).Count) expected=$($n0 + $probe.Count)"
+  # ROUND 4 (2026-11-28): the ledger named only the VS Code TOOL, so a day file could hold 10 463
+  # run_in_terminal rows and still not answer what an agentq `status` costs beside a `land`. The verb is
+  # now recorded for the tools that run a command. One case per shape that MUST be recognised, and the
+  # negatives that must stay EMPTY - a field that guesses is worse than one that is absent.
+  $verbCases = @(
+    @{ n = 'verb directly after the installed script path'; c = 'pwsh -NoProfile -File C:\Users\x\.copilot\bin\agentq.ps1 since -Hours 4'; w = 'since' },
+    @{ n = 'verb after the repo script path'; c = 'pwsh -File E:\gh\agentq\ps\bin\agentq.ps1 status -All'; w = 'status' },
+    @{ n = 'a QUOTED script path (escaped quotes in the payload)'; c = 'pwsh -NoProfile -File "C:\bin\agentq.ps1" lease -Role scratch'; w = 'lease' },
+    @{ n = 'the -v2 copy'; c = 'pwsh -File .\ps\bin\agentq-v2.ps1 land -Branch x'; w = 'land' },
+    @{ n = 'the node entry point'; c = 'node dist/cli.mjs log --tail 20'; w = 'log' },
+    @{ n = 'uppercase is normalised'; c = 'pwsh -File C:\bin\agentq.ps1 SINCE'; w = 'since' },
+    @{ n = 'a command of another tool leaves it empty'; c = 'git status --porcelain'; w = '' },
+    @{ n = 'naming the script without running a verb leaves it empty'; c = 'Get-Item E:\gh\agentq\ps\bin\agentq.ps1'; w = '' },
+    @{ n = 'a flag before the verb is not guessed through'; c = 'pwsh -File C:\bin\agentq.ps1 -Purpose x land'; w = '' }
+  )
+  foreach ($vc in $verbCases) {
+    [void](Invoke-Hook ($vs + @{ tool_name = 'run_in_terminal'; tool_input = @{ command = $vc.c } }))
+    $got = [string](@(Cost-Lines) | Select-Object -Last 1).verb
+    Ok ($got -eq $vc.w) ("cost log: verb recorded for " + $vc.n) ("got='$got' want='$($vc.w)'")
+  }
+  # A read tool has no command in its payload; the field must still exist, empty.
+  [void](Invoke-Hook ($vs + @{ tool_name = 'read_file'; tool_input = @{ filePath = "$plain\README.md" } }))
+  $readVerb = @(Cost-Lines) | Select-Object -Last 1
+  Ok ($readVerb.tool -eq 'read_file' -and [string]$readVerb.verb -eq '') 'cost log: a tool that runs no command carries the field, empty (never a guess)' ($readVerb | ConvertTo-Json -Compress)
+  # One shape for every parser: sat-report.ps1 / agentq-slo.mjs read this file by regex, so a line
+  # WITHOUT the field is what would break them silently.
+  Ok (@(@(Cost-Lines) | Where-Object { $null -eq $_.verb }).Count -eq 0) 'cost log: EVERY line of this run carries the verb field (empty string, never missing)'
   # an unwritable log location must not fail or change the call
   $blocked = Join-Path $env:TEMP ("hook-pre-nodir-{0}" -f [guid]::NewGuid().ToString('N'))
   [IO.File]::WriteAllText($blocked, 'a file where the state folder should be')

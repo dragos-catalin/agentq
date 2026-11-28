@@ -205,6 +205,11 @@ $suites = [ordered]@{
   'gate input selection' = @('-File', (Join-Path $PSScriptRoot 'test-gate-input-selection.ps1'))
   'agentq timings'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-timings.ps1'))
   'agentq reclaim'  = @('-File', (Join-Path $PSScriptRoot 'test-agentq-reclaim.ps1'))
+  # 2026-11-28 (round 4): sat-report.ps1's classifier suite existed and ran NOWHERE - it was in neither
+  # this map nor install.ps1's, so the verb-coverage assertions that came with the per-verb ledger could
+  # never fail. The load-bearing case is a null startMs ("no measurement") that must never be read as 0,
+  # which would turn an unmeasured call into a resident-host hit.
+  'sat report'      = @('-File', (Join-Path $PSScriptRoot 'test-sat-report.ps1'))
   #  - agentq approve: the edit-ticket approval path. Hermetic: AGENTQ_HOME in a temp dir, the human
   #    replaced by a stub window script and the mint by a stub ticket script, plus a mutation check on the
   #    verdict comparison - so an undetected regression there cannot pass as green.
@@ -392,7 +397,15 @@ function Complete-Suite($Job) {
 # one result line per suite (+ FAIL lines, + the tail of the log when a suite died without a FAIL line)
 function Report-Suite([string]$Name, [int]$Code, [bool]$TimedOut, [int]$Sec, [string[]]$Lines, [string]$LogPath) {
   $fails = @($Lines | Where-Object { $_ -match '^\s*(FAIL)\b' })
-  Write-Host ("{0,-15} exit={1} pass={2} fail={3} sec={4}" -f $Name, $Code, @($Lines | Where-Object { $_ -match '^\s*(PASS|ok)\b' }).Count, $fails.Count, $Sec)
+  # Under -Parallel > 1 this `sec` is WALL-CLOCK under contention, not this suite's cost: every suite
+  # competes for the box, so the number is shared with the suites running beside it. Say it on the line
+  # so nobody reads a pooled number as a per-suite cost again (2026-11-27: a pooled sec=47 printed on
+  # three unrelated suites - identical, because it was the run total - was read as each suite's own 47 s
+  # and a 30 s delay was attributed to the wrong code). The suffix is appended AFTER the fields scripts
+  # and humans parse (`exit=`, `pass=`, `fail=`, `sec=`) so the format stays parseable; a solo run
+  # (-Parallel 1) leaves $usePool false and prints the bare line exactly as before.
+  $costNote = if ($usePool) { " (pooled: wall-clock under contention; -Only '$Name' for its own cost)" } else { '' }
+  Write-Host ("{0,-15} exit={1} pass={2} fail={3} sec={4}{5}" -f $Name, $Code, @($Lines | Where-Object { $_ -match '^\s*(PASS|ok)\b' }).Count, $fails.Count, $Sec, $costNote)
   $fails | ForEach-Object { Write-Host "   $_" }
   if ($TimedOut) { Write-Host "   TIMEOUT after $TimeoutMin min" }
   $failed = [bool]($Code -or $TimedOut)
@@ -484,6 +497,12 @@ foreach ($k in $selected) {
     continue
   }
   if ($running.Count) { Drain-Pool }
+  # Under -Parallel > 1 this suite is a serial-only BARRIER: the pool has just drained and no other suite
+  # starts until it finishes, so a long one is minutes of legitimate silence. State the fact on both sides,
+  # so the silence reads as a barrier instead of a hang (2026-11-27: exactly that silence on the `install`
+  # barrier was misread as a `-Parallel 8` hang). A solo run (-Parallel 1) sets $barrier false and is unchanged.
+  $barrier = $usePool -and ($serialOnly -contains $k)
+  if ($barrier) { Write-Host "BARRIER $k (serial-only: no suite starts until it finishes)" }
   $sw = [Diagnostics.Stopwatch]::StartNew(); $code = 0; $timedOut = $false; $log = $null
   if ($useProc) {
     $log = Get-SuiteLog $k
@@ -497,6 +516,7 @@ foreach ($k in $selected) {
   }
   $ran++
   if (Report-Suite $k $code $timedOut ([int][math]::Round($sw.Elapsed.TotalSeconds)) $out $log) { $bad += $k }
+  if ($barrier) { Write-Host "BARRIER $k done (pool resumes)" }
 }
 if ($running.Count) { Drain-Pool }
 cmd /c rmdir /s /q "`"$stage`"" 2>$null

@@ -401,7 +401,13 @@ $script:DoctorExit = $null
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
 # consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
 # happens where work happens (run/commit/lease/land) and in `sweep`.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'lessons', 'metrics', 'doctor', 'help', 'timings'
+# `since` belongs in this set (agentq round 4). Its help line already advertises it as READ-ONLY and
+# Register-Agent already excludes it, but it was NOT here: it ends in `Show-Status` and ran as a working
+# verb, so the first call of nearly every task boot silently REAPED the dead tickets `sweep` exists to
+# report (Get-Live drops them when the flag is off) and CONSUMED the caller's own lease-loss notice. The
+# brief lists `since` under "READ-ONLY (never queue, never reap)" - this makes the code say what the docs
+# promise. Session liveness is unaffected: line ~2674 renews the session for `since` explicitly.
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'since', 'lessons', 'metrics', 'doctor', 'help', 'timings'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -973,7 +979,10 @@ function Test-SlotShareRefusal([string]$repoName, [string]$role) {
   $sh = Get-SlotShare (Read-Leases $null) $Session $cap
   if (-not $sh.competing -or $sh.held -lt $sh.share) { return $null }
   $mine = @(Read-Leases $null | Where-Object { $_ -and -not $_.stale -and "$(P $_ 'session' '')" -eq "$Session" })
-  $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
+  # repo/slot, not the bare slot: this list is built from Read-Leases $null (EVERY repo), and the same
+  # slot NAME lives in each repo (`codai/scratch-1` beside `marcai/scratch-1`), so a bare name read as one
+  # duplicate lease held twice (the same 2026-11-27 display defect fixed in Show-SlotShare).
+  $heldTxt = ($mine | ForEach-Object { "$($_.repo)/$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
   if (-not $script:SlotShareSaid) {
     $script:SlotShareSaid = $true
     Write-Journal @{ event = 'slot-fair-share'; resource = "slot:${repoName}:$(if ($role) { $role } else { 'slot' })"; session = $Session; held = [int]$sh.held; cap = [int]$sh.share; slotsPerSession = [int]$sh.slotsPerSession; sessions = [int]$sh.sessions; taskCap = [int]$sh.taskCap; slots = @($mine | ForEach-Object { "$($_.slot)" }); repo = $repoName; reason = "this session already holds $($sh.held) slot(s); its share of the machine task cap $($sh.taskCap) is $($sh.share) while $($sh.sessions) sessions compete" }
@@ -993,6 +1002,12 @@ function Show-SlotShare {
   # (2026-11-27: a "duplicate leases" report that was two repos, the display was the only thing wrong).
   $held = ($mine | ForEach-Object { " [$($_.repo)/$($_.slot) $(P $_ 'role' '')]" }) -join ''
   Write-Output ("SLOT SHARE {0}{1} held by my session {2}{3}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) sessions compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (no other session competes)' }), $Session, $held)
+  # R4-5 (2026-11-28): the number was printed but never JUDGED, so an agent at 14/10 read a healthy line
+  # and only learned the truth 28 minutes later, from a land that refused after its pre-gate. Say it here,
+  # where the agent already looks, and name both ways out in the order that works (ADR 0012 reuse first).
+  if ($sh.competing -and $sh.held -ge $sh.share) {
+    Write-Output ("  OVER SHARE: at $($sh.held)/$($sh.share) this session will be REFUSED the next slot (lease exit 3, and a land refuses BEFORE its pre-gate). Subagents work in the lead's slot - pass them its path (ADR 0012); or give one back: agentq unlease -Repo <path> -LeaseId <id>. One deliberate run may bypass it with AGENTQ_NO_FAIRSHARE=1.")
+  }
 }
 # Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one
 # session's block of five waiters cannot sit in front of another session's single waiter. Grouping
@@ -2445,9 +2460,16 @@ function Show-Since {
   Show-PrewarmHint $repo.Name
   Write-Output "== git log origin (last $Hours h)"
   & git -C $repo.Top fetch -q 2>$null
-  $up = (& git -C $repo.Top rev-parse --abbrev-ref '@{u}' 2>$null)
-  $ref = if ($up) { $up } else { 'HEAD' }
-  & git -C $repo.Top log $ref --since="$([int]($Hours * 60)) minutes ago" --format='%h %ad %an %s' --date=format:'%m-%d %H:%M' -n 60
+  # ONE log spawn, not two: `@{u}` asks git for the upstream itself and the separate
+  # `rev-parse --abbrev-ref '@{u}'` existed only to choose the NEXT spawn's argument -- a whole process
+  # whose output was never printed. The fallback keeps the no-upstream case at the same two spawns as
+  # before (log fails, log HEAD succeeds), so this only ever removes one. `since` is the first call of
+  # nearly every task boot, so the saving is paid fleet-wide (agentq round 4).
+  $sinceArg = "--since=$([int]($Hours * 60)) minutes ago"
+  $fmtArg = '--format=%h %ad %an %s'
+  $dtArg = "--date=format:%m-%d %H:%M"
+  & git -C $repo.Top log '@{u}' $sinceArg $fmtArg $dtArg -n 60 2>$null
+  if ($LASTEXITCODE) { & git -C $repo.Top log HEAD $sinceArg $fmtArg $dtArg -n 60 }
   Write-Output '== live queues'
   Show-Status
 }
