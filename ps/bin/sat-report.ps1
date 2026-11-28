@@ -11,13 +11,17 @@
   SECTIONS
 
   1. HOOK CALLS PER HOUR, split by execution path. Source (JSON lines, one object per line):
-       <CoordDir>\hooks\cost-<yyyyMMdd>.jsonl   fields: ts, ms, startMs, tool, deny, session
+      <CoordDir>\hooks\cost-<yyyyMMdd>.jsonl   fields: ts, ms, startMs, tool, verb, deny, session
      `startMs` is where the hook call actually started:
        startMs <  50        served by the RESIDENT host (in-process, no fresh spawn)
        startMs 50..5000     a FRESH process spawn
        startMs >  5000      junk (do NOT repair, just count)
      `startMs` can be the literal JSON null: that is "no measurement" and is NEVER coerced to 0 -
      an unmeasured call and a genuinely-zero one are different facts.
+    The second table of this section sums the same file PER AGENTQ VERB (`verb`, added round 4,
+    2026-11-28): the tool name alone cannot answer "what does one `status` cost beside one `land`",
+    a measured day having held 10 463 run_in_terminal rows and no verb at all. Rows whose command ran
+    no agentq carry an empty verb and are counted only in the coverage line.
 
   2. RESIDENT HOST SERVICE TIME. Source: <ResidentDir>\server.log, lines such as
        "23:05:12.381  req 18498  total 427 ms (read 0, run 422)  exit 0 ..."
@@ -89,11 +93,17 @@ Emit '== HOOK CALLS PER HOUR (UTC)'
 $costFile = Join-Path (Join-Path $CoordDir 'hooks') ('cost-' + $Date + '.jsonl')
 Emit ("source: " + $costFile)
 $hours = @{}
+# Per-verb totals, filled in the same pass - a second read of the file would be a second cost.
+$verbs = @{}
+$withVerb = 0
 $tot = 0; $srv = 0; $spn = 0; $jnk = 0; $non = 0
 if (Test-Path -LiteralPath $costFile) {
   foreach ($line in [System.IO.File]::ReadLines($costFile)) {
     $h = '??'
     if ($line -match '"ts":"\d{4}-\d{2}-\d{2}T(\d{2}):') { $h = $Matches[1] }
+    # The verb first: the `ms` match below overwrites $Matches.
+    $vb = ''
+    if ($line -match '"verb":"([^"]{0,24})"') { $vb = $Matches[1] }
     $cls = 'none'
     if ($line -match '"startMs":\s*(null|-?\d+)') {
       $raw = $Matches[1]
@@ -105,6 +115,14 @@ if (Test-Path -LiteralPath $costFile) {
         elseif ($v -le 5000) { $cls = 'spawned' } # 50..5000 = a fresh process spawn
         else { $cls = 'junk' }                  # > 5000 = junk, counted not repaired
       }
+    }
+    if ($vb) {
+      if (-not $verbs.ContainsKey($vb)) { $verbs[$vb] = @{ calls = 0; served = 0; spawned = 0; ms = [int64]0; msN = 0 } }
+      $v = $verbs[$vb]
+      $v.calls++
+      if ($cls -eq 'served') { $v.served++ } elseif ($cls -eq 'spawned') { $v.spawned++ }
+      if ($line -match '"ms":(\d+)') { $v.ms += [int64]$Matches[1]; $v.msN++ }
+      $withVerb++
     }
     if (-not $hours.ContainsKey($h)) { $hours[$h] = @{ total = 0; served = 0; spawned = 0; junk = 0; none = 0 } }
     $c = $hours[$h]
@@ -125,6 +143,20 @@ if (Test-Path -LiteralPath $costFile) {
   Emit ('DAY TOTAL calls=' + (S $tot) + ' served=' + (S $srv) + ' spawned=' + (S $spn) + ' junk=' + (S $jnk) + ' no-measurement=' + (S $non))
   Emit ('PERCENT served=' + (Pct $srv $tot) + '% spawned=' + (Pct $spn $tot) + '% junk=' + (Pct $jnk $tot) + '% no-measurement=' + (Pct $non $tot) + '%')
   Emit 'CLASSIFY served<50  spawned=50..5000  junk>5000  null=no-measurement'
+  # --- 1b. the same day, per agentq verb ---------------------------------------------------------
+  Emit ''
+  Emit '== AGENTQ VERB COST (same file, same pass)'
+  if ($verbs.Count -eq 0) {
+    Emit '(no line names a verb: none of the calls ran agentq, or the hook predates 2026-11-28)'
+  } else {
+    Emit 'verb calls served spawned avg-ms'
+    foreach ($k in ($verbs.Keys | Sort-Object { $verbs[$_].calls } -Descending)) {
+      $v = $verbs[$k]
+      $avg = if ($v.msN -gt 0) { ([double]$v.ms / $v.msN).ToString('0.0', $inv) } else { '-' }
+      Emit ($k + '   ' + (S $v.calls) + '   ' + (S $v.served) + '   ' + (S $v.spawned) + '   ' + $avg)
+    }
+  }
+  Emit ('VERB COVERAGE rows=' + (S $tot) + ' with-verb=' + (S $withVerb) + ' (' + (Pct $withVerb $tot) + '%)')
 } else {
   Emit ("(no cost file for " + $Date + ")")
 }
