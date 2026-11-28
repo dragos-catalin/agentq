@@ -20,7 +20,7 @@
         "map": {
           "todo": "todo",
           "in progress": "in-progress",
-"done": "done",
+          "done": "done",
           "dropped": "dropped"
         }
       },

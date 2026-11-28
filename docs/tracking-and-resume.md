@@ -101,6 +101,41 @@ status, dangling narrative reference. These are exactly the defects the survey
 found ungated: agentq's own `TRACKER.csv` is not covered by any gate today, and
 nothing checks that two repos agree.
 
+## Adding a repo to the index — `--scan` rewrites, it does not merge
+
+`--scan` builds the index from exactly the directories it is handed and writes
+that as the whole file — `const index = { version: 1, generatedAt, repos }`,
+then a bare `writeFileSync`. It never reads the old index back and folds it in,
+so a scan of one new root is a **replacement, not an addition**: every repo
+already in the index disappears. The forms, quoted from the tool's usage header:
+
+```
+node tracker-lint.mjs [--root <dir>] [--json]        validate one repo
+node tracker-lint.mjs --scan <dir> [<dir> ...]       scan repos, write index
+node tracker-lint.mjs --scan --all [--json]          scan every child of $HOME/gh
+```
+
+`--scan --all` is not the general answer either: it expands to the children of
+`$HOME/gh`, so a repo under `E:\GitHub` (cursuri) is never picked up.
+
+Onboard a root by naming every root you intend to keep — the ones already in the
+index plus the new one — in a single call:
+
+```powershell
+$idx   = Get-Content "$HOME\.codai\coord\trackers\index.json" -Raw | ConvertFrom-Json
+$roots = @($idx.repos.root) + 'E:\GitHub\cursuri' | Sort-Object -Unique
+node E:\gh\agentq\tools\tracker-lint.mjs --scan @roots
+```
+
+Then verify against the snapshot you scanned: no root that was in it has gone,
+and the new root is present. The index is shared live state several agents
+write, so the root set can move between reading it and scanning it; if a root
+vanished, a sibling onboarded a repo in that window — re-read the index and
+re-run with the union, never rescan the changed set alone. Getting it wrong is
+silent in the scan and loud a minute later: `track.mjs status` lists fewer repos
+than it did a moment ago, because the scan replaced the index with only what it
+was given.
+
 ## Layer 4 — the view (Vitals Tracking page)
 
 Reads `$STATE/trackers/index.json` (via the host) and renders repos → trackers →
