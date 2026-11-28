@@ -27,24 +27,10 @@ function Start-Writer([string]$log, [string]$body) {
   Start-Process pwsh -ArgumentList @('-NoProfile', '-File', "`"$f`"") -WindowStyle Hidden -PassThru
 }
 
-# ONE calibration for the whole suite: what a single pwsh invocation costs on THIS machine, in seconds.
-# Every fixture life and bound below that has to clear a SPAWN is expressed against it, because a constant
-# that assumes an idle box measures machine load instead of the product. Startup on a shared machine with
-# 20+ peer agents ranges from 1.5 s to 151 s (measured 2026-11-28); the wall time of a Run-Wait call is
-# pwsh STARTUP + the bound, so the startup is the noise every one of these checks shares. Calibrate on the
-# same invocation shape with a 0.3 s bound, same tick, and compare.
-$lb = Join-Path $tmp 'boundbase.log'
-Set-Content -LiteralPath $lb -Value 'nothing yet'
-$b1 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
-$b2 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
-$base = [math]::Min($b1, $b2)                       # startup + ~0.3 s bound
-$spawnSec = [math]::Max(0.5, $base - 0.3)
-$mkSec = [int][math]::Ceiling($base + 20)           # a marker fixture: one spawn + its own work + slack
-
 # --- wait-job: DONE with a literal marker containing regex metacharacters ---------------------------
 $l1 = Join-Path $tmp 'done.log'
 $w = Start-Writer $l1 'W "starting"; Start-Sleep -Milliseconds 800; W "^RB_EXIT=0 (literal)"; Start-Sleep 5'
-$r = Run-Wait @('-Log', $l1, '-Done', '^RB_EXIT=|.*never', '-EveryS', '0.2', '-MaxSec', "$mkSec")
+$r = Run-Wait @('-Log', $l1, '-Done', '^RB_EXIT=|.*never', '-EveryS', '0.2', '-MaxSec', '20')
 Check 'wait-job DONE on literal marker with ^ (not a regex anchor)' ($r.code -eq 0 -and $r.out -match "DONE: marker '\^RB_EXIT='") "code=$($r.code) $($r.out)"
 $w | Stop-Process -Force -ErrorAction SilentlyContinue
 
@@ -57,7 +43,7 @@ Check 'wait-job does not treat markers as regex (".*never" no match)' ($r.code -
 # --- FAILED: fail marker, and EXIT=<nonzero> beside the done marker ----------------------------------
 $l2 = Join-Path $tmp 'fail.log'
 $w = Start-Writer $l2 'W "compiling"; Start-Sleep -Milliseconds 600; W "Traceback (most recent call last):"; Start-Sleep 5'
-$r = Run-Wait @('-Log', $l2, '-Done', 'DONE', '-Fail', 'Traceback|BUILD FAILED', '-EveryS', '0.2', '-MaxSec', "$mkSec")
+$r = Run-Wait @('-Log', $l2, '-Done', 'DONE', '-Fail', 'Traceback|BUILD FAILED', '-EveryS', '0.2', '-MaxSec', '20')
 Check 'wait-job FAILED on fail marker (exit 1)' ($r.code -eq 1 -and $r.out -match 'Traceback') "code=$($r.code)"
 $w | Stop-Process -Force -ErrorAction SilentlyContinue
 $l2b = Join-Path $tmp 'exit3.log'
@@ -76,27 +62,46 @@ Check 'STALLED detects Terminate batch job (Y/N)' ($r.out -match 'got Ctrl\+C')
 Check 'STALLED prints the process tree with cpu/ws' ($r.out -match "process tree of pid $($sleeper.Id)" -and $r.out -match 'cpu=[\d.]+s ws=\d+MB') $r.out
 $sleeper | Stop-Process -Force -ErrorAction SilentlyContinue
 
+# --- cloud placement suppresses STALLED: a silent LOCAL log is expected while the VM works ----------
+# Measured 2026-11-28: a land pre-push step dispatched to a workspace by `agentq run -Resource build
+# -Where cloud` emits NO local output; the local log stayed flat and wait-job printed a FALSE STALLED.
+# A cloud-placed run's silence must be a TIMEOUT (3), never STALLED (2), with an explicit message.
+# WAITJOB_CLOUD_STATE supplies the cloud heartbeat state with no network.
+$l6 = Join-Path $tmp 'cloud-stall.log'
+Set-Content -LiteralPath $l6 -Value 'queued on the cloud workspace'
+$env:WAITJOB_CLOUD_STATE = 'busy'
+$r = Run-Wait @('-Log', $l6, '-Done', 'DONE', '-Placement', 'cloud:ws-codai', '-EveryS', '0.2', '-MaxSec', '3', '-StallSec', '1')
+Check 'cloud placement: NOT STALLED (exit 3, not 2)' ($r.code -eq 3 -and $r.out -notmatch 'STALLED:') "code=$($r.code) $($r.out)"
+Check 'cloud placement: says cloud, not local, with the heartbeat state' ($r.out -match 'cloud . NOT local' -and $r.out -match 'cloud:ws-codai' -and $r.out -match "heartbeat state 'busy'") $r.out
+# The SAME silent log with NO placement is still a stall: the branch is keyed on placement only, so a
+# local run cannot hide behind it (no over-suppression).
+$r = Run-Wait @('-Log', $l6, '-Done', 'DONE', '-EveryS', '0.2', '-MaxSec', '20', '-StallSec', '1')
+Check 'no placement: the same silent log is still STALLED (exit 2)' ($r.code -eq 2 -and $r.out -match 'STALLED:') "code=$($r.code) $($r.out)"
+# The real path: a job record's OWN `placement` drives it, no -Placement flag needed. A live pid keeps
+# wait-job out of the DEAD branch while the (cloud) log stays silent.
+$cloudSleeper = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 30' -WindowStyle Hidden -PassThru
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $env:AGENTQ_HOME 'jobs')
+@{ id = 'cloudplaced'; label = 'cloud job'; command = 'x'; cwd = $tmp; repo = ''; host = 'h'; placement = 'cloud:ws-codai'; pid = $cloudSleeper.Id; pidStart = $null; log = $l6; expectedMin = 1; startedAt = [DateTime]::UtcNow.ToString('o'); state = 'running'; ownerPid = 0; exitCode = $null; endedAt = $null } | ConvertTo-Json | Set-Content (Join-Path $env:AGENTQ_HOME 'jobs\cloudplaced.json')
+$r = Run-Wait @('-JobId', 'cloudplaced', '-EveryS', '0.2', '-MaxSec', '3', '-StallSec', '1')
+Check 'job-record placement cloud:<ws> suppresses STALLED (exit 3)' ($r.code -eq 3 -and $r.out -match 'cloud . NOT local' -and $r.out -match 'cloud:ws-codai') "code=$($r.code) $($r.out)"
+$cloudSleeper | Stop-Process -Force -ErrorAction SilentlyContinue
+Remove-Item Env:WAITJOB_CLOUD_STATE -ErrorAction SilentlyContinue
+
 # --- TIMEOUT: log still growing at the bound -> exit 3, tail + advice; bound respected --------------
 $l4 = Join-Path $tmp 'grow.log'
 $w = Start-Writer $l4 '1..200 | ForEach-Object { W "line $_"; Start-Sleep -Milliseconds 200 }'
 $r = Run-Wait @('-Log', $l4, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '2.5')
 Check 'wait-job TIMEOUT (exit 3) while log grows' ($r.code -eq 3 -and $r.out -match 'still running, keep working or investigate') "code=$($r.code)"
-$boundOk = ($r.sec -lt ($base + 2.5 + 3))
-$boundMsg = "$([math]::Round($r.sec,1))s total; startup baseline $([math]::Round($base,1))s; bound 2.5s"
-if (-not $boundOk) {
-  # A spawn on a saturated machine is not a constant, so a baseline taken a moment earlier UNDER-estimates
-  # the startup of the probe that follows it. Measured 2026-11-28 at 100 % CPU with 300+ pwsh alive:
-  # baseline 18.7 s (min of two), probe 34.5 s with the 2.5 s bound respected - adjacent invocations cost
-  # 19 s and 32 s. That run reddened this check in a suite whose product was green, which is the defect.
-  # Re-measure the baseline immediately before a second probe of the same shape: a real "blocks past its
-  # bound" bug fails both attempts, a load spike does not.
-  $b3 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
-  $r = Run-Wait @('-Log', $l4, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '2.5')
-  $base2 = [math]::Min($base, $b3)
-  $boundOk = ($r.code -eq 3 -and $r.sec -lt ($base2 + 2.5 + 3))
-  $boundMsg += " | retry $([math]::Round($r.sec,1))s total (code $($r.code)); fresh baseline $([math]::Round($b3,1))s"
-}
-Check 'wait-job never blocks past its bound (+ measured pwsh startup)' $boundOk $boundMsg
+# The wall time of a Run-Wait call is pwsh STARTUP + the bound. Startup on a shared machine with 20+
+# peer agents ranges 0.5 s to 30 s (measured 2026-11-19: a full-suite run under contention reported
+# 40.4 s here with the product bound respected), so an absolute second count is a load test, not a
+# bound test. Calibrate on the same invocation shape with a 0.3 s bound, same tick, and compare.
+$lb = Join-Path $tmp 'boundbase.log'
+Set-Content -LiteralPath $lb -Value 'nothing yet'
+$b1 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
+$b2 = (Run-Wait @('-Log', $lb, '-Done', 'DONE', '-EveryS', '0.2', '-StallSec', '30', '-MaxSec', '0.3')).sec
+$base = [math]::Min($b1, $b2)   # startup + ~0.3 s bound
+Check 'wait-job never blocks past its bound (+ measured pwsh startup)' ($r.sec -lt ($base + 2.5 + 3)) "$([math]::Round($r.sec,1))s total; startup baseline $([math]::Round($base,1))s; bound 2.5s"
 Check 'wait-job prints one line per change, not per tick' (@($r.out -split "`n" | Where-Object { $_ -match 'log \d+ bytes' }).Count -le 20)
 $w | Stop-Process -Force -ErrorAction SilentlyContinue
 # -MaxMin above the hard cap is clamped to 10 (shown in the banner)
@@ -112,20 +117,11 @@ Check '-MaxMin 60 is clamped to 10' ($bannerOut -match 'max 10 min') $bannerOut
 # DONE) turned the nonzero check red on a green tree - that is how the land gate of 2026-11-25 20:22
 # failed (log: 'waiting on pid 102192' and 'DONE: pid 102192 exited' in the same second). The fixture
 # now lives 5 s, and the zero case asserts the code was actually READ ('(exit 0)'), not fallen back to.
-#
-# 5 s is still a constant, and the loss is deterministic, so a retry cannot rescue it (unlike the bound
-# check above, whose failure is a load spike). Measured 2026-11-28, 100 % CPU with 300+ pwsh alive: the
-# 5 s fixture was dead before wait-job's own spawn finished - the log read 'waiting on pid 99368' and
-# 'DONE: pid 99368 exited' in the SAME second, the code came back unreadable, and the fallback left
-# '(exit 0)' absent on a green tree. The fixture must therefore outlive ONE spawn, sized on the spawn
-# cost measured above; on an idle box (spawnSec 0.5) these resolve to the 5 s / 30 s of before.
-$pidLifeMs = [int][math]::Max(5000, $spawnSec * 3000)
-$pidSec = [int][math]::Max(30, $spawnSec * 4)
-$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', "Start-Sleep -Milliseconds $pidLifeMs; exit 0" -WindowStyle Hidden -PassThru
-$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', "$pidSec")
+$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 5000; exit 0' -WindowStyle Hidden -PassThru
+$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '30')
 Check 'wait-job -Pid DONE when the process exits 0' ($r.code -eq 0 -and $r.out -match '\(exit 0\)') "code=$($r.code) $($r.out)"
-$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', "Start-Sleep -Milliseconds $pidLifeMs; exit 4" -WindowStyle Hidden -PassThru
-$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', "$pidSec")
+$p = Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 5000; exit 4' -WindowStyle Hidden -PassThru
+$r = Run-Wait @('-Pid', "$($p.Id)", '-EveryS', '0.2', '-MaxSec', '30')
 Check 'wait-job -Pid FAILED when the process exits nonzero' ($r.code -eq 1 -and $r.out -match 'exit code 4') "code=$($r.code) $($r.out)"
 # The fallback above, pinned on purpose: with no readable code wait-job reports DONE, never FAILED (a
 # guess would be worse). An unreachable pid keeps the check free of process-table races.
@@ -134,41 +130,17 @@ Check 'wait-job -Pid with an unreadable exit code is DONE, not FAILED (documente
 
 # --- job-start -> registry -> jobs list -> done ------------------------------------------------------
 $cwd = Join-Path $tmp 'work'; New-Item -ItemType Directory -Force $cwd | Out-Null
-# The guarantee is "job-start returns WITHOUT waiting for its job", and it cannot be a number of seconds:
-# one pwsh spawn here measured 1.5 s quiet and 151.2 s saturated (this check red with '151.2s' on
-# 2026-11-28 while the product was fine), and no constant covers an 8x spread in the cost of the very
-# thing it measures. The job therefore blocks on a sentinel THIS test writes only after the launcher has
-# returned, so the job cannot have ended early for any other reason: a launcher that waited returns with
-# 'EXIT=0' already in the job's log. The cap on that wait keeps a regression from hanging the suite, and
-# costs a healthy run nothing (the sentinel releases the job immediately); it scales on the calibration
-# above so a saturated machine does not trip it.
-$sq = [char]39
-$sentinel = Join-Path $tmp 'release.txt'
-$capSec = [int][math]::Max(30, $spawnSec * 20)
-$jobBody = '"hello from job"; $in = [Console]::In.ReadLine(); "stdin-null=$($null -eq $in)"; $stop = (Get-Date).AddSeconds(' + $capSec + '); while (-not (Test-Path ' + $sq + $sentinel + $sq + ') -and (Get-Date) -lt $stop) { Start-Sleep -Milliseconds 200 }; Write-Error "to stderr" -ErrorAction Continue; exit 0'
 $sw0 = [Diagnostics.Stopwatch]::StartNew()
-$o = (& pwsh -NoProfile -File $start -Label 'unit ok' -Command $jobBody -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
+$o = (& pwsh -NoProfile -File $start -Label 'unit ok' -Command '"hello from job"; $in = [Console]::In.ReadLine(); "stdin-null=$($null -eq $in)"; Start-Sleep 8; Write-Error "to stderr" -ErrorAction Continue; exit 0' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
 $launchSec = $sw0.Elapsed.TotalSeconds
+Check 'job-start returns at once even when its output is captured (no inherited handles)' ($launchSec -lt 7) "$([math]::Round($launchSec,1))s"
 $jf = Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json"
 Check 'job-start writes the registry json' (Test-Path $jf)
 $reg = Get-Content $jf -Raw | ConvertFrom-Json
 Check 'registry has pid, pidStart, log, host, ownerPid, state running' ($reg.pid -gt 0 -and $reg.pidStart -and $reg.log.StartsWith("$cwd\.copilot-tmp\jobs\", [StringComparison]::OrdinalIgnoreCase) -and $reg.host -and $reg.ownerPid -gt 0 -and $reg.state -eq 'running') (($reg | ConvertTo-Json -Compress) + " cwd=$cwd")
 $lst = (& pwsh -NoProfile -File $jobs list -Json) | ConvertFrom-Json
 Check 'jobs list shows the running job' (@($lst | Where-Object { $_.id -eq $o.id -and $_.state -in 'running', 'starting' }).Count -eq 1) (($lst | ConvertTo-Json -Compress))
-# `Get-Content -Raw` on an EMPTY file returns $null, and `$null -notmatch <pattern>` yields NOTHING -
-# which is falsy, not $true - so the check below reads as failed in exactly the state it is looking for
-# (an empty log means the launcher did not wait). Reproduce: `$v = Get-Content <empty> -Raw;
-# $v -notmatch '(?m)^EXIT=0'` prints an empty line. The probe on 2026-11-28 caught this on the REAL
-# launcher; cast the read so the operator's left side is always a string.
-$earlyLog = if ($reg.log -and (Test-Path $reg.log)) { [string](Get-Content $reg.log -Raw) } else { '' }
-Check 'job-start returned without waiting for its job (no EXIT=0 in the log yet)' ($earlyLog -notmatch '(?m)^EXIT=0') "launcher took $([math]::Round($launchSec,1))s; job log has $($earlyLog.Length)B; sentinel cap ${capSec}s"
-Set-Content -LiteralPath $sentinel -Value 'go'
-# The bound below is a HANG GUARD, not a latency assertion, and it must clear a saturated machine's
-# spawn: measured 2026-11-28 on a box at 100 % CPU (300+ pwsh) this fixture's job was still `running`
-# at 60 s, which reddened four cascade checks here while CI was green. The pool runs this suite UNDER
-# contention, so the bound is 180 s - a wait returns the moment the registry says done, so a healthy
-# run pays nothing, and a job that truly never finishes still fails (just later).
-$r = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180')
+$r = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60')
 Check 'wait-job -JobId DONE' ($r.code -eq 0) "code=$($r.code) $($r.out)"
 Start-Sleep -Milliseconds 800
 $reg = Get-Content $jf -Raw | ConvertFrom-Json
@@ -184,17 +156,17 @@ Check 'jobs show prints json + tail' ($show -match '"label": "unit ok"' -and $sh
 # --- priority: the job's command runs below normal by default, so it yields to interactive work ------
 $pcmd = '"prio=" + (Get-Process -Id $PID).PriorityClass'
 $o = (& pwsh -NoProfile -File $start -Label 'prio default' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180'); Start-Sleep -Milliseconds 500
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
 $pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
 Check 'job command inherits BelowNormal priority by default' ($pl -match 'prio=BelowNormal') $pl
 $o = (& pwsh -NoProfile -File $start -Label 'prio normal' -Command $pcmd -Cwd $cwd -ExpectedMin 1 -Priority Normal -Json) | ConvertFrom-Json
-$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '180'); Start-Sleep -Milliseconds 500
+$null = Run-Wait @('-JobId', $o.id, '-EveryS', '0.3', '-MaxSec', '60'); Start-Sleep -Milliseconds 500
 $pl = Get-Content ((Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o.id).json") -Raw | ConvertFrom-Json).log) -Raw
 Check 'job-start -Priority Normal runs the command at Normal' ($pl -match 'prio=Normal') $pl
 
 # failing job -> failed + wait-job exit 1
 $o2 = (& pwsh -NoProfile -File $start -Label 'unit fail' -Command '"boom"; exit 7' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o2.id, '-EveryS', '0.3', '-MaxSec', '180')
+$r = Run-Wait @('-JobId', $o2.id, '-EveryS', '0.3', '-MaxSec', '60')
 Start-Sleep -Milliseconds 800
 $reg2 = Get-Content (Join-Path $env:AGENTQ_HOME "jobs\$($o2.id).json") -Raw | ConvertFrom-Json
 Check 'failing job: wait-job FAILED and registry failed/7' ($r.code -eq 1 -and $reg2.state -eq 'failed' -and $reg2.exitCode -eq 7) "code=$($r.code) state=$($reg2.state) exit=$($reg2.exitCode)"
@@ -202,11 +174,11 @@ Check 'failing job: wait-job FAILED and registry failed/7' ($r.code -eq 1 -and $
 # -File mode with args
 # a job that PRINTS 'EXIT=0' mid-run must not end a -JobId wait (completion comes from the registry)
 $o5 = (& pwsh -NoProfile -File $start -Label 'unit echo' -Command '"EXIT=0"; "DONE"; Start-Sleep 4; "really finished"' -Cwd $cwd -ExpectedMin 1 -Json) | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o5.id, '-EveryS', '0.3', '-MaxSec', '180')
+$r = Run-Wait @('-JobId', $o5.id, '-EveryS', '0.3', '-MaxSec', '60')
 Check 'wait-job -JobId ignores EXIT=/DONE printed by the job itself' ($r.code -eq 0 -and (Get-Content $o5.log -Raw) -match 'really finished' -and $r.out -match 'finished \(exit 0\)') "code=$($r.code) $($r.out)"
 $scr = Join-Path $cwd 'echo.ps1'; Set-Content -LiteralPath $scr -Value 'param($a, $b) "args=$a,$b"'
 $o3 = (& pwsh -NoProfile -File $start -Label 'unit file' -File $scr -Cwd $cwd -ExpectedMin 1 -Json x1 'y 2') | ConvertFrom-Json
-$r = Run-Wait @('-JobId', $o3.id, '-EveryS', '0.3', '-MaxSec', '180')
+$r = Run-Wait @('-JobId', $o3.id, '-EveryS', '0.3', '-MaxSec', '60')
 Check 'job-start -File with args' ($r.code -eq 0 -and (Get-Content $o3.log -Raw) -match 'args=x1,y 2') "code=$($r.code)"
 
 # --- jobs kill + SUSPECT/DEAD computed states --------------------------------------------------------

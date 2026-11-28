@@ -6,7 +6,12 @@ wait-job — BOUNDED wait on a background job, with stall detection. Never block
                                                             registry state / runner exit, not log text)
   wait-job.ps1 -Log <path> -Done 'RB_EXIT=|DONE|EXIT=' [-Fail 'Traceback|BUILD FAILED'] [-Pid <n>]
   wait-job.ps1 -Pid <n>                                     done when the process exits
-  common: [-MaxMin 10] [-StallMin 5] [-EveryS 15]
+  common: [-MaxMin 10] [-StallMin 5] [-EveryS 15] [-Placement <local|cloud:<ws>>]
+
+Placement: where the run actually happens. `cloud:<ws>` (a land/build step dispatched to a workspace)
+means the real work is on a VM and the LOCAL log is silent by construction, so silence is NOT a stall:
+wait-job says so explicitly and waits to the bound instead of exiting 2. Defaults to the job record's
+own `placement` when -JobId is given, and to local otherwise.
 
 -Done / -Fail are pipe-separated LITERAL substrings (ordinal, case-sensitive): '^RB_EXIT' matches the
 text "^RB_EXIT", never a regex anchor. A line `EXIT=<n>` / `RB_EXIT=<n>` with n != 0 counts as FAILED.
@@ -22,6 +27,9 @@ EXIT CODES
 #>
 param(
   [string]$Log, [string]$Done, [string]$Fail, [Alias('Pid')][int]$ProcId = 0, [string]$JobId,
+  # Placement of the run: `cloud:<ws>` (the work is on a VM, so a silent LOCAL log is EXPECTED, not a
+  # stall), `local`, or '' (unknown). For -JobId it defaults to the job record's own `placement`.
+  [string]$Placement,
   [double]$MaxMin = 10, [double]$StallMin = 5, [double]$EveryS = 15,
   # test-only fine-grained overrides (seconds); MaxSec is still capped at 600
   [double]$MaxSec = 0, [double]$StallSec = 0
@@ -44,6 +52,13 @@ if ($JobId) {
 }
 if (-not (Test-Path variable:script:RegistryMode)) { $script:RegistryMode = $false }
 if (-not $Log -and -not $ProcId) { [Console]::Error.WriteLine('wait-job: -Log <path>, -Pid <n> or -JobId <id> is required'); exit 2 }
+# Where this run is placed (devcloud DC-037): an explicit -Placement wins, else the job record's own
+# `placement`. A `cloud:<ws>` run does its real work on a VM and emits NO local output while it waits,
+# so a flat local log is EXPECTED, not a stall (measured 2026-11-28: a land pre-push step dispatched to
+# a workspace by `agentq run -Resource build -Where cloud` left the local log silent and wait-job
+# printed a FALSE STALLED). $job is set only when -JobId is given; `-and` short-circuits on a bare run.
+$placement = if ($Placement) { $Placement } elseif ($JobId -and $job) { "$($job['placement'])" } else { '' }
+$cloudWs = if ($placement -like 'cloud:*') { $placement.Substring(6) } else { $null }
 if ($Log -and -not $Done -and -not $ProcId) { $Done = 'RB_EXIT=|DONE|EXIT=' }
 
 $doneMarks = @("$Done" -split '\|' | Where-Object { $_ -ne '' })
@@ -70,6 +85,24 @@ function Get-ExitLine([string]$text) {
   foreach ($line in ($text -split "`r?`n")) { if ($line -match '^\s*(RB_)?EXIT=(-?\d+)\s*$') { $hit = [int]$Matches[2] } }
   $hit
 }
+# Cloud-state consult for a cloud-placed run (ADR 0050 read-only surface). `agentq-cloud.ps1 -Status
+# -Json` reports every workspace's heartbeat `state` ('busy' while the VM works); we pick our ws's row.
+# Bounded and best-effort: a slow or offline consult returns 'unavailable'/'unknown' and NEVER blocks
+# the wait. WAITJOB_CLOUD_STATE lets a test supply the state with no network at all.
+function Get-CloudHeartbeatState([string]$Ws) {
+  if ($env:WAITJOB_CLOUD_STATE) { return "$($env:WAITJOB_CLOUD_STATE)".Trim() }
+  $cloud = Join-Path $PSScriptRoot 'agentq-cloud.ps1'
+  if (-not (Test-Path -LiteralPath $cloud)) { return 'unknown' }
+  try {
+    $jb = Start-Job -ScriptBlock { param($c, $w) @(& pwsh -NoProfile -File $c -Status -Ws $w -Json 2>&1) -join "`n" } -ArgumentList $cloud, $Ws
+    if (-not (Wait-Job $jb -Timeout 25)) { Stop-Job $jb; Remove-Job $jb -Force; return 'unavailable' }
+    $raw = @(Receive-Job $jb) -join "`n"; Remove-Job $jb -Force
+    $doc = $raw | ConvertFrom-Json
+    $row = @($doc.workspaces | Where-Object { "$($_.ws)" -eq $Ws }) | Select-Object -First 1
+    if ($row -and "$($row.state)") { return "$($row.state)" }
+    return 'unknown'
+  } catch { return 'unknown' }
+}
 
 function Show-Diagnostics {
   Write-Output '--- last 30 log lines'
@@ -93,9 +126,9 @@ function Show-Diagnostics {
 }
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$pos = 0L; $carry = ''; $lastGrowth = 0.0; $lastSize = -2L; $wasAlive = Test-PidAlive
+$pos = 0L; $carry = ''; $lastGrowth = 0.0; $lastSize = -2L; $wasAlive = Test-PidAlive; $cloudNoted = $false
 $label = if ($JobId) { "job $JobId" } elseif ($Log) { $Log } else { "pid $ProcId" }
-Say "waiting on $label (max $([math]::Round($maxS / 60, 2)) min, stall $([math]::Round($stallS / 60, 2)) min, done='$Done'$(if ($Fail) { " fail='$Fail'" })$(if ($ProcId) { " pid=$ProcId" }))"
+Say "waiting on $label (max $([math]::Round($maxS / 60, 2)) min, stall $([math]::Round($stallS / 60, 2)) min, done='$Done'$(if ($Fail) { " fail='$Fail'" })$(if ($ProcId) { " pid=$ProcId" })$(if ($cloudWs) { " placement=cloud:$cloudWs" }))"
 # The wait is the moment an agent next submits cloud work: if this job's workspace has gone back to
 # sleep, say so now rather than 41 s into the next queue wait (same hint as `agentq since`).
 if ($JobId -and $job) { Show-JobPrewarmHint "$($job['repo'])" }
@@ -135,6 +168,7 @@ while ($true) {
         }
       } elseif ($lastSize -ne -1) { Say "log not there yet: $Log" }
       $lastSize = $size; $lastGrowth = $sw.Elapsed.TotalSeconds
+      $cloudNoted = $false
     }
   }
   if ($ProcId) {
@@ -167,9 +201,19 @@ while ($true) {
   }
   $el = $sw.Elapsed.TotalSeconds
   if ($Log -and ($el - $lastGrowth) -ge $stallS) {
-    Say "STALLED: log unchanged for $([math]::Round(($el - $lastGrowth) / 60, 1)) min ($Log, $([math]::Max(0, $lastSize)) bytes)$(if ($ProcId) { "; pid $ProcId alive" })"
-    Show-Diagnostics
-    exit 2
+    if ($cloudWs) {
+      # A cloud-placed run's real work is on a VM; its LOCAL log is silent by construction, so silence
+      # is NOT a stall. Consult the cloud state, say so explicitly, and keep waiting to the bound.
+      if (-not $cloudNoted) {
+        $cloudNoted = $true
+        $st = Get-CloudHeartbeatState $cloudWs
+        Say "cloud — NOT local: placement 'cloud:$cloudWs' with a silent local log for $([math]::Round(($el - $lastGrowth) / 60, 1)) min is not a stall (cloud heartbeat state '$st'); waiting to the bound."
+      }
+    } else {
+      Say "STALLED: log unchanged for $([math]::Round(($el - $lastGrowth) / 60, 1)) min ($Log, $([math]::Max(0, $lastSize)) bytes)$(if ($ProcId) { "; pid $ProcId alive" })"
+      Show-Diagnostics
+      exit 2
+    }
   }
   if ($el -ge $maxS) {
     Say "TIMEOUT after $([math]::Round($el / 60, 1)) min: still running, keep working or investigate"

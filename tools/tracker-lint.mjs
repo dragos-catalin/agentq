@@ -12,12 +12,32 @@
 // hand, the mapping says how it is read, and the index is a rebuildable view.
 //
 // Usage:
-//   node tracker-lint.mjs [--root <dir>] [--json]        validate one repo
+//   node tracker-lint.mjs [--root <dir>] [--json] [--no-coverage]  validate one repo
 //   node tracker-lint.mjs --scan <dir> [<dir> ...]       scan repos, write index
 //   node tracker-lint.mjs --scan --all [--json]          scan every child of $HOME/gh
 //
 // Exit code = number of drift findings (capped at 255); 0 means the conventions
 // hold. Read-only except the index file in --scan mode.
+//
+// Status-map coverage (on by default; --coverage asks for it explicitly and
+// --no-coverage quiets the human lines - neither changes the findings or the
+// exit code, and --json/the written index always carry the coverage object):
+//   For every tracker this reports how the RAW status tokens actually present in
+//   the file were mapped, so "no unmapped token" is provable from the output
+//   rather than inferred from a clean exit code. A token counts as mapped when
+//   status.map has it AS SPELLED IN THE FILE - the cell is looked up verbatim (it
+//   is never trimmed or case-folded first), and this report uses that same raw
+//   string, so the vocabulary of the report is the vocabulary of the mapping.
+//   Per tracker the shape is:
+//     { rows, tokens, mapped, unmapped, byToken: { "<raw token>": { rows, mapped } } }
+//   rows = rows whose status was read, tokens = DISTINCT raw tokens, mapped and
+//   unmapped = how many of those distinct tokens the map covers, byToken = the
+//   per-token row count. The human output prints one line per tracker:
+//     tracker <id>: <rows> row(s), <tokens> token(s), <mapped> mapped, <unmapped> unmapped (<token>=<rows>, ...)
+//   An unmapped token stays a drift finding (kind "unmapped-status") and is
+//   reported ONCE PER DISTINCT TOKEN - not once per row - with the row count in
+//   the detail and ref = the first row that carried it, so a token repeated over
+//   500 rows costs one finding rather than 500.
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve, basename } from "node:path";
@@ -31,14 +51,33 @@ import { rootIssueFor } from "./track.mjs";
 const CANONICAL = ["todo", "in-progress", "blocked", "review", "done", "dropped", "deferred"];
 const REQUIRED = ["id", "title", "status"];
 
+// Coverage starts empty and grows only from rows that were actually read, so a
+// missing or empty tracker reports zeros instead of being absent from the report.
+function emptyCoverage() {
+    return { rows: 0, tokens: 0, mapped: 0, unmapped: 0, byToken: {} };
+}
+
+// The one-line human rendering of a tracker's coverage, shared by `--root` and
+// `--scan` so the two modes cannot describe the same numbers differently.
+function coverageLine(t) {
+    const c = t.coverage || emptyCoverage();
+    const detail = Object.keys(c.byToken)
+        .sort()
+        .map((k) => `${k === "" ? "(empty)" : k}=${c.byToken[k].rows}`)
+        .join(", ");
+    return `tracker ${t.id}: ${c.rows} row(s), ${c.tokens} token(s), ${c.mapped} mapped, ${c.unmapped} unmapped${detail ? ` (${detail})` : ""}`;
+}
+
 function parseArgs(argv) {
-    const out = { root: process.cwd(), json: false, scan: false, all: false, dirs: [] };
+    const out = { root: process.cwd(), json: false, scan: false, all: false, coverage: true, dirs: [] };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === "--root") out.root = resolve(argv[++i]);
         else if (a === "--json") out.json = true;
         else if (a === "--scan") out.scan = true;
         else if (a === "--all") out.all = true;
+        else if (a === "--coverage") out.coverage = true;
+        else if (a === "--no-coverage") out.coverage = false;
         else if (!a.startsWith("--")) out.dirs.push(resolve(a));
     }
     if (out.scan && out.dirs.length === 0 && !out.all) out.dirs.push(resolve(out.root));
@@ -88,7 +127,8 @@ function parseCsv(text) {
             // A blank line is not a record (RFC 4180), and the canonical
             // generators emit separator lines inside generated files, so
             // counting one as a 1-column record reports phantom arity drift.
-            if (fields.some((f) => f.trim() !== "")) records.push({ line: recordLine, fields });
+            if (fields.some((f) => f.trim() !== ""))
+                records.push({ line: recordLine, fields });
             fields = [];
             line++;
             recordLine = line;
@@ -98,7 +138,8 @@ function parseCsv(text) {
     }
     if (sb.length > 0 || fields.length > 0) {
         fields.push(sb);
-        if (fields.some((f) => f.trim() !== "")) records.push({ line: recordLine, fields });
+        if (fields.some((f) => f.trim() !== ""))
+            records.push({ line: recordLine, fields });
     }
     return records;
 }
@@ -139,13 +180,18 @@ function readTrackerFile(root, def) {
                     detail: "declared tracker file does not exist",
                 },
             ],
+            coverage: emptyCoverage(),
         };
     }
     const text = stripBom(readFileSync(full, "utf8"));
     const records = parseCsv(text);
     const drift = [];
     if (records.length === 0)
-        return { items: [], drift: [{ kind: "arity", tracker: def.id, ref: def.file, detail: "empty file" }] };
+        return {
+            items: [],
+            drift: [{ kind: "arity", tracker: def.id, ref: def.file, detail: "empty file" }],
+            coverage: emptyCoverage(),
+        };
 
     const header = records[0].fields.map((s) => s.trim());
     const col = {};
@@ -173,6 +219,10 @@ function readTrackerFile(root, def) {
     const groupRe = def.groupPattern ? new RegExp(def.groupPattern) : null;
     const seen = new Map();
     const items = [];
+    // Coverage is tallied from the SAME raw cell the status lookup uses, in the
+    // same loop, so the report cannot drift from what the mapping actually saw.
+    const tokenRows = new Map(); // raw status token -> row count
+    const firstIdForToken = new Map(); // raw status token -> id of its first row (the finding's ref)
 
     for (let r = 1; r < records.length; r++) {
         const rec = records[r];
@@ -220,13 +270,8 @@ function readTrackerFile(root, def) {
                 detail: `group '${group}' does not match ${def.groupPattern}`,
             });
         const status = statusMap[rawStatus];
-        if (status === undefined)
-            drift.push({
-                kind: "unmapped-status",
-                tracker: def.id,
-                ref: id,
-                detail: `status '${rawStatus}' has no mapping; map it to one of ${CANONICAL.join(", ")}`,
-            });
+        tokenRows.set(rawStatus, (tokenRows.get(rawStatus) || 0) + 1);
+        if (!firstIdForToken.has(rawStatus)) firstIdForToken.set(rawStatus, id);
 
         const item = { id, title: get("title"), status: status ?? rawStatus };
         if (group) item.group = group;
@@ -235,6 +280,24 @@ function readTrackerFile(root, def) {
         const notes = get("notes");
         if (notes) item.notes = notes;
         items.push(item);
+    }
+
+    // One finding per DISTINCT unmapped token, not one per row: an unmapped
+    // status is one decision to make whether it appears in one row or five
+    // hundred, and the row count keeps the size of that decision visible. ref is
+    // the first row that carried the token, so the finding still points at a real
+    // row.
+    for (const [token, rows] of tokenRows) {
+        if (Object.prototype.hasOwnProperty.call(statusMap, token)) continue;
+        drift.push({
+            kind: "unmapped-status",
+            tracker: def.id,
+            ref: firstIdForToken.get(token),
+            detail:
+                rows === 1
+                    ? `status '${token}' has no mapping; map it to one of ${CANONICAL.join(", ")}`
+                    : `status '${token}' has no mapping in ${rows} rows; map it to one of ${CANONICAL.join(", ")}`,
+        });
     }
 
     if (def.status && def.status.map) {
@@ -265,7 +328,14 @@ function readTrackerFile(root, def) {
         }
     }
 
-    return { items, drift };
+    const byToken = {};
+    for (const [token, rows] of tokenRows) {
+        byToken[token] = { rows, mapped: Object.prototype.hasOwnProperty.call(statusMap, token) };
+    }
+    const tokens = tokenRows.size;
+    const mapped = Object.values(byToken).filter((t) => t.mapped).length;
+
+    return { items, drift, coverage: { rows: items.length, tokens, mapped, unmapped: tokens - mapped, byToken } };
 }
 
 function narrativeDrift(root, registry, ids) {
@@ -319,12 +389,12 @@ export function scanRepo(root) {
     const trackers = [];
     const drift = [];
     for (const def of registry.trackers) {
-        const { items, drift: d } = readTrackerFile(root, def);
+        const { items, drift: d, coverage } = readTrackerFile(root, def);
         items.forEach((it) => allIds.add(it.id));
         drift.push(...d);
         const countsByStatus = {};
         for (const it of items) countsByStatus[it.status] = (countsByStatus[it.status] || 0) + 1;
-        trackers.push({ id: def.id, file: def.file, countsByStatus, items });
+        trackers.push({ id: def.id, file: def.file, countsByStatus, coverage, items });
     }
     drift.push(...narrativeDrift(root, registry, allIds));
     // rootIssue is written here too, so every indexed entry carries the same
@@ -357,6 +427,7 @@ export function main(argv) {
                     .map(([s, n]) => `${s} ${n}`)
                     .join(", ")}`,
             );
+            if (args.coverage) for (const t of entry.trackers) console.log(coverageLine(t));
             for (const d of entry.drift) console.log(`drift: [${d.kind}] ${d.tracker} ${d.ref} - ${d.detail}`);
         }
         return Math.min(entry.drift.length, 255);
@@ -413,6 +484,20 @@ export function main(argv) {
             const total = r.trackers.reduce((n, t) => n + t.items.length, 0);
             const issue = r.rootIssue ? `  [${r.rootIssue}]` : "";
             console.log(`  ${r.repo}: ${total} item(s), ${r.drift.length} drift finding(s)${issue}`);
+            if (args.coverage && r.trackers.length) {
+                let rows = 0;
+                let tokens = 0;
+                let mapped = 0;
+                let unmapped = 0;
+                for (const t of r.trackers) {
+                    const c = t.coverage || emptyCoverage();
+                    rows += c.rows;
+                    tokens += c.tokens;
+                    mapped += c.mapped;
+                    unmapped += c.unmapped;
+                }
+                console.log(`    coverage: ${rows} row(s), ${tokens} token(s), ${mapped} mapped, ${unmapped} unmapped`);
+            }
         }
         console.log(findings === 0 ? "tracker-lint: clean" : `tracker-lint: ${findings} finding(s)`);
     }

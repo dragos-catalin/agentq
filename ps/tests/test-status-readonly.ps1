@@ -148,6 +148,52 @@ try {
   $runArgs = @('run', '-Resource', 'build', '-Purpose', 'real work', '-MinFreeGB', '0', '-Repo', $repo, '--', 'pwsh', '-NoProfile', '-Command', 'exit 0')
   $o = AQ @runArgs
   Check '3 a real run refreshes capacity + adaptive cap and drops the expired burst' ($code -eq 0 -and (Get-Content (Join-Path $mq 'capacity') -Raw) -ne '9' -and (Get-Content (Join-Path $mq 'adaptive.json') -Raw) -notmatch [regex]::Escape($past) -and -not (Test-Path (Join-Path $mq 'burst.json'))) $o
+
+  # --- 4. a sample that fights back: unparsable, and VANISHING mid-read (2026-11-28) -------------------
+  # Live: `status` died with `Could not find file '...\queues\gate_machine\00000119-*.json'` because the
+  # file was picked and then GONE before the read -- a sibling's sweep reaped it in the gap. A reader every
+  # other agent's cleanup can kill is a reader that takes the whole fleet's toolbox down with it, so the
+  # property is: churn may hide a row, never end the call. The resources are named when it happens, because
+  # a silently skipped row is how a holder becomes invisible.
+  $cqd = Join-Path $home_ 'queues\build_churn'; New-Item -ItemType Directory -Force $cqd | Out-Null
+  function Write-Churn([int]$i) {
+    $t = @{ id = "churn$i"; seq = $i; resource = 'build:churn'; pid = 999999; procStart = $past; session = "s$i"; purpose = 'holder work'; cmd = 'x'; repo = $repo; created = $past; v = 3; lane = 'gate'; prio = 0; bump = 0; held = $true; ready = $true }
+    [IO.File]::WriteAllText((Join-Path $cqd ('{0:d8}-churn.json' -f $i)), ($t | ConvertTo-Json), $utf8)
+  }
+  foreach ($i in 1..3) { Write-Churn $i }
+  [IO.File]::WriteAllText((Join-Path $cqd 'seq'), '3'); [IO.File]::WriteAllText((Join-Path $cqd 'capacity'), '1')
+  # (a) unparsable samples: every ticket of the resource is broken, so whichever one the reader samples is
+  # one it cannot parse. It must exit 0, must not raise, and must NAME the resource it skipped.
+  foreach ($i in 1..3) { [IO.File]::WriteAllText((Join-Path $cqd ('{0:d8}-churn.json' -f $i)), '{ not json at all', $utf8) }
+  $o = AQ status; $c = $code
+  $errLine = (($o -split "`n") | Where-Object { $_ -match 'Exception|InvalidJson|Cannot convert|Could not find' }) -join ' | '
+  Check '4a an unparsable queue sample does not take status down' ($c -eq 0 -and $errLine -eq '') "code=$c :: $errLine"
+  Check '4a the skipped resource is REPORTED by name, not swallowed' ($o -match 'QUEUE CHURN' -and $o -match 'build[:_]churn') "code=$c :: $((($o -split "`n") | Where-Object { $_ -match 'CHURN' }) -join ' | ')"
+  # (b) the live shape: the file is deleted and recreated under the reader, thousands of times, while status
+  # runs. Hampering all three files means whichever the reader picks is the one being churned.
+  foreach ($i in 1..3) { Write-Churn $i }
+  $job = Start-Job -ScriptBlock {
+    param($dir, $seconds)
+    $until = (Get-Date).AddSeconds($seconds); $k = 0
+    while ((Get-Date) -lt $until) {
+      foreach ($i in 1..3) {
+        $f = Join-Path $dir ('{0:d8}-churn.json' -f $i)
+        try { [IO.File]::Delete($f) } catch {}
+        try { [IO.File]::WriteAllText($f, (@{ id = "churn$i"; seq = $i; resource = 'build:churn'; pid = 999999; session = "s$i"; purpose = 'holder work'; cmd = 'x'; v = 3; lane = 'gate'; prio = 0; bump = 0; held = $true; ready = $true } | ConvertTo-Json)) } catch {}
+        $k++
+      }
+    }
+    $k
+  } -ArgumentList $cqd, 60
+  $bad = @(); $churnSaw = 0
+  try {
+    for ($k = 1; $k -le 12; $k++) {
+      $o = AQ status
+      if ($code -ne 0 -or $o -match 'Could not find file') { $bad += "run$k code=$code" }
+      if ($o -match 'QUEUE CHURN') { $churnSaw++ }
+    }
+  } finally { Stop-Job $job -ErrorAction SilentlyContinue; $churnCycles = (Receive-Job $job | Select-Object -Last 1); Remove-Job $job -Force -ErrorAction SilentlyContinue }
+  Check '4b status survives a queue file deleted mid-read (12 runs against a live churn hammer)' ($bad.Count -eq 0) (($bad -join ', ') + " cycles=$churnCycles churnLines=$churnSaw")
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_PRUNE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }

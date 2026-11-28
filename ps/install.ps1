@@ -166,6 +166,11 @@ $map = [ordered]@{
   'tests\slo-second-red.test.mjs' = 'bin\slo-second-red.test.mjs'
   'tests\slo-second-red-baseline.json' = 'bin\slo-second-red-baseline.json'
   'tests\test-verify-resident-freshness.ps1' = 'bin\test-verify-resident-freshness.ps1'
+  # 2026-11-28 (hook reachability slice): every top-level ps/hooks/*.ps1 must be REACHED - named in the
+  # dispatcher (hook-pre.ps1), the harness registration or this map. A hook added to ps/hooks/ and wired
+  # nowhere (the reported nudge-parallel.ps1) shipped unreached for months because nothing checked.
+  # Paired with the run-all.ps1 entry in this same slice; 'install wiring' pins the two lists.
+  'tests\test-hook-reachability.ps1' = 'bin\test-hook-reachability.ps1'
   # 2026-11-23: `bump -Id|-Session` (a waiter can target its OWN ticket) + the `== MINE session ...` line
   # in `status`. Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
   'tests\test-agentq-bump.ps1' = 'bin\test-agentq-bump.ps1'

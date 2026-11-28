@@ -944,7 +944,14 @@ function Get-FairShare {
 # here. A lease with no record file (the helper suite builds hashtables by hand) is passed through untouched,
 # and Add-LeaseChats is never invoked for a batch that has none - so it need not even be defined then.
 function Add-LeaseChats($leases) {
-  @($leases | ForEach-Object { if ($_ -and "$(P $_ 'file' '')") { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } else { $_ } })
+  # Idempotent: an item that already carries `chats` (Add-LeaseChats output, e.g. `status`'s $all, handed on
+  # to Get-SlotShare) is returned as is - `Select-Object *, @{ n = 'chats' ... }` THROWS when the property
+  # already exists (measured 2026-11-28: passing the enriched list to Get-SlotShare broke `status`).
+  @($leases | ForEach-Object {
+      if (-not $_ -or -not "$(P $_ 'file' '')") { $_ }
+      elseif (@($_.PSObject.Properties.Name) -contains 'chats') { $_ }
+      else { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } }
+    })
 }
 # $leases is a lease array (a RAW Read-Leases view: the chat binding is attached HERE, the one store), $sess a
 # session id, $taskCap the machine task-slot cap, $chat the caller's chat id ('' keys the share by session).
@@ -992,6 +999,56 @@ function Get-SlotShare($leases, [string]$sess, [int]$taskCap, [string]$chat, [st
     mode = $(if ($chatMode) { 'chat' } else { 'session' }); chat = $chat
     chargedIn = $repoFilter; chargedCount = @($charged).Count
   }
+}
+# D8 (owner 2026-11-28): the CHAT behind a lease, for DISPLAY. D6/D7 made the CHAT the accounting unit, but
+# `status` and `who` still showed the SESSION, so one window's 18 leases under a single `term-<pid>` could
+# not be told apart - which lease belongs to which chat was unreadable. These helpers turn a lease into
+# "which chat, how old". The id is the lease's FIRST chat binding: the guard hook writes it to the
+# <lease>.json.chat sidecar, attached as `.chats` by Add-LeaseChats (status) or read here for a RAW
+# Read-Leases view (`who`); a lease with no binding falls back to its session. The AGE is the per-chat
+# registry file's CREATION time (<Root>\chats\<id>.json, the same file Get-ShareChatId confirms against),
+# i.e. how long that chat has been working here - $null (shown '-') when the registry file is gone.
+function Get-ChatAgeMin([string]$chatId) {
+  if (-not $chatId) { return $null }
+  try {
+    $cf = Join-Path (Join-Path $Root 'chats') (($chatId -replace '[^A-Za-z0-9._-]', '_') + '.json')
+    if (-not [IO.File]::Exists($cf)) { return $null }
+    [math]::Round(((Now) - [IO.File]::GetCreationTimeUtc($cf)).TotalMinutes, 1)
+  } catch { $null }
+}
+# The lease's chat (id + age + idle), or its session when no chat is bound. ONE helper, so `status`, `who`
+# and the doctor rows cannot drift on which chat a lease belongs to. The `chats` key is tested on an
+# IDictionary and on a PSObject: the helper suite builds hashtables by hand, the real path passes objects.
+function Get-LeaseChatInfo($l) {
+  $idleMin = $null; $ids = @()
+  if ($l) {
+    try {
+      $isDict = $l -is [System.Collections.IDictionary]
+      $hasChats = if ($isDict) { $l.Contains('chats') } else { @($l.PSObject.Properties.Name) -contains 'chats' }
+      if ($hasChats) { $ids = @(P $l 'chats' @()) }
+      elseif ("$(P $l 'file' '')") { $ch = Read-LeaseChat "$(P $l 'file')"; $ids = @($ch.chats); if ($ch.at) { $idleMin = [math]::Round(((Now) - $ch.at).TotalMinutes, 1) } }
+    } catch {}
+  }
+  $ids = @($ids | ForEach-Object { "$_" } | Where-Object { $_ })
+  if (-not $ids.Count) { return [pscustomobject]@{ key = 'session'; id = "$(P $l 'session' '')"; ageMin = $null; idleMin = $idleMin } }
+  $id = "$($ids[0])"
+  [pscustomobject]@{ key = 'chat'; id = $id; ageMin = (Get-ChatAgeMin $id); idleMin = $idleMin }
+}
+# "chat <id> (age 12m, idle 3m)" for the SLOT SHARE held list, or "session <id>" when no chat is bound.
+function Format-LeaseChatTag($l) {
+  $ci = Get-LeaseChatInfo $l
+  if ($ci.key -ne 'chat') { return "session $($ci.id)" }
+  $age = if ($null -ne $ci.ageMin) { "$($ci.ageMin)m" } else { '-' }
+  $idle = if ($null -ne $ci.idleMin) { "$($ci.idleMin)m" } else { '-' }
+  "chat $($ci.id) (age $age, idle $idle)"
+}
+# "<id> (age 12m, idle 3m)" for the `who` chat column, or '-' when the lease has no chat binding.
+function Format-LeaseChatCell($l) {
+  $ci = Get-LeaseChatInfo $l
+  if ($ci.key -ne 'chat') { return '-' }
+  $age = if ($null -ne $ci.ageMin) { "$($ci.ageMin)m" } else { '-' }
+  $idle = if ($null -ne $ci.idleMin) { "$($ci.idleMin)m" } else { '-' }
+  "$($ci.id) (age $age, idle $idle)"
 }
 # (1) REUSE BEFORE RENTING: the CLEAN slot of $role this session already holds in $repoName, else $null.
 # The dirty test is the SAME one the pre-gate uses (tracked OR non-ignored untracked changes disqualify):
@@ -1043,9 +1100,10 @@ function Test-SlotShareRefusal([string]$repoName, [string]$role, [switch]$PerRep
   # share by session, exactly as before.
   $all = @(Add-LeaseChats (Read-Leases $null))
   $chat = "$(Get-ShareChatId $all)"
-  # The RAW all-repos view goes in: Get-SlotShare attaches the chat bindings itself, so the lease path and
-  # `status` share ONE store (the sidecars). test-agentq-slotshare.ps1 A9 pins this literal call shape.
-  $sh = Get-SlotShare (Read-Leases $null) $Session $cap $chat $(if ($PerRepo) { $repoName } else { '' })
+  # The ENRICHED all-repos view ($all, chat bindings attached above) goes in: Get-SlotShare's Add-LeaseChats
+  # is idempotent, so the lease path and `status` share ONE store (the sidecars) without a second read.
+  # test-agentq-slotshare.ps1 A9 pins this literal call shape.
+  $sh = Get-SlotShare $all $Session $cap $chat $(if ($PerRepo) { $repoName } else { '' })
   # (a) owner 2026-11-28: an override that CHANGED THE OUTCOME is journaled - once per invocation, with the
   # numbers it overrode. Without this AGENTQ_NO_FAIRSHARE leaves no trace anywhere, and a fleet where every
   # caller quietly opts out looks exactly like a fleet with no contention. An override UNDER the share journals
@@ -1076,27 +1134,35 @@ function Test-SlotShareRefusal([string]$repoName, [string]$role, [switch]$PerRep
   }
   "this $keyTxt already holds $($sh.held) of the $($sh.sessions) competing $unitTxt' share of $($sh.share) slot(s) (machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession), keyed by $($sh.mode)): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path. You may reuse a slot this session already holds; or give one back first: agentq unlease -Repo <path> -LeaseId <id>; or wait for another $unitTxt to finish."
 }
-# The `SLOT SHARE` line of `status` (both halves of D5 in one line: the share and what it is derived from).
+# The `SLOT SHARE` line of `status`. It answers three questions in one line (D8, owner 2026-11-28):
+#   (a) how many slots MY chat holds vs its fair share - printed ALWAYS, so a lone holder still reads "3/3"
+#       and never a bare "15 (nothing else competes)" (the number that started this);
+#   (b) how many chats (or sessions, when no chat key applies) compete for the machine task cap;
+#   (c) for EVERY held slot, the CHAT it belongs to and that chat's age - not just the session.
 function Show-SlotShare {
   $fs = Get-FairShare
   if (-not $fs.enabled) { Write-Output 'SLOT SHARE off (fairShare.enabled = false)'; return }
   # D6: the status line shows the SAME key the refusal uses, or the two would disagree (the reader would see
   # 17 held by the window while the refusal charged 1 to the chat). The "mine" list below needs the enriched
-  # view, but Get-SlotShare is handed the RAW one and attaches the bindings itself (one store - see
-  # Test-SlotShareRefusal). Copies, never Add-Member: the Read-Leases records are memoized in-process.
+  # view; Get-SlotShare attaches the bindings itself, so the enriched list is handed in as-is (one store -
+  # see Test-SlotShareRefusal; Add-LeaseChats is idempotent). Copies, never Add-Member: the Read-Leases
+  # records are memoized in-process.
   $leases = @(Add-LeaseChats (Read-Leases $null))
   $cap = [int](Get-TaskSlotBudget).cap
   $chat = "$(Get-ShareChatId $leases)"
-  $sh = Get-SlotShare (Read-Leases $null) $Session $cap $chat
+  $sh = Get-SlotShare $leases $Session $cap $chat
   $isMine = { param($l) if ($sh.mode -eq 'chat') { @(P $l 'chats' @()) -contains $chat } else { "$(P $l 'session' '')" -eq "$Session" } }
   $mine = @($leases | Where-Object { $_ -and -not $_.stale -and (& $isMine $_) })
   # repo/slot, not the bare slot: the same slot NAME lives in every repo (`codai\scratch-1` next to
   # `marcai\scratch-1`), so a bare name made two sessions in different repos read as one duplicate lease
-  # (2026-11-27: a "duplicate leases" report that was two repos, the display was the only thing wrong).
-  $held = ($mine | ForEach-Object { " [$($_.repo)/$($_.slot) $(P $_ 'role' '')]" }) -join ''
+  # (2026-11-27). D8 adds the CHAT + its AGE to each entry, so a window's many chats are a readable list.
+  $held = ($mine | ForEach-Object { " [$($_.repo)/$($_.slot) $(P $_ 'role' '') $(Format-LeaseChatTag $_)]" }) -join ''
   $unitTxt = if ($sh.mode -eq 'chat') { 'chats' } else { 'sessions' }
   $keyId = if ($sh.mode -eq 'chat') { $chat } else { $Session }
-  Write-Output ("SLOT SHARE {0}{1} held by my {2} {3}{4}" -f $sh.held, $(if ($sh.competing) { "/$($sh.share) ($($sh.sessions) $unitTxt compete, machine task cap $($sh.taskCap), slotsPerSession $($sh.slotsPerSession))" } else { ' (nothing else competes)' }), $sh.mode, $keyId, $held)
+  $keyTxt = if ($sh.mode -eq 'chat') { "my chat $keyId" } else { "my session $keyId" }
+  # (a) held vs share ALWAYS; (b) the competing count; both derivation numbers last.
+  $compete = if ($sh.competing) { "$($sh.sessions) $unitTxt compete" } else { 'nothing else competes' }
+  Write-Output ("SLOT SHARE {0}/{1} held by {2} - {3} (machine task cap {4}, slotsPerSession $($sh.slotsPerSession)){5}" -f $sh.held, $sh.share, $keyTxt, $compete, $sh.taskCap, $held)
 }
 # Interleave by round: round 1 takes each session's first waiter, round 2 its second, ... so one
 # session's block of five waiters cannot sit in front of another session's single waiter. Grouping

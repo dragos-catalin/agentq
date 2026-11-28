@@ -177,7 +177,8 @@
       "lease spawns",
       "text encoding",
       "resident freshness",
-      "slo second red"
+      "slo second red",
+      "hook reachability"
     ]
   },
   "sharedCloneMode": "warn",

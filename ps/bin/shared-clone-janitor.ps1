@@ -33,6 +33,15 @@ WHAT ONE PASS DOES, per repo whose config marks it `sharedCloneMode=refuse` and 
      If it refuses (exit 5: the result would drop lines that landed upstream after the caller's base),
      NOTHING else happens — the journal gets `publish-refused` with agentq's own message and the tree is
      left exactly as it was.
+    4c. AND makes the salvage FINDABLE (2026-11-28). The publish commit used to live only on
+      `publish/<session>-<ts>`, a throwaway ref nobody can guess, so the salvaged file read as vanished
+      (verified: `chore(shared-clone): salvage unowned edits in codai (1 path(s))` was reachable only from
+      origin/publish/term-137124-20261127224118). Now the SAME commit is ALSO pushed to a well-known
+      durable ref `refs/heads/salvage/<repo>/<yyyyMMdd-HHmmss>` (Reap-LandedBranch never reaps it), and a
+      `SALVAGE.json` manifest is written to `~/.codai/parked/<repo>/<ts>/` naming the ref, the publish
+      topic, the commit sha, the paths and the backup dir; both are journaled (`salvaged`). A failed ref
+      push is journaled (`salvage-ref-failed`) and never aborts the pass - the publish ref and the local
+      backup still hold the bytes. Find any of them later with `agentq recover -Repo <repo>`.
   5. ONLY after the publish is verified on origin (publish verifies its own push): clean EXACTLY those
      paths with
        git stash push -u -m "shared-clone-janitor <repo> <ts>: published by <session>" -- <paths>
@@ -66,7 +75,8 @@ WHAT ONE PASS DOES, per repo whose config marks it `sharedCloneMode=refuse` and 
   A stale ticket blocks a repo until agentq reaps it (any working verb does); that is deliberate — this
   tool never decides a held ticket is dead.
 Environment overrides (tests): SHARED_CLONE_JANITOR_LOG, SHARED_CLONE_JANITOR_BACKUP,
-SHARED_CLONE_JANITOR_COORD (also honours AGENTQ_HOME), SHARED_CLONE_JANITOR_AGENTQ, AGENTQ_CONFIG.
+SHARED_CLONE_JANITOR_PARK, SHARED_CLONE_JANITOR_COORD (also honours AGENTQ_HOME),
+SHARED_CLONE_JANITOR_AGENTQ, AGENTQ_CONFIG.
 Log: ~/.codai/shared-clone-janitor.log (one line per action); Journal: <coord>\journal.jsonl.
 #>
 param(
@@ -87,6 +97,10 @@ Set-StrictMode -Version 3
 
 $Log = if ($env:SHARED_CLONE_JANITOR_LOG) { $env:SHARED_CLONE_JANITOR_LOG } else { Join-Path $HOME '.codai\shared-clone-janitor.log' }
 $BackupRoot = if ($env:SHARED_CLONE_JANITOR_BACKUP) { $env:SHARED_CLONE_JANITOR_BACKUP } else { Join-Path $HOME '.codai\backups\shared-clone' }
+# Where the SALVAGE.json manifest lands (2026-11-28), so a later agent can FIND the salvaged commit
+# instead of the file reading as "vanished". Same root git-autosync.ps1 parks into, and the place
+# `agentq recover` reads.
+$ParkRoot = if ($env:SHARED_CLONE_JANITOR_PARK) { $env:SHARED_CLONE_JANITOR_PARK } else { Join-Path $HOME '.codai\parked' }
 # The coord root holds the journal and the queue dirs; same resolution agentq.ps1 / git-autosync.ps1 use.
 $CoordRoot = if ($env:SHARED_CLONE_JANITOR_COORD) { $env:SHARED_CLONE_JANITOR_COORD }
   elseif ($env:AGENTQ_HOME) { $env:AGENTQ_HOME }
@@ -342,6 +356,8 @@ function Invoke-Repo([string]$top) {
   $L.Add("   $(if ($dry) { 'WOULD ACT' } else { 'ACT' }): $($rows.Count) unowned path(s) -> publish then clean")
   $L.Add("   ${verb}:  backup  $($rows.Count) path(s) -> $dest  (+ manifest.json)")
   $L.Add("   ${verb}:  pwsh -NoProfile -ExecutionPolicy Bypass -File `"$AgentqPath`" publish -Paths `"$joined`" -Message `"$msg`" -Purpose `"$purp`" -Repo $top")
+  $L.Add("   ${verb}:  git -C $top push --no-verify origin <sha>:refs/heads/salvage/$name/$ts   (well-known durable ref)")
+  $L.Add("   ${verb}:  write $ParkRoot\$name\$ts\SALVAGE.json   (ref + sha + paths, discoverable via agentq recover)")
   $L.Add("   ${verb}:  git -C $top stash push -u -m `"$stashMsg`" -- $qPaths")
   $L.Add("   ${verb}:  git -C $top status --porcelain -- $qPaths   (must be empty)")
   if ($dry) {
@@ -383,12 +399,46 @@ function Invoke-Repo([string]$top) {
       $r.decision = 'error'; $r.reason = "publish failed (exit $pubRc)"; $r.code = 1
       $r.lines = $L.ToArray(); return $r
     }
-    $topic = ''
+    $topic = ''; $pubShort = ''; $sha = ''; $salvageRef = ''
     # agentq returns 0 with 'nothing to publish' when origin already has exactly this content (the edit
     # was landed by someone else): then there is no topic to hand over, and the clean step is still right.
-    if ($pubText -match 'pushed origin/(\S+)\s*=\s*([0-9a-f]+)') { $topic = $Matches[1] }
+    if ($pubText -match 'pushed origin/(\S+)\s*=\s*([0-9a-f]+)') { $topic = $Matches[1]; $pubShort = $Matches[2] }
+    # 2026-11-28: the salvage commit used to land ONLY on `publish/<session>-<ts>` - a throwaway ref nobody
+    # can guess (verified: `chore(shared-clone): salvage unowned edits in codai (1 path(s))` was reachable
+    # ONLY from origin/publish/term-137124-20261127224118, so to the agent that wrote the file it simply
+    # vanished). Give the SAME commit a well-known durable ref (refs/heads/salvage/<repo>/<ts>, which
+    # Reap-LandedBranch never touches) plus a manifest + journal line naming ref + sha + paths, so a later
+    # agent that has never heard of the pass can always find it with `agentq recover`.
+    if ($topic) {
+      $sha = "$(& git -C $top rev-parse $pubShort 2>$null)".Trim()
+      if ($sha) {
+        $salvageRef = "refs/heads/salvage/$name/$ts"
+        $spush = @(& git -C $top push -q --no-verify origin "${sha}:$salvageRef" 2>&1 | ForEach-Object { "$_" })
+        $sremote = (("$(& git -C $top ls-remote origin $salvageRef 2>$null)".Trim()) -split '\s+' | Select-Object -First 1)
+        if ($sremote -ne $sha) {
+          # Never fail the pass over the recovery ref: the publish ref + the local backup already hold the bytes.
+          Write-Journal @{ event = 'salvage-ref-failed'; repo = $name; paths = $paths; ref = $salvageRef; sha = $sha; topic = $topic; reason = (@($spush) -join ' | '); tool = 'shared-clone-janitor' }
+          $L.Add("   WARN: could not push the well-known ref $salvageRef (origin/$topic still holds the commit)")
+          $salvageRef = ''
+        }
+      }
+      # The manifest is written whether or not the ref push succeeded, so a later agent can always FIND
+      # the salvaged copy - by the durable ref, by the publish ref, or by the local backup dir.
+      $pdir = Join-Path (Join-Path $ParkRoot $name) $ts
+      New-Item -ItemType Directory -Force $pdir | Out-Null
+      $man = [ordered]@{
+        repo = $name; at = $ts; session = $Session; tree = $top; head = "$($script:HeadSha)"
+        topic = "refs/heads/$topic"; salvageRef = $salvageRef; sha = $sha; paths = @($paths)
+        reason = 'shared-clone-janitor salvaged unowned edits so the shared clone could fast-forward'
+        backup = $backupDir; restored_with = "agentq recover -Repo $name"
+      }
+      [IO.File]::WriteAllText((Join-Path $pdir 'SALVAGE.json'), ($man | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+      Write-Journal @{ event = 'salvaged'; repo = $name; paths = $paths; topic = $topic; salvageRef = $salvageRef; sha = $sha; backup = $backupDir; manifest = (Join-Path $pdir 'SALVAGE.json'); tool = 'shared-clone-janitor' }
+      $short = if ($sha.Length -gt 10) { $sha.Substring(0, 10) } else { $sha }
+      $L.Add("   salvaged: $(if ($salvageRef) { $salvageRef } else { "origin/$topic" }) ($short) - find it later with: agentq recover -Repo $name")
+    }
     $where = if ($topic) { "origin/$topic" } else { 'origin (it already had exactly this content)' }
-    Write-Journal @{ event = $(if ($topic) { 'published' } else { 'already-on-origin' }); repo = $name; paths = $paths; topic = $topic; backup = $backupDir; tool = 'shared-clone-janitor' }
+    Write-Journal @{ event = $(if ($topic) { 'published' } else { 'already-on-origin' }); repo = $name; paths = $paths; topic = $topic; sha = $sha; salvageRef = $salvageRef; backup = $backupDir; tool = 'shared-clone-janitor' }
     foreach ($ln in @($pub | ForEach-Object { "$_" })) { if ($ln.Trim()) { $L.Add("     $ln") } }
 
     # ---- 4b. the writer that appeared while publish ran keeps its newer edit

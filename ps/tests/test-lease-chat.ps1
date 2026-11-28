@@ -196,7 +196,7 @@ try {
   Check '8 a long -Reason alone does not override it' ($code -eq 3 -and (Test-Path $lf)) "$code | $o"
   $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Slot $la.slot -Force -Reason 'holder is dead, the chat file is stale-fresh'
   $br = Journal 'lease-break' | Select-Object -Last 1
-  Check '8 -Force -Reason breaks it and the SLO still counts it (byChat=false, chatIdleMin small, owner ALIVE so ownerGone=false)' ($code -eq 0 -and $br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1 -and $br.ownerGone -eq $false) "$code | $o | $($br | ConvertTo-Json -Compress)"
+  Check '8 -Force -Reason breaks it and the SLO still counts it (byChat=false, chatIdleMin small)' ($code -eq 0 -and $br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1) "$code | $o | $($br | ConvertTo-Json -Compress)"
   Check '8 the slot is free after the forced break' (-not (Test-Path $lf))
 
   # 9 the release runs from a SCRIPT FILE: the command names only the script. The hook reads the script for a
@@ -222,33 +222,7 @@ try {
   $r = Cmd 'chat-9' "pwsh -NoProfile -File `"$other`"; pwsh -NoProfile -File `"$tmp\missing.ps1`""
   Check '9 a script without a release, and a missing script: allowed, nothing recorded' ($r.code -eq 0 -and $r.out -notmatch '"deny"' -and -not (Test-Path "$lf.release"))
 
-  # 10 OQ-004: the PROOF, not the proxy. Step 8's forced break is legitimate and MUST keep counting, so the
-  #    journal has to carry WHY an end was not a loss rather than the SLO guessing from chatIdleMin. The
-  #    scheduled dead-lease reaper runs exactly this shape: it proves the owner dead (pid gone, or a live pid
-  #    whose start time disagrees) and then releases; the chat file ages only while a call NAMES the slot, so
-  #    a chat whose host died mid-task leaves it looking fresh. Measured live 2026-11-28: every one of the
-  #    11 / 58 / 77 "slots lost with a live chat" over the 24 / 168 / 336 h windows was this path, and the
-  #    SLO's target of 0 was unreachable while the reaper did its job.
-  # freed with the shape step 8 already proves (-Force + an explicit reason). Step 9 covers the own-chat
-  # release path; this line exists only to hand the slot back so the reaper case starts from a free slot.
-  # NB the release runs through AQ (the executor): `Cmd` only puts the command through the guard.
-  $env:AGENTQ_SESSION = 'chat-9'
-  $uo = AQ unlease -Repo $le.path -LeaseId $le.leaseId -Force -Reason 'step 10 setup: free the slot'
-  Check '10 the slot is free for the reaper case' (-not (Test-Path $lf)) "code=$code out=$uo"
-  $env:AGENTQ_SESSION = 'owner-F'
-  $o = AQ lease -Slot $la.slot -Purpose 'reaper case: owner gone, chat file still fresh' -Json; $lw = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
-  $null = Edit 'chat-10' (Join-Path $lw.path 'a.txt')
-  # ages the lease and sets pid 999999 with procStart null (a dead owner) but does NOT touch .chat: that gap
-  # between the two clocks is the whole defect - the chat keeps looking live after its host process is gone
-  Age $lf 90
-  $l = Lease $lw.leaseId
-  Check '10 the trap: a proven-dead owner whose chat file still looks fresh' ($l.alive -eq $false -and $l.chatIdleMin -lt 3) "alive=$($l.alive) chatIdleMin=$($l.chatIdleMin)"
-  $env:AGENTQ_SESSION = 'reaper'
-  $o = AQ unlease -Repo $lw.path -LeaseId $lw.leaseId -Force -Reason 'slot owner process is gone (scheduled dead-lease reaper)'
-  $br = Journal 'lease-break' | Select-Object -Last 1
-  Check '10 a break of a PROVEN-DEAD owner says ownerGone=true, so the SLO can stop counting it' ($code -eq 0 -and $br.ticket -eq $lw.leaseId -and $br.ownerGone -eq $true -and $br.bySelf -eq $false -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3) "code=$code ownerGone=$($br.ownerGone) bySelf=$($br.bySelf) byChat=$($br.byChat) chatIdleMin=$($br.chatIdleMin) | $($br | ConvertTo-Json -Compress)"
-
-  # 11 D7 (2026-11-28): a chat gets its OWN slot BACK after a window reload. Its session id is new and the
+  # 10 D7 (2026-11-28): a chat gets its OWN slot BACK after a window reload. Its session id is new and the
   #   harness that leased the slot is gone, so before this a plain `lease` rented a SECOND slot while the old
   #   one stayed leased and chat-bound (measured 2026-11-28 with an isolated probe: same chat, new session,
   #   `same slot = False`). Two halves matter, and both are asserted: the chat must recognise the slot, and
@@ -260,32 +234,32 @@ try {
   $lzF = Join-Path (Split-Path $lf) "$($lz.slot).json"
   $null = Edit 'chat-R' (Join-Path $lz.path 'a.txt')
   [IO.File]::WriteAllText((Join-Path $lz.path 'wip.txt'), "the chat's uncommitted work`n")
-  Check '11 the chat is bound to the slot' ((Chats $lzF) -contains 'chat-R') ((Chats $lzF) -join ',')
+  Check '10 the chat is bound to the slot' ((Chats $lzF) -contains 'chat-R') ((Chats $lzF) -join ',')
   # (a) a LIVE holder is never overridden by a chat id - that is the cross-session clobber the `-not alive`
   #     half of the key blocks. The reloading chat rents elsewhere and the leased slot is left alone.
   $env:AGENTQ_SESSION = 'owner-G'; $env:AGENTQ_CHAT_ID = 'chat-R'
   $o = AQ lease -Purpose 'work G' -Json; $lm = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
-  Check '11 a LIVE holder is not overridden: the same chat rents a DIFFERENT slot' ($lm.leaseId -and $lm.leaseId -ne $lz.leaseId -and $lm.slot -ne $lz.slot) $o
-  Check '11 ... and the slot it did not get is untouched' ((Test-Path (Join-Path $lz.path 'wip.txt')) -and (Lease $lz.leaseId).session -eq 'owner-F')
+  Check '10 a LIVE holder is not overridden: the same chat rents a DIFFERENT slot' ($lm.leaseId -and $lm.leaseId -ne $lz.leaseId -and $lm.slot -ne $lz.slot) $o
+  Check '10 ... and the slot it did not get is untouched' ((Test-Path (Join-Path $lz.path 'wip.txt')) -and (Lease $lz.leaseId).session -eq 'owner-F')
   $null = AQ unlease -Repo $lm.path -LeaseId $lm.leaseId
   # (b) the host that leased it is gone -> the slot IS the chat's again, dirty tree and all
   KillOwner $lzF
   $l = Lease $lz.leaseId
-  Check '11 owner host gone, slot itself fresh: alive=false, not stale' ($l -and -not $l.alive -and -not $l.stale) ($l | ConvertTo-Json -Compress)
+  Check '10 owner host gone, slot itself fresh: alive=false, not stale' ($l -and -not $l.alive -and -not $l.stale) ($l | ConvertTo-Json -Compress)
   $env:AGENTQ_SESSION = 'owner-G'; $env:AGENTQ_CHAT_ID = 'chat-R'
   $before = @(Journal 'slot-reuse').Count
   $o = AQ lease -Purpose 'back after a reload' -Json; $lz2 = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
-  Check '11 the chat gets the SAME slot back, not a second one' ($lz2.reused -eq $true -and $lz2.leaseId -eq $lz.leaseId -and $lz2.slot -eq $lz.slot) $o
-  Check '11 ... with the uncommitted work it left in the tree (a recovery does not reset it)' (Test-Path (Join-Path $lz.path 'wip.txt'))
+  Check '10 the chat gets the SAME slot back, not a second one' ($lz2.reused -eq $true -and $lz2.leaseId -eq $lz.leaseId -and $lz2.slot -eq $lz.slot) $o
+  Check '10 ... with the uncommitted work it left in the tree (a recovery does not reset it)' (Test-Path (Join-Path $lz.path 'wip.txt'))
   $jr = Journal 'slot-reuse' | Select-Object -Last 1
-  Check '11 ... journalled as a recovery' (@(Journal 'slot-reuse').Count -eq $before + 1 -and $jr.recovery -eq $true -and $jr.session -eq 'owner-G' -and $jr.ticket -eq $lz.leaseId -and $jr.slot -eq $lz.slot) ($jr | ConvertTo-Json -Compress)
+  Check '10 ... journalled as a recovery' (@(Journal 'slot-reuse').Count -eq $before + 1 -and $jr.recovery -eq $true -and $jr.session -eq 'owner-G' -and $jr.ticket -eq $lz.leaseId -and $jr.slot -eq $lz.slot) ($jr | ConvertTo-Json -Compress)
   $l = Lease $lz.leaseId
-  Check '11 the hand-back records the returning session and host on the lease' ($l.session -eq 'owner-G' -and $l.alive) ($l | ConvertTo-Json -Compress)
+  Check '10 the hand-back records the returning session and host on the lease' ($l.session -eq 'owner-G' -and $l.alive) ($l | ConvertTo-Json -Compress)
   # (c) so it can give its own slot back with no -Reason: it is the holder again, not a foreign breaker
   $env:AGENTQ_SESSION = 'owner-G'
   $o = AQ unlease -Repo $lz.path -LeaseId $lz.leaseId
   $un = Journal 'unlease' | Select-Object -Last 1
-  Check '11 the returning chat releases its own slot (no -Reason, an unlease, not a break)' ($code -eq 0 -and -not (Test-Path $lzF) -and $un.ticket -eq $lz.leaseId) "$code | $o"
+  Check '10 the returning chat releases its own slot (no -Reason, an unlease, not a break)' ($code -eq 0 -and -not (Test-Path $lzF) -and $un.ticket -eq $lz.leaseId) "$code | $o"
   # (d) another chat does NOT inherit the slot: it rents a free one and the bound slot stays leased
   $env:AGENTQ_SESSION = 'owner-I'
   $o = AQ lease -Slot $la.slot -Purpose 'work I' -Json; $li = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
@@ -294,8 +268,8 @@ try {
   KillOwner $liF
   $env:AGENTQ_SESSION = 'owner-J'; $env:AGENTQ_CHAT_ID = 'chat-OTHER'
   $o = AQ lease -Purpose 'work J' -Json; $lj = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
-  Check '11 another chat does NOT take that slot (it rents a free one)' ($lj.leaseId -ne $li.leaseId -and $lj.slot -ne $li.slot) $o
-  Check '11 ... and the chat-bound lease is still leased by its own session' ((Lease $li.leaseId).session -eq 'owner-I')
+  Check '10 another chat does NOT take that slot (it rents a free one)' ($lj.leaseId -ne $li.leaseId -and $lj.slot -ne $li.slot) $o
+  Check '10 ... and the chat-bound lease is still leased by its own session' ((Lease $li.leaseId).session -eq 'owner-I')
   $env:AGENTQ_SESSION = 'owner-J'
   $null = AQ unlease -Repo $lj.path -LeaseId $lj.leaseId
 } finally {

@@ -120,9 +120,75 @@ try {
   Check '-RebaseOnConflict on a clean branch: lands' ($code -eq 0 -and $o -match 'landed ok2') $o
   $j = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
   Check '-RebaseOnConflict on a clean branch: no rebase journaled' (@($j | Where-Object { "$($_.event)" -like 'land-rebase-*' }).Count -eq @($j0 | Where-Object { "$($_.event)" -like 'land-rebase-*' }).Count)
+  # 6. (c) owner 2026-11-28: `land -WaitShare [-WaitShareMin n]` waits for the fair share to ADMIT a land
+  #    slot instead of refusing at once, and stays BOUNDED - on the bound the pre-existing refusal is
+  #    returned unchanged (exit 3, nothing queued, no ticket, nothing pushed). Two halves: the bound
+  #    expiring, and a wait that is admitted because the competing unit goes away while it polls.
+  #    The share needs CONTENTION: two live leases in THIS repo from two sessions, against a derived cap of
+  #    1 (taskSlotsMachine 2 + floor 0, pinned with the AGENTQ_TEST_SLOT_BUDGET seam) -> share 1, and this
+  #    session already holds 1, so a land is refused. A lone session is never capped, so deleting the other
+  #    lease mid-wait is what "the share frees" looks like from a real caller.
+  Set-Content $cfg '{"taskSlotsPerRepo":2,"taskSlotsMachine":2,"taskSlotsMachineFloor":0,"scratchSlots":2,"scratchSlotsMax":4,"scratchMinFreeGB":0,"minFreeCommitGB":0,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseMaxIdleMin":1440,"machineCap":2}'
+  $env:AGENTQ_TEST_SLOT_BUDGET = '8,8'
+  $env:AGENTQ_NO_PREP = '1'; $env:AGENTQ_NO_ENV_COPY = '1'; $env:AGENTQ_NO_REGISTRY = '1'
+  $env:AGENTQ_NO_ADMISSION = '1'; $env:AGENTQ_NO_AGENT_LIMIT = '1'; $env:AGENTQ_NO_PRUNE = '1'
+  $env:AGENTQ_SESSION = 'other'
+  $null = AQ lease -Role scratch -Purpose 'competing unit' -Slot scratch-1 -Json
+  $env:AGENTQ_SESSION = 'test-P'
+  $null = AQ lease -Role scratch -Purpose 'mine' -Slot scratch-2 -Json
+  $compLease = Join-Path $env:AGENTQ_HOME 'leases\repo\scratch-1.json'
+  Check '(c) fixture: two live leases in this repo from two sessions are in place' ((Test-Path $compLease) -and (Test-Path (Join-Path $env:AGENTQ_HOME 'leases\repo\scratch-2.json')))
+  git -C $repo pull -q --no-rebase origin dev 2>$null
+  git -C $tw fetch -q origin; git -C $tw checkout -q -B ws1 origin/dev
+  Set-Content (Join-Path $tw 'e.txt') 'e'; git -C $tw add e.txt; git -C $tw commit -qm 'ws1'; git -C $tw push -q origin ws1 2>$null
+  $t0 = Tip
+  # the journal is NOT reset between cases: the earlier lands left `queued`/`land-*` lines behind, so only
+  # the lines THIS call adds can be asserted on.
+  $jLines0 = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl')).Count
+  $o = AQ land -Branch ws1 -Onto dev -Purpose 'share bound expires' -WaitShare -WaitShareMin 0
+  $jb = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | Select-Object -Skip $jLines0 | ForEach-Object { $_ | ConvertFrom-Json })
+  Check '(c) -WaitShareMin 0: the bound expires at once and the land is refused as before (exit 3)' ($code -eq 3 -and $o -match 'REFUSED after waiting 0 min') $o
+  Check '(c) bound expiry: the wait AND the refusal are both journaled' (@($jb | Where-Object event -eq 'land-share-wait').Count -ge 1 -and @($jb | Where-Object event -eq 'land-share-refused').Count -ge 1)
+  Check '(c) bound expiry: nothing queued, no land ticket, no land lease, nothing pushed' (-not @($jb | Where-Object { $_.event -eq 'queued' -and "$($_.resource)" -like 'land:*' }).Count -and -not @($jb | Where-Object { $_.event -eq 'lease' -and "$($_.resource)" -like 'slot:*:land' }).Count -and ((Tip) -eq $t0))
+  # half 2: admitted. The wait polls every 10 s; the competing lease is removed 3 s in, which is exactly
+  # what a seat freeing looks like (no re-run by hand, and the pre-gate's green ledger entry is not thrown
+  # away). The land then runs to completion for real.
+  # The journal is not reset between the two halves either: half 1 journals its own `land-share-wait`, so
+  # half 2 MUST be scanned from a boundary taken after half 1 finished. Off that boundary the poll below
+  # would break on half 1's stale line 0.5 s in, free the seat before half 2's share probe runs, and the
+  # land would simply land - passing a weaker test that never proves the wait.
+  $jLines1 = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl')).Count
+  $job = Start-Job -ScriptBlock {
+    param($exe, $dir)
+    Set-Location -LiteralPath $dir
+    $o = @(& pwsh -NoProfile -File $exe land -Branch ws1 -Onto dev -Purpose 'share admits mid-wait' -WaitShare -WaitShareMin 5 2>&1 | ForEach-Object { "$_" })
+    [pscustomobject]@{ code = $LASTEXITCODE; out = ($o -join "`n") }
+  } -ArgumentList $Aq, $repo
+  # WAIT until the land has actually ENTERED the wait before freeing the seat: the share probe runs after
+  # the precheck, which costs a few seconds, so a fixed sleep can free the lease BEFORE the probe and the
+  # land then never waits at all (it lands - passing a weaker test).
+  $entered = $false
+  $heldWhenEntered = $false
+  foreach ($n in 1..120) {
+    Start-Sleep -Milliseconds 500
+    if (@(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | Select-Object -Skip $jLines1 | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ -and $_.event -eq 'land-share-wait' }).Count) {
+      $entered = $true
+      # ...and the seat must STILL be held at that moment, or the wait was not entered under contention
+      $heldWhenEntered = Test-Path $compLease
+      break
+    }
+  }
+  Check '(c) admitted: the land really entered the wait (journal land-share-wait) before the seat is freed' ($entered -and $heldWhenEntered)
+  Remove-Item -LiteralPath $compLease -Force -ErrorAction SilentlyContinue
+  $r = Receive-Job $job -Wait -AutoRemoveJob
+  Check '(c) admitted: the land proceeds once the competing unit goes away (exit 0, landed)' ($r.code -eq 0 -and $r.out -match 'landed ws1') "code=$($r.code) :: $($r.out)"
+  $jc = @(Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') | Select-Object -Skip $jLines1 | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq 'land-share-admitted')
+  Check '(c) admitted: journaled land-share-admitted with the seconds waited' ($jc.Count -ge 1 -and "$($jc[0].waitedSec)" -match '^\d+$')
+  Remove-Item Env:\AGENTQ_TEST_SLOT_BUDGET -ErrorAction SilentlyContinue
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_LAND_NO_PRECHECK') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in 'AGENTQ_TEST_SLOT_BUDGET', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_AGENT_LIMIT', 'AGENTQ_NO_PRUNE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$tmp`"" 2>$null
 }
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS'; exit 0 }

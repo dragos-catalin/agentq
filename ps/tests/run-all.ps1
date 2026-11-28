@@ -193,6 +193,12 @@ $suites = [ordered]@{
   'doctor'          = @('-File', (Join-Path $PSScriptRoot 'test-agentq-doctor.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'agentq-sync'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-sync.ps1'), '-Bin', $bin)
   'hook pre'        = @('-File', (Join-Path $PSScriptRoot 'test-hook-pre.ps1'), '-Hooks', $hooks)
+    # 2026-11-28: every ps/hooks/*.ps1 (top level) must be REACHED - named in the dispatcher
+    # (hook-pre.ps1), the harness registration (codai-hooks.json, when present) or the install map
+    # (install.ps1). A hook file added to ps/hooks/ and wired nowhere (the reported nudge-parallel.ps1)
+    # shipped unreached for months because nothing checked. Paired with the gateSuites.agentq entry in
+    # bin\agentq-config.json; the install.ps1 map entry is what 'install wiring' also requires.
+    'hook reachability' = @('-File', (Join-Path $PSScriptRoot 'test-hook-reachability.ps1'))
   'install'         = @('-File', (Join-Path $PSScriptRoot 'test-install.ps1'), '-Src', $root)
   # 2026-11-21 (ADR 0014): take-over + `recover` safety net, the commit/push split (D1), the
   # per-session fair share of a resource (D4). Without these lines the suites existed and never ran.

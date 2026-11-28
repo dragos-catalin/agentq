@@ -91,6 +91,12 @@ param(
     [switch]$AllSlots,
     # Parent of the worktree slots (default E:\gh\.wt\<repo leaf> when it exists).
     [string]$WorktreeRoot,
+    # Count only runs whose suite exited 0. A failed or aborted run attributes the whole remaining wall
+    # clock to whichever member was in flight when it died (measured: gate:knip 1045.98s, gate:docs
+    # 336.58s in runs that aborted), so a suite that takes 11s green reads as a 68s MEDIAN once a
+    # handful of such runs fall inside the window. Green-only is the window that answers "what does
+    # this suite cost", which is the question the report exists for.
+    [switch]$GreenOnly,
     # Skip the last-green.json context line.
     [switch]$NoLastGreen,
     [switch]$Help
@@ -207,7 +213,8 @@ function Get-AgentqSuiteTimings {
     [CmdletBinding()]
     param(
         [string[]]$LogDir,
-        [int]$Last = 5
+        [int]$Last = 5,
+        [bool]$GreenOnly = $false
     )
     $result = [pscustomobject]@{ Rows = @(); Logs = @(); BadLines = @(); NewestRun = $null; Errors = @() }
     $dirs = @($LogDir | Where-Object { $_ })
@@ -228,6 +235,7 @@ function Get-AgentqSuiteTimings {
         if ($r.Run) { $result.NewestRun = [pscustomobject]@{ Source = $f.Name; Exit = $r.Run.Exit; Sec = $r.Run.Sec; Raw = $r.Run.Raw; At = $f.LastWriteTime } }
     }
     if (-not $all.Count) { return $result }
+    if ($GreenOnly) { $all = @($all | Where-Object { $_.Exit -eq 0 }); if (-not $all.Count) { return $result } }
 
     $window = $(if ($Last -lt 1) { 1 } else { $Last })
     $byName = @{}
@@ -307,9 +315,23 @@ function Resolve-AgentqLogDir([string[]]$Dirs) {
 }
 
 function Invoke-AgentqTimingsMain {
-    param($LogDir, $Root, [int]$Last, [int]$Top, [bool]$Json, [bool]$AllSlots, $WorktreeRoot, [bool]$NoLastGreen)
+    param($LogDir, $Root, [int]$Last, [int]$Top, [bool]$Json, [bool]$AllSlots, $WorktreeRoot, [bool]$NoLastGreen, [bool]$GreenOnly)
 
-    $repoRoot = $(if ($Root) { $Root } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) })
+    # Default root = the repo the CALLER is working in, not the directory this installed script happens
+    # to live in. The old derivation (<bin>\..\.. = $HOME) made a bare `agentq timings` read
+    # $HOME\.copilot-tmp\build-logs - a directory that does not exist - so it answered "nothing recorded
+    # (scanned 0 log file(s))" while the repo's own gate logs sat in <repo>\.copilot-tmp\build-logs.
+    # A caller outside any repo keeps the old behaviour, which is the correct fallback there.
+    $repoRoot = $Root
+    if (-not $repoRoot) {
+        $gitTop = $null
+        try { $gitTop = (& git -C $PWD.Path rev-parse --show-toplevel 2>$null) } catch { $gitTop = $null }
+        if ($gitTop) { $gitTop = ("$gitTop").Trim() }
+        if (-not $gitTop -or -not (Test-Path -LiteralPath "$gitTop")) {
+            $gitTop = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        }
+        $repoRoot = "$gitTop"
+    }
     $dirs = @()
     if ($LogDir) { $dirs = Resolve-AgentqLogDir $LogDir }
     else {
@@ -330,7 +352,7 @@ function Invoke-AgentqTimingsMain {
     }
 
     $out = New-Object System.Collections.ArrayList
-    $t = Get-AgentqSuiteTimings -LogDir $dirs -Last $Last
+    $t = Get-AgentqSuiteTimings -LogDir $dirs -Last $Last -GreenOnly $GreenOnly
     $rows = @($t.Rows)
     foreach ($b in @($t.BadLines)) { [Console]::Error.WriteLine("agentq-timings: skipped unparsable result line(s) - $b") }
     foreach ($e in @($t.Errors)) { [Console]::Error.WriteLine("agentq-timings: $e") }
@@ -342,6 +364,7 @@ function Invoke-AgentqTimingsMain {
         $wit = @($dirs) -join '; '
         $run = $t.NewestRun
         $why = $(if ($run) { "; the newest log says '$($run.Raw)' and carries no suite result line" } else { '' })
+        if ($GreenOnly) { $why += ' (note: -GreenOnly was set, so every run that failed was excluded)' }
         $msg = "agentq-timings: no timings recorded (scanned $(@($t.Logs).Count) log file(s) under: $wit$why). Run a gate (run-all.ps1 / ps/devcloud/gate.ps1) or pass -LogDir."
         if ($Json) {
             [Console]::Error.WriteLine($msg)
@@ -385,6 +408,8 @@ ps/bin/agentq-timings.ps1 - which gate suite costs what (read from the build log
   -Top n       print only the first n rows (0 = all)
   -Json        emit a clean JSON array of rows instead of the table
   -AllSlots    also scan <WorktreeRoot>\*\.copilot-tmp\build-logs
+    -GreenOnly   count only runs whose suite exited 0 (a failed/aborted run attributes the remaining wall
+                             clock to the member in flight, so it must not sit in the median of a green suite)
   -NoLastGreen skip the last-green.json context line
 
   Exit 0 = a table/JSON was produced, 3 = nothing was recorded, 2 = bad arguments.
@@ -401,7 +426,7 @@ if ($Last -lt 1) { Write-Output 'agentq-timings: -Last must be 1 or more (it is 
 if ($Top -lt 0) { Write-Output 'agentq-timings: -Top must be 0 (all) or more'; exit 2 }
 
 try {
-    $res = Invoke-AgentqTimingsMain -LogDir $LogDir -Root $Root -Last $Last -Top $Top -Json:$Json -AllSlots:$AllSlots -WorktreeRoot $WorktreeRoot -NoLastGreen:$NoLastGreen
+    $res = Invoke-AgentqTimingsMain -LogDir $LogDir -Root $Root -Last $Last -Top $Top -Json:$Json -AllSlots:$AllSlots -WorktreeRoot $WorktreeRoot -NoLastGreen:$NoLastGreen -GreenOnly:$GreenOnly
 } catch {
     # Never throw out of a reporting tool.
     Write-Output "agentq-timings: failed to read the recorded timings: $($_.Exception.Message)"

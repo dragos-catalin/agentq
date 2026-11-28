@@ -11,6 +11,9 @@ or sent into a shared VS Code terminal can never reach it (the "Terminate batch 
 caller capturing our output never waits for the job; the command gets an empty stdin (no prompt blocks).
 Log: <cwd>\.copilot-tmp\jobs\<id>.log (combined output, then `EXIT=<code>` and `DONE`).
 Registry: <AGENTQ_HOME or ~/.codai/coord>\jobs\<id>.json (mirrored to the hub by agentq-sync).
+Placement (-Placement, default local): where the job actually runs - `local`, or `cloud:<workspace>`
+when the caller already knows it delegates. A cloud run corrects its OWN record from inside the job
+(the workspace is only resolved there), so this parameter is for the cases that know it up front.
 Priority (-Priority, default BelowNormal): the runner lowers its own priority class before starting
 the command, so the whole tree inherits it. Background builds/tests then yield to interactive work -
 VS Code terminals took 2-7 s (up to tens of seconds) to start while 32 cores were saturated by jobs
@@ -22,7 +25,7 @@ param(
   [Parameter(Mandatory)][string]$Label,
   [string]$Command, [string]$File,
   [Parameter(ValueFromRemainingArguments)][Alias('Args')][string[]]$ArgList = @(),
-  [string]$Cwd, [double]$ExpectedMin = 10, [string]$Repo,
+  [string]$Cwd, [double]$ExpectedMin = 10, [string]$Repo, [string]$Placement = 'local',
   [ValidateSet('Idle', 'BelowNormal', 'Normal')][string]$Priority = 'BelowNormal', [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
@@ -51,7 +54,7 @@ try { $pp = (Get-Process -Id $PID).Parent; if ($pp -and $pp.ProcessName -match '
 $display = if ($File) { (@("-File `"$File`"") + @($ArgList | ForEach-Object { "$_" })) -join ' ' } else { $Command }
 Save-Job @{
   id = $id; label = $Label; command = $display; file = $(if ($File) { $File } else { $null }); args = @($ArgList)
-  cwd = $Cwd; repo = $Repo; pid = 0; pidStart = $null; log = $log; expectedMin = $ExpectedMin
+  cwd = $Cwd; repo = $Repo; placement = $Placement; pid = 0; pidStart = $null; log = $log; expectedMin = $ExpectedMin
   startedAt = (Get-JobIso ([DateTime]::UtcNow)); state = 'running'; ownerPid = $owner; host = $env:COMPUTERNAME
   exitCode = $null; endedAt = $null; priority = $Priority
 }

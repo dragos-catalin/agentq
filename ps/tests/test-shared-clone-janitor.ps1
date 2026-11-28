@@ -20,6 +20,7 @@ New-Item -ItemType Directory $root | Out-Null
 
 $env:SHARED_CLONE_JANITOR_LOG = Join-Path $root 'janitor.log'
 $env:SHARED_CLONE_JANITOR_BACKUP = Join-Path $root 'backups'
+$env:SHARED_CLONE_JANITOR_PARK = Join-Path $root 'parked'
 $env:SHARED_CLONE_JANITOR_COORD = Join-Path $root 'coord'
 $env:SHARED_CLONE_JANITOR_AGENTQ = $agentq
 $env:AGENTQ_HOME = Join-Path $root 'coord'
@@ -67,6 +68,8 @@ function RunJ([string[]]$x) {
 # an empty array), so `(Dirty $r).Count` would throw under StrictMode. `,@(...)` keeps it an array.
 function Dirty([string]$p) { ,@(git -C $p -c core.quotepath=off status --porcelain -uall 2>$null | ForEach-Object { "$_" }) }
 function PublishRefs([string]$o) { ,@(git -C $o for-each-ref --format='%(refname)' refs/heads/publish 2>$null | ForEach-Object { "$_" }) }
+function SalvageRefs([string]$o) { ,@(git -C $o for-each-ref --format='%(refname)' refs/heads/salvage 2>$null | ForEach-Object { "$_" }) }
+function ParkManifests([string]$leaf) { ,@(Get-ChildItem -LiteralPath (Join-Path $env:SHARED_CLONE_JANITOR_PARK $leaf) -Recurse -Filter 'SALVAGE.json' -ErrorAction SilentlyContinue) }
 function InRef([string]$p, [string]$ref, [string]$file) { (@(& git -C $p show "${ref}:${file}" 2>$null) -join "`n") }
 function Stashes([string]$p) { ,@(git -C $p stash list 2>$null | ForEach-Object { "$_" }) }
 function Backups([string]$leaf) { ,@(Get-ChildItem -LiteralPath (Join-Path $env:SHARED_CLONE_JANITOR_BACKUP $leaf) -Recurse -Filter manifest.json -ErrorAction SilentlyContinue) }
@@ -107,6 +110,25 @@ if ($bk.Count -eq 1) {
 $ev = JEvents 'scj-a'
 Ok ($ev -contains 'backup' -and $ev -contains 'published' -and $ev -contains 'cleaned') "A journaled backup+published+cleaned (got $($ev -join ','))"
 OkText (Get-Content -LiteralPath $env:SHARED_CLONE_JANITOR_LOG -Raw) 'published 1 path\(s\) as origin/publish/' 'A the log line records the publish'
+# A (2026-11-28): the salvage commit must ALSO be on a well-known durable ref with a discoverable
+# manifest, so an agent that never heard of the pass can find a file that was moved out of the shared
+# clone (before this, it lived ONLY on the throwaway origin/publish/<session>-<ts> ref and read as gone).
+$srefs = SalvageRefs $a.o
+Ok ($srefs.Count -eq 1) "A exactly one salvage ref on origin (got $($srefs.Count))"
+if ($srefs.Count -eq 1) {
+  OkText $srefs[0] '^refs/heads/salvage/scj-a/\d{8}-\d{6}$' 'A the salvage ref is the well-known <repo>/<ts> form'
+  Ok ((InRef $a.o $srefs[0] 'base.txt') -eq 'edited-by-nobody') 'A the salvage ref holds the salvaged content'
+}
+$pm = ParkManifests 'scj-a'
+Ok ($pm.Count -eq 1) 'A one SALVAGE.json manifest'
+if ($pm.Count -eq 1) {
+  $sj = Get-Content -LiteralPath $pm[0].FullName -Raw | ConvertFrom-Json
+  Ok ($sj.sha -and $sj.sha.Length -eq 40) 'A the manifest names the full commit sha'
+  Ok ($sj.salvageRef -like 'refs/heads/salvage/scj-a/*') 'A the manifest names the salvage ref'
+  Ok ($sj.paths -contains 'base.txt') 'A the manifest lists the salvaged path'
+  Ok ((InRef $a.o $sj.salvageRef 'base.txt') -eq 'edited-by-nobody') 'A the manifest ref really holds the content'
+}
+Ok ((JEvents 'scj-a') -contains 'salvaged') 'A journaled salvaged'
 
 # ---- B: a path written seconds ago belongs to a live writer -> skip, touch nothing
 $b = New-Repo 'scj-b'

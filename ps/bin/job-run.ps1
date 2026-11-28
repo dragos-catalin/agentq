@@ -21,6 +21,10 @@ Out-Log "=== job $Id ($($job['label'])) started $(Get-JobIso ([DateTime]::UtcNow
 Out-Log "=== cwd $($job['cwd'])"
 # Children inherit the creator's priority class, so lowering ours lowers the whole job tree.
 $prio = if ($job['priority']) { "$($job['priority'])" } else { 'BelowNormal' }
+# Tell the child which job record it is. A job that delegates to the cloud resolves its workspace in
+# the child, so the child is the only place that can correct `placement` - and the record says 'local'
+# for work that ran on a workspace until it does (the blindness the ops page was fixed for, 2026-11-25).
+$env:AGENTQ_JOB_ID = $Id
 try { (Get-Process -Id $PID).PriorityClass = [Diagnostics.ProcessPriorityClass]$prio } catch { Out-Log "job-run: priority $prio not applied: $($_.Exception.Message)" }
 $code = 1
 try {

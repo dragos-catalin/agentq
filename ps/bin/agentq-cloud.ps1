@@ -85,6 +85,11 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 
+# The job registry, so a run that lands on a workspace can correct the placement of the job record it
+# belongs to (link: AGENTQ_JOB_ID, set by job-run - see the note there). Dot-sourcing is how every
+# other job script loads it; the library defines functions only.
+. (Join-Path $PSScriptRoot 'agentq-jobs-lib.ps1')
+
 # Workspace registry: where each warm workspace lives (VM project/zone). Control plane = $CtlProject.
 # Built-ins + config `cloudRegistry` ({ "<ws>": { "project": "..", "zone": ".." } }) so a new
 # workspace needs no code change. vitals-win (DC-063) = Windows Server 2025 for Windows-only gates.
@@ -594,6 +599,9 @@ try {
   if ($wake) { Wait-VmWake -wake $wake -TimeoutSec $AsyncResumeWaitSec }
   Write-Obj "ws/$Ws/queue/$id.json" $sf 'application/json'
   $submitted = $true
+  # The workspace is settled now, so the job record can say where this really ran. Only the record of
+  # the job that owns this child is touched; a caller that did not come from job-start has no id here.
+  if ($env:AGENTQ_JOB_ID) { Update-Job "$($env:AGENTQ_JOB_ID)" @{ placement = "cloud:$Ws" } }
   Remove-Item -LiteralPath $DownFile -ErrorAction SilentlyContinue
   $queuedAt = [DateTime]::UtcNow
   $submitSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
