@@ -240,6 +240,9 @@ $map = [ordered]@{
   # 2026-11-27: the SPAWN SHAPE of a lease (perf). Paired with the run-all.ps1 entry in this same
   # commit - 'install wiring' pins the two.
   'tests\test-lease-spawns.ps1' = 'bin\test-lease-spawns.ps1'
+  # 2026-11-28: the CP437 trap (a captured-then-rewritten file silently loses its non-ASCII characters).
+  # Paired with the run-all.ps1 entry in this same commit - 'install wiring' pins the two.
+  'tests\test-text-encoding.ps1' = 'bin\test-text-encoding.ps1'
   # 2026-11-25: a journal write that loses a race must never abort the operation it describes, and the
   # land PRE-gate must run at Normal like the queued land gate. Paired with the run-all.ps1 entry in
   # this same commit - 'install wiring' pins the two.

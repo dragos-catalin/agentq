@@ -145,6 +145,27 @@ try {
   try { $wSelf = Run-Reclaim @('-Json') } finally { Pop-Location }
   Check 'j cwd inside the slot => kept (not this process own)' ($null -ne $wSelf['relidle'] -and -not $wSelf['relidle'].safe -and $wSelf['relidle'].reason -match 'holds the slot') $wSelf['relidle'].reason
 
+  # ---- (k) the pid test must be start-time aware ------------------------------------------------------
+  # A pid alone is not ownership: Windows reuses a freed pid within milliseconds, and the pool reuses its
+  # own (`agentq reclaim` case d went red in the cloud on 2026-11-28 while this suite was green locally,
+  # with one shared reason string hiding which of the two tests had fired). The end-to-end fixtures cannot
+  # force a collision - the child's pid is unknown in advance - so the function is extracted from the script
+  # text and evaluated here, fail-closed. It goes RED if the start-time comparison is dropped.
+  $src = Get-Content $reclaim -Raw
+  $m = [regex]::Match($src, '(?ms)^function Test-SelfOwnedPid\(.*?\n\}\s*$')
+  Check 'k the pid test can be extracted from the script' $m.Success 'function Test-SelfOwnedPid not found'
+  if ($m.Success) {
+    function LProp($o, $k, $d) { if ($o -is [hashtable] -and $o.ContainsKey($k)) { return $o[$k] }; return $d }
+    Invoke-Expression $m.Value
+    $mine = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    $kSame = Test-SelfOwnedPid @{ pid = $PID; procStart = $mine }
+    $kStale = Test-SelfOwnedPid @{ pid = $PID; procStart = ([DateTime]::UtcNow.AddHours(-3).ToString('o')) }
+    $kOther = Test-SelfOwnedPid @{ pid = ($PID + 12345); procStart = $mine }
+    Check 'k same pid and the same start time => this process own' ($kSame -eq $true)
+    Check 'k same pid but a different start time => NOT own (recycled pid)' ($kStale -eq $false)
+    Check 'k a different pid => not own' ($kOther -eq $false)
+  }
+
   # ---- -Apply: only the proven-safe leases are released, backup-first ---------------------------------
   $ap = Run-Reclaim @('-Apply', '-Json')
   Check 'apply exits 0' ($script:lastCode -eq 0) "code=$($script:lastCode)"

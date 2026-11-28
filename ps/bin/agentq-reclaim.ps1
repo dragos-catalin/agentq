@@ -138,11 +138,25 @@ function Test-PregateLive($lease, $now) {
   return @{ Live = $false; Why = $null }
 }
 
-# This process's own slot: its recorded pid is us, or the cwd is inside the slot path (boundary-aware, so
-# scratch-1 is not treated as a prefix of scratch-11).
-function Test-SelfOwned($lease) {
+# This process's own slot. Two independent tests with distinct reasons, so a red in the pool names the
+# mechanism instead of leaving two of them behind one sentence.
+#
+# The pid ALONE is not enough: pids are recycled, and the suite's dead-pid fixture had its own pid reused
+# within ~120 ms under pool load (measured 2026-11-28 - `agentq reclaim` case d went red in the cloud while
+# the same suite was green locally, and the shared reason string hid which test had fired). The recorded
+# start time must agree, exactly as Get-OwnerState discriminates a recycled owner.
+function Test-SelfOwnedPid($lease) {
   $id = 0; try { $id = [int](LProp $lease 'pid' 0) } catch { $id = 0 }
-  if ($id -gt 0 -and $id -eq $PID) { return $true }
+  if ($id -le 0 -or $id -ne $PID) { return $false }
+  $theirs = "$(LProp $lease 'procStart' '')"
+  if (-not $theirs) { return $true }
+  $mine = ''
+  try { $mine = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o') } catch { return $true }
+  return $theirs -eq $mine
+}
+
+# Boundary-aware, so scratch-1 is not treated as a prefix of scratch-11.
+function Test-CwdInSlot($lease) {
   $p = "$(LProp $lease 'path' '')".TrimEnd('\', '/')
   if (-not $p) { return $false }
   try {
@@ -156,7 +170,10 @@ function Test-SelfOwned($lease) {
 # THE PREDICATE. One decision object: Safe / Verdict ('keep'|'release') / Reason.
 function Test-SlotSafeToRelease($lease, $facts) {
   if (-not $facts.Parseable) { return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = 'unreadable lease record' } }
-  if ($facts.SelfOwned) { return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = 'this process or cwd holds the slot' } }
+  if ($facts.SelfOwned) {
+    $why = if ($facts.SelfOwnedWhy) { $facts.SelfOwnedWhy } else { 'this process or cwd holds the slot' }
+    return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = $why }
+  }
   if ($facts.PregateLive) { return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = "land pre-gate active: $($facts.PregateWhy)" } }
   if (-not $facts.SlotExists) { return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = 'slot directory missing (release via the main clone with -Repo)' } }
   if (-not $facts.GitOk) { return [pscustomobject]@{ Safe = $false; Verdict = 'keep'; Reason = 'git could not be read (fail closed)' } }
@@ -251,9 +268,16 @@ foreach ($f in $files) {
     PregateLive = $false
     PregateWhy  = $null
     SelfOwned   = $false
+    SelfOwnedWhy = ''
   }
   if ($parseable) {
-    $facts.SelfOwned = Test-SelfOwned $lease
+    if (Test-SelfOwnedPid $lease) {
+      $facts.SelfOwned = $true
+      $facts.SelfOwnedWhy = 'this process holds the slot (pid and start time)'
+    } elseif (Test-CwdInSlot $lease) {
+      $facts.SelfOwned = $true
+      $facts.SelfOwnedWhy = 'this process holds the slot (cwd inside it)'
+    }
     $pg = Test-PregateLive $lease $now
     $facts.PregateLive = [bool]$pg.Live
     $facts.PregateWhy = $pg.Why

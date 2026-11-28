@@ -81,6 +81,14 @@ $suites = [ordered]@{
   # into six worker processes (54 cases preserved, both mutation checks still load-bearing, the PowerShell
   # 5.1 leg kept) - 141 s serial -> 18 s measured, so it is no longer the critical path of this gate.
   'guard format'   = @('-File', (Join-Path $PSScriptRoot 'test-guard-format.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
+  # 2026-11-28: the CP437 trap. A PowerShell pipeline that CAPTURES a file's bytes as text decodes them
+  # with the console's OEM code page, and writing that back as UTF-8 makes the damage permanent. It
+  # reached main inside a landed commit and a diff review did not catch it, because the terminal renders
+  # the mojibake with the shapes of the characters it replaced. This suite decodes every source file
+  # strictly as UTF-8 and fails on the CP437 render of a UTF-8 lead byte; its fixtures are built from
+  # codepoints (so the guard can never be the reason it fails) and its two real-revision arms are
+  # mutation controls. Registered here and in install.ps1 in the same slice - 'install wiring' pins them.
+  'text encoding'  = @('-File', (Join-Path $PSScriptRoot 'test-text-encoding.ps1'))
   'guard forms'    = @('-File', (Join-Path $PSScriptRoot 'test-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'deploy guard'   = @('-File', (Join-Path $PSScriptRoot 'test-deploy-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-DeployClean', (Join-Path $hooks 'deploy-clean.ps1'))
   # ADR 0003 wave 1

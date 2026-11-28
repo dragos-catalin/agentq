@@ -88,8 +88,7 @@ function parseCsv(text) {
             // A blank line is not a record (RFC 4180), and the canonical
             // generators emit separator lines inside generated files, so
             // counting one as a 1-column record reports phantom arity drift.
-            if (fields.some((f) => f.trim() !== ""))
-                records.push({ line: recordLine, fields });
+            if (fields.some((f) => f.trim() !== "")) records.push({ line: recordLine, fields });
             fields = [];
             line++;
             recordLine = line;
@@ -99,8 +98,7 @@ function parseCsv(text) {
     }
     if (sb.length > 0 || fields.length > 0) {
         fields.push(sb);
-        if (fields.some((f) => f.trim() !== ""))
-            records.push({ line: recordLine, fields });
+        if (fields.some((f) => f.trim() !== "")) records.push({ line: recordLine, fields });
     }
     return records;
 }
