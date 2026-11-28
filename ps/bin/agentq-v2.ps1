@@ -1455,20 +1455,21 @@ function Invoke-Lease {
     # D7: chat-aware, so a chat that comes back after a window reload is measured against the slots IT
     # holds, not against a session id that no longer exists.
     $mine = @(Read-Leases $repo.Name | Where-Object { (P $_ 'role') -eq 'task' -and (Test-LeaseOurs $_) -and -not $_.stale })
-    # D7: holding the slot is not the only reason to fall through. My own CLEAN task slot, asked for without
-    # -Slot, is a RECOVERY - the chat wants its slot BACK, not a second one - so hand THAT slot back. It has
-    # to be forced here rather than left to the D5 reuse below: D5 matches on the ROLE and a plain `lease`
-    # carries no -Role, so the match comes back empty and the caller rents a second slot - measured
-    # 2026-11-28, after the chat key was in place: S1 held task-1, S2 (same chat, owner pid gone) rented
-    # task-2. Anything else still refuses with the two sanctioned alternatives.
+    # D7: a chat coming back after a reload still HOLDS its slot on paper, so the session-keyed match above
+    # would refuse the recovery. The hand-back must be forced here rather than left to the D5 reuse below:
+    # D5 matches on the ROLE and a plain `lease` carries no -Role, so the match comes back empty and the
+    # caller rents a second slot - measured 2026-11-28: S1 held task-1, S2 (same chat, owner pid gone)
+    # rented task-2. What falls through is the CHAT arm ONLY: a slot this session merely still HOLDS keeps
+    # the ADR 0012 refusal (exit 3, asserted by ps/tests/test-agentq-v2.ps1), because reusing it on a plain
+    # `lease` would silently turn a documented refusal into a second hand-out of the same slot.
     if ($mine.Count) {
       # D7 ordering: a slot my CHAT was working in (recorded owner host gone) is handed back AS IT IS, dirty
       # tree included - that tree IS this conversation's own work, and a recovery that reset or refused it
-      # would be worse than renting a new slot. The cleanliness rule below stays for the ordinary D5 case
-      # (a slot this session still owns): handing it back mid-edit would silently lose that work.
+      # would be worse than renting a new slot. `Test-LeaseChatMine` already requires the recorded owner host
+      # to be GONE, so a LIVE holder is never overridden (ps/tests/test-lease-chat.ps1 section 11a), and the
+      # D5 cleanliness rule below is untouched for the ordinary session-held case.
       $ownRecover = $mine | Where-Object { $p = Norm-Dir "$(P $_ 'path')"; $p -and (Test-Path -LiteralPath $p) -and (Test-LeaseChatMine $_) } | Select-Object -First 1
-      $ownClean = if ($ownRecover) { $ownRecover } else { $mine | Where-Object { $p = Norm-Dir "$(P $_ 'path')"; $p -and (Test-Path -LiteralPath $p) -and (Test-GitClean $p) } | Select-Object -First 1 }
-      if ($ownClean -and (Get-FairShare).enabled) { $script:ReuseMine = $ownClean } else {
+      if ($ownRecover -and (Get-FairShare).enabled) { $script:ReuseMine = $ownRecover } else {
         $heldTxt = ($mine | ForEach-Object { "$($_.slot) ($($_.leaseId), idle $($_.idleMin)m, '$($_.purpose)')" }) -join '; '
         [Console]::Error.WriteLine("agentq: this session already holds a task slot in $($repo.Name): $heldTxt`n  Subagents work in the LEAD's slot - pass them its path instead of leasing. For isolated one-off work use a scratch slot: agentq lease -Role scratch -Purpose '<why>' (not counted against the caps, reclaimed after 15 min without work). To take a second task slot on purpose, name it: -Slot task-N. If that slot is the SAME chat coming back after a reload, name it to get it back once its tree is clean: agentq lease -Slot <slot> -Purpose '<why>'.")
         exit 3
