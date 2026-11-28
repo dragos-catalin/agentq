@@ -113,6 +113,12 @@ $suites = [ordered]@{
   # own bare origins; paired with the install.ps1 map entry in this same slice ('install wiring' pins it).
   'land stale base' = @('-File', (Join-Path $PSScriptRoot 'test-land-stale-base.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'land reclaim'   = @('-File', (Join-Path $PSScriptRoot 'test-land-reclaim.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
+  # 2026-11-28: a NETWORK git verb has no timeout of its own - `git fetch` inside a land sat 10 minutes
+  # (2.9 s from another shell) and an earlier one 55 minutes, both holding `land:<repo>` while every
+  # other agent waited behind a banner-only job. Proves the wall-clock bound kills a wedged transport,
+  # journals it, and lets its caller carry on - and that a healthy fetch is untouched. Deterministic:
+  # the wedge is an `ext::` remote whose helper sleeps, so it needs no network.
+  'git net timeout' = @('-File', (Join-Path $PSScriptRoot 'test-git-net-timeout.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'job object'     = @('-File', (Join-Path $PSScriptRoot 'test-jobobject.ps1'), '-Bin', $bin)
   # 2026-11-25: (a) a journal write that loses a race must never abort the operation it describes - a
   # sharing violation on journal.jsonl killed a land pre-gate BEFORE its gate had run; (b) the land

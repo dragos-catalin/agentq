@@ -19,6 +19,28 @@ $env:FAKE_GATE_HOLD = Join-Path $tmp 'hold.flag'
 New-Item -ItemType Directory -Force $tmp | Out-Null
 $fail = 0
 function Check([string]$name, [bool]$ok, [string]$detail = '') { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name $detail" -ForegroundColor Red; $script:fail++ } }
+# TASK 1 (2026-11-27): the land-batch cap default is 3, so one holder absorbs up to TWO waiters (two
+# extra 43-suite gates fold into the holder's single gate). Pin the literal default AND prove an explicit
+# config value still wins, by loading ONLY Get-LandBatchSize's definition out of agentq-v2.ps1 into this
+# scope: Get-Config and Get-JournalFor are stubbed here, so no real config, journal or queue is touched.
+$v2 = Join-Path (Split-Path $PSScriptRoot) 'bin\agentq-v2.ps1'
+$v2t = $null; $v2e = $null
+$v2ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $v2).Path, [ref]$v2t, [ref]$v2e)
+$fnBat = $v2ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LandBatchSize' }, $true)
+if ($fnBat) {
+  Invoke-Expression $fnBat.Extent.Text
+  $script:CfgStub = @{}
+  function Get-Config { return $script:CfgStub }
+  function Get-JournalFor { param([hashtable]$e) return (Join-Path $tmp 'nojournal.jsonl') }
+  Check 'batch cap source default is the literal 3' ($fnBat.Extent.Text -match 'else\s*\{\s*3\s*\}') 'literal not 3'
+  Check 'batch cap default (no config key) is 3' ((Get-LandBatchSize 'r') -eq 3) "got=$((Get-LandBatchSize 'r'))"
+  $script:CfgStub = @{ landBatchMax = 2 }
+  Check 'batch cap explicit 2 wins over the default 3' ((Get-LandBatchSize 'r') -eq 2) "got=$((Get-LandBatchSize 'r'))"
+  $script:CfgStub = @{ landBatchMax = 4 }
+  Check 'batch cap explicit 4 wins over the default 3' ((Get-LandBatchSize 'r') -eq 4) "got=$((Get-LandBatchSize 'r'))"
+} else {
+  Check 'batch cap Get-LandBatchSize found in agentq-v2.ps1' $false 'function not found'
+}
 $bare = Join-Path $tmp 'origin.git'; $repo = Join-Path $tmp 'repo'
 git init -q --bare -b dev $bare
 git init -q -b dev $repo; git -C $repo config user.email t@t; git -C $repo config user.name t; git -C $repo config core.autocrlf false

@@ -94,6 +94,10 @@ $map = [ordered]@{
   'tests\test-land-stale-base.ps1' = 'bin\test-land-stale-base.ps1'
   # ADR 0008 (2026-11-11): post-land hook (agentq-v2.ps1 runs the landed tree's scripts/post-land.ps1 after the push)
   'tests\test-post-land.ps1' = 'bin\test-post-land.ps1'
+  # 2026-11-28: the wall-clock bound on a network git verb (Invoke-GitNet / Invoke-GitBounded). A wedged
+  # `git fetch` held a land for 10 minutes (and an earlier one 55) with no way to tell it from a hung job.
+  # Registered in run-all.ps1 in the same slice; 'install wiring' pins the two together.
+  'tests\test-git-net-timeout.ps1' = 'bin\test-git-net-timeout.ps1'
   # 2026-10-18: Ctrl+C + exit before any force-kill of a terminal
   'bin\console-signal.ps1' = 'bin\console-signal.ps1'
   # 2026-10-18: stop a stuck command, keep the terminal (Ctrl+C -> Y -> Ctrl+Break -> kill children)
@@ -338,6 +342,21 @@ function Test-GreenRecordFresh([string]$Path, [double]$MaxHours = 24) {
     (((Get-Date).ToUniversalTime() - $at.ToUniversalTime()).TotalHours -lt $MaxHours)
   } catch { $false }
 }
+# --- the install gate ANNOUNCES itself (2026-11-28) -------------------------------------------------
+# Measured: three concurrent installs waited on `Global\agentq-install-gate` for 17 min, 1,9 h and 2,5 h
+# and printed NOTHING - the only line about the gate came AFTER the wait, so a wedged holder was
+# indistinguishable from a wedged install and every agent re-diagnosed it by hand from scratch. Two
+# halves: the holder publishes WHO it is (a marker beside the installed manifest) and the waiter says
+# what it is waiting for, naming the holder, under a cap in minutes that a full suite fits comfortably
+# (43 suites ~11 min on the pool, measured 2026-11-27). Both are pure functions so the `install` suite
+# pins the protocol instead of grepping for a sentence.
+function Get-InstallGateWaitMin { param([int]$CapMin = 12) if ($CapMin -lt 3) { return 3 } ; return $CapMin }
+function Format-InstallGateWait {
+  param([int]$WaitMin, $Holder)
+  $who = if ($Holder -and $Holder.pid) { "held by pid $($Holder.pid) since $($Holder.at) ($($Holder.src))" }
+         else { 'no holder published a marker (an older install, or the holder died)' }
+  return "install gate: waiting up to $WaitMin min - $who"
+}
 # --- green record freshness (end) -----------------------------------------------------------------
 $drift = @()
 foreach ($k in $map.Keys) {
@@ -355,13 +374,34 @@ if (-not $SkipTests) {
   # when run alone). A red suite makes install REFUSE to install, so contention means nobody installs --
   # the installed agentq stayed stale for hours. The gate is held for the whole test phase only.
   $gate = $null; $gotGate = $false
+  $gateMarker = $null
   if ($env:AGENTQ_INSTALL_NO_GATE) { 'install gate: disabled by AGENTQ_INSTALL_NO_GATE' }
   else {
     try {
       $gate = New-Object Threading.Mutex($false, 'Global\agentq-install-gate')
-      $gotGate = $gate.WaitOne(45 * 60 * 1000)
-      if ($gotGate) { 'install gate acquired (the test suite runs one install at a time)' }
-      else { 'WARNING: another agentq install has held the gate for 45 min - running the suite ungated (that holder may be stuck)' }
+      $gateMarker = Join-Path $dst 'bin\agentq-install-gate.holder.json'
+      $holder = $null
+      if (Test-Path -LiteralPath $gateMarker) { try { $holder = Get-Content -LiteralPath $gateMarker -Raw | ConvertFrom-Json } catch { $holder = $null } }
+      $waitMin = Get-InstallGateWaitMin
+      # BEFORE the wait, never after it: 45 min of silence is how three installs were left looking healthy.
+      Format-InstallGateWait -WaitMin $waitMin -Holder $holder
+      $t0 = Get-Date
+      $gotGate = $gate.WaitOne($waitMin * 60 * 1000)
+      $waitedSec = [int]((Get-Date) - $t0).TotalSeconds
+      if ($gotGate) {
+        if ($waitedSec -ge 5) { "install gate acquired after $waitedSec s of waiting" }
+        else { 'install gate acquired (the test suite runs one install at a time)' }
+        [IO.File]::WriteAllText("$gateMarker.new", (@{ pid = $PID; at = (Get-Date).ToString('o'); src = $src } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        Move-Item "$gateMarker.new" $gateMarker -Force
+      }
+      else { "WARNING: another agentq install has held the gate for $waitMin min - running the suite ungated (that holder may be stuck)" }
+    } catch [System.Threading.AbandonedMutexException] {
+      # The previous holder died without releasing - it was killed, or it wedged and was reaped. .NET hands
+      # the mutex to US and throws. Treat that as ACQUIRED (we hold it, and the finally releases it) and say
+      # it out loud: a dead holder is an incident, not noise. Measured 2026-11-28: a wedged `ps/install.ps1`
+      # held this gate for 2 h 40 min at 2 s of CPU while three installs queued behind it in silence.
+      $gotGate = $true
+      'install gate acquired: the previous holder died without releasing it (abandoned mutex)'
     } catch {
       $gate = $null; $gotGate = $true
       "WARNING: install gate unavailable ($($_.Exception.Message)) - running the suite ungated"
@@ -398,7 +438,12 @@ if (-not $SkipTests) {
     if ($code) { throw 'install: tests are red - not installing' }
   }
   } finally {
-    if ($gate -and $gotGate) { try { $gate.ReleaseMutex() } catch { } }
+    if ($gate -and $gotGate) {
+      # The marker is only useful while the gate is held: leaving it behind would name a holder that is
+      # gone - and the marker is exactly what the next waiter prints to find the holder.
+      try { Remove-Item -LiteralPath $gateMarker -Force -ErrorAction SilentlyContinue } catch { }
+      try { $gate.ReleaseMutex() } catch { }
+    }
   }
 }
 $bk = Join-Path $dst ".backup\$((Get-Date).ToString('yyyyMMdd-HHmmss'))"

@@ -161,7 +161,44 @@ function G {
   if (-not $a.Count) { throw 'G: missing repository path' }
   $repo = $a[0]
   $rest = @(); if ($a.Count -gt 1) { $rest = @($a[1..($a.Count - 1)]) }
+  # A NETWORK verb is bounded by WALL CLOCK, a local verb is not. git has no transfer timeout of its
+  # own, and this helper runs every 15 minutes x 24 repos, so a wedged fetch used to sit on its repo
+  # for tens of minutes and make the whole pass look hung (2026-11-28: a land's `git fetch` sat 10
+  # minutes where the same command from another shell took 2.9 s; an earlier one sat 55 minutes).
+  # Local verbs keep the exact bytes the callers below parse (`ls-tree`, `diff-tree`, `cat-file`).
+  $verb = ''
+  foreach ($x in $rest) { if ("$x" -notmatch '^-') { $verb = "$x"; break } }
+  if ($verb -in @('fetch', 'push', 'ls-remote', 'clone', 'pull')) {
+    return Invoke-GitBounded -Repo $repo -GitArgs $rest
+  }
   & git -C $repo --no-optional-locks @rest
+}
+# The wall-clock bound used by G for a network verb. 180 s is ~60x a healthy fetch; override with
+# AGENTQ_GIT_NET_TIMEOUT_SEC. On timeout the child and its remote helper are killed and $LASTEXITCODE
+# becomes 124, so a wedged fetch reads as a FAILED fetch (the pass moves on and retries next tick).
+function Invoke-GitBounded {
+  param([string]$Repo, [string[]]$GitArgs, [int]$TimeoutSec = 0)
+  if ($TimeoutSec -le 0) {
+    $TimeoutSec = 180
+    if ($env:AGENTQ_GIT_NET_TIMEOUT_SEC) { $TimeoutSec = [int]$env:AGENTQ_GIT_NET_TIMEOUT_SEC }
+  }
+  $psi = [Diagnostics.ProcessStartInfo]::new('git')
+  foreach ($x in @('-C', $Repo, '--no-optional-locks', '-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=30') + $GitArgs) { $psi.ArgumentList.Add($x) }
+  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
+  $pr = [Diagnostics.Process]::Start($psi)
+  $errTask = $pr.StandardError.ReadToEndAsync()
+  $outTask = $pr.StandardOutput.ReadToEndAsync()
+  if (-not $pr.WaitForExit($TimeoutSec * 1000)) {
+    try { $pr.Kill($true) } catch { }
+    try { [void]$pr.WaitForExit(5000) } catch { }
+    [Console]::Error.WriteLine("git-autosync: 'git -C $Repo $($GitArgs -join ' ')' did not finish in ${TimeoutSec}s - killed; the pass moves on.")
+    $global:LASTEXITCODE = 124
+    return @()
+  }
+  $global:LASTEXITCODE = $pr.ExitCode
+  @((($outTask.Result + "`n" + $errTask.Result) -split "`n") | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ })
 }
 # `G` returns NOTHING when git itself fails to run (loaded machine: bursts on 09-29, 10-05, 10-14,
 # 11-15), and a bare `.Trim()` on that result becomes "You cannot call a method on a null-valued
@@ -1282,7 +1319,7 @@ do {
   if ($Loop -and $Repo.Count -gt 1) {
     # One parallel fetch round per pass (sequential fetches made a 24-repo pass take ~6 min).
     $Repo | ForEach-Object -ThrottleLimit $FetchThrottle -Parallel {
-      if (Test-Path (Join-Path $_ '.git')) { & git -C $_ --no-optional-locks fetch -q --all 2>&1 | Out-Null }
+      if (Test-Path (Join-Path $_ '.git')) { Invoke-GitBounded -Repo $_ -GitArgs @('fetch', '-q', '--all') | Out-Null }
     }
     $script:NoFetch = $true
     try {

@@ -165,8 +165,13 @@ if (-not $gateList.Count) {
 # Computed HERE, where the git range (origin/main...HEAD) exists - a pool checkout has no origin refs,
 # so it can only be TOLD the result. Every uncertainty falls back to the FULL list (see
 # ps/bin/agentq-suite-inputs.ps1: fail-open toward running). `Proved` is false unless at least one suite
-# still runs AND at least one skips AND the global inputs (the runner, the suite list, this module) did
-# not change, so a narrowing can never leave the gate with nothing to run.
+# still runs AND at least one skips AND no HARNESS global input changed, so a narrowing can never leave
+# the gate with nothing to run. The widening rule, applied in the module and kept EXPLICIT there:
+#   * HARNESS global (the runner, the suite table, the pool half, the module, THIS caller) - a change
+#     alters which suites exist / how every suite runs / how this decision is made, so it widens to
+#     EVERY suite and the message NAMES the changed file and the count (it is the evidence).
+#   * SCOPED global (`ps/install.ps1`: an installer that runs no suite) - a change narrows to the suites
+#     that DECLARE it (install / script scope / install wiring), never to all 43.
 $selection = $null
 try {
     . (Join-Path $repoRoot 'ps\bin\agentq-suite-inputs.ps1')

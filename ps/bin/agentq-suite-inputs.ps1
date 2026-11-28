@@ -21,8 +21,10 @@
 # Every other outcome is `run` or `force-run`. A wrong, stale or unreadable map therefore degrades
 # toward running MORE suites, never toward skipping one that should have run. The one hazard a map
 # cannot make safe - globs that OMIT a file a suite really depends on - is mitigated by (a) deliberately
-# BROAD globs, (b) the GLOBAL widening set below (a change to the runner, the suite list, the installer
-# or this module runs EVERYTHING), and (c) `run-all.ps1` itself never treating "nothing ran" as a pass.
+# BROAD globs, (b) the GLOBAL set below - its HARNESS entries (the runner, the suite table, the pool
+# half, this module, the gate caller) run EVERYTHING, while a SCOPED entry (`ps/install.ps1`, an
+# installer that runs no suite) narrows to the suites that declare it - and (c) `run-all.ps1` itself
+# never treating "nothing ran" as a pass.
 #
 # Dot-source this file for the selection functions:
 #     . ps/bin/agentq-suite-inputs.ps1
@@ -118,21 +120,43 @@ $script:AqSuiteInputMap = [ordered]@{
     'agentq approve'          = @('ps/bin/agentq-approve.ps1', 'ps/bin/agentq-approve-gui.ps1', 'ps/tests/test-agentq-approve.ps1')
 }
 
-# --- inputs whose change invalidates the whole map -------------------------------------------------
-# A change here can alter WHICH suites exist, HOW they run, or HOW this decision is made, so the only
-# safe answer is "run everything". Same idea as the pre-push hook's ROOT_CHANGED widening.
-$script:AqGlobalInputGlobs = @(
-    'ps/tests/run-all.ps1'                 # the runner and the suite table itself
-    'ps/bin/agentq-config.json'            # gateSuites.<repo> - the list being narrowed
-    'ps/install.ps1'                       # the installer that consumes the green record
-    'ps/devcloud/gate.ps1'                 # the caller
-    'ps/devcloud/pool-suites.ps1'          # the pool half the selection is transported to
-    'ps/bin/agentq-suite-inputs.ps1'       # this map
-)
+# --- the GLOBAL set: inputs whose change reaches beyond a single suite -----------------------------
+# Each entry declares WHAT a change to it MEANS. This is what keeps the widening HONEST and MINIMAL:
+# only gate MACHINERY widens to every suite; an entry that is merely a per-suite input of some suites
+# narrows to exactly those (the per-suite pass below selects them).
+#
+#   harness - the file is part of the gate MACHINERY: the runner, the suite table, the pool half, this
+#             module, or the gate caller. A change alters WHICH suites exist, HOW every suite runs, or
+#             HOW this decision is made, so the only safe answer is "run EVERY suite" (same idea as the
+#             pre-push hook's ROOT_CHANGED widening). The widened message NAMES the file and the count.
+#   scoped  - the file runs NO suite and is NOT machinery. It is a real input of only the suites that
+#             DECLARE it in the per-suite map above (or that glob-match it), so a change must NOT widen
+#             to all of them - the normal per-suite pass already selects exactly those. Listing it here
+#             as 'scoped' is the explicit "do NOT widen to everything" statement, and keeps it visible.
+#             If NO suite declares it, the run set empties and the caller falls back to the FULL list
+#             (Proved=$false) - still the fail-open direction, never a silent skip.
+#
+# Correctness beats speed: an entry whose effect is UNCERTAIN is 'harness' (widen) and says so in its
+# comment. 'scoped' is used only where it is PROVEN that the file runs no suite and is consumed by a
+# bounded set of suites.
+$script:AqGlobalInputMap = [ordered]@{
+    'ps/tests/run-all.ps1'                 = 'harness'   # the runner and the suite table itself
+    'ps/bin/agentq-config.json'            = 'harness'   # gateSuites.<repo> - the list being narrowed
+    'ps/devcloud/pool-suites.ps1'          = 'harness'   # the pool half the selection is transported to
+    'ps/bin/agentq-suite-inputs.ps1'       = 'harness'   # this map (a change alters HOW this decision is made)
+    'ps/devcloud/gate.ps1'                 = 'harness'   # the caller (resolves the list, builds the argv)
+    'ps/install.ps1'                       = 'scoped'    # the installer: it RUNS no suite, and is a declared
+                                                         # input of 'install wiring' + glob-matched by
+                                                         # 'install'/'script scope' (ps/**). A change widens
+                                                         # to those, never to all 43 suites.
+}
 
 function Get-AqSuiteInputMap { $script:AqSuiteInputMap }
 
-function Get-AqGlobalInputGlobs { @($script:AqGlobalInputGlobs) }
+function Get-AqGlobalInputMap { $script:AqGlobalInputMap }
+
+# The global globs as a flat list (harness + scoped), for callers that only need the names.
+function Get-AqGlobalInputGlobs { @($script:AqGlobalInputMap.Keys) }
 
 # Run git and NEVER throw: every caller must treat an error as "cannot prove -> run".
 function Invoke-AqGitCapture {
@@ -272,7 +296,7 @@ function Resolve-AqSuiteInputDecision {
 
 # Decide a whole list. Returns an object with Run/Skip, a per-suite Decisions list and `Proved` - the
 # single gate the caller keys on: a narrowing exists only when at least one suite runs AND at least one
-# skips, and the global inputs did not change. Anything else (an empty run set, no skip, a global
+# skips, and NO HARNESS global input changed. Anything else (an empty run set, no skip, a harness
 # change) leaves Proved=$false so the caller falls back to the FULL list.
 function Select-AqSuites {
     param(
@@ -282,33 +306,53 @@ function Select-AqSuites {
         [string]$RepoRoot = '.',
         $Map,
         [string[]]$GlobalGlobs,
+        $GlobalMap,
         [switch]$Force
     )
     if ($null -eq $Map) { $Map = Get-AqSuiteInputMap }
-    if ($null -eq $GlobalGlobs) { $GlobalGlobs = Get-AqGlobalInputGlobs }
+    # The global set as a glob -> kind map ('harness' | 'scoped'). -GlobalMap wins; else -GlobalGlobs (a
+    # legacy string[] whose every entry is treated as 'harness', the fail-open reading); else the real map.
+    if ($null -eq $GlobalMap) {
+        if ($null -ne $GlobalGlobs) {
+            $GlobalMap = [ordered]@{}
+            foreach ($g in @($GlobalGlobs)) { $GlobalMap["$g"] = 'harness' }
+        } else { $GlobalMap = Get-AqGlobalInputMap }
+    }
 
-    $globalChanged = $false; $globalReason = ''
+    $harnessChanged = $false; $globalReason = ''; $scopedHits = @()
     $changedPaths = @()
-    if ($Force) { $globalChanged = $true; $globalReason = '-Force' }
-    elseif (-not $Base -or -not "$Base".Trim()) { $globalChanged = $true; $globalReason = 'no base commit - cannot prove the selection' }
+    if ($Force) { $harnessChanged = $true; $globalReason = '-Force' }
+    elseif (-not $Base -or -not "$Base".Trim()) { $harnessChanged = $true; $globalReason = 'no base commit - cannot prove the selection' }
     else {
         $cp = Get-AqChangedPaths -RepoRoot $RepoRoot -Base $Base -Head $Head
-        if (-not $cp.Ok) { $globalChanged = $true; $globalReason = 'cannot read the changed-path range (git error)' }
+        if (-not $cp.Ok) { $harnessChanged = $true; $globalReason = 'cannot read the changed-path range (git error)' }
         else {
             $changedPaths = $cp.Paths
-            $globals = @($GlobalGlobs | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
-            foreach ($g in $globals) {
-                $rx = ConvertFrom-AqGlob $g
-                if ($null -eq $rx) { $globalChanged = $true; $globalReason = "a global input glob is unusable ('$g') - running every suite"; break }
+            foreach ($g in @($GlobalMap.Keys)) {
+                $glob = "$g".Trim(); if (-not $glob) { continue }
+                $kind = "$($GlobalMap[$g])".Trim().ToLowerInvariant()
+                $rx = ConvertFrom-AqGlob $glob
+                if ($null -eq $rx) { $harnessChanged = $true; $globalReason = "a global input glob is unusable ('$glob') - running every suite"; break }
                 $hit = @($changedPaths | Where-Object { "$_" -match $rx })
-                if ($hit.Count) { $globalChanged = $true; $globalReason = "global input changed: $($hit -join ', ')"; break }
+                if (-not $hit.Count) { continue }
+                if ($kind -eq 'scoped') {
+                    # NOT machinery: do NOT widen. The per-suite pass below selects exactly the suites that
+                    # declare/match this file; if none do, the run set empties and the caller falls back to
+                    # the full list (Proved=$false) - still fail-open. Recorded for the reason only.
+                    $scopedHits += $hit
+                } else {
+                    # HARNESS: name the file (the evidence) and the count, then run EVERY suite.
+                    $harnessChanged = $true
+                    $globalReason = "global harness input changed: $(@($hit | Select-Object -Unique) -join ', ') - running all $($Suites.Count) suites (a change here can alter which suites exist, how every suite runs, or how this decision is made)"
+                    break
+                }
             }
         }
     }
 
     $decisions = @()
     foreach ($s in $Suites) {
-        if ($globalChanged) {
+        if ($harnessChanged) {
             $decisions += [pscustomobject]@{ Suite = $s; Decision = 'force-run'; Reason = $globalReason; Globs = @(); Changed = @() }
         } else {
             $decisions += Resolve-AqSuiteInputDecision -Suite $s -Base $Base -Head $Head -RepoRoot $RepoRoot -Map $Map -ChangedPaths $changedPaths
@@ -318,9 +362,10 @@ function Select-AqSuites {
     $run = @($decisions | Where-Object { $_.Decision -eq 'run' -or $_.Decision -eq 'force-run' } | ForEach-Object { $_.Suite })
     $skip = @($decisions | Where-Object { $_.Decision -eq 'skip' } | ForEach-Object { $_.Suite })
     $proved = ($run.Count -gt 0 -and $skip.Count -gt 0)
-    $reason = if ($globalChanged) { $globalReason }
-        elseif ($proved) { "narrowed by input change: $($run.Count) run / $($skip.Count) skip" }
-        else { 'no narrowing proved (running every suite)' }
+    $scopedNote = if (@($scopedHits).Count) { " (scoped global input changed: $(@($scopedHits | Select-Object -Unique) -join ', ') - not widened)" } else { '' }
+    $reason = if ($harnessChanged) { $globalReason }
+        elseif ($proved) { "narrowed by input change: $($run.Count) run / $($skip.Count) skip$scopedNote" }
+        else { "no narrowing proved (running every suite)$scopedNote" }
 
     [pscustomobject]@{ Base = $Base; Head = $Head; Proved = $proved; Run = $run; Skip = $skip; Decisions = $decisions; Reason = $reason }
 }

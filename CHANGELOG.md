@@ -101,7 +101,43 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   before, unchanged. New suite `tests/test-agentq-cloud-status.ps1` pins the shape, the null rule (a
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
+- A NETWORK git verb is now bounded by WALL CLOCK. git has no transfer timeout of its own, and on 2026-11-28 a
+  `git -C <main> fetch -q origin main` inside `agentq land` sat for 10 minutes with the child alive and ~0 CPU -
+  the same command from another shell took 2.9 s at that moment - while an earlier one sat 55 minutes. Both held
+  `land:<repo>`, so every other agent waited behind a job whose log was 126 bytes and which could not be told apart
+  from a hung one. `Invoke-GitNet` (`agentq-v2.ps1`) runs a `fetch`/`push`/`ls-remote` under `gitNetTimeoutSec`
+  (default 180 s), kills the child and its remote helper on expiry, prints the exact command that was killed,
+  journals a `git-net-timeout` event and sets `$LASTEXITCODE=124` - so a wedged fetch reads as a FAILED fetch its
+  caller already handles, never as an unbounded wait. Every network verb in `agentq.ps1`, `agentq-v2.ps1` and
+  `git-autosync.ps1` goes through it; `git-autosync` bounds ONLY the network verbs, so the local verbs whose exact
+  bytes its callers parse (`ls-tree`, `diff-tree`, `cat-file`) are untouched. `push` has its own, much larger
+  `gitPushTimeoutSec` (default 1800 s) because a pre-push hook is legitimately slow (codai `gate:platform`:
+  145-182 s per member) - it is a safety net against a wedged transport, not a performance bound. New suite
+  `tests/test-git-net-timeout.ps1` pins all of it with a deterministic wedge (an `ext::` remote whose helper
+  sleeps, so it needs no network): the kill happens at the bound, is journaled with the verb it killed, the caller
+  carries on, and a healthy fetch is neither killed nor journaled.
+
 ### Fixed
+
+- **The install gate could be held for hours by a wedge, silently.** `ps/install.ps1` took
+  `Global\agentq-install-gate` and then printed nothing: on 2026-11-28 a holder left over from a shell whose
+  lease had expired 18 h earlier (2 h 40 m of wall-clock, 2.1 s of CPU) blocked three installs at once with no
+  line from any of them, and a holder that dies mid-hold leaves the mutex abandoned - every later install then
+  waited the full 45-minute cap and failed. The gate now writes `bin/agentq-install-gate.holder.json`
+  (`{pid, at, src}`) on acquire and removes it in `finally`, prints
+  `install gate: waiting up to N min - held by pid X since Y` BEFORE it waits (or says that no holder
+  published a marker), caps the wait at **12 min** instead of 45, reports how long it actually waited, and ACQUIRES an
+  abandoned mutex with a named line instead of stalling until the cap. `ps/tests/test-install.ps1` pins the
+  protocol in 8a-8g (45 checks, was 38).
+
+- **A change to `ps/install.ps1` widened the land gate to every suite.** The pool's global-input map treated
+  every mapped path as machinery, so an edit to the installer - which runs no suite itself - forced the full
+  pooled gate instead of selecting the handful of suites that declare it. Each global input is now classified
+  **HARNESS** (the runner, the suite table, the pool half, the selection module, this gate caller: a change
+  alters which suites exist or how they run, so it still widens to every suite and the refusal NAMES the file)
+  or **SCOPED** (`ps/install.ps1`: narrows to its declarers). `ps/tests/test-gate-input-selection.ps1` pins
+  both sides with a discriminating pair - the same synthetic change classified the two ways selects
+  differently.
 
 - **A fixture that has to spawn before it can write a marker gets a window that clears one spawn.** Three
   `wait-job` checks in the `jobs` suite watch a marker a hidden child appends (`^RB_EXIT=`, `Traceback`), and
@@ -356,6 +392,13 @@ test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is 
   unchanged, and docs/plan/markdown/.copilot-tmp stay writable in the shared clone.
 
 ### Changed
+
+- **`landBatchMax` defaults to 3 (was 4): one holder absorbs up to TWO waiters.** With `agentq` in
+  `landBatch`, two extra 43-suite land gates (~11 min of pool wall-clock each) now fold into the holder's
+  single gate instead of running back to back, and the batch path and `Get-LandBatchSize` finally agree on one
+  literal. An explicit `landBatchMax` in `agentq-config.json` still wins (clamped 2..4);
+  `ps/tests/test-land-wait.ps1` pins the literal default AND proves both overrides, by loading only that
+  function's definition into its own scope with `Get-Config` and `Get-JournalFor` stubbed.
 
 - `agentq lease` resolves its result with one git spawn fewer per arm: `head` is taken from the repo
   resolution's existing combined `rev-parse` (which now also asks for `--short HEAD`) instead of a second

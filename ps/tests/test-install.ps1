@@ -190,6 +190,23 @@ try {
   # 6. the live folder was never the destination
   $now = if (Test-Path -LiteralPath $live) { (Get-Item -LiteralPath $live).LastWriteTimeUtc.Ticks } else { 0 }
   Check '6 the live config was not written by this suite' ($now -eq $liveStamp)
+
+  # 8. the install gate ANNOUNCES itself (2026-11-28). Three concurrent installs once waited 17 min,
+  #    1,9 h and 2,5 h on `Global\agentq-install-gate` and printed nothing at all: the single line about
+  #    the gate came after the wait, so a wedged holder looked exactly like a wedged install. This is a
+  #    protocol, not cosmetics - a line BEFORE the wait, a cap in minutes, the holder marker, and the
+  #    marker removed on the way out. The suite installs with -SkipTests, so the block is pinned by text
+  #    (the same shape as 7e).
+  $waitIdx = $text.IndexOf('$gotGate = $gate.WaitOne(')
+  $sayIdx = $text.IndexOf('Format-InstallGateWait -WaitMin')
+  Check '8a the waiter says it is waiting BEFORE it waits' (($waitIdx -gt 0) -and ($sayIdx -gt 0) -and ($sayIdx -lt $waitIdx))
+  Check '8b the wait is capped in minutes, not 45 of them' (($text -match 'Get-InstallGateWaitMin') -and (-not ($text -match '\$gate\.WaitOne\(45 \* 60 \* 1000\)')))
+  $capFn = [regex]::Match($text, '(?s)function Get-InstallGateWaitMin \{.*?\n\}').Value
+  Check '8c the cap is 12 min and can never drop under 3 (pure helper)' (($capFn -match '\$CapMin = 12') -and ($capFn -match 'if \(\$CapMin -lt 3\) \{ return 3 \}'))
+  Check '8d the waiter names the holder from the published marker' ($text.Contains('agentq-install-gate.holder.json') -and $text.Contains('Format-InstallGateWait -WaitMin $waitMin -Holder $holder'))
+  Check '8e the holder publishes the marker and removes it on release' ($text.Contains('[IO.File]::WriteAllText("$gateMarker.new"') -and $text.Contains('Remove-Item -LiteralPath $gateMarker'))
+  Check '8f the wait is reported with its real duration' ($text.Contains('install gate acquired after $waitedSec s of waiting'))
+  Check '8g a dead holder is treated as acquired, not as an error' ($text.Contains('catch [System.Threading.AbandonedMutexException]') -and $text.Contains('the previous holder died without releasing it'))
 } finally {
   Remove-Item Env:AGENTQ_INSTALL_DIR -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
