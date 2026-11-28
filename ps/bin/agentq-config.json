@@ -172,7 +172,9 @@
       "takeover chat",
       "args comma",
         "lease spawns",
-        "text encoding"
+        "text encoding",
+        "resident freshness",
+        "slo second red"
     ]
   },
   "sharedCloneMode": "warn",
