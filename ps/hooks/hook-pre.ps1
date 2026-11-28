@@ -216,7 +216,7 @@ if ($runGate -and (Test-Path $axiomCmd)) {
 }
 
 $warnings = [System.Collections.Generic.List[string]]::new()
-foreach ($child in 'guard-tooluse.ps1', 'guard-rules-surface.ps1') {
+foreach ($child in 'guard-tooluse.ps1', 'guard-rules-surface.ps1', 'guard-dev-vm.ps1') {
   $r = Invoke-Child $child
   $json = ($r.Out -split "`n" | Where-Object { $_ -match '"permissionDecision"\s*:\s*"deny"' } | Select-Object -First 1)
   if ($json) { Deny $r.Err $json }

@@ -28,7 +28,7 @@ $hookDir = Split-Path -Parent $Hook
 if (-not (Test-Path -LiteralPath (Join-Path $hookDir 'guard-rules-surface.ps1'))) {
   $stage = Join-Path $env:TEMP ("hook-pre-stage-{0}" -f [guid]::NewGuid().ToString('N'))
   $null = New-Item -ItemType Directory -Force -Path $stage
-  Copy-Item -LiteralPath $Hook, (Join-Path $hookDir 'guard-tooluse.ps1') -Destination $stage
+  Copy-Item -LiteralPath $Hook, (Join-Path $hookDir 'guard-tooluse.ps1'), (Join-Path $hookDir 'guard-dev-vm.ps1') -Destination $stage
   $standIn = @'
 # Stand-in for the machine's rules-surface guard (test only): same contract, two protected folders.
 $raw = ''; try { $raw = [Console]::In.ReadToEnd() } catch { }
