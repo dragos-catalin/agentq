@@ -926,13 +926,29 @@ function Remove-LeaseRecord($l, [string]$event, [string]$why, [string]$backupRef
   $f = Get-LeaseChatFacts $l
   $chatIdle = $f.idle
   $byChat = $f.byChat
+  # OQ-004 (2026-11-28). `chatIdleMin <= 30` is only a PROXY for "the holder's chat was still alive", and it
+  # is the wrong one for a reclamation that is correct by construction: the chat file ages only while a call
+  # NAMES the slot, so a chat whose host process died mid-task leaves it looking fresh. The scheduled
+  # dead-lease reaper proves the owner dead before it releases (pid gone, or a live pid whose start time
+  # disagrees with procStart), and every one of its releases was counted as slotsLostLiveChat - 11 / 58 / 77
+  # in the 24 / 168 / 336 h windows ending 2026-11-28T03:28Z, all of it the reaper's `-Force` path, none of
+  # it a real steal. `alive` is the liveness Read-LeasesUncached already computed (pid + procStart), so the
+  # event carries the PROOF instead of the proxy. This is deliberately `-not $alive` and NOT the 120-minute
+  # `leaseOwnerGoneIdleMin` patience threshold used below for the unsaved-work guard: the question here is
+  # "was the owner there at all", not "has it been gone long enough to stop protecting its tree".
+  # Default $true = fail safe: a lease read that somehow lost the member still counts as a loss rather than
+  # silently hiding one.
+  $ownerGone = -not [bool](P $l 'alive' $true)
+  # Ending the lease from the holder's own session (a sweep inside its own agentq call) resets no other
+  # chat's context, so it is not a loss either.
+  $bySelf = ((P $l 'session' '') -eq $Session)
   if ($event -eq 'lease-expire-failed') { Remove-Item -LiteralPath "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   else { Remove-Item -LiteralPath $l.file, "$($l.file).hb", "$($l.file).chat", "$($l.file).work", "$($l.file).release" -Force -ErrorAction SilentlyContinue }
   if ($event -in 'lease-expire', 'lease-break' -and (P $l 'session') -ne $Session) { Add-LeaseNotice $l $event $why $backupRef }
   # Slot history (2026-11-21): the holder + the backup ref survive the lease record, so a later takeover
   # can still name whose work it just found and point at the exact ref to restore from.
   Add-SlotHistory $l.repo $l.slot $event (P $l 'session') $backupRef '' $why
-  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat }
+  Write-Journal @{ event = $event; resource = "slot:$($l.repo):$($l.slot)"; ticket = (P $l 'leaseId'); holderSession = (P $l 'session'); purpose = (P $l 'purpose'); reason = $why; ref = $backupRef; repo = $l.repo; chats = @($f.chats).Count; chatIdleMin = $chatIdle; byChat = $byChat; ownerGone = $ownerGone; bySelf = $bySelf }
 }
 # A worktree with no resolvable HEAD is the ONE case Backup-Slot refuses (its guard) and it can never
 # succeed on a later sweep: failing closed kept the lease for ever and re-counted the SAME directory on
