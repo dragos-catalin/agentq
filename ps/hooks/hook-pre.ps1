@@ -111,7 +111,7 @@ $runGate = $toolName -notmatch $gateReadOnly
 # generic shell names. An ALLOW list on purpose, like $gateReadOnly above: an unknown name is not
 # scanned rather than guessed at.
 $cmdTools = '^(run_in_terminal|Bash|bash|sh|shell|execute|execute_command|run_command|terminal)$'
-# The verb is the word the launcher runs: `agentq.ps1 since`, `"…\agentq.ps1" land`,
+# The verb is the word the launcher runs: `agentq.ps1 since`, `"...\agentq.ps1" land`,
 # `node dist/cli.mjs log`. Anything after a flag (`agentq.ps1 -Purpose x land`) does not match, which
 # is deliberate: an empty verb is honest, a guessed one would not be. Bounded to 24 characters and to
 # [A-Za-z0-9-], so the value can never carry a quote or a backslash into the JSON line.
