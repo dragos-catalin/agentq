@@ -41,6 +41,18 @@
   bounded to $maxChars characters -- the proposal fixes no bound, and additionalContext is re-sent and
   billed on every later model call, so a whole multi-kilobyte note must not ride along unmetered.
 
+  Registration: the config key is the EDITOR's alias, not the canonical event name. Its alias table
+  (read out of workbench.desktop.main.js on 2026-11-28) is
+    sessionStart->SessionStart, sessionEnd->SessionEnd,
+    userPromptSubmitted->UserPromptSubmit, userPromptTransformed->UserPromptTransformed,
+    preToolUse->PreToolUse, postToolUse->PostToolUse, preCompact->PreCompact,
+    subagentStart->SubagentStart, agentStop->Stop, subagentStop->SubagentStop,
+    errorOccurred->ErrorOccurred
+  and the canonical spellings are accepted verbatim too. So the key to register is
+  `userPromptSubmitted`: `userPromptSubmit` is NOT a key, is ignored without a diagnostic, and this
+  hook would never fire. The payload then carries the CANONICAL name in
+  hook_event_name/hookEventName, which is what the guard below compares against.
+
   PowerShell 5.1 compatible (VS Code invokes hooks as powershell.exe): no ternary, no `??`, no
   `-Parallel`. Source is ASCII only (diacritics are folded by CODE POINT), so no BOM is needed.
 #>

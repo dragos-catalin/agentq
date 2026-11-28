@@ -161,11 +161,18 @@ workspace is **linked**, never **merged** (one owner per fact).
 2. **The Stop hook updates it.** On a stop, the plan's `todos`/`roster`/`jobs` are
    reconciled from the transcript (reusing the todo-extraction already in the
    stop classifier) and `updatedAt` moves.
-3. **A `UserPromptSubmit` hook consumes it.** Today **no hook is registered on
-   `UserPromptSubmit`**, so a typed "Continue/Continuă/Resume/Reia" fires nothing.
-   The fix: that hook detects a resume word, reads the plan, and injects
-   `goal + next[0..] + pending roster + jobs` — so the agent does the same next
+3. **A prompt-submit hook consumes it.** `ps/hooks/user-prompt-resume.ps1` is installed at
+   `~/.copilot/hooks/` and registered in `codai-hooks.json` under the editor's config key
+   **`userPromptSubmitted`** — the editor's own alias table maps that to its canonical
+   `UserPromptSubmit` event, while a typed `userPromptSubmit` is not a key at all and is
+   ignored without a diagnostic (read out of the editor bundle on 2026-11-28; the accepted
+   vocabulary is in that hook's header). It detects a resume word, reads the plan, and
+   injects `goal + next[0..] + pending roster + jobs` — so the agent does the same next
    step and re-dispatches the same subagents instead of guessing.
+   Open on this machine (2026-11-28): `~/.copilot/hooks/test-config-integrity.ps1` still
+   lists only `preToolUse, postToolUse, sessionStart, Stop` as known-firing, so its
+   `hook registration` check flags this event until that live-only list is extended (an
+   owner-ticket edit — the gate has no repo mirror and no agent may write the trust surface).
 4. **`agentq plan`** prints the same record from a terminal, and the Vitals page
    shows it, so a person can see what "continue" will do before typing it.
 
