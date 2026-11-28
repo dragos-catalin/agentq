@@ -938,9 +938,22 @@ function Get-FairShare {
 #   (2) PER-SESSION SHARE - at most `fairShare.slotsPerSession` slots when > 0, else ceil(machine task cap /
 #       competing sessions) floored at 1. Over it: a bounded wait, then a refusal naming the held slots and
 #       both recipes.
-# $leases is a lease array (Read-Leases), $sess a session id, $taskCap the machine task-slot cap.
+# D6/D7: each lease RECORD with its chat binding attached (`chats`), read from the sidecar the guard hook
+# writes (<lease>.json.chat). ONE definition, so the lease path and `status` cannot drift on WHICH store the
+# chat key comes from: both hand Get-SlotShare the RAW `Read-Leases $null` view and it attaches the bindings
+# here. A lease with no record file (the helper suite builds hashtables by hand) is passed through untouched,
+# and Add-LeaseChats is never invoked for a batch that has none - so it need not even be defined then.
+function Add-LeaseChats($leases) {
+  @($leases | ForEach-Object { if ($_ -and "$(P $_ 'file' '')") { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } else { $_ } })
+}
+# $leases is a lease array (a RAW Read-Leases view: the chat binding is attached HERE, the one store), $sess a
+# session id, $taskCap the machine task-slot cap, $chat the caller's chat id ('' keys the share by session).
 function Get-SlotShare($leases, [string]$sess, [int]$taskCap, [string]$chat, [string]$repoFilter = '') {
   $fs = Get-FairShare
+  # D6/D7: the chat binding is attached in ONE place, so the lease path and `status` read the SAME store. The
+  # guard keeps the helper suite (part A: hand-built hashtables, no Read-LeaseChat in scope) working: no lease
+  # has a record file, so Add-LeaseChats is not called at all and those leases key by session exactly as before.
+  if (@($leases | Where-Object { $_ -and "$(P $_ 'file' '')" }).Count) { $leases = @(Add-LeaseChats $leases) }
   $live = @($leases | Where-Object { $_ -and -not [bool](P $_ 'stale' $false) })
   # (e) owner 2026-11-28 "charge lands per REPO, not across repos": WHAT IS CHARGED is not the same question as
   # WHAT COMPETES. The divisor stays machine-wide ($units -> share, unchanged, so the machine task-slot budget
@@ -1021,15 +1034,18 @@ function Test-SlotShareRefusal([string]$repoName, [string]$role, [switch]$PerRep
   if (-not (Get-Variable -Name SlotShareSaid -Scope Script -ErrorAction SilentlyContinue)) { $script:SlotShareSaid = $false }
   # NOTE the $cap local: the literal call below is pinned by test-agentq-slotshare.ps1 (A9), that IS the shape.
   $cap = [int](Get-TaskSlotBudget).cap
-  # D6: ONE read of the all-repos view, each lease carrying its chat binding (Read-LeaseChat reads the
-  # sidecar only). A COPY, not Add-Member: Read-Leases memoizes its records in-process, so writing to them
-  # would leak a `chats` key into every other view that reads the same list (status -Json, the SLO report).
-  # The chat id is best effort - Get-ShareChatId returns $null for a call that is not under a live hook
-  # payload (a script, a scheduled task) and whenever the hook's candidate cannot be CONFIRMED against the
-  # per-chat registry (see its D6 note); '' then keys the share by session, exactly as before.
-  $all = @(Read-Leases $null | ForEach-Object { if ($_) { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } })
+  # D6: ONE read of the all-repos view for the chat-id derivation and the "mine" list below, each lease
+  # carrying its chat binding (Add-LeaseChats reads the sidecars only, and copies - never Add-Member: the
+  # Read-Leases records are memoized in-process, so writing to them would leak a `chats` key into every other
+  # view that reads the same list - status -Json, the SLO report). The chat id is best effort - Get-ShareChatId
+  # returns $null for a call that is not under a live hook payload (a script, a scheduled task) and whenever
+  # the hook's candidate cannot be CONFIRMED against the per-chat registry (see its D6 note); '' then keys the
+  # share by session, exactly as before.
+  $all = @(Add-LeaseChats (Read-Leases $null))
   $chat = "$(Get-ShareChatId $all)"
-  $sh = Get-SlotShare $all $Session $cap $chat $(if ($PerRepo) { $repoName } else { '' })
+  # The RAW all-repos view goes in: Get-SlotShare attaches the chat bindings itself, so the lease path and
+  # `status` share ONE store (the sidecars). test-agentq-slotshare.ps1 A9 pins this literal call shape.
+  $sh = Get-SlotShare (Read-Leases $null) $Session $cap $chat $(if ($PerRepo) { $repoName } else { '' })
   # (a) owner 2026-11-28: an override that CHANGED THE OUTCOME is journaled - once per invocation, with the
   # numbers it overrode. Without this AGENTQ_NO_FAIRSHARE leaves no trace anywhere, and a fleet where every
   # caller quietly opts out looks exactly like a fleet with no contention. An override UNDER the share journals
@@ -1065,12 +1081,13 @@ function Show-SlotShare {
   $fs = Get-FairShare
   if (-not $fs.enabled) { Write-Output 'SLOT SHARE off (fairShare.enabled = false)'; return }
   # D6: the status line shows the SAME key the refusal uses, or the two would disagree (the reader would see
-  # 17 held by the window while the refusal charged 1 to the chat). Copies, never Add-Member: Read-Leases
-  # memoizes its records in-process (see Test-SlotShareRefusal).
-  $leases = @(Read-Leases $null | ForEach-Object { if ($_) { $chb = @(); try { $chb = @((Read-LeaseChat (P $_ 'file' '')).chats) } catch { }; $_ | Select-Object *, @{ n = 'chats'; e = { $chb } } } })
+  # 17 held by the window while the refusal charged 1 to the chat). The "mine" list below needs the enriched
+  # view, but Get-SlotShare is handed the RAW one and attaches the bindings itself (one store - see
+  # Test-SlotShareRefusal). Copies, never Add-Member: the Read-Leases records are memoized in-process.
+  $leases = @(Add-LeaseChats (Read-Leases $null))
   $cap = [int](Get-TaskSlotBudget).cap
   $chat = "$(Get-ShareChatId $leases)"
-  $sh = Get-SlotShare $leases $Session $cap $chat
+  $sh = Get-SlotShare (Read-Leases $null) $Session $cap $chat
   $isMine = { param($l) if ($sh.mode -eq 'chat') { @(P $l 'chats' @()) -contains $chat } else { "$(P $l 'session' '')" -eq "$Session" } }
   $mine = @($leases | Where-Object { $_ -and -not $_.stale -and (& $isMine $_) })
   # repo/slot, not the bare slot: the same slot NAME lives in every repo (`codai\scratch-1` next to
