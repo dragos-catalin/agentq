@@ -125,7 +125,7 @@ $gatePath = Join-Path $psRoot 'devcloud\gate.ps1'
 $gateText = if (Test-Path -LiteralPath $gatePath) { Get-Content -LiteralPath $gatePath -Raw } else { '' }
 Check 'gate.ps1 exposes the pool concurrency as -PoolParallel (default 4)' ($gateText -match '(?m)\[int\]\$PoolParallel\s*=\s*4')
 Check 'gate.ps1 threads it everywhere and leaves no hardcoded pool concurrency' `
-        ((@([regex]::Matches($gateText, '\$PoolParallel')).Count -ge 4) -and ($gateText -notmatch "(?m)-Parallel',\s*'4'"))
+    ((@([regex]::Matches($gateText, '\$PoolParallel')).Count -ge 4) -and ($gateText -notmatch "(?m)-Parallel',\s*'4'"))
 # ...and it must SURVIVE the dot-source: the sourced script's own `param()` assigns its defaults into the
 # caller's scope, so -PoolParallel read back as 4 with no assignment in the file to grep for. The re-assert
 # from $PSBoundParameters is what makes the knob real; without it the parameter is silently inert.
@@ -143,6 +143,20 @@ Check 'the config poolParallel is applied AFTER the dot-source re-assert (else i
 $poolCfg = Get-Content -LiteralPath (Join-Path $psRoot 'bin\agentq-config.json') -Raw | ConvertFrom-Json -AsHashtable
 Check 'the repo pins a poolParallel in 4..8 (wider than the box only adds contention)' `
     ($poolCfg.ContainsKey('poolParallel') -and [int]$poolCfg['poolParallel'] -ge 4 -and [int]$poolCfg['poolParallel'] -le 8) "value=$($poolCfg['poolParallel'])"
+
+# --- the pool width is tunable per repo, and read in the ONE safe place (2026-11-27) ----------------
+# 43 suites ran in 671 s with the pool at 4 (land #5) and 4 vs 8 measured 1035,7 s vs 1049,2 s (noise):
+# the wall-clock the whole fleet waits for. The knob puts that number in agentq-config.json so a width can
+# be tried without a code edit - but the value MUST be applied after the dot-source re-assert above,
+# because the sourced param() clobbers anything assigned before it. Both halves are pinned: assigned
+# anywhere else, the knob silently reads back as 4.
+Check 'gate.ps1 reads poolParallel from the config' ($gateText -match "\`$cfg\['poolParallel'\]")
+Check 'the config poolParallel is applied AFTER the dot-source re-assert (else it is clobbered)' `
+    (($gateText.IndexOf('$PSBoundParameters[''PoolParallel'']') -ge 0) -and ($gateText.IndexOf("`$cfg['poolParallel']") -gt $gateText.IndexOf('$PSBoundParameters[''PoolParallel'']')))
+$poolCfg = Get-Content -LiteralPath (Join-Path $psRoot 'bin\agentq-config.json') -Raw | ConvertFrom-Json -AsHashtable
+Check 'the repo pins a poolParallel in 4..8 (wider than the box only adds contention)' `
+    ($poolCfg.ContainsKey('poolParallel') -and [int]$poolCfg['poolParallel'] -ge 4 -and [int]$poolCfg['poolParallel'] -le 8) "value=$($poolCfg['poolParallel'])"
+
 # --- the serial-only barrier is ANNOUNCED, not silent (2026-11-27) ----------------------------------
 # Under -Parallel > 1 run-all.ps1 drains the pool for the `$serialOnly` suites (install, term interrupt,
 # reap terminals, git-autosync, guard cloud, deploy guard) and runs each ALONE. A long one is minutes of
