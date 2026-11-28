@@ -13,6 +13,12 @@
 #   Invoke-AgentqTrackerPlan  -> node tools/track.mjs plan   <args...>   (the session plan record)
 #   Invoke-AgentqTrackerTask  -> node tools/track.mjs task   <args...>   (claimable tasks)
 #   Invoke-AgentqTrackerVerb  -> the one-line dispatcher: -Verb trackers|plan|task
+#   Invoke-AgentqTrackersPush -> `trackers push`: POST the local index to <Hub>/trackers/ingest
+#
+# ONE exception to the pass-through rule: `agentq trackers push` is NOT `node tools/track.mjs ...`. The
+# upload needs a machine key (DPAPI) and an HTTP POST to the Codwen gateway, so it lives here; the Node
+# tool stays strictly offline and portable. push REIMPLEMENTS NOTHING of the store - it reads the very
+# file the `trackers` verb reads and sends it verbatim, so the hub holds exactly what a local reader sees.
 #
 # Each writes the tool's stdout/stderr through UNCHANGED and sets $script:AgentqTrackExit to the tool's
 # exit code (0 ok; 2 bad use / missing index / missing plan / claim held; 3 no ready task; n = drift
@@ -76,12 +82,168 @@ function Invoke-AgentqTrackCli {
     $script:AgentqTrackExit = $LASTEXITCODE
 }
 
+# The index `tracker-lint.mjs --scan` writes: <root>/trackers/index.json, where root is $AGENTQ_HOME or
+# ~/.codai/coord. The SAME resolution agentq.ps1 and agentq-sync.ps1 use, so a push uploads the exact
+# file the Vitals page and `agentq trackers` read - never a re-serialised approximation of it.
+function Get-AgentqTrackIndexPath {
+    $root = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
+    Join-Path (Join-Path $root 'trackers') 'index.json'
+}
+
+# The DPAPI-hex key convention, copied from ps/bin/devbox-team-sync.ps1 - the one place on this machine
+# it is defined: a `codai...` value is the key verbatim (a short dev/test key), anything else is a hex
+# dump of a CurrentUser-DPAPI blob. CODAI_HUB_KEY wins (tests, and a caller that holds the key in its
+# own environment). A missing or unreadable file is $null, never a crash, so the caller can print one
+# honest line and exit non-zero. The key is NEVER printed by this module.
+function Get-AgentqPushKey {
+    param([Parameter(Mandatory = $true)][string]$KeyFile)
+    if ($env:CODAI_HUB_KEY) { return $env:CODAI_HUB_KEY }
+    if (-not (Test-Path -LiteralPath $KeyFile)) { return $null }
+    try { $txt = ([IO.File]::ReadAllText($KeyFile)).Trim() } catch { return $null }
+    if ($txt -like 'codai*') { return $txt }
+    if ($txt.Length -eq 0 -or ($txt.Length % 2) -ne 0) { return $null }
+    try {
+        Add-Type -AssemblyName System.Security
+        $raw = [byte[]]::new($txt.Length / 2)
+        for ($i = 0; $i -lt $raw.Length; $i++) { $raw[$i] = [Convert]::ToByte($txt.Substring($i * 2, 2), 16) }
+        [Text.Encoding]::Unicode.GetString([Security.Cryptography.ProtectedData]::Unprotect($raw, $null, 'CurrentUser')).Trim()
+    } catch { $null }
+}
+
+function Write-AgentqPushUsage {
+    [Console]::Error.WriteLine('agentq trackers push [-Hub <url>] [-KeyFile <path>] [-DryRun] [-Repo <name>]')
+    [Console]::Error.WriteLine('  POSTs the local tracker index to <url>/trackers/ingest with the machine key.')
+    [Console]::Error.WriteLine('  -Hub      gateway base URL (default https://ai.codai.ro/v1)')
+    [Console]::Error.WriteLine('  -KeyFile  DPAPI-hex key file (default ~/.codai/copilot.key); CODAI_HUB_KEY overrides')
+    [Console]::Error.WriteLine('  -DryRun   print what would be sent, make no request')
+    [Console]::Error.WriteLine('  -Repo     push only these repositories (repeatable); default: every repo in the index')
+}
+
+# `agentq trackers push [-Hub <url>] [-KeyFile <path>] [-DryRun] [-Repo <name>]`
+#   POST <Hub>/trackers/ingest with the local index (the file the `trackers` verb reads), authorised by
+#   the machine key. The body IS the index, so the hub stores exactly what a local reader sees; a
+#   `-Repo` filter re-serialises only when the caller asks for a subset.
+#   Exit: 0 sent (or printed, with -DryRun); 2 no index / no key / bad use / an empty -Repo filter;
+#         3 the hub could not be reached; 4 the hub refused (a non-2xx status).
+function Invoke-AgentqTrackersPush {
+    param([string[]]$Arguments = @())
+
+    $Hub = 'https://ai.codai.ro/v1'
+    $KeyFile = Join-Path $HOME '.codai/copilot.key'
+    $dryRun = $false
+    $include = @()
+    # @($null) is an empty array in PowerShell, but be explicit: an empty argument list must reach the
+    # "no flags" path, never the unknown-argument branch with a phantom '' flag.
+    $args0 = @()
+    if ($Arguments) { $args0 = @($Arguments) }
+    for ($i = 0; $i -lt $args0.Count; $i++) {
+        $flag = "$($args0[$i])".ToLowerInvariant()
+        if ($flag -in '-hub', '-keyfile', '-repo') {
+            if (($i + 1) -ge $args0.Count) { Write-AgentqPushUsage; $script:AgentqTrackExit = 2; return }
+            $i++
+            switch ($flag) {
+                '-hub' { $Hub = "$($args0[$i])" }
+                '-keyfile' { $KeyFile = "$($args0[$i])" }
+                '-repo' { $include += "$($args0[$i])" }
+            }
+        } elseif ($flag -eq '-dryrun') {
+            $dryRun = $true
+        } else {
+            [Console]::Error.WriteLine("agentq trackers push: unknown argument '$($args0[$i])'")
+            Write-AgentqPushUsage
+            $script:AgentqTrackExit = 2
+            return
+        }
+    }
+
+    $idxPath = Get-AgentqTrackIndexPath
+    if (-not (Test-Path -LiteralPath $idxPath)) {
+        [Console]::Error.WriteLine("agentq trackers push: no index at '$idxPath' (run the scan that writes it first)")
+        $script:AgentqTrackExit = 2
+        return
+    }
+    $raw = $null
+    try { $raw = [IO.File]::ReadAllText($idxPath) } catch {
+        [Console]::Error.WriteLine("agentq trackers push: cannot read '$idxPath': $($_.Exception.Message)")
+        $script:AgentqTrackExit = 2
+        return
+    }
+    # A leading BOM would make the gateway's JSON.parse throw, and node's writeFileSync never adds one -
+    # strip it defensively so an editor that saved the index cannot break every push.
+    $raw = $raw.TrimStart([char]0xFEFF)
+    $index = $null
+    try { $index = $raw | ConvertFrom-Json } catch {
+        [Console]::Error.WriteLine("agentq trackers push: '$idxPath' is not JSON: $($_.Exception.Message)")
+        $script:AgentqTrackExit = 2
+        return
+    }
+    if (-not $index -or -not ($index.PSObject.Properties.Name -contains 'repos')) {
+        [Console]::Error.WriteLine("agentq trackers push: '$idxPath' has no 'repos' array")
+        $script:AgentqTrackExit = 2
+        return
+    }
+
+    if ($include.Count -gt 0) {
+        $kept = @($index.repos | Where-Object { $include -contains "$($_.repo)" })
+        if ($kept.Count -eq 0) {
+            [Console]::Error.WriteLine("agentq trackers push: no repository in the index matches -Repo $($include -join ', ')")
+            $script:AgentqTrackExit = 2
+            return
+        }
+        $index.repos = $kept
+        # Depth 100: the index nests repos -> trackers -> items -> counts, and ConvertTo-Json defaults to 2.
+        $body = [Text.Encoding]::UTF8.GetBytes(($index | ConvertTo-Json -Depth 100 -Compress))
+    } else {
+        # The whole index, byte for byte: no re-serialisation, so the hub receives what the file says.
+        $body = [Text.Encoding]::UTF8.GetBytes($raw)
+    }
+    $repoCount = @($index.repos).Count
+    $url = ($Hub.TrimEnd('/')) + '/trackers/ingest'
+
+    if ($dryRun) {
+        Write-Output ("DRYRUN would POST {0} ({1} repo(s), {2} bytes) using the key from '{3}'" -f $url, $repoCount, $body.Length, $KeyFile)
+        $script:AgentqTrackExit = 0
+        return
+    }
+
+    $key = Get-AgentqPushKey -KeyFile $KeyFile
+    if (-not $key) {
+        [Console]::Error.WriteLine("agentq trackers push: no key at '$KeyFile' (DPAPI-hex or a codai... value; set CODAI_HUB_KEY to override)")
+        $script:AgentqTrackExit = 2
+        return
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri $url -Headers @{ Authorization = "Bearer $key" } `
+            -ContentType 'application/json' -Body $body -TimeoutSec 180 -ErrorAction Stop
+        Write-Output ("ok: pushed {0} repo(s) to {1}" -f $repoCount, $url)
+        $script:AgentqTrackExit = 0
+    } catch {
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+        $msg = "$($_.Exception.Message)"
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg = "$($_.ErrorDetails.Message)" }
+        if ($status -gt 0) {
+            [Console]::Error.WriteLine("agentq trackers push: hub refused ($status): $msg")
+            $script:AgentqTrackExit = 4
+        } else {
+            [Console]::Error.WriteLine("agentq trackers push: could not reach $url : $msg")
+            $script:AgentqTrackExit = 3
+        }
+    }
+}
+
 # `agentq trackers [-- <args>]` - the tracker index: repo/item counts and the drift total. Maps to the
 # tool's `status` (track.mjs has no `trackers` subcommand; status IS the "which trackers exist and do
-# they agree" view). --json prints the raw index. The tool's `roster`, `export`, `import` and `drift`
-# subcommands are NOT reachable through these three verbs (see the footer note).
+# they agree" view). --json prints the raw index. `push` is the ONE sub-verb handled here rather than
+# forwarded (see its own doc above); everything else passes through untouched. The tool's `roster`,
+# `export`, `import` and `drift` subcommands are NOT reachable through these three verbs (footer note).
 function Invoke-AgentqTrackers {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    if ($Arguments -and $Arguments.Count -gt 0 -and "$($Arguments[0])".ToLowerInvariant() -eq 'push') {
+        Invoke-AgentqTrackersPush -Arguments @($Arguments | Select-Object -Skip 1)
+        return
+    }
     Invoke-AgentqTrackCli -Sub 'status' -Arguments $Arguments
 }
 
@@ -130,10 +292,11 @@ function Invoke-AgentqTrackerVerb {
 # `$_` is the switch's value (the lower-cased verb); `$Rest` is everything the caller put after `--`,
 # which is the only channel agentq.ps1's argument parser leaves untouched. Usage therefore is:
 #   agentq trackers -- --json
+#   agentq trackers push [-Hub <url>] [-KeyFile <path>] [-DryRun] [-Repo <name>]   (no `--`; handled here)
 #   agentq plan -- show --session <id> [--json]
 #   agentq task -- list [--json]
 # and the matching one-line help entry for $AqHelp:
-#   'trackers' = @{ g = 'Tracking'; u = 'trackers [-- --json]'; d = 'tracker index: repo/item counts and drift (tools/track.mjs status)'; e = 'agentq trackers -- --json' }
+#   'trackers' = @{ g = 'Tracking'; u = 'trackers [push [-Hub <url>] [-KeyFile <path>] [-DryRun] [-Repo <name>]] [-- --json]'; d = 'tracker index: repo/item counts and drift (tools/track.mjs status); push uploads it to the Codwen hub'; e = 'agentq trackers -- --json  |  agentq trackers push -DryRun' }
 #   'plan'     = @{ g = 'Tracking'; u = 'plan -- set|show --session <id> [--goal s] [--json]'; d = 'the per-session plan record (goal/doneMeans/next/roster/jobs/todos)'; e = 'agentq plan -- show --session $env:AGENTQ_SESSION' }
 #   'task'     = @{ g = 'Tracking'; u = 'task -- add|claim|next|block|done|show|list [flags]'; d = 'a claimable task; claim is atomic across agents, next skips open dependencies'; e = 'agentq task -- list --json' }
 # ---------------------------------------------------------------------------------------------------

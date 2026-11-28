@@ -145,6 +145,198 @@ exit $script:AgentqTrackExit
     $ErrorActionPreference = 'Continue'   # the child propagates the tool's stderr (5.1: not while 'Stop')
     & $hostExe -NoProfile -File $child2 -Mod $mut2 -Root $binDir 1>$null 2>$null
     Check '8a swallowing the exit code reports 0 where the real CLI reports 2, so the exit checks are load-bearing' ($LASTEXITCODE -eq 0) "mutated exit=$LASTEXITCODE (real is 2)"
+
+    # ---- 9-15. `trackers push` - the ONE sub-verb that is not a pass-through to the Node tool -------
+    # A raw TCP listener in a child runspace is a real HTTP/1.1 exchange (no URL ACL, no admin, no
+    # mock): it records the request line, headers and body the module actually sent, then answers with
+    # the status the test asks for. Both the happy path and a refusal are therefore exercised end to end
+    # and the assertions are about the WIRE, not about a function having been called.
+    function Start-FakeHub {
+        param([int]$Status, [string]$Reason, [string]$RespBody)
+        $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $script:HubPort = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $script:HubRec = Join-Path $tmp ("hub-" + [guid]::NewGuid().ToString('N').Substring(0, 6) + ".txt")
+        $rs = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(); $rs.Open()
+        $ps = [Management.Automation.PowerShell]::Create(); $ps.Runspace = $rs
+        $null = $ps.AddScript({
+            param($listener, $status, $reason, $body, $recFile)
+            $client = $listener.AcceptTcpClient()
+            try {
+                $stream = $client.GetStream()
+                # One byte at a time is plenty for a request head and keeps the framing unambiguous.
+                $head = [Text.StringBuilder]::new()
+                $one = New-Object byte[] 1
+                while ($true) {
+                    $n = $stream.Read($one, 0, 1); if ($n -le 0) { break }
+                    $null = $head.Append([char]$one[0])
+                    if ($head.Length -ge 4 -and $head.ToString($head.Length - 4, 4) -eq "`r`n`r`n") { break }
+                }
+                $htext = $head.ToString()
+                if ($htext -match '(?i)Expect:\s*100-continue') {
+                    # Windows PowerShell 5.1 sends Expect: 100-continue by default; a server that ignores
+                    # it makes the client wait out its own timeout, so answer it.
+                    $cont = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n")
+                    $stream.Write($cont, 0, $cont.Length); $stream.Flush()
+                }
+                $len = 0
+                foreach ($line in ($htext -split "`r`n")) { if ($line -match '^Content-Length:\s*(\d+)') { $len = [int]$Matches[1] } }
+                $bytes = New-Object IO.MemoryStream
+                $buf = New-Object byte[] 65536
+                $left = $len
+                while ($left -gt 0) {
+                    $n = $stream.Read($buf, 0, [Math]::Min($buf.Length, $left)); if ($n -le 0) { break }
+                    $bytes.Write($buf, 0, $n); $left -= $n
+                }
+                [IO.File]::WriteAllText($recFile, ($htext + "`n---BODY---`n" + [Text.Encoding]::UTF8.GetString($bytes.ToArray())))
+                $rb = [Text.Encoding]::UTF8.GetBytes($body)
+                $respHead = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $status $reason`r`nContent-Type: application/json`r`nContent-Length: $($rb.Length)`r`nConnection: close`r`n`r`n")
+                $stream.Write($respHead, 0, $respHead.Length); $stream.Write($rb, 0, $rb.Length); $stream.Flush()
+            } finally { $client.Close(); $listener.Stop() }
+        })
+        foreach ($a in @($listener, $Status, $Reason, $RespBody, $script:HubRec)) { $null = $ps.AddArgument($a) }
+        $script:HubPS = $ps; $script:HubRS = $rs; $script:HubHandle = $ps.BeginInvoke()
+    }
+    function Stop-FakeHub {
+        if ($script:HubPS -and $script:HubHandle) {
+            try { $null = $script:HubHandle.AsyncWaitHandle.WaitOne(5000) } catch { }
+            try { if ($script:HubHandle.IsCompleted) { $null = $script:HubPS.EndInvoke($script:HubHandle) } else { $script:HubPS.Stop() } } catch { }
+            try { $script:HubPS.Dispose() } catch { }
+        }
+        if ($script:HubRS) { try { $script:HubRS.Close() } catch { } }
+        $script:HubPS = $null; $script:HubRS = $null; $script:HubHandle = $null
+    }
+    function HubBody([string]$rec) { (($rec -split '---BODY---')[-1]) }
+
+    # The module reports on [Console]::Error, which writes to the PROCESS stderr handle and therefore
+    # bypasses an in-process `2>&1` entirely. A child pwsh makes it a native child, whose stderr IS
+    # capturable, so the "say it honestly" assertions below actually read the line the user will see.
+    $childVerb = Join-Path $tmp 'child-verb.ps1'
+    WriteText $childVerb (@'
+param([string]$Mod,[string]$Root,[string]$Verb,[string]$ArgsLine)
+. $Mod
+$script:AgentqTrackModuleRoot = $Root
+$trackArgs = @()
+if ($ArgsLine) { $trackArgs = $ArgsLine -split ' ' }
+Invoke-AgentqTrackerVerb -Verb $Verb -Arguments $trackArgs
+exit $script:AgentqTrackExit
+'@)
+    function ChildRun([string]$Verb, [string[]]$TrackArgs) {
+        $ErrorActionPreference = 'Continue'
+        $o = @(& $hostExe -NoProfile -File $childVerb -Mod $Module -Root $binDir -Verb $Verb -ArgsLine ($TrackArgs -join ' ') 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        [pscustomobject]@{ Text = $o; Code = $LASTEXITCODE }
+    }
+
+    # -DryRun must PRINT and not POST. The -Hub below is a port nothing listens on, so a request would
+    # exit 3 - exit 0 is the proof that the network was never touched.
+    Remove-Item Env:\CODAI_HUB_KEY -ErrorAction SilentlyContinue
+    $keyFile = Join-Path $tmp 'push.key'
+    WriteText $keyFile 'codai_test_key_abcdef'
+    $dead = 'http://127.0.0.1:9/v1'
+    $m = ModuleRun 'trackers' @('push', '-DryRun', '-Hub', $dead, '-KeyFile', $keyFile)
+    Check '9 push -DryRun exits 0 without touching an unreachable hub' ($m.Code -eq 0) "exit=$($m.Code) $($m.Text)"
+    Check '9a -DryRun names the ingest URL, the size and the repo count' ($m.Text -match 'DRYRUN' -and $m.Text -match '/v1/trackers/ingest' -and $m.Text -match '1 repo\(s\)') $m.Text
+
+    # ---- 10. the wire contract of a successful push --------------------------------------------------
+    Start-FakeHub -Status 200 -Reason 'OK' -RespBody '{"count":1}'
+    $m = ModuleRun 'trackers' @('push', '-Hub', "http://127.0.0.1:$($script:HubPort)/v1", '-KeyFile', $keyFile)
+    Stop-FakeHub
+    $rec = if (Test-Path -LiteralPath $script:HubRec) { [IO.File]::ReadAllText($script:HubRec) } else { '' }
+    Check '10 push exits 0 on a 2xx' ($m.Code -eq 0) "exit=$($m.Code) $($m.Text)"
+    Check '10a the hub received POST /v1/trackers/ingest' ($rec -match '^POST /v1/trackers/ingest ') ($rec -split "`n")[0]
+    Check '10b the request carried the machine key as a bearer token' ($rec -match '(?i)authorization: Bearer codai_test_key_abcdef') ''
+    Check '10c the body was the local index verbatim (repos + the repo name)' ($rec -match '"repos"' -and $rec -match '"demo"') (HubBody $rec).Substring(0, [Math]::Min(120, (HubBody $rec).Length))
+    Check '10d the success line reports what was sent' ($m.Text -match 'ok: pushed 1 repo\(s\)') $m.Text
+
+    # ---- 11. a refusal is reported and is NOT a success -----------------------------------------------
+    Start-FakeHub -Status 422 -Reason 'Unprocessable Entity' -RespBody '{"error":{"message":"repos[0].repo is required"}}'
+    $c = ChildRun 'trackers' @('push', '-Hub', "http://127.0.0.1:$($script:HubPort)/v1", '-KeyFile', $keyFile)
+    Stop-FakeHub
+    Check '11 a 422 exits non-zero' ($c.Code -ne 0) "exit=$($c.Code) $($c.Text)"
+    Check '11a the refusal names the status code' ($c.Text -match 'refused \(422\)') $c.Text
+
+    # ---- 12/13. the cheap refusals happen before any request ------------------------------------------
+    $emptyHome = Join-Path $tmp 'emptyhome'
+    New-Item -ItemType Directory -Force $emptyHome | Out-Null
+    $savedHome = $env:AGENTQ_HOME
+    $env:AGENTQ_HOME = $emptyHome
+    $c = ChildRun 'trackers' @('push', '-Hub', $dead, '-KeyFile', $keyFile)
+    Check '12 a missing index exits 2' ($c.Code -eq 2) "exit=$($c.Code) $($c.Text)"
+    Check '12a the missing-index line names the path' ($c.Text -match 'no index at') $c.Text
+    $env:AGENTQ_HOME = $savedHome
+    $c = ChildRun 'trackers' @('push', '-Hub', $dead, '-KeyFile', (Join-Path $tmp 'absent.key'))
+    Check '13 a missing key exits 2 (after the index exists)' ($c.Code -eq 2) "exit=$($c.Code) $($c.Text)"
+    Check '13a the missing-key line names the file it looked for' ($c.Text -match 'no key at') $c.Text
+
+    # ---- 14. -Repo narrows the payload, and a filter that matches nothing is a usage error -------------
+    $twoHome = Join-Path $tmp 'twohome'
+    New-Item -ItemType Directory -Force (Join-Path $twoHome 'trackers') | Out-Null
+    $two = [ordered]@{
+        generatedAt = '2026-01-01T00:00:00.000Z'
+        repos = @(
+            [ordered]@{ repo = 'alpha'; root = 'X:\a'; trackers = @(); drift = @() }
+            [ordered]@{ repo = 'beta'; root = 'X:\b'; trackers = @(); drift = @() }
+        )
+    }
+    WriteText (Join-Path $twoHome 'trackers\index.json') ($two | ConvertTo-Json -Depth 10)
+    $env:AGENTQ_HOME = $twoHome
+    Start-FakeHub -Status 200 -Reason 'OK' -RespBody '{"count":1}'
+    $hub = "http://127.0.0.1:$($script:HubPort)/v1"
+    $m = ModuleRun 'trackers' @('push', '-Repo', 'alpha', '-Hub', $hub, '-KeyFile', $keyFile)
+    Stop-FakeHub
+    $rec = if (Test-Path -LiteralPath $script:HubRec) { [IO.File]::ReadAllText($script:HubRec) } else { '' }
+    Check '14 -Repo alpha exits 0' ($m.Code -eq 0) "exit=$($m.Code) $($m.Text)"
+    Check '14a -Repo kept alpha and dropped beta from the body' ((HubBody $rec) -match '"alpha"' -and (HubBody $rec) -notmatch '"beta"') (HubBody $rec)
+    $m = ModuleRun 'trackers' @('push', '-Repo', 'nosuchrepo', '-Hub', $hub, '-KeyFile', $keyFile)
+    Check '14b a -Repo filter that matches nothing exits 2' ($m.Code -eq 2) "exit=$($m.Code) $($m.Text)"
+    $c = ChildRun 'trackers' @('push', '-Bogus')
+    Check '14c an unknown push flag is a usage error (exit 2, no request)' ($c.Code -eq 2 -and $c.Text -match 'unknown argument') "exit=$($c.Code) $($c.Text)"
+    $env:AGENTQ_HOME = $savedHome
+
+    # ---- 15. MUTATION CONTROL 3: the non-2xx exit is load-bearing --------------------------------------
+    # A copy that reports success on a refusal must exit 0 where the real module exits 4. Without this,
+    # "push exits non-zero on a 422" could pass for the wrong reason (e.g. an unrelated crash).
+    $needle3 = '            $script:AgentqTrackExit = 4'
+    $mut3 = Join-Path $tmp 'mut-push-refusal.ps1'
+    Check '15 the mutation target line exists in the module' ($src.Contains($needle3)) 'needle not found'
+    WriteText $mut3 ($src.Replace($needle3, '            $script:AgentqTrackExit = 0'))
+    $child3 = Join-Path $tmp 'child-push.ps1'
+    WriteText $child3 (@'
+param([string]$Mod,[string]$Root,[string]$Hub,[string]$Key)
+. $Mod
+$script:AgentqTrackModuleRoot = $Root   # the copy lives in %TEMP%; point the resolver at the real ps\bin
+Invoke-AgentqTrackers -Arguments @('push','-Hub',$Hub,'-KeyFile',$Key)
+exit $script:AgentqTrackExit
+'@)
+    Start-FakeHub -Status 422 -Reason 'Unprocessable Entity' -RespBody '{"error":{"message":"no"}}'
+    $ErrorActionPreference = 'Continue'   # the child writes the refusal to stderr
+    & $hostExe -NoProfile -File $child3 -Mod $mut3 -Root $binDir -Hub "http://127.0.0.1:$($script:HubPort)/v1" -Key $keyFile 1>$null 2>$null
+    $mutExit = $LASTEXITCODE
+    Stop-FakeHub
+    Check '15a reporting 0 on a refusal makes the exit assertion go red (the real module exits 4)' ($mutExit -eq 0) "mutated exit=$mutExit (real is 4)"
+
+    # ---- 16. `push` is reachable through the REAL dispatcher, exactly as documented --------------------
+    # A perfect module is not a usable verb: agentq.ps1's parser refuses every bare positional, so
+    # `agentq trackers push ...` died with "unknown argument 'push' (put the command after '--')" until a
+    # branch scoped to that one word forwarded the tail. This section drives ps/bin/agentq.ps1 itself,
+    # and 16b is the vacuity control: a DIFFERENT bare word is still refused, so "push is reachable"
+    # cannot be passing because the parser simply stopped refusing positionals.
+    $AqPath = Join-Path $binDir 'agentq.ps1'
+    $env:AGENTQ_NO_SIGNAL = '1'; $env:AGENTQ_NO_REGISTRY = '1'; $env:AGENTQ_NO_ADMISSION = '1'
+    $env:CODAI_WT_ROOT = Join-Path $tmp 'wt'
+    $env:AGENTQ_SESSION = 'test-trackers'
+    function DispatcherRun([string[]]$Argv) {
+        $ErrorActionPreference = 'Continue'
+        $o = @(& $hostExe -NoProfile -File $AqPath @Argv 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        [pscustomobject]@{ Text = $o; Code = $LASTEXITCODE }
+    }
+    $d1 = DispatcherRun @('trackers', 'push', '-DryRun', '-KeyFile', $keyFile)
+    Check '16 the dispatcher reaches push, and -DryRun exits 0' ($d1.Code -eq 0 -and $d1.Text -match 'DRYRUN') "exit=$($d1.Code) $($d1.Text)"
+    Check '16a the forwarded tail was parsed by push (it named the ingest URL)' ($d1.Text -match '/trackers/ingest') $d1.Text
+    $d2 = DispatcherRun @('trackers', 'bubble', '-KeyFile', $keyFile)
+    Check '16b another bare word is still refused, so the allowance is scoped to push' ($d2.Code -eq 2 -and $d2.Text -match "unknown argument 'bubble'") "exit=$($d2.Code) $($d2.Text)"
+    $d3 = DispatcherRun @('trackers', '--', 'push', '-DryRun', '-KeyFile', $keyFile)
+    Check '16c the `-- push` spelling keeps working' ($d3.Code -eq 0 -and $d3.Text -match 'DRYRUN') "exit=$($d3.Code) $($d3.Text)"
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

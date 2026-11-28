@@ -152,6 +152,50 @@ schema `projects-health.ts`, migrations 0222/0223); the tracker mirror extends
 that surface rather than starting a new one. A project that is also a local
 workspace is **linked**, never **merged** (one owner per fact).
 
+### The pushing side — `agentq trackers push`
+
+```text
+agentq trackers push [-Hub <url>] [-KeyFile <path>] [-DryRun] [-Repo <name>]
+```
+
+The mirror is useless with nothing to mirror it, so `push` is the one tracker
+verb that is not a pass-through to `tools/track.mjs`: it needs a machine key and
+an HTTP POST, and the Node tool stays strictly offline (it is also the reason
+the module, not the tool, owns this verb). It reimplements nothing of the store
+— it sends the file the `trackers` verb reads, byte for byte, so a client can
+never be looking at a different index from the one the terminal prints.
+
+- **Where.** `<hub>/trackers/ingest`, hub defaulting to `https://ai.codai.ro/v1`
+  → `POST /v1/trackers/ingest`. The codai side of this contract (auth scope,
+  per-repo visibility, the snapshot table) is documented in the codai note.
+- **The key.** `CODAI_HUB_KEY` wins when set; a `codai…` value is used verbatim
+  (handy for a smoke key). Otherwise `-KeyFile` — default `~/.codai/copilot.key`
+  — is read as the same DPAPI-hex convention `ps/bin/devbox-team-sync.ps1` uses,
+  so one machine secret serves both. The key is never printed: messages and
+  `-DryRun` name the _file_, never the value, and the test suite asserts the
+  bearer header rather than echoing it.
+- **What.** The index is sent **verbatim** (a leading BOM is stripped, since
+  `ConvertFrom-Json` would not otherwise parse it); `-Repo <name>` is the only
+  narrowing, and it re-serialises just the kept repos. Verbatim is deliberate:
+  the body has to survive the gateway's own validation and redaction, and
+  re-serialising the whole index would silently change a field schema that the
+  ingest route validates.
+- **`-DryRun`** prints the URL, the repo count, the byte size and which key file
+  it would use, and makes no request at all — a test proves that by pointing it
+  at an unreachable port and asserting exit 0.
+- **Exit codes.** `0` sent (or a dry run); `2` no index, no key, nothing matching
+  `-Repo`, unreadable JSON or an unknown flag; `3` the hub was unreachable; `4`
+  the hub refused it (non-2xx). `4` is distinct from `3` on purpose: a refusal is
+  a contract problem to fix, an unreachable hub is a network to retry.
+
+**Size is the standing risk.** The gateway caps a body at 12 MB and the live
+index measured 10,761,304 bytes across 39 repos on 2026-11-28 — about 11 % of
+headroom, and a fleet that keeps growing will cross it. `-Repo` is the escape
+hatch (one repo measured 2,179,416 bytes, well inside), and a repo failing with
+`413` is the signal to push per repo rather than to raise the cap. The hub's own
+`ingestBody` caps 500 repos × 200 trackers, so the two limits are not the same
+number and neither is derived from the other.
+
 ## The resume protocol — the part that fixes "Continue"
 
 1. **Leave a plan before you build or dispatch.** Before the first file edit or
@@ -195,16 +239,17 @@ and the in-flight jobs are fields in it, not three separate memories.
 
 ## Roadmap (maps onto the existing OQ tracker — this is not new scope)
 
-| step                               | tracker row      | what                                 |
-| ---------------------------------- | ---------------- | ------------------------------------ |
-| schemas + mapping format + linter  | (this work, new) | Layer 0/1/3 foundations              |
-| tracker mapping for the fleet      | **OQ-030**       | add `.agentq/trackers.json` per repo |
-| claim / next / block / done        | **OQ-031/032**   | Layer 2 tasks                        |
-| conflict forecast from path claims | **OQ-033**       | `paths` on tasks                     |
-| handoff as an object               | **OQ-034**       | `handoff` + `handoffPrompt`          |
-| task timeline / flight recorder    | **OQ-035**       | journal ↔ plan                       |
-| hub / Vitals / clients             | **OQ-060…066**   | Layer 4/5                            |
-| resume-on-prompt hook              | new              | the `UserPromptSubmit` gap           |
+| step                               | tracker row      | what                                                |
+| ---------------------------------- | ---------------- | --------------------------------------------------- |
+| schemas + mapping format + linter  | (this work, new) | Layer 0/1/3 foundations                             |
+| tracker mapping for the fleet      | **OQ-030**       | add `.agentq/trackers.json` per repo                |
+| claim / next / block / done        | **OQ-031/032**   | Layer 2 tasks                                       |
+| conflict forecast from path claims | **OQ-033**       | `paths` on tasks                                    |
+| handoff as an object               | **OQ-034**       | `handoff` + `handoffPrompt`                         |
+| task timeline / flight recorder    | **OQ-035**       | journal ↔ plan                                      |
+| hub / Vitals / clients             | **OQ-060…066**   | Layer 4/5                                           |
+| pushing side (uploader)            | (this work, new) | `agentq trackers push` → `POST /v1/trackers/ingest` |
+| resume-on-prompt hook              | new              | the `UserPromptSubmit` gap                          |
 
 ## Open decisions
 
