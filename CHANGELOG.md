@@ -76,6 +76,34 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Fixed
 
+- **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
+  them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
+  gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,
+  `takeover chat`, `args comma`, `gate input selection` and `agentq timings` no matter what had actually
+  changed. The map now has **44 entries for the 44 suite names (0 missing, 0 extra)**, each pointing at the
+  module its suite actually drives, and the proof run reports `Proved=True run=2 skip=42`: **nine suites moved
+  from "always runs" to "skippable"**, measured per name by touching each glob and asserting the suite is
+  selected (`pass=18 fail=0`).
+
+- **`since` reaped dead tickets and ate the caller's lease-loss notice, although the brief calls it
+  READ-ONLY.** It ends in `Show-Status`, and it was not in the `$script:ReadOnly` set, so it ran as a working
+  verb: `Get-Live` dropped every dead ticket before `agentq sweep` could report it, and `Show-LeaseNotices` /
+  `Show-MessageNotices` consumed the notice the caller was supposed to see on its next working call. The verb
+  is the FIRST call of nearly every task boot, so the loss was fleet-wide and silent - and `Register-Agent`
+  already excluded `since`, i.e. the code was half-way to the documented contract. `since` is now in the
+  read-only set, which also stops it rewriting the machine capacity, sampling the adaptive cap, dropping an
+  expired burst and sampling the load probe. Session liveness is unchanged (line ~2674 renews the session for
+  `since` explicitly). Found by the new guard in `ps/tests/test-status-readonly.ps1`, not by reading the code:
+  the suite went 3 FAILED with the verb as it was and ALL PASS with it moved, on the same fixture.
+
+- **`agentq since` spawned git twice to do one log.** `rev-parse --abbrev-ref '@{u}'` existed only to pick the
+  NEXT spawn's argument, and its output was never printed. The log now asks git for the upstream itself
+  (`log '@{u}'`), with the `HEAD` fallback keeping the no-upstream case at the same two spawns as before, so
+  the change only ever removes one. Measured with a `git.cmd` shim first on PATH on the same fixture:
+  **4 spawns before, 3 after** (`rev-parse` to resolve the repo + `rev-parse --abbrev-ref '@{u}'` + `fetch` +
+  `log` -> `rev-parse` + `fetch` + `log`), with
+  byte-identical output in both the has-upstream and the no-upstream case.
+
 - A hung child in `ps/tests/test-lease-spawns.ps1` can no longer hang a gate. Every fixture child now has a
   bounded wait (override `AGENTQ_TEST_CHILD_BOUND_SEC`); on timeout the child is KILLED, its stdout, stderr and
   elapsed time are printed, the suite FAILS, and its `%TEMP%\aqspawn-*` tree is still removed (retried, and then

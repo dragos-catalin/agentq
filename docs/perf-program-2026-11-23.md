@@ -171,11 +171,12 @@ figures in this document need their provenance re-checked against a clean window
 vs ~16.8 h/day measured 2026-11-27, and the resident hook client's ledger now under-counts ~7x because its
 timing window starts inside the already-running server.
 
-Not done, stated so nobody assumes it is covered: the pool's `AqSuiteInputMap` has no entry for 8 of the 43
-`gateSuites.agentq` names (`lease spawns`, `land capacity`, `agentq reclaim`, `agentq approve`, `takeover chat`,
-`args comma`, `gate input selection`, `agentq timings`), so those can never be SKIPPED - but filling the map
-outside `ps/` selects zero suites (`$proved` needs both a run and a skip), which makes `gate.ps1` fall back to
-the full 43-suite pool: fixes for it need a measurement, not a guess.
+**Closed 2026-11-28**: the pool's `AqSuiteInputMap` was missing an entry for the 8 `gateSuites.agentq` names
+listed here, plus a 9th (`land stale base`) that round 3 added afterwards - so those could never be SKIPPED.
+Measured, not guessed: the pool now covers **44 of 44**, and a proof
+run reports `pass=18 fail=0`, `Proved=True run=2 skip=42` - i.e. **9 suites moved from "always runs" to
+"skippable"**, which is the whole point of the input map (a suite with no input can never be skipped, so
+every gate pays for it). See the round-2026-11-28 section below.
 
 Shared-clone note from the same round: `git-autosync` refused `agentq` for **14 h 49 m** over ONE obsolete
 local commit (`main` ahead 1, behind 10) while every other repo synced. Pushing that commit to a branch does
@@ -185,3 +186,49 @@ value in `refs/backup/autosync/main`): a ref-only `update-ref refs/heads/main or
 the files whose worktree content still equals the old commit (and re-add the ones upstream added), leaving any
 path a live session has edited exactly as it is. Verified: 13 files aligned, the 10 files of the sibling
 session byte-identical before and after, `git-autosync -WhatIf` -> `agentq in sync`.
+
+## Round 2026-11-28 — per-verb spawn counts, and `since` was not read-only
+
+Everything here is counted in **git SPAWNS**, not in wall-clock: a `git.cmd` shim first on `PATH` appends
+`%*` to a log, each verb runs in its own child process against one synthetic fixture, and the count is the
+log's line count. Wall-clock on this machine moves by 2-5x with load (a 169 s pool measured 792 s under it),
+which is why the round-3 numbers were re-measured this way and why the numbers below are stable across runs.
+
+| verb                                                                | exit  | git spawns                  |
+| ------------------------------------------------------------------- | ----- | --------------------------- |
+| `lease` (genuinely fresh - a slot to create)                        | 0     | 5                           |
+| `lease -Slot <mine>` (reuse of a clean slot)                        | 0     | 2                           |
+| `status`, `status -Json`, `log`, `note`, `lessons`, `doctor -Quiet` | 0     | 1 each                      |
+| `since`                                                             | 0     | **3** (4 before this round) |
+| `who`, `metrics`, `scale`, `probe`, `slo`, `lease-check`, `renew`   | 0     | 0 each                      |
+| `backup`, `unlease` (refused: nothing to do)                        | 1     | 1 each                      |
+| `eval`, `claim` (refused path)                                      | 2 / 1 | 0 / 0                       |
+
+The one-spawn rows are the repo resolution (`rev-parse --show-toplevel`); the zero-spawn rows take the repo
+from the cwd, so they are already at the floor. A lease pays one `status` per slot it considers, which is the
+only place a bigger number is still available.
+
+**`since` spawned git twice to do one log.** `rev-parse --abbrev-ref '@{u}'` existed only to choose the NEXT
+spawn's argument, and its output was never printed. The log now asks git for the upstream itself (`log '@{u}'`)
+with the `HEAD` fallback for the no-upstream case, so the change can only ever remove a spawn: measured
+**4 -> 3** on the same fixture, one arm at a time, with byte-identical output in both cases. Guarded by
+`ps/tests/test-status-readonly.ps1` ("no separate upstream probe", "one log spawn"), both non-vacuous - the
+suite asserts the shim captured calls at all before it asserts the shape.
+
+**`since` was not in the read-only set, although the brief calls it READ-ONLY.** It ends in `Show-Status` and
+ran as a working verb, so the FIRST call of nearly every task boot reaped the dead tickets `sweep` exists to
+report (`Get-Live` drops them when the flag is off) and consumed the caller's own lease-loss notice. The
+damage was fleet-wide and silent; `Register-Agent` already excluded `since`, i.e. the code was half-way to
+its own documentation. Moving it into the set also stops it rewriting the machine capacity, sampling the
+adaptive cap and the load probe, and dropping an expired burst. Session liveness is unaffected (the session
+is renewed for `since` explicitly).
+
+Found by the new guard rather than by reading the code: the suite reported **3 FAILED** with the verb as it
+was and **ALL PASS** with it moved, on the same fixture, and the pristine suite from `origin/main` passes on
+the same machine - so the failures were the guard's and the fix was the verb's. `status readonly` is a gate
+member, so the read-only fix is what keeps the gate green, not an optional tidy-up.
+
+**The input map is closed too** (see "Open decisions" above): `AqSuiteInputMap` now has **44 entries for the 44
+`gateSuites.agentq` names, 0 missing, 0 extra**, and `Select-AqSuites` on a real commit range reports
+`Proved=True run=2 skip=42`. The proof run asserts, per newly-added name, that touching its own glob selects
+the suite (`pass=18 fail=0`), so the coverage is measured rather than inferred from the map's size.

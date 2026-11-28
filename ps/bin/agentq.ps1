@@ -401,7 +401,13 @@ $script:DoctorExit = $null
 # tickets, rewrote the machine capacity, sampled the adaptive cap, marked dead releases failed and
 # consumed lease notices, so every reader was also a writer (and `status -All` cost 4 s). Reaping now
 # happens where work happens (run/commit/lease/land) and in `sweep`.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'lessons', 'metrics', 'doctor', 'help', 'timings'
+# `since` belongs in this set (agentq round 4). Its help line already advertises it as READ-ONLY and
+# Register-Agent already excludes it, but it was NOT here: it ends in `Show-Status` and ran as a working
+# verb, so the first call of nearly every task boot silently REAPED the dead tickets `sweep` exists to
+# report (Get-Live drops them when the flag is off) and CONSUMED the caller's own lease-loss notice. The
+# brief lists `since` under "READ-ONLY (never queue, never reap)" - this makes the code say what the docs
+# promise. Session liveness is unaffected: line ~2674 renews the session for `since` explicitly.
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'since', 'lessons', 'metrics', 'doctor', 'help', 'timings'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -2448,9 +2454,16 @@ function Show-Since {
   Show-PrewarmHint $repo.Name
   Write-Output "== git log origin (last $Hours h)"
   & git -C $repo.Top fetch -q 2>$null
-  $up = (& git -C $repo.Top rev-parse --abbrev-ref '@{u}' 2>$null)
-  $ref = if ($up) { $up } else { 'HEAD' }
-  & git -C $repo.Top log $ref --since="$([int]($Hours * 60)) minutes ago" --format='%h %ad %an %s' --date=format:'%m-%d %H:%M' -n 60
+  # ONE log spawn, not two: `@{u}` asks git for the upstream itself and the separate
+  # `rev-parse --abbrev-ref '@{u}'` existed only to choose the NEXT spawn's argument -- a whole process
+  # whose output was never printed. The fallback keeps the no-upstream case at the same two spawns as
+  # before (log fails, log HEAD succeeds), so this only ever removes one. `since` is the first call of
+  # nearly every task boot, so the saving is paid fleet-wide (agentq round 4).
+  $sinceArg = "--since=$([int]($Hours * 60)) minutes ago"
+  $fmtArg = '--format=%h %ad %an %s'
+  $dtArg = "--date=format:%m-%d %H:%M"
+  & git -C $repo.Top log '@{u}' $sinceArg $fmtArg $dtArg -n 60 2>$null
+  if ($LASTEXITCODE) { & git -C $repo.Top log HEAD $sinceArg $fmtArg $dtArg -n 60 }
   Write-Output '== live queues'
   Show-Status
 }
