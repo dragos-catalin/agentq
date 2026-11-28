@@ -91,6 +91,7 @@ $suites = [ordered]@{
   'text encoding'  = @('-File', (Join-Path $PSScriptRoot 'test-text-encoding.ps1'))
   'guard forms'    = @('-File', (Join-Path $PSScriptRoot 'test-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'))
   'deploy guard'   = @('-File', (Join-Path $PSScriptRoot 'test-deploy-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-tooluse.ps1'), '-DeployClean', (Join-Path $hooks 'deploy-clean.ps1'))
+  'dev vm guard'   = @('-File', (Join-Path $PSScriptRoot 'test-dev-vm-guard.ps1'), '-Guard', (Join-Path $hooks 'guard-dev-vm.ps1'))
   # ADR 0003 wave 1
   'publish'        = @('-File', (Join-Path $PSScriptRoot 'test-agentq-publish.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
   'lease3+prep'    = @('-File', (Join-Path $PSScriptRoot 'test-agentq-lease3.ps1'), '-Aq', (Join-Path $bin 'agentq.ps1'))
