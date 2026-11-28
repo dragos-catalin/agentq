@@ -82,8 +82,8 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   line from any of them, and a holder that dies mid-hold leaves the mutex abandoned - every later install then
   waited the full 45-minute cap and failed. The gate now writes `bin/agentq-install-gate.holder.json`
   (`{pid, at, src}`) on acquire and removes it in `finally`, prints
-  `install gate: waiting up to N min - held by pid X since Y` BEFORE it waits (or `no holder published a
-  marker`), caps the wait at **12 min** instead of 45, reports how long it actually waited, and ACQUIRES an
+  `install gate: waiting up to N min - held by pid X since Y` BEFORE it waits (or says that no holder
+  published a marker), caps the wait at **12 min** instead of 45, reports how long it actually waited, and ACQUIRES an
   abandoned mutex with a named line instead of stalling until the cap. `ps/tests/test-install.ps1` pins the
   protocol in 8a-8g (45 checks, was 38).
 
