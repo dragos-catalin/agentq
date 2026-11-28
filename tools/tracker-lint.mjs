@@ -22,6 +22,11 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve, basename } from "node:path";
 import { homedir } from "node:os";
+// The single definition of root health lives in track.mjs (this file imports it
+// so the scan and `track status` cannot disagree). track.mjs imports scanRepo
+// from here in turn - an intentional, benign cycle: both are function
+// declarations, so each binding is initialised before either module body runs.
+import { rootIssueFor } from "./track.mjs";
 
 const CANONICAL = ["todo", "in-progress", "blocked", "review", "done", "dropped", "deferred"];
 const REQUIRED = ["id", "title", "status"];
@@ -113,6 +118,16 @@ function stripBom(text) {
     return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
+// `idPattern` may be one string or a list. A mapping with several id families (a
+// `D-nnn` tracker beside an `F-nnn` one) declares them all, and an id is valid if
+// it matches ANY of them. Normalised once, here, so the row check, the unused
+// check and the narrative scan all read the same set.
+function idPatternList(def) {
+    const p = def && def.idPattern;
+    if (!p) return [];
+    return (Array.isArray(p) ? p : [p]).map(String).filter(Boolean);
+}
+
 function readTrackerFile(root, def) {
     const full = join(root, def.file);
     if (!existsSync(full)) {
@@ -155,7 +170,8 @@ function readTrackerFile(root, def) {
     }
 
     const statusMap = (def.status && def.status.map) || {};
-    const idRe = def.idPattern ? new RegExp(def.idPattern) : null;
+    const idSrcs = idPatternList(def);
+    const idRes = idSrcs.map((s) => new RegExp(s));
     const groupRe = def.groupPattern ? new RegExp(def.groupPattern) : null;
     const seen = new Map();
     const items = [];
@@ -190,8 +206,13 @@ function readTrackerFile(root, def) {
                 detail: `first seen at line ${seen.get(id)}`,
             });
         else seen.set(id, rec.line);
-        if (idRe && !idRe.test(id))
-            drift.push({ kind: "bad-id-shape", tracker: def.id, ref: id, detail: `does not match ${def.idPattern}` });
+        if (idRes.length && !idRes.some((re) => re.test(id)))
+            drift.push({
+                kind: "bad-id-shape",
+                tracker: def.id,
+                ref: id,
+                detail: `does not match ${idSrcs.join(" | ")}`,
+            });
         const group = get("group");
         if (groupRe && group && !groupRe.test(group))
             drift.push({
@@ -230,6 +251,22 @@ function readTrackerFile(root, def) {
         }
     }
 
+    // A declared idPattern that matches no row at all is a silent lie: the
+    // mapping claims a shape the file does not use, so every consumer that
+    // trusts it reads the wrong ids (or none). Only meaningful when the tracker
+    // has rows; an empty file is a different, already-reported problem.
+    if (items.length > 0) {
+        for (let i = 0; i < idRes.length; i++) {
+            if (!items.some((it) => idRes[i].test(it.id)))
+                drift.push({
+                    kind: "id-pattern-unused",
+                    tracker: def.id,
+                    ref: idSrcs[i],
+                    detail: `idPattern '${idSrcs[i]}' matches none of the ${items.length} id row(s) in ${def.file}`,
+                });
+        }
+    }
+
     return { items, drift };
 }
 
@@ -238,10 +275,7 @@ function narrativeDrift(root, registry, ids) {
     // Only a token shaped exactly like some tracker's id vocabulary can be a
     // dangling reference; free-form prose tokens (D1, F30, Stage-0) are not ids
     // and flagging them would drown the real finding.
-    const shapes = (registry.trackers || [])
-        .map((t) => t.idPattern)
-        .filter(Boolean)
-        .map((p) => new RegExp(p));
+    const shapes = (registry.trackers || []).flatMap((t) => idPatternList(t)).map((p) => new RegExp(p));
     if (shapes.length === 0) return drift;
     for (const rel of registry.narrative || []) {
         const full = join(root, rel);
@@ -295,7 +329,10 @@ export function scanRepo(root) {
         trackers.push({ id: def.id, file: def.file, countsByStatus, items });
     }
     drift.push(...narrativeDrift(root, registry, allIds));
-    return { repo, root, git: gitInfo(root), trackers, drift };
+    // rootIssue is written here too, so every indexed entry carries the same
+    // health evidence a `track status` reads (always null here: a repo without a
+    // mapping never reaches this function).
+    return { repo, root, git: gitInfo(root), rootIssue: rootIssueFor(root), trackers, drift };
 }
 
 // The CLI entrypoint, callable from a test or from another tool. It RETURNS the
@@ -346,9 +383,19 @@ export function main(argv) {
     let findings = 0;
     for (const d of dirs) {
         const entry = scanRepo(d);
-        if (!entry) continue;
-        repos.push(entry);
-        findings += entry.drift.length;
+        if (entry) {
+            repos.push(entry);
+            findings += entry.drift.length;
+            continue;
+        }
+        // A root with no mapping is not silently dropped: record WHY, so a
+        // consumer sees an explained card ("the mapping is on origin/main only")
+        // instead of no card at all. Only a directory that is actually a git
+        // repository is recorded - a scratch folder is not a repo - so this
+        // cannot turn ~/gh's working directories into phantom entries.
+        const issue = rootIssueFor(d);
+        if (issue && existsSync(join(d, ".git")))
+            repos.push({ repo: basename(d), root: d, git: gitInfo(d), rootIssue: issue, trackers: [], drift: [] });
     }
     const index = { version: 1, generatedAt: new Date().toISOString(), repos };
     const stateDir = process.env.AGENTQ_HOME || join(homedir(), ".codai", "coord");
@@ -366,7 +413,8 @@ export function main(argv) {
         console.log(`scanned ${repos.length} repo(s) -> ${outPath}`);
         for (const r of repos) {
             const total = r.trackers.reduce((n, t) => n + t.items.length, 0);
-            console.log(`  ${r.repo}: ${total} item(s), ${r.drift.length} drift finding(s)`);
+            const issue = r.rootIssue ? `  [${r.rootIssue}]` : "";
+            console.log(`  ${r.repo}: ${total} item(s), ${r.drift.length} drift finding(s)${issue}`);
         }
         console.log(findings === 0 ? "tracker-lint: clean" : `tracker-lint: ${findings} finding(s)`);
     }

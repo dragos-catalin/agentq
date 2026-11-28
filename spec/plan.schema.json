@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codwen.com/schemas/plan.schema.json",
+  "title": "Codwen session plan - the resume record",
+  "description": "One canonical record of what a chat is doing, written before it builds or dispatches work and updated as it goes, so a stop - crash, sleep, another window, a model handover - is resumable. Read on a typed Continue (UserPromptSubmit hook), on a new chat (sessionStart hook) and by 'agentq plan'. It is the plan the agent must leave behind; the todo list, the subagent roster and the in-flight jobs are all fields here, not three separate truths.",
+  "$defs": {
+    "nextStep": {
+      "type": "object",
+      "description": "One actionable step. 'next' is an ordered list; resuming means doing next()[0] and never re-deriving it from the transcript.",
+      "required": ["title"],
+      "additionalProperties": true,
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["todo", "in-progress", "done", "blocked"] },
+        "owner": { "type": "string", "description": "The agent that owns it, or 'self'." },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "rosterEntry": {
+      "type": "object",
+      "description": "A subagent this chat dispatched (or planned to). This is what a resume re-dispatches without asking - the single biggest thing a Continue currently loses.",
+      "required": ["agentName", "purpose"],
+      "additionalProperties": true,
+      "properties": {
+        "agentName": { "type": "string", "description": "Researcher | Deep Build | ... - the exact picker name." },
+        "purpose": { "type": "string" },
+        "status": { "enum": ["planned", "running", "done", "failed", "dropped"] },
+        "paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Files this subagent owns; no two roster entries may share a file."
+        },
+        "spawnedAt": { "type": "string", "format": "date-time" },
+        "resultRef": { "type": "string", "description": "Where the subagent's artifact landed, if any." }
+      }
+    },
+    "jobRef": {
+      "type": "object",
+      "description": "An in-flight background job or cloud resource. Recorded the moment it launches; a lost id is orphaned spend.",
+      "required": ["id"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "description": "agentq job id, or the cloud job / revision name." },
+        "kind": { "type": "string", "description": "job | cloud | deploy | train" },
+        "expected": { "type": "string", "description": "Expected duration, e.g. '~4 min'." },
+        "log": { "type": "string" },
+        "status": { "enum": ["running", "done", "failed", "stalled", "timeout"] }
+      }
+    },
+    "todo": {
+      "type": "object",
+      "required": ["title"],
+      "additionalProperties": true,
+      "properties": {
+        "title": { "type": "string" },
+        "status": { "enum": ["not-started", "in-progress", "completed"] }
+      }
+    },
+    "planTask": {
+      "type": "object",
+      "description": "A claimable unit in the live task store (state dir tasks/<id>.json), modelled on the agentq messages template. Claim/next/block/done operate on these.",
+      "required": ["id", "title", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "status": { "enum": ["todo", "claimed", "in-progress", "blocked", "review", "done", "dropped"] },
+        "owner": { "type": "string", "description": "The session (lease) that claimed it; set atomically on claim." },
+        "repo": { "type": "string" },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "deps": { "type": "array", "items": { "type": "string" } },
+        "trackerRef": {
+          "type": "object",
+          "description": "Pointer back to the committed tracker row this task carries out.",
+          "properties": { "repo": { "type": "string" }, "tracker": { "type": "string" }, "id": { "type": "string" } }
+        },
+        "handoffPrompt": {
+          "type": "string",
+          "description": "The ready-to-paste next-chat prompt for this task (OQ-034)."
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "description": "The session plan file: state dir chats/<sessionId>.plan.json.",
+      "required": ["version", "goal", "next"],
+      "additionalProperties": true,
+      "properties": {
+        "version": { "const": 1 },
+        "sessionId": { "type": "string" },
+        "cwd": { "type": "string" },
+        "repo": { "type": "string" },
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The outcome in one sentence - the thing 'Continue' must not lose."
+        },
+        "doneMeans": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "3-7 checks provable by command, test, query or live request."
+        },
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Rules that must survive the reset (clean-tree deploys, shadow-until-green, ...)."
+        },
+        "next": { "type": "array", "items": { "$ref": "#/$defs/nextStep" } },
+        "roster": { "type": "array", "items": { "$ref": "#/$defs/rosterEntry" } },
+        "jobs": { "type": "array", "items": { "$ref": "#/$defs/jobRef" } },
+        "todos": { "type": "array", "items": { "$ref": "#/$defs/todo" } },
+        "handoff": {
+          "type": "string",
+          "description": "The ready-to-paste new-chat prompt, when this chat is handing off."
+        },
+        "handoffPath": {
+          "type": "string",
+          "description": "The repository memory handoff file, e.g. /memories/repo/handoffs/<date>-<slug>.md."
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "$ref": "#/$defs/plan"
+}

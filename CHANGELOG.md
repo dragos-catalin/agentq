@@ -6,6 +6,24 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- The hook cost ledger names the agentq **verb**, not only the tool: a row is now
+  `{ts, ms, startMs, tool, verb, deny, session}` and `sat-report.ps1` sums the day per verb. The question a
+  per-verb budget cannot answer today is "what does one `status` cost beside one `land`" - a measured day held
+  10 463 `run_in_terminal` rows and no verb, so the round-4 table had to be collected by hand with a `git.cmd`
+  shim on PATH. The verb comes from one regex over the raw payload, for the tools that carry a command only (a
+  megabyte `apply_patch` payload is not scanned), with no `ConvertFrom-Json` and **no process spawn** - the
+  metric of that round IS the spawn count, so instrumentation that spawned would erase its own measurement. The
+  field is always present and empty when the command runs no agentq, when the tool runs no command, and when a
+  flag precedes the verb (`agentq.ps1 -Purpose x land` records nothing rather than guessing `x`); its value is
+  bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry a quote or a backslash into the JSON
+  line. `sat-report.ps1` prints the per-verb table (calls, served, spawned, avg ms) plus
+  `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
+  `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
+  `agentq-prune.ps1` needed no change (`JSON.parse` by name, and a file-NAME match). Guards: `sat-report` 16/16
+  with the three `status` fixture rows in three different cost classes, and `hook-pre` gains 11 cases - the six
+  shapes that must be recognised (installed path, repo path, quoted path, `-v2`, the node CLI, uppercase) and
+  the four that must stay empty (another command, a script named but not run, a flag before the verb, a read
+  tool), plus "every line of the run carries the field".
 - `agentq land` refuses a topic whose merge resolution would silently revert `origin/<onto>`. The class is real
   and was an inch from landing on 2026-11-27: a branch whose tip is a merge of a base already inside main, hand
   resolved back to the old content - it deleted `ps/tests/test-agentq-gate-machine.ps1` (143 lines) and cut
@@ -112,6 +130,117 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   both sides with a discriminating pair - the same synthetic change classified the two ways selects
   differently.
 
+- **A fixture that has to spawn before it can write a marker gets a window that clears one spawn.** Three
+  `wait-job` checks in the `jobs` suite watch a marker a hidden child appends (`^RB_EXIT=`, `Traceback`), and
+  their window was a flat 20 s. On a box at 100 % CPU with 300+ `pwsh` alive the child's own startup exceeded
+  it: measured 2026-11-28 the suite reported `log not there yet` and `TIMEOUT after 0.4 min` for a product
+  that was correct, and `FAIL wait-job DONE on literal marker with ^ (not a regex anchor) code=3` on a tree CI
+  accepted. Those two windows are now one measured spawn + 20 s, from the single calibration at the top of the
+  suite. Bounds that do NOT have to clear a spawn - a pre-written log, and the `-MaxSec` override probes that
+  assert the bound itself - keep their constants, so a real failure still surfaces in seconds.
+- **"job-start returns at once" is proved structurally, because it cannot be a number of seconds.** One `pwsh`
+  spawn on this machine measured 1.5 s quiet and 151.2 s saturated, so the `-lt 7` bound on the launcher was a
+  load test: measured 2026-11-28 the `jobs` suite red it with `151.2s` while the launcher behaved. The fixture
+  job now blocks on a sentinel the suite writes only after the launcher returned, so the job cannot have ended
+  early for any other reason - a launcher that waited produces `EXIT=0` in the job's log by the time it
+  returns, and that is what the check reads. The sentinel wait is capped (30 s, scaled on the measured spawn
+  cost) so a regression fails instead of hanging the suite, and a healthy run pays nothing for it.
+  The first version of that check failed on the state it looks for: `Get-Content -Raw` on an EMPTY file returns
+  `$null`, and `$null -notmatch <pattern>` evaluates to nothing - falsy, not `$true` - so an empty log read as a
+  failed check. A mutation probe against the REAL launcher caught it (`A_real_CHECK_VERDICT=FAIL` with
+  `LOG_BYTES=0`, `$null -notmatch` printing an empty line); the read is cast to a string.
+- **A fixture that must outlive one spawn is sized on the measured spawn cost, not on a constant.** The `-Pid`
+  checks read a process's exit code through a handle opened while it is still alive, and they pinned the
+  fixture's life at 5 s: measured 2026-11-28 with a 18.7 s startup baseline, the fixture was dead before
+  `wait-job`'s own spawn finished - the log read `waiting on pid 99368` and `DONE: pid 99368 exited` in the
+  same second, the code came back unreadable, and the documented fallback left `(exit 0)` absent on a green
+  tree. Deterministic A/B with a simulated 20 s spawn: the 5 s fixture / 30 s bound failed to read the code,
+  while `max(5 s, 3 x spawn)` / `max(30 s, 4 x spawn)` read it. On a quiet box (spawn 1.5 s) both branches
+  reduce to the constants of before, so CI timing is unchanged - verified by running the same probe twice.
+- **A spawn cost on a saturated machine is not a constant, so a `wait-job` bound check calibrates its
+  startup baseline on the run it judges.** The `jobs` suite proves `wait-job` does not block past its
+  `-MaxSec 2.5` by subtracting a measured `pwsh` startup, and it calibrated that baseline with two runs
+  taken a moment earlier. Measured 2026-11-28 on a box at 100 % CPU with 300+ `pwsh` alive: baseline 18.7 s
+  (min of two), the probe 34.5 s with the bound respected - adjacent invocations cost 19 s and 32 s, so the
+  earlier baseline under-estimated the spawn that followed it, and the check went red in a suite whose
+  product was green. It now re-measures the baseline immediately before a second probe of the same shape and
+  reports both numbers: a real "blocks past its bound" bug fails both attempts, a load spike does not.
+
+- **A `wait-job` fixture bound is a hang guard, not a latency assertion, and 60 s does not clear a saturated
+  machine.** The pool that gates every land runs 44 suites under contention, and four cascade checks in the
+  `jobs` suite (`wait-job -JobId DONE`, the registry's `state done / exitCode 0 / endedAt`, the log's
+  `EXIT=0` + `DONE`, and `jobs list shows done`) all judge ONE fixture job that has to finish inside its wait.
+  Measured 2026-11-28 on a box at 100 % CPU with 300+ `pwsh` alive: the suite ran red (`EXIT=1`) with that job
+  still `state running, exitCode null` at the 60 s bound, while the CI run of the same tree was green on those
+  checks - the bound, not the product. The six fixture waits now use `-MaxSec 180`; a wait returns the instant
+  the registry says done, so a healthy run pays nothing and only a genuinely hung job pays the longer ceiling
+  (it still fails, just later). The remaining sub-120 s bounds in this suite are log-based or fixture-file
+  waits with no process spawn behind them, and are deliberately unchanged.
+- **A worker that dies WITHOUT asserting anything no longer reds the land gate.** The cloud pool that gates
+  every land is shared, so one flaky suite stops the whole fleet: measured 2026-11-28, `guard format exit=1
+pass=53 fail=2 sec=14` where the two failures were the group's own exit code and the coverage ratchet, with
+  **no output from the worker at all** - a process that was killed or crashed, not one that judged (the two
+  pool runs either side of it were `pass=54 fail=0 sec=6`). The shape is not a spawn that never happened: the
+  orchestrator re-emits worker stderr and the worker prints `N failure(s)` before exiting 1, so a throw would
+  have been visible, and no suite in the pool kills a process it did not start. The orchestrator therefore
+  retries a group **once** when it exits non-zero having printed no `FAIL` line, because a failure that was
+  ASSERTED always prints one - a real regression can never be retried away, and a second silent death is now
+  reported as `# group <name> died with no output twice (exit=N)` instead of a bare exit code. Proven by
+  mutation in a copy, with the worker replaced by a stub through the `AGENTQ_GF_WORKER` seam: with the retry
+  removed the group dies and **5 checks go red**; with the "no FAIL line" discriminator removed an asserted
+  failure IS retried (`attempts=2`) and the check forbidding it goes red. Full suite `checks=61 pass=61 fail=0`
+  (7 new checks, `groups=7`), 57 s under load - the same order as the 54-check run before it.
+
+- **A `guard format` worker could die mid-shard and leave the gate red with no failing assertion behind it.**
+  Measured in the cloud land-gate pool on 2026-11-28: the run that took `sec=14` (against `sec=6` for the two
+  green pool runs either side of it) reported `guard format exit=1 pass=53 fail=2` as `FAIL group block-3
+exited non-zero exit=1` plus `FAIL required check not exercised: case prettier --write --config (no cfg)` -
+  one check short of 54, and the missing one was the LAST case of the last shard. A worker writes its id file
+  from its own `finally`, so a case that never runs is a check the coverage ratchet can never see, and the
+  gate goes red for something that was never asserted. The shape is a spawn that never happened: `& $Exe`
+  raises a TERMINATING error when the child cannot be started, and the `$ErrorActionPreference = 'Continue'`
+  that `Hook` restores for the call does not cover it. Every case now goes through `Hook-Case`: **retry once**
+  - a real regression throws on both attempts, a resource hiccup does not - and if it throws twice, **FAIL
+    that case with the exception type and message**, reporting BOTH of its ids so a warn case cannot also trip
+    the ratchet. Mutation-checked in a copy: forcing both attempts to throw gives 43 FAIL lines naming
+    `RuntimeException: synthetic spawn failure` with **zero** `required check not exercised` lines, and forcing
+    only the first attempt to throw still gives `checks=54 pass=54 fail=0`.
+
+- **The `PowerShell suites` job was red on `main` for four independent reasons, none of them a defect in the
+  code it judged.** Baseline run 46080801888 finished `suites=92 failed=4` on a commit whose tooling was fine,
+  so every land after it inherited a red it did not cause. (1) **`jobs`** pinned the sync contract at 14
+  properties while the contract has carried 15 since 2026-11-25 (`agentq-jobs-lib.ps1:224` names `placement`),
+  so the exact-field `Compare-Object` always found a difference; `placement` is now in the list. (2) **`worktree
+v2`** read the process table with `-ErrorAction SilentlyContinue`, so a failed or degraded CIM query produced
+  an EMPTY list - "no process references this slot" for every slot - and a slot whose process was very much
+  alive was parked on the runner. The read is now fail-closed in one place (`Get-ProcLineMap` + `InUseReason`):
+  an unreadable table, or zero rows without an exception, means IN USE and the report says which. The fixture
+  no longer polls the same facility the guard uses to see its sleeper: the sleeper writes a marker only it can
+  write, and the assertion requires both the slot to survive and the output to name it. (3) **`git-autosync`**
+  read the doctor's exit code through `pwsh -NoProfile -Command "& '<script>'"`, which maps a legitimate
+  `exit 3` to 1 (measured: the same script gives 3 through `-File` and 1 through `-Command`, while an `exit 0`
+  script gives 0 both ways), so the assertion was unfalsifiable for the one verdict it exists to accept - on a
+  hosted runner, which has no scheduled task, the doctor legitimately reports FAIL. It now uses `-File`, and the
+  doctor itself wraps its report so a terminating error becomes `FAIL doctor could not complete: …` and exit 3
+  instead of PowerShell's default 1; new control 13g forces exactly that line to throw in a copy and requires
+  `DOCTOR:` and an exit code of 0 or 3. (4) **`autosync wip snapshot`** builds its mutation baseline from
+  history (`git log -S`), which `actions/checkout`'s default `fetch-depth: 1` hides, and the red blamed a
+  missing `*.prefix.bak`; the job now fetches full history (the repo is small) and the message names the shallow
+  checkout and its fix. All four are pinned by an `Ok`/`Check` that reports the value it judged, so the next red
+  of this kind carries its own diagnosis.
+- **`sat-report.ps1`'s classifier suite existed and ran nowhere.** It was in neither `ps/tests/run-all.ps1`'s
+  suite map nor `ps/install.ps1`'s, so the `VERB COVERAGE` assertions that came with the per-verb ledger could
+  never fail - a guard nobody executes is a comment. Nothing audited the two lists in that direction (the
+  README's "each `test-*` file in this folder is one suite" is a description, not a check), and the suite had
+  never been reachable by name either. Registering it in one list and not the other is the same defect one step
+  over, which is how it was caught: `install wiring` went RED on all three of its checks (`1 missing:
+  test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is a valid, fully installed gate
+test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is a valid, fully installed gate
+  list") and GREEN at `pass=19 fail=0` once the file was mapped. The suite resolves its subject as
+  `$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
+  test are mapped together. Proven by running the three suites through the sanctioned runner
+  (`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre` 60/60, `sat report` 16/16,
+  `install wiring` 19/19, `RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
 - **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
   them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
   gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,

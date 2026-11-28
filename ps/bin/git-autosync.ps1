@@ -47,8 +47,11 @@ What one pass does, per repo (only when it is provably safe):
   pass. Now: commits go to origin autosync/replay-<branch> (--no-verify, own namespace) and land via
   `agentq land` (clean slot, dedupe, hooks on the clean result). A failed land backs off -ReplayBackoffMin.
 
-  DAEMON (2026-11-19): the scheduled task runs ONE PASS PER TICK (a 15-minute repetition trigger), not a
-  long-lived -Loop. A -Loop process keeps the copy of this script it loaded at start, so an edit made
+  DAEMON (2026-11-19; cadence re-read 2026-11-28): the scheduled task runs ONE PASS PER TICK, not a
+  long-lived -Loop. The tick is a 15-minute repetition trigger (`Get-ScheduledTask git-autosync` ->
+  Triggers.Repetition.Interval = PT15M; this header said "2-minute" until 2026-11-28, and -InstallLoop
+  writes the same 15) - read the cadence from the TASK, never from prose that outlived a change. A
+  -Loop process keeps the copy of this script it loaded at start, so an edit made
   mid-life is silently ignored: the per-repo status snapshot landed 2026-11-18 07:37 while the loop
   (started 05:16) was running, and for the next 20 h it kept syncing (log lines at 01:45Z) yet never
   wrote a status - `-Status` showed all 24 repos "stale" and read as "the daemon is dead". One pass per
@@ -881,9 +884,10 @@ function Sync-Repo([string]$r) {
     if ($written -contains $w) { $untrackedHit += [pscustomobject]@{ p = $p; w = $w } } else { $conflict += "$p (untracked)" }
   }
   # The per-path 3-way classification costs several git spawns per path and a held repo recomputed it
-  # every tick (every 15 min; the ~28 min codai pass was measured at the 2-minute tick, 2026-11-20).
-  # Reuse it for 10 min while HEAD, target and the
-  # path's content are unchanged; the idle and live-owner gates below always run fresh.
+  # on every pass (~28 min per codai pass, measured 2026-11-20 when the tick was 2 min; the task's
+  # interval is 15 min since 2026-11-28, so the same cache covers a larger share of a pass now).
+  # Reuse it for 10 min while HEAD, target and the path's content are unchanged; the idle and
+  # live-owner gates below always run fresh.
   $st0 = Get-State; $rcAll = if ($st0['resolveCache']) { $st0['resolveCache'] } else { @{} }
   $rcOld = if ($rcAll[$name]) { $rcAll[$name] } else { @{} }; $rcNew = @{}; $nowU = [DateTime]::UtcNow
   $resolved = @(); $hold = @()
@@ -1078,7 +1082,15 @@ if ($Doctor) {
   # while the log still looks alive, and checking 25 repos by hand takes minutes on the loaded machine.
   # The computation is factored into Invoke-AutosyncDoctor so the human report and the -Json daemon
   # record are built once and never diverge.
-  $d = Invoke-AutosyncDoctor
+  # A doctor that CRASHES is useless exactly when it is needed. The contract this file promises (and
+  # ps/tests/test-git-autosync.ps1 asserts) is exit 0 or 3, never anything else - but $ErrorActionPreference
+  # is 'Stop' here, so one unreadable machine detail kills the whole report with PowerShell's default code 1.
+  # Seen on the hosted CI runner 2026-11-27 ("13 -Doctor exits 0 or 3" red, verdict line printed, code
+  # neither 0 nor 3): a machine with no scheduled task and a bare `/tmp`-style state dir is a machine the
+  # doctor must still be able to REPORT on. Any terminating error becomes a FAIL line and exit 3.
+  try { $d = Invoke-AutosyncDoctor } catch {
+    $d = @{ lines = @("FAIL doctor could not complete: $($_.Exception.Message) [$($_.Exception.GetType().Name)]"); bad = 1; warn = 0 }
+  }
   $lines = @($d.lines); $bad = [int]$d.bad; $warn = [int]$d.warn
   $verdict = if ($bad) { 'fail' } elseif ($warn) { 'warn' } else { 'ok' }
   $ok = [math]::Max(0, $lines.Count - $bad - $warn)

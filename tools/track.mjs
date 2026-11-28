@@ -16,9 +16,10 @@
 // then rename, utf8 with no BOM), so a reader never sees half a record, and a
 // claim is serialised with an exclusive lock file so two agents cannot both win.
 //
-// Exit codes are harness-readable: `status` = total drift (capped 255, 2 when the
-// index is missing); `task claim` = 2 when the claim is already held; `task next`
-// = 3 when nothing is ready. Read-only except the one file it is asked to write.
+// Exit codes are harness-readable: `status` = total drift + root issues (capped
+// 255, 2 when the index is missing); `task claim` = 2 when the claim is already
+// held; `task next` = 3 when nothing is ready. Read-only except the one file it
+// is asked to write.
 //
 // Usage:
 //   node track.mjs status [--json]
@@ -49,6 +50,7 @@ import {
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
 // The drift computation lives in tracker-lint and is NOT re-implemented here:
 // `track drift` imports the very same scanRepo that wrote the index, so the two
 // can never disagree about what a drift finding is.
@@ -279,6 +281,31 @@ function canonical(v) {
 
 // ---- status -----------------------------------------------------------------
 
+// Does the root this repo was indexed under still carry the mapping that made
+// it a repo at all? The index is keyed by a root that may be a worktree slot
+// while the shared clone is the copy a reader actually opens; a root that has
+// quietly lost its `.agentq/trackers.json` is the "missing card with no
+// explanation" this records. Only when the file is absent do we ask git - an
+// exit-0 `cat-file -e` proves the mapping still lives on origin/main - and a
+// missing git, or a root that is not a repository, is never an error: it just
+// means the mapping is simply gone. This is the ONE definition of root health;
+// tracker-lint imports it so the scan and the status report cannot disagree
+// (the mirror of how track imports scanRepo from tracker-lint).
+export function rootIssueFor(root) {
+    if (!root) return null;
+    if (existsSync(join(root, ".agentq", "trackers.json"))) return null;
+    try {
+        const r = spawnSync("git", ["-C", root, "cat-file", "-e", "origin/main:.agentq/trackers.json"], {
+            stdio: "ignore",
+        });
+        if (r && r.status === 0) return "mapping-on-origin-main-only";
+    } catch {
+        // git is not installed, or the root is not a repository: not a reason to
+        // fail the command, only to report the mapping as simply missing.
+    }
+    return "mapping-missing-at-root";
+}
+
 // The ONE place a repo's live index entry is reduced to (items, drift). `track
 // status` and `track drift` both read the index through this, so the number a
 // drift check compares against is the same number status prints.
@@ -303,22 +330,33 @@ function cmdStatus(flags) {
     const repos = Array.isArray(index.repos) ? index.repos : [];
     let totalItems = 0;
     let totalDrift = 0;
+    let totalIssues = 0;
     for (const r of repos) {
         const { items, drift } = summarizeRepo(r);
         totalItems += items;
         totalDrift += drift;
+        if (r.rootIssue) totalIssues++;
     }
+    // A root issue is a finding too: a harness that reads the exit code must see
+    // a broken root even when the trackers under it happen to be drift-free.
+    const rc = Math.min(totalDrift + totalIssues, 255);
     if (flags.json) {
         process.stdout.write(JSON.stringify(index, null, 2) + "\n");
-        return Math.min(totalDrift, 255);
+        return rc;
     }
     console.log(`trackers: ${repos.length} repo(s), ${totalItems} item(s)  (generated ${index.generatedAt || "?"})`);
     for (const r of repos) {
         const { items, drift } = summarizeRepo(r);
         console.log(`  ${r.repo}: ${items} item(s), ${drift} drift`);
     }
-    console.log(`total drift: ${totalDrift}`);
-    return Math.min(totalDrift, 255);
+    // A root that lost its mapping "has no card": name the repo, the root and
+    // the issue, so a consumer can tell a broken root from a repo that was never
+    // tracked at all.
+    for (const r of repos) {
+        if (r.rootIssue) console.log(`  root [${r.repo}] ${r.root} - ${r.rootIssue}`);
+    }
+    console.log(`total drift: ${totalDrift}${totalIssues ? `, ${totalIssues} root issue(s)` : ""}`);
+    return rc;
 }
 
 // ---- plan -------------------------------------------------------------------

@@ -1,11 +1,19 @@
 # Focused acceptance check for the resident hook (run after ANY change to hookc4/resident-server).
-#   powershell -NoProfile -File verify-resident.ps1 [-N 5]
+#   powershell -NoProfile -File verify-resident.ps1 [-N 5] [-BindMs 30000]
 # Prints ONE verdict block and writes verify-resident.out.txt. Asserts, in this order:
 #   0. CORPUS parity: every guard path returns the same DECISION (and stderr) in both paths, with
 #      fellBack=False on every call - a byte-identical answer that fell back proves nothing;
 #   1. the fallback really re-runs hook-pre.ps1 with the SAME payload (byte-identical when down);
 #   2. deny is a deny in both paths: exit code equal AND a permissionDecision on both sides;
 #   3. the deadline is the CLIENT's budget (<= budget + slack), not the peer's patience.
+#   4. the fallback with the server DOWN is bounded in TIME too, not only byte-identical (2026-11-28);
+#   5. a run that cannot confirm the server it started is the one answering REFUSES loudly (non-zero),
+#      instead of printing a verdict a reader would take for a client regression (2026-11-28).
+#      The refusal also names the surviving holders of the pipe; until 2026-11-28 that line printed a
+#      CommandNotFoundException instead, because the helper it called (`Procs`) did not exist here.
+#   6. the concurrency case is judged against the pool size the HOST reports, never against the burst:
+#      burst > pool forces a queue, so a burst-relative threshold reports a loaded machine as a
+#      regression (measured 2026-11-28: healthy host, 4/6 at 21.7 busy cores of 32).
 #
 # Parity is SEMANTIC on purpose. The resident path runs the guard under PowerShell 7 (the server is a
 # pwsh process) whereas the classic path spawns powershell.exe 5.1, and ConvertTo-Json serializes the
@@ -13,7 +21,7 @@
 # decision - not the byte layout - is the contract. Byte equality is still required where the client
 # must reproduce the classic command: with the server down (it literally runs it).
 [CmdletBinding()]
-param([int]$N = 5, [int]$TimeoutMs = 10000, [int]$DeadlineMs = 3000)
+param([int]$N = 5, [int]$TimeoutMs = 10000, [int]$DeadlineMs = 3000, [int]$BindMs = 30000)
 $ErrorActionPreference = 'Continue'
 $here = $PSScriptRoot
 $out  = Join-Path $here 'verify-resident.out.txt'
@@ -28,7 +36,7 @@ $env:HOOKC_TIMEOUT_MS = "$TimeoutMs"
 $hooks  = Join-Path $env:USERPROFILE '.copilot\hooks'
 $guard  = Join-Path $hooks 'hook-pre.ps1'
 $client = Join-Path $here 'hookc4.exe'
-# 2026-11-27: this pointed at server4.ps1, which no longer exists (the host lives in
+# 2026-11-28: this pointed at server4.ps1, which no longer exists (the host lives in
 # resident-server.ps1 since it moved into the repo), so the suite could not run at all and the
 # pool change went in untested. A path here IS the test's precondition: assert it.
 $server = Join-Path $here 'resident-server.ps1'
@@ -54,6 +62,15 @@ function Stop-Matched($pat) {
     @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -EA SilentlyContinue |
         Where-Object { $_.CommandLine -like $pat }) |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
+}
+
+# Holders of a pipe name, for the refusal below. This helper did not exist until 2026-11-28 even
+# though the refusal called it, so the line whose whole job is to make a refusal diagnosable threw
+# instead - the reader got a PowerShell error where the holder list should be. Same CIM source as
+# Stop-Matched: Get-Process exposes NO CommandLine in pwsh 7, so a Get-Process filter matches nothing.
+function Procs($pat) {
+    @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -EA SilentlyContinue |
+        Where-Object { "$($_.CommandLine)" -like $pat })
 }
 
 function Call([string]$exe, [string[]]$pre, [string]$json, [string]$tag) {
@@ -150,17 +167,35 @@ Stop-Matched '*resident-server.ps1*'; Stop-Matched '*dummy-silent*'; Stop-Matche
 Start-Sleep -Milliseconds 300
 Remove-Item (Join-Path $here 'server.log') -EA SilentlyContinue
 $srv = Start-Process pwsh -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$server,'-GuardName','hook-pre.ps1','-PipeName',$pipe,'-HostMode','subst','-MaxRequests','200') -WindowStyle Hidden -PassThru
-$up = $false
-for ($i = 0; $i -lt 16; $i++) { Start-Sleep -Milliseconds 500; if ([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*$pipe*" }) { $up = $true; break } }
-$srvPid = 0; $srvMode = '?'
-$listen = Get-Content (Join-Path $here 'server.log') -EA SilentlyContinue | Where-Object { $_ -match 'listening on' } | Select-Object -First 1
-if ($listen -match 'mode=(\S+)') { $srvMode = $Matches[1] }
-if ($listen -match 'pid=(\d+)') { $srvPid = [int]$Matches[1] }
+# Wait for BOTH the pipe AND the log line that names OUR process. Waiting on the pipe alone was half of
+# the 2026-11-28 defect: the pipe exists as soon as the listener opens, but the pid/mode line is written
+# a moment later, so under load the identity check read pid=0 and the run declared a foreign server while
+# measuring its own. The budget is a PARAMETER, not a fixed 16 x 500 ms = 8 s (too tight the same day a
+# bare pwsh start measured p90 7 s).
+$bindTries = [Math]::Ceiling($BindMs / 500)
+$up = $false; $srvPid = 0; $srvMode = '?'; $poolN = 0
+for ($i = 0; $i -lt $bindTries; $i++) {
+    Start-Sleep -Milliseconds 500
+    $up = [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*$pipe*" })
+    $listen = Get-Content (Join-Path $here 'server.log') -EA SilentlyContinue | Where-Object { $_ -match 'listening on' } | Select-Object -First 1
+    if ($listen -match 'mode=(\S+)') { $srvMode = $Matches[1] }
+    if ($listen -match 'pid=(\d+)') { $srvPid = [int]$Matches[1] }
+    # The host prints its own pool size (`instances=N`); case 3e asserts against that claim, so it is
+    # parsed here, from the same line, and 0 means the host never said.
+    if ($listen -match 'instances=(\d+)') { $poolN = [int]$Matches[1] }
+    if ($up -and ($srvPid -eq $srv.Id) -and ($srvMode -eq 'v6-subst')) { break }
+}
 $srvOk = $up -and ($srvPid -eq $srv.Id) -and ($srvMode -eq 'v6-subst')
-W ("server up: {0}  pipe-bound={1}  our pid {2} vs log pid {3}  mode={4}  -> identity {5}" -f $up, $up, $srv.Id, $srvPid, $srvMode, $(if ($srvOk) { 'OK' } else { 'WRONG SERVER / WRONG MODE' }))
+W ("server up: {0}  pipe-bound={1}  our pid {2} vs log pid {3}  mode={4}  instances={5}  -> identity {6}" -f $up, $up, $srv.Id, $srvPid, $srvMode, $poolN, $(if ($srvOk) { 'OK' } else { 'WRONG SERVER / WRONG MODE' }))
 if (-not $srvOk) {
     W '  refusing to measure: the answers would come from a process this run did not start.'
-    W ("  holders of the pipe name: {0}" -f ((Procs "*$pipe*" | ForEach-Object { "$($_.ProcessId):$($_.CommandLine.Substring([Math]::Max(0,$_.CommandLine.Length-70)))" }) -join ' | '))
+    # Null-safe: a process whose CommandLine cannot be read must not turn the refusal into a second error.
+    W ("  holders of the pipe name: {0}" -f ((Procs "*$pipe*" | ForEach-Object { $hc = "$($_.CommandLine)"; "$($_.ProcessId):$($hc.Substring([Math]::Max(0, $hc.Length - 70)))" }) -join ' | '))
+    # The refusal must be REAL. Until 2026-11-28 it printed this and measured anyway, so a bind that lost
+    # the race produced a 4/12 "verdict" that read as a client regression. Write the log, then stop.
+    $L | Set-Content -LiteralPath $out -Encoding utf8
+    Get-Content $out
+    throw ('server identity not confirmed within {0} ms: log pid {1}, expected {2}, mode {3}' -f $BindMs, $srvPid, $srv.Id, $srvMode)
 }
 
 # 1. parity + fellBack, on a deny and an allow
@@ -278,13 +313,20 @@ $rudeOk = (-not ($rd1.err -match 'falling back')) -and (-not ($rd2.err -match 'f
 W ("rude client: before fell={0} | broken writes {1}->{2} | req lines {3}->{4} | after fell={5} same={6} | server pid {7} alive={8}" -f `
     [bool]($rd1.err -match 'falling back'), $brkBefore, $brkAfter, $reqBefore, $reqAfter, [bool]($rd2.err -match 'falling back'), ((Sem $rd1.out) -eq (Sem $rd2.out)), $srvPidBefore, $alive)
 
-# 3e. CONCURRENCY - why a POOL of pipe instances exists at all. One instance serves one request at a time,
-# so simultaneous tool calls (a batch resolved in parallel, several chats on one machine) made the later
-# callers see ERROR_PIPE_BUSY, and before 2026-11-27 they paid the spawn instead. The signature of a
-# regression to a single instance is MEASURED, not guessed: on the rig a burst of 8 against `instances=1`
-# fell back 5.3 and 6 times per 8, against the pooled host 0.7 and 2 (and 0 in its best rounds). One
-# straggler is tolerated here: a client waits up to 900 ms for a busy instance and a loaded machine can
-# exceed that, so the threshold catches the 5-6-of-6 signature and not the machine.
+# 3e. CONCURRENCY - why a POOL of pipe instances exists at all. One instance serves one request at a
+# time, so simultaneous tool calls (a batch resolved in parallel, several chats on one machine) made the
+# later callers see ERROR_PIPE_BUSY and pay the spawn instead. The host states its own pool size in the
+# log (`instances=N`), and `HOOKC_POOL=1` can ask for the broken shape on purpose.
+#
+# The assertion is anchored on the POOL, not on the burst (rewritten 2026-11-28). Until then it demanded
+# 5 of 6 served, which cannot see the difference it exists for: at a burst of 6 against a pool of 4, TWO
+# callers MUST queue, and a client waits only 900 ms for a busy instance (hookc4.c: min(budget, 900)), so
+# on a loaded box - measured 2026-11-28 at 21.7 busy cores of 32 - the HEALTHY host reported 4/6 and the
+# run went red against the machine. That is the same failure mode as the 8 s bind budget and the abort
+# that measured anyway. What the case must protect is the host honouring its own claim, so: the claim
+# must be a pool at all (a single instance IS the regression - the server's own comment records 16 % of
+# calls falling back), and at least `instances` callers must be served without a spawn. Callers beyond
+# the pool may queue and fall back - that is the queue doing its job, not a defect.
 $cc = 6
 $ccIn = Join-Path $here 'v.conc.in'
 Set-Content -LiteralPath $ccIn -Value $allowJson -NoNewline -Encoding utf8
@@ -298,20 +340,27 @@ $concServed = 0; $concFall = 0
 for ($i = 0; $i -lt $cc; $i++) {
     if ((Get-Content (Join-Path $here "v.conc.$i.err") -Raw -Encoding utf8 -EA SilentlyContinue) -match 'falling back') { $concFall++ } else { $concServed++ }
 }
-$concOk = ($concServed -ge ($cc - 1))
-W ("concurrent burst ({0} at once): served by the resident {1}/{0}, fell back {2}  (one-instance host: 5-6 of 8)" -f $cc, $concServed, $concFall)
+$concOk = ($poolN -ge 2) -and ($concServed -ge $poolN)
+W ("concurrent burst ({0} at once): served by the resident {1}/{0}, fell back {2} | pool instances={3} (must be >= 2 and all of them served)" -f $cc, $concServed, $concFall, $poolN)
 
 # 4. server down -> classic answer with the SAME payload (byte-for-byte stdout)
 Stop-Matched '*resident-server.ps1*'; Start-Sleep -Milliseconds 400
 $cd = Call 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',$guard) $denyJson 'dn.cl'
 $rd = Call $client @($guard, $pipe) $denyJson 'dn.rs'
-$downOk = ($cd.rc -eq $rd.rc) -and ($cd.out -eq $rd.out)
-W ("server down: classic exit={0} out={1}B | client exit={2} out={3}B | same={4}" -f $cd.rc, $cd.out.Length, $rd.rc, $rd.out.Length, $downOk)
+# Timing bound: this case used to compare ONLY exit code and stdout, so a client that spent 61.5-80 s
+# falling back (win32 121 = ERROR_SEM_TIMEOUT - every instance of the peer busy) passed invisibly
+# (2026-11-28 defect). The client's own budget is $TimeoutMs, so a fallback must stay inside it plus the
+# same slack the silent case allows.
+$downOk = ($cd.rc -eq $rd.rc) -and ($cd.out -eq $rd.out) -and ($rd.ms -le ($TimeoutMs + 4000))
+W ("server down: classic exit={0} out={1}B | client exit={2} out={3}B {4}ms (bound {5}ms) | same={6}" -f $cd.rc, $cd.out.Length, $rd.rc, $rd.out.Length, $rd.ms, ($TimeoutMs + 4000), $downOk)
 
 # 5. server silent -> the CLIENT's budget, not the peer's patience (the only case with a tight budget)
 $env:HOOKC_TIMEOUT_MS = "$DeadlineMs"
 Start-Process pwsh -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $here 'dummy-silent.ps1'),'-PipeName',$pipe,'-HoldSec','30') -WindowStyle Hidden | Out-Null
-for ($i = 0; $i -lt 16; $i++) { Start-Sleep -Milliseconds 500; if ([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*$pipe*" }) { break } }
+# Same budget as the main host ($bindTries): an 8 s window here fails the SAME way - the dummy had not
+# bound yet, the client fell back to classic in milliseconds and deadlineOk read False, i.e. a machine
+# artefact reported as a client defect.
+for ($i = 0; $i -lt $bindTries; $i++) { Start-Sleep -Milliseconds 500; if ([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -like "*$pipe*" }) { break } }
 $cd = Call 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',$guard) $denyJson 'sl.cl'
 $rd = Call $client @($guard, $pipe) $denyJson 'sl.rs'
 $deadlineOk = ($cd.rc -eq $rd.rc) -and ($cd.out -eq $rd.out) -and ($rd.ms -le ($DeadlineMs + 4000)) -and ($rd.ms -ge ($DeadlineMs - 1500))
