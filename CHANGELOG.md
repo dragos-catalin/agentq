@@ -92,6 +92,41 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
 ### Fixed
+- **A fixture that has to spawn before it can write a marker gets a window that clears one spawn.** Three
+  `wait-job` checks in the `jobs` suite watch a marker a hidden child appends (`^RB_EXIT=`, `Traceback`), and
+  their window was a flat 20 s. On a box at 100 % CPU with 300+ `pwsh` alive the child's own startup exceeded
+  it: measured 2026-11-28 the suite reported `log not there yet` and `TIMEOUT after 0.4 min` for a product
+  that was correct, and `FAIL wait-job DONE on literal marker with ^ (not a regex anchor) code=3` on a tree CI
+  accepted. Those two windows are now one measured spawn + 20 s, from the single calibration at the top of the
+  suite. Bounds that do NOT have to clear a spawn - a pre-written log, and the `-MaxSec` override probes that
+  assert the bound itself - keep their constants, so a real failure still surfaces in seconds.
+- **"job-start returns at once" is proved structurally, because it cannot be a number of seconds.** One `pwsh`
+  spawn on this machine measured 1.5 s quiet and 151.2 s saturated, so the `-lt 7` bound on the launcher was a
+  load test: measured 2026-11-28 the `jobs` suite red it with `151.2s` while the launcher behaved. The fixture
+  job now blocks on a sentinel the suite writes only after the launcher returned, so the job cannot have ended
+  early for any other reason - a launcher that waited produces `EXIT=0` in the job's log by the time it
+  returns, and that is what the check reads. The sentinel wait is capped (30 s, scaled on the measured spawn
+  cost) so a regression fails instead of hanging the suite, and a healthy run pays nothing for it.
+  The first version of that check failed on the state it looks for: `Get-Content -Raw` on an EMPTY file returns
+  `$null`, and `$null -notmatch <pattern>` evaluates to nothing - falsy, not `$true` - so an empty log read as a
+  failed check. A mutation probe against the REAL launcher caught it (`A_real_CHECK_VERDICT=FAIL` with
+  `LOG_BYTES=0`, `$null -notmatch` printing an empty line); the read is cast to a string.
+- **A fixture that must outlive one spawn is sized on the measured spawn cost, not on a constant.** The `-Pid`
+  checks read a process's exit code through a handle opened while it is still alive, and they pinned the
+  fixture's life at 5 s: measured 2026-11-28 with a 18.7 s startup baseline, the fixture was dead before
+  `wait-job`'s own spawn finished - the log read `waiting on pid 99368` and `DONE: pid 99368 exited` in the
+  same second, the code came back unreadable, and the documented fallback left `(exit 0)` absent on a green
+  tree. Deterministic A/B with a simulated 20 s spawn: the 5 s fixture / 30 s bound failed to read the code,
+  while `max(5 s, 3 x spawn)` / `max(30 s, 4 x spawn)` read it. On a quiet box (spawn 1.5 s) both branches
+  reduce to the constants of before, so CI timing is unchanged - verified by running the same probe twice.
+- **A spawn cost on a saturated machine is not a constant, so a `wait-job` bound check calibrates its
+  startup baseline on the run it judges.** The `jobs` suite proves `wait-job` does not block past its
+  `-MaxSec 2.5` by subtracting a measured `pwsh` startup, and it calibrated that baseline with two runs
+  taken a moment earlier. Measured 2026-11-28 on a box at 100 % CPU with 300+ `pwsh` alive: baseline 18.7 s
+  (min of two), the probe 34.5 s with the bound respected - adjacent invocations cost 19 s and 32 s, so the
+  earlier baseline under-estimated the spawn that followed it, and the check went red in a suite whose
+  product was green. It now re-measures the baseline immediately before a second probe of the same shape and
+  reports both numbers: a real "blocks past its bound" bug fails both attempts, a load spike does not.
 
 - **`sat-report.ps1`'s classifier suite existed and ran nowhere.** It was in neither `ps/tests/run-all.ps1`'s
   suite map nor `ps/install.ps1`'s, so the `VERB COVERAGE` assertions that came with the per-verb ledger could
