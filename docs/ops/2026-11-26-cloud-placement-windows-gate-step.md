@@ -158,5 +158,6 @@ is doing instead of guessing from a quiet local log.
   `20261126-072626-feb9ba`) were reported by the coordinator from the devcloud pool; this report
   re-derives the mechanism from source rather than re-running the jobs. The Linux-side `exit 64` is the
   same pwsh usage exit verified locally.
-- File a tracker row for this (next free id in `docs/TRACKER.csv` is **OQ-073**) and an ADR only if (a)
-  is adopted, since it adds a placement knob.
+- File a tracker row for this (next free id in `docs/TRACKER.csv` was **OQ-073** on 2026-11-26; OQ-073 has
+  since been taken by the round-4 per-verb spawn budget row, so read the file for the current next free id
+  rather than trusting this line) and an ADR only if (a) is adopted, since it adds a placement knob.

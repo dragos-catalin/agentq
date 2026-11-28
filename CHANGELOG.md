@@ -6,6 +6,23 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- The hook cost ledger names the agentq **verb**, not only the tool: a row is now
+  `{ts, ms, startMs, tool, verb, deny, session}` and `sat-report.ps1` sums the day per verb. The question a
+  per-verb budget cannot answer today is "what does one `status` cost beside one `land`" - a measured day held
+  10 463 `run_in_terminal` rows and no verb, so the round-4 table had to be collected by hand with a `git.cmd`
+  shim on PATH. The verb comes from one regex over the raw payload, for the tools that carry a command only (a
+  megabyte `apply_patch` payload is not scanned), with no `ConvertFrom-Json` and **no process spawn** - the
+  metric of that round IS the spawn count, so instrumentation that spawned would erase its own measurement. The
+  field is always present and empty when the command runs no agentq, when the tool runs no command, and when a
+  flag precedes the verb (`agentq.ps1 -Purpose x land` records nothing rather than guessing `x`); its value is
+  bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry a quote or a backslash into the JSON
+  line. `sat-report.ps1` prints the per-verb table (calls, served, spawned, avg ms) plus
+  `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
+  `agentq-prune.ps1` needed no change (`JSON.parse` by name, and a file-NAME match). Guards: `sat-report` 16/16
+  with the three `status` fixture rows in three different cost classes, and `hook-pre` gains 11 cases - the six
+  shapes that must be recognised (installed path, repo path, quoted path, `-v2`, the node CLI, uppercase) and
+  the four that must stay empty (another command, a script named but not run, a flag before the verb, a read
+  tool), plus "every line of the run carries the field".
 - `agentq land` refuses a topic whose merge resolution would silently revert `origin/<onto>`. The class is real
   and was an inch from landing on 2026-11-27: a branch whose tip is a merge of a base already inside main, hand
   resolved back to the old content - it deleted `ps/tests/test-agentq-gate-machine.ps1` (143 lines) and cut
@@ -76,6 +93,18 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 
 ### Fixed
 
+- **`sat-report.ps1`'s classifier suite existed and ran nowhere.** It was in neither `ps/tests/run-all.ps1`'s
+  suite map nor `ps/install.ps1`'s, so the `VERB COVERAGE` assertions that came with the per-verb ledger could
+  never fail - a guard nobody executes is a comment. Nothing audited the two lists in that direction (the
+  README's "each `test-*` file in this folder is one suite" is a description, not a check), and the suite had
+  never been reachable by name either. Registering it in one list and not the other is the same defect one step
+  over, which is how it was caught: `install wiring` went RED on all three of its checks (`1 missing:
+  test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is a valid, fully installed gate
+  list") and GREEN at `pass=19 fail=0` once the file was mapped. The suite resolves its subject as
+  `$PSScriptRoot\..\bin\sat-report.ps1`, which is exactly the installed layout, so `bin\sat-report.ps1` and its
+  test are mapped together. Proven by running the three suites through the sanctioned runner
+  (`run-all.ps1 -Only 'hook pre,sat report,install wiring'`): `hook pre` 60/60, `sat report` 16/16,
+  `install wiring` 19/19, `RUNALL_EXIT=0`; before the map edit the same command ended `failed=1`.
 - **Nine `gateSuites.agentq` suites could never be SKIPPED, because the pool's input map had no entry for
   them.** `Select-AqSuites` fails open on an unknown name: with no globs it always runs the suite, so every
   gated change paid for `lease spawns`, `land capacity`, `land stale base`, `agentq reclaim`, `agentq approve`,
