@@ -21,7 +21,7 @@ $script:LandSrcSlot = $null
 $script:SlotWorkCache = $null
 # `$script:ReadOnly` is NOT reset here: agentq.ps1 computes it (from the verb) at its line ~295 and only
 # dot-sources this file at ~1922, so `$script:ReadOnly = $null` here wiped it and turned every READ-ONLY
-# verb (status/log/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
+# verb (status/log/since/metrics/doctor/help) back into a writer - the reader-reaps-dead-tickets bug that
 # comment in agentq.ps1 says was fixed. Verified by ps/tests/test-status-readonly.ps1 (2026-11-22).
 $script:GateExit = $null
 $script:GateFailedMembers = @()
@@ -1223,6 +1223,11 @@ function New-Lease($repo, [string]$slot, [string]$role, [string]$purpose, [strin
       if ($got -eq 'SHARE' -and $script:SlotShareWhy) {
         # Deliberately exit 3, not the -Wait lease-timeout exit 7: another session's slot freeing does not
         # help MY session, only giving one of MY OWN slots back does, so this is a refusal and not a retry.
+        # R4-2/R4-3 (2026-11-28): a refusal used to be PRINTED only, so the one artefact that said whether a
+        # 28-minute pre-gate had already been paid for this refusal was the terminal scrollback. Journal it,
+        # with the seconds THIS process has already spent inside a gate (`$script:GateSec`, set by the gate
+        # runner) - a land that gated first and was refused second must be visible as a cost, not as noise.
+        Write-Journal @{ event = 'slot-share-refused'; resource = "slot:${repoName}:$role"; role = $role; session = $Session; stage = $(if ([int]$script:GateSec -gt 0) { 'after-gate' } else { 'before-gate' }); gateSec = [int]$script:GateSec; reason = $script:SlotShareWhy; repo = $repoName }
         [Console]::Error.WriteLine("agentq: $($script:SlotShareWhy)")
         exit 3
       }
@@ -3189,6 +3194,20 @@ function Invoke-Land {
     }
   }
   # OQ-002: run the gate on the rebased result in the caller's slot BEFORE taking the land ticket.
+  # R4-1 (2026-11-28): the LAND slot is leased later (New-Lease 'land', after New-Ticket), and the lease
+  # path answers "is this session over its share?" with `Test-SlotShareRefusal` - a question that needs no
+  # gate and no slot. Measured: a land paid a 28-minute pre-gate (44/44 PASS) and only THEN exited 3 on
+  # "my session is at its slot share" while it leased the land slot, so the gate was spent on a refusal
+  # that was decidable up front. The policy is UNCHANGED (an over-share session is still refused, exit 3);
+  # only the ORDER changes - ask first, name the numbers, spend nothing. A lone session is unaffected
+  # (`Test-SlotShareRefusal` returns $null unless another live session competes).
+  $shareWhy = Test-SlotShareRefusal $repo.Name 'land'
+  if ($shareWhy) {
+    Write-Journal @{ event = 'land-share-refused'; resource = $res; branch = $Branch; onto = $Onto; stage = 'before-pregate'; gate = "$Gate"; reason = $shareWhy; repo = $repo.Name }
+    [Console]::Error.WriteLine("land: REFUSED before the pre-gate - $shareWhy")
+    [Console]::Error.WriteLine('  Nothing queued, no gate run, no slot taken, so nothing was spent. Give one of this session''s slots back (agentq status lists them) and land again. One deliberate land may run anyway with AGENTQ_NO_FAIRSHARE=1 (documented hatch, single process: agentq.ps1 Get-FairShare).')
+    $script:LandExit = 3; return
+  }
   if ($Gate) {
     $pgRef = Resolve-LandRef $main $Branch
     if ($pgRef) {

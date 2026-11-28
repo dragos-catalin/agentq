@@ -40,26 +40,27 @@ New-Item -ItemType Directory -Force $resident | Out-Null
 $date = '20260101'
 $cost = Join-Path $coord ('hooks\cost-' + $date + '.jsonl')
 
-# One JSON object per line, exactly the field order the real file uses (ts, ms, startMs, tool, deny,
-# session). 'null' is emitted UNQUOTED so it is the JSON literal null, not the string "null".
-function CostRow([string]$ts, [string]$startMs) {
-  return '{"ts":"' + $ts + '","ms":1,"startMs":' + $startMs + ',"tool":"t","deny":false,"session":"s"}'
+# One JSON object per line, exactly the field order the real file uses (ts, ms, startMs, tool, verb,
+# deny, session). 'null' is emitted UNQUOTED so it is the JSON literal null, not the string "null".
+# -Verb is the agentq verb the call ran (round 4, 2026-11-28); empty for a call that ran none.
+function CostRow([string]$ts, [string]$startMs, [string]$Verb = '') {
+  return '{"ts":"' + $ts + '","ms":1,"startMs":' + $startMs + ',"tool":"t","verb":"' + $Verb + '","deny":false,"session":"s"}'
 }
 $rows = @(
   # hour 00 - served (<50): 4, 10, 49
-  (CostRow '2026-01-01T00:00:01Z' '4'),
+  (CostRow '2026-01-01T00:00:01Z' '4' 'status'),
   (CostRow '2026-01-01T00:00:02Z' '10'),
   (CostRow '2026-01-01T00:00:03Z' '49'),
   # hour 00 - spawned (50..5000, boundaries included): 50, 500, 5000
-  (CostRow '2026-01-01T00:05:00Z' '50'),
+  (CostRow '2026-01-01T00:05:00Z' '50' 'status'),
   (CostRow '2026-01-01T00:05:01Z' '500'),
   (CostRow '2026-01-01T00:05:02Z' '5000'),
   # hour 00 - junk (>5000): 5001, 9999, 104941927
-  (CostRow '2026-01-01T00:06:00Z' '5001'),
+  (CostRow '2026-01-01T00:06:00Z' '5001' 'status'),
   (CostRow '2026-01-01T00:06:01Z' '9999'),
   (CostRow '2026-01-01T00:06:02Z' '104941927'),
   # hour 01 - the load-bearing row: startMs is literal null -> no measurement, never 0
-  (CostRow '2026-01-01T01:00:00Z' 'null')
+  (CostRow '2026-01-01T01:00:00Z' 'null' 'land')
 )
 [IO.File]::WriteAllLines($cost, $rows, [System.Text.UTF8Encoding]::new($false))
 
@@ -116,6 +117,19 @@ Check 'resident host: 4th line (listening) ignored, read p50=3' ($text -match 'r
 Check 'section 3 (processes) ran' ($text -match '== TOP PROCESSES BY CPU DELTA')
 Check 'section 4 (agentq status) ran and shows the stub output' ($text -match 'STUB-STATUS-ALPHA')
 Check 'CLASSIFY legend printed' ($text -match 'CLASSIFY served<50  spawned=50\.\.5000  junk>5000')
+# --- 1b: the same file summed per agentq verb ---------------------------------------------------
+# 'status' is on three rows of three DIFFERENT classes (served / spawned / junk), so a table that
+# counted only one path, or that looked at a row's tool instead of its verb, moves here.
+Check 'verb table: status = 3 calls, 1 served, 1 spawned, avg 1.0 ms' ($text -match '(?m)^status\s+3\s+1\s+1\s+1\.0$')
+# The null-startMs row has no measurement and still belongs to its verb (a null must not drop it).
+Check 'verb table: land = 1 call, counted none served/spawned (null is not 0)' ($text -match '(?m)^land\s+1\s+0\s+0\s+1\.0$')
+Check 'verb coverage: 4 of the 10 rows name a verb' ($text -match 'VERB COVERAGE rows=10 with-verb=4 \(40\.0%\)')
+Check 'verb section printed even though most rows name none' ($text -match '== AGENTQ VERB COST')
+# R4-6: the read verbs are named whether or not they were called. 'status' has fixture rows, 'who' and
+# 'since' do not - and the two must be DISTINGUISHABLE, because "absent from the table" reads as "not
+# instrumented" as easily as "not called today", which is exactly how a stealth regression hides.
+Check 'read verbs: status printed with its real numbers' ($text -match 'READ VERBS .*status calls=3 spawned=1 avg-ms=1\.0')
+Check 'read verbs: an uncalled verb is named as no-call-today, not omitted' ($text -match 'who no-call-today')
 Check 'read-only: neither fixture tree changed (hash, size, files)' ($drift.Count -eq 0) (($drift | Select-Object -First 5) -join ' ; ')
 
 Write-Host ("sat-report: checks=" + ($script:pass + $script:fail) + " pass=" + $script:pass + " fail=" + $script:fail + " script=" + $Script)

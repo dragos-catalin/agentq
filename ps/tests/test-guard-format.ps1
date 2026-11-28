@@ -15,8 +15,13 @@
 # orchestrator re-enters itself with `-Group`: the case table then lives in exactly ONE place, so a
 # shard can never drift from the list it was split from.
 # Nothing is weakened: the same cases, the same ids, the same mutation checks - plus a ratchet that
-# FAILS if any of the 54 ids a passing run must exercise stops being exercised (a lost case is now a
+# FAILS if any of the 61 ids a passing run must exercise stops being exercised (a lost case is now a
 # RED suite instead of a quieter one).
+# 2026-11-28 - A WORKER THAT DIES SILENTLY IS RETRIED. The pool that gates every land is shared, so one
+# flaky suite reds every land's pre-gate: measured `guard format exit=1 pass=53 fail=2 sec=14` whose two
+# failures were the group's exit code and the coverage ratchet, with NO output from the worker at all -
+# a process that was killed or crashed, not one that judged. The orchestrator now retries a group that
+# exits non-zero having printed no FAIL line, once; an ASSERTED failure is never retried.
 [CmdletBinding()]
 param(
   # '..\hooks\' resolves in BOTH layouts: the repo runs it as ps\tests\..\hooks\guard-tooluse.ps1, the
@@ -28,7 +33,7 @@ param(
   [string]$Exe = 'pwsh',
   # 'auto' = ORCHESTRATOR: spawn one worker per group and aggregate. A group name = run ONLY that group
   # in THIS process, which is how the orchestrator re-enters itself (see the header).
-  [ValidateSet('auto', 'block-1', 'block-2', 'block-3', 'guard-mutation', 'allow-list', 'post')]
+  [ValidateSet('auto', 'block-1', 'block-2', 'block-3', 'guard-mutation', 'allow-list', 'post', 'orchestrator')]
   [string]$Group = 'auto',
   # The orchestrator hands every worker its OWN temp dir, so no two workers can share a fixture.
   [string]$WorkDir = '',
@@ -129,6 +134,23 @@ function Hook([string]$g, [string]$cwd, [string]$command, [string]$tool = 'run_i
 function HookDenies([string]$out) { $out -match '"permissionDecision":"deny"' }
 function Blocks([string]$g, [string]$cwd, [string]$command) { HookDenies (Hook $g $cwd $command) }
 function Warns([string]$g, [string]$cwd, [string]$command) { (Hook $g $cwd $command) -match 'WARNING \(guard-command\)' }
+# A case IS a spawn, and a spawn can FAIL - which is not the same thing as a rule saying nothing.
+# `& $Exe` raises a TERMINATING error (CommandNotFoundException / Win32Exception) when the child cannot
+# be started, and the `$ErrorActionPreference = 'Continue'` that Hook restores for the call does not
+# cover it: the worker dies mid-shard, its `finally` writes a PARTIAL id file, and the orchestrator
+# reports `required check not exercised` - a red gate with no failing assertion behind it. Measured in
+# the cloud land-gate pool on 2026-11-28: the run that took 14 s (against 6 s for the two green pool
+# runs either side of it) reported `guard format exit=1 pass=53 fail=2` with exactly that pair of
+# FAILs. Retry ONCE - a real regression throws on both attempts, a resource hiccup does not - and
+# report a second throw as the case's FAIL so the id is still exercised and the message is visible.
+function Hook-Case([string]$cwd, [string]$cmd) {
+  $err = ''
+  for ($i = 1; $i -le 2; $i++) {
+    try { return @{ Out = (Hook $Guard $cwd $cmd); Err = '' } }
+    catch { $err = "$($_.Exception.GetType().Name): $($_.Exception.Message)" }
+  }
+  return @{ Out = ''; Err = $err }
+}
 
 # The case table lives in ONE place; the worker shards are DERIVED from it (Get-BlockShards), so a new
 # case can never be dropped by the split. The cwd values are the fixture variables the WORKER assigns
@@ -209,7 +231,15 @@ function Invoke-BlockGroup([string]$g, [string]$fx) {
     $c = $cases[$k]
     # ONE spawn per case: the block verdict and the advisory are read off the SAME output (the
     # pre-parallel suite spawned twice per warn case - same verdict, twice the wait).
-    $out = Hook $Guard $c.cwd $c.cmd
+    $h = Hook-Case $c.cwd $c.cmd
+    if ($h.Err) {
+      # Report BOTH ids of the case: a case whose spawn failed must still exercise its ids, otherwise a
+      # warn case would fail twice over (its own FAIL and the ratchet's "required check not exercised").
+      Check (BlockId $c.block $k) $false ("spawn failed on both attempts - " + $h.Err)
+      if ($c.warn) { Check (WarnId $k) $false ("spawn failed on both attempts - " + $h.Err) }
+      continue
+    }
+    $out = $h.Out
     # A BLANK capture is not a verdict. The guard writes its refusal/advisory to stderr and exits 0,
     # so an empty result means the child never ran (or lost its stdin payload - guard-tooluse.ps1:38
     # `catch { Flush-Stderr; exit 0 }` on an unparseable payload), NOT that the rule said nothing.
@@ -218,7 +248,15 @@ function Invoke-BlockGroup([string]$g, [string]$fx) {
     # Re-run it ONCE, and only for a case that MUST produce output (`block` writes the deny JSON on
     # stdout, `warn` the advisory on stderr): a real regression always produces output, so the retry
     # cannot hide one, and the ~15 cases whose CORRECT answer is silence pay no extra spawn.
-    if (-not "$out".Trim() -and ($c.block -or $c.warn)) { $out = Hook $Guard $c.cwd $c.cmd }
+    if (-not "$out".Trim() -and ($c.block -or $c.warn)) {
+      $h = Hook-Case $c.cwd $c.cmd
+      if ($h.Err) {
+        Check (BlockId $c.block $k) $false ("spawn failed on the retry - " + $h.Err)
+        if ($c.warn) { Check (WarnId $k) $false ("spawn failed on the retry - " + $h.Err) }
+        continue
+      }
+      $out = $h.Out
+    }
     $b = HookDenies $out
     Check (BlockId $c.block $k) ($b -eq $c.block) "(got block=$b)"
     if ($c.warn) { Check (WarnId $k) ($out -match 'WARNING \(guard-command\)') ("took: " + ((("$out").Trim() -split '\r?\n' | Where-Object { $_ } | Select-Object -First 1) -join '')) }
@@ -354,8 +392,72 @@ if (-not (Test-Path -LiteralPath $postHook)) {
 }
 }
 
+# ---- the orchestrator's own failure handling -------------------------------------------------------
+# `guard format` is one of the pool's 44 suites, so a worker that dies WITHOUT asserting anything reds
+# every land's pre-gate (measured 2026-11-28: `exit=1 pass=53 fail=2 sec=14`, the two failures being the
+# group's exit code and this suite's coverage ratchet, with no output from the worker). The retry below
+# is the fix; these cases point the orchestrator at a STUB worker through the AGENTQ_GF_WORKER seam - a
+# stub can be made to die silently on demand, which no real worker can - and assert what it does.
+function Invoke-Orchestrator([string]$fx) {
+  $selfPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+  $stub = Join-Path $fx 'stub-worker.ps1'
+  $stubDir = Join-Path $fx 'stub'
+  New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+  # No param binding for the env vars: the stub is spawned by the orchestrator exactly as a real worker
+  # is, so it has to accept the same four names or it fails for the wrong reason.
+  $code = @'
+param([string]$Group, [string]$Guard, [string]$Exe, [string]$WorkDir)
+$dir = $env:AGENTQ_GF_STUB_DIR; if (-not $dir) { $dir = $WorkDir }
+$n = Join-Path $dir ("attempts-" + $Group)
+$c = 0
+if (Test-Path -LiteralPath $n) { $c = [int]((Get-Content -LiteralPath $n -Raw) -replace '\s', '') }
+$c++
+[IO.File]::WriteAllText($n, "$c")
+[IO.File]::WriteAllLines((Join-Path $WorkDir 'ids.txt'), @('case probe'))
+$mode = $env:AGENTQ_GF_STUB
+if ($mode -eq 'fail') { Write-Host 'FAIL block=True probe'; exit 1 }
+if ($mode -eq 'always-die') { exit 1 }
+if ($c -gt 1) { Write-Host 'PASS block=True probe'; exit 0 }
+exit 1
+'@
+  [IO.File]::WriteAllText($stub, $code, (New-Object Text.UTF8Encoding $false))
+  # One attempts directory per mode: a SHARED one accumulates across the three runs below (measured -
+  # 'attempts=5' for what is two attempts per run, which would make the ceiling assertion meaningless).
+  function Run-Orchestrator([string]$mode) {
+    $d = Join-Path $fx ("stub-" + $mode)
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    $env:AGENTQ_GF_WORKER = $stub
+    $env:AGENTQ_GF_STUB = $mode
+    $env:AGENTQ_GF_STUB_DIR = $d
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $o = (@(& $Exe -NoProfile -ExecutionPolicy Bypass -File $selfPath -Guard $Guard -Exe $Exe -Workers 7 2>&1) -join "`n") }
+    finally {
+      $ErrorActionPreference = $prev
+      Remove-Item Env:AGENTQ_GF_WORKER -ErrorAction SilentlyContinue
+      Remove-Item Env:AGENTQ_GF_STUB -ErrorAction SilentlyContinue
+      Remove-Item Env:AGENTQ_GF_STUB_DIR -ErrorAction SilentlyContinue
+    }
+    return $o
+  }
+  # One line only: a multi-line detail would be echoed on a FAIL and its inner PASS/FAIL lines would be
+  # counted a second time by the process that reads THIS suite's output.
+  function Brief([string]$o) { return (@($o -split "`n" | Where-Object { $_ -match 'retrying it once|no output twice|PASS block=True probe|FAIL block=True probe|exit=' } | Select-Object -First 4) -join ' | ') }
+  function Attempts([string]$mode, [string]$g) { $f = Join-Path (Join-Path $fx ("stub-" + $mode)) ("attempts-" + $g); if (Test-Path -LiteralPath $f) { return [int]((Get-Content -LiteralPath $f -Raw) -replace '\s', '') } return 0 }
+  $o = Run-Orchestrator 'die-once'
+  Check 'orchestrator: a group that dies with no FAIL line is retried' ($o -match 'retrying it once') (Brief $o)
+  Check 'orchestrator: the retry is what makes it pass' ($o -match 'PASS block=True probe') (Brief $o)
+  Check 'orchestrator: the group is run exactly twice, never more' ((Attempts 'die-once' 'block-1') -eq 2) ('attempts=' + (Attempts 'die-once' 'block-1'))
+  $o2 = Run-Orchestrator 'fail'
+  Check 'orchestrator: an ASSERTED failure is never retried' ((-not ($o2 -match 'retrying it once')) -and ((Attempts 'fail' 'block-1') -eq 1)) ('attempts=' + (Attempts 'fail' 'block-1'))
+  Check 'orchestrator: and the asserted failure is still reported' ($o2 -match 'FAIL block=True probe') (Brief $o2)
+  $o3 = Run-Orchestrator 'always-die'
+  Check 'orchestrator: a group that dies twice is reported, not looped' (($o3 -match 'no output twice') -and ($o3 -match 'FAIL group block-1 exited non-zero')) (Brief $o3)
+  Check 'orchestrator: two attempts is the ceiling for a silent death' ((Attempts 'always-die' 'block-1') -eq 2) ('attempts=' + (Attempts 'always-die' 'block-1'))
+}
+
 # ---- the coverage ratchet --------------------------------------------------------------------------
-# The ids a PASSING run must exercise: 31 case names + 9 advisories + the 14 fixed ids = 54. FROZEN on
+# The ids a PASSING run must exercise: 31 case names + 9 advisories + the 21 fixed ids = 61. FROZEN on
 # purpose - deriving them from the case table would make DELETING a case invisible, because the expected
 # set would shrink with it. A lost case is worse than a slow suite, so this list only ever grows: update
 # it when you ADD or RENAME a case, and the suite goes red if a case stops being exercised.
@@ -403,7 +505,7 @@ $script:baselineWarn = @(
   'swiftformat (no cfg)'
   'zig fmt (no cfg)'
 )
-# The 14 ids that do not come from the case table.
+# The 21 ids that do not come from the case table.
 $script:fixedIds = @(
   'mutation: all 4 deny cases pass through with the branch disabled'
   'allow-list: still blocks with no entry'
@@ -419,6 +521,13 @@ $script:fixedIds = @(
   'post: apply_patch is a targeted edit, never touched'
   'post: a garbage payload is silent (fail-open)'
   'post mutation: without the ownership test a config-less repo WOULD be rewritten'
+  'orchestrator: a group that dies with no FAIL line is retried'
+  'orchestrator: the retry is what makes it pass'
+  'orchestrator: the group is run exactly twice, never more'
+  'orchestrator: an ASSERTED failure is never retried'
+  'orchestrator: and the asserted failure is still reported'
+  'orchestrator: a group that dies twice is reported, not looped'
+  'orchestrator: two attempts is the ceiling for a silent death'
 )
 function Get-RequiredIds {
   $o = New-Object System.Collections.Generic.List[string]
@@ -460,6 +569,7 @@ if ($Group -ne 'auto') {
       'guard-mutation' { Invoke-GuardMutation $fx }
       'allow-list' { Invoke-AllowList $fx }
       'post' { Invoke-Post $fx }
+      'orchestrator' { Invoke-Orchestrator $fx }
     }
   } finally {
     # Always leave the emitted ids behind: the orchestrator reads them for the coverage ratchet.
@@ -480,7 +590,7 @@ function Get-HostExe {
 }
 function Quote-Arg([string]$a) { if ($a -match '\s') { return '"' + $a + '"' } return $a }
 
-$order = @((Get-BlockShards).Keys) + @('guard-mutation', 'allow-list', 'post')
+$order = @((Get-BlockShards).Keys) + @('guard-mutation', 'allow-list', 'post', 'orchestrator')
 $w = $Workers
 if ($w -le 0 -and $env:AGENTQ_GUARD_FORMAT_WORKERS) { $w = [int]$env:AGENTQ_GUARD_FORMAT_WORKERS }
 if ($w -le 0) { $w = $order.Count }
@@ -489,7 +599,24 @@ if ($w -lt 1) { $w = 1 }
 $root = Get-FixtureRoot 'gf-'
 $hostExe = Get-HostExe
 $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+# Test seam: the retry below is only provable if a worker can be made to die on demand, so the suite can
+# point the orchestrator at a stub. Nothing in production sets this.
+if ($env:AGENTQ_GF_WORKER) { $self = $env:AGENTQ_GF_WORKER }
 Write-Host ("guard-format: running $($order.Count) group(s) with $w worker(s) via $hostExe")
+function Start-GroupWorker([string]$g, [string]$wd, [string]$out, [string]$err) {
+  $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self, '-Group', $g, '-Guard', $Guard, '-Exe', $Exe, '-WorkDir', $wd)
+  # The argv is joined into ONE string, so every element has to be quoted BEFORE it is joined: an
+  # unquoted Windows path with a space silently becomes two arguments.
+  return Start-Process -FilePath $hostExe -ArgumentList (($argv | ForEach-Object { Quote-Arg $_ }) -join ' ') -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+}
+function Get-GroupText([string]$out, [string]$err) {
+  $l = @()
+  if (Test-Path -LiteralPath $out) { $l += @(Get-Content -LiteralPath $out -Encoding utf8) }
+  if ((Test-Path -LiteralPath $err) -and (Get-Item -LiteralPath $err).Length) {
+    $l += @(Get-Content -LiteralPath $err -Encoding utf8 | ForEach-Object { "stderr: $_" })
+  }
+  return $l
+}
 $groups = @()
 for ($i = 0; $i -lt $order.Count; $i += $w) {
   $running = @()
@@ -497,25 +624,44 @@ for ($i = 0; $i -lt $order.Count; $i += $w) {
     $wd = Join-Path $root $g
     New-Item -ItemType Directory -Force -Path $wd | Out-Null
     $out = Join-Path $root ("$g.out.txt"); $err = Join-Path $root ("$g.err.txt")
-    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self, '-Group', $g, '-Guard', $Guard, '-Exe', $Exe, '-WorkDir', $wd)
     try {
-      $proc = Start-Process -FilePath $hostExe -ArgumentList (($argv | ForEach-Object { Quote-Arg $_ }) -join ' ') -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+      $proc = Start-GroupWorker $g $wd $out $err
     } catch {
       Write-Host ("FAIL group $g could not start: $($_.Exception.Message)") -ForegroundColor Red; $script:fails++
       continue
     }
-    $running += [pscustomobject]@{ Group = $g; Proc = $proc; Out = $out; Err = $err; Wd = $wd }
+    $running += [pscustomobject]@{ Group = $g; Proc = $proc; Out = $out; Err = $err; Wd = $wd; Retried = $false }
   }
   foreach ($j in $running) { $j.Proc.WaitForExit() }
+  # A group that exits NON-ZERO having printed no FAIL line asserted nothing: it died - killed, crashed,
+  # or a spawn that never happened - and the only evidence is the exit code (measured 2026-11-28 in the
+  # cloud pool: `guard format exit=1 pass=53 fail=2 sec=14`, the two failures being this exit code and the
+  # coverage ratchet, with no output from the worker at all). Run such a group ONCE more before believing
+  # it. An ASSERTED failure prints a FAIL line and is never retried, so a real regression cannot be retried
+  # away, and a second silent death is reported exactly as before.
+  foreach ($j in $running) {
+    $seen = Get-GroupText $j.Out $j.Err
+    if ($j.Proc.ExitCode -ne 0 -and -not @($seen | Where-Object { $_ -match '^\s*FAIL\b' }).Count) {
+      Write-Host ("# group {0} exited {1} with no FAIL line - retrying it once" -f $j.Group, $j.Proc.ExitCode)
+      $j.Retried = $true
+      try {
+        $j.Proc = Start-GroupWorker $j.Group $j.Wd $j.Out $j.Err
+        $j.Proc.WaitForExit()
+      } catch {
+        Write-Host ("FAIL group {0} could not be restarted: {1}" -f $j.Group, $_.Exception.Message) -ForegroundColor Red; $script:fails++
+      }
+    }
+  }
   $groups += $running
 }
 # Re-emit every worker line verbatim (run-all.ps1 counts the PASS/FAIL lines) and collect its ids.
 foreach ($j in $groups) {
   Write-Host ("# group {0} exit={1}" -f $j.Group, $j.Proc.ExitCode)
-  $lines = @()
-  if (Test-Path -LiteralPath $j.Out) { $lines += @(Get-Content -LiteralPath $j.Out -Encoding utf8) }
-  if ((Test-Path -LiteralPath $j.Err) -and (Get-Item -LiteralPath $j.Err).Length) {
-    $lines += @(Get-Content -LiteralPath $j.Err -Encoding utf8 | ForEach-Object { "stderr: $_" })
+  $lines = Get-GroupText $j.Out $j.Err
+  # A silent death is named as such: without this line the log says only "exited non-zero", which is how
+  # the flake cost a fleet-wide land block for hours on 2026-11-28.
+  if ($j.Proc.ExitCode -ne 0 -and $j.Retried -and -not @($lines | Where-Object { $_ -match '^\s*FAIL\b' }).Count) {
+    Write-Host ("# group {0} died with no output twice (exit={1})" -f $j.Group, $j.Proc.ExitCode) -ForegroundColor Red
   }
   foreach ($l in $lines) {
     if ($l -match '^\s*PASS\b') { $script:pass++; Write-Host $l }

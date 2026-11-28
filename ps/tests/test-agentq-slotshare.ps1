@@ -154,6 +154,12 @@ try {
   Check 'B4 the refusal is journaled ONCE with session/held/cap' ($ev.Count -eq 1 -and $ev[0].session -eq 'me' -and [int]$ev[0].held -ge 1 -and [int]$ev[0].cap -eq 1) ($ev[0] | ConvertTo-Json -Compress)
   Check 'B4 the message names my session, the held count, the share, the held purpose and BOTH recipes' ($o -match 'me' -and $o -match 'holds 1' -and $o -match 'share of 1' -and $o -match 'mine-1' -and $o -match 'agentq unlease' -and $o -match 'reuse') $o
   Check 'B4 no event is journaled for the OTHER session' (@($ev | Where-Object { $_.session -ne 'me' }).Count -eq 0)
+  # R4-2/R4-3 (2026-11-28): the refusal used to exist ONLY as stderr text, so the artefact that answers
+  # "was a gate already paid for before this refusal?" was the terminal scrollback. It is journaled now,
+  # with the gate seconds THIS process spent (`$script:GateSec`) so a land refused AFTER its pre-gate is
+  # visible as a cost. A plain lease has spent none, hence stage before-gate / gateSec 0.
+  $sr = @(Ev 'slot-share-refused')
+  Check 'B4 the refusal is JOURNALED as slot-share-refused (role + gate cost)' ($sr.Count -eq 1 -and $sr[0].role -eq 'scratch' -and $sr[0].stage -eq 'before-gate' -and [int]$sr[0].gateSec -eq 0) (($sr | ConvertTo-Json -Compress))
 
   # =============================== B5: slotsPerSession > 0 is honoured (overrides the derived share)
   Clear-Leases; Reset-Journal
@@ -174,6 +180,36 @@ try {
   $env:AGENTQ_SESSION = 'me'
   $o = AQ status -All
   Check 'B6 status -All prints a SLOT SHARE line' ($script:code -eq 0 -and $o -match 'SLOT SHARE') "code=$($script:code) :: $o"
+  # R4-5: B5 left this session at 1/1 (pin 1) while 'other' holds a slot, so the line must JUDGE the
+  # number it prints. Read a healthy "SLOT SHARE 1/1" and you only learn the truth 28 minutes later from
+  # a land that refuses after its pre-gate - which is what this line exists to prevent.
+  Check 'B6b status says OVER SHARE when my session is at its share' ($o -match 'OVER SHARE') "code=$($script:code) :: $o"
+  Check 'B6b the over-share line names both ways out (reuse the lead slot, give one back) and the hatch' `
+    ($o -match 'lead' -and $o -match 'unlease' -and $o -match 'AGENTQ_NO_FAIRSHARE=1') "code=$($script:code) :: $o"
+
+  # =============================== B6c: a land refuses BEFORE its pre-gate (R4-1/R4-3)
+  # Measured 2026-11-28: a land paid a 28-minute pre-gate (44/44 PASS) and only THEN exited 3 on "my
+  # session is at its slot share" while it leased the LAND slot. The gate is pointed at a script that
+  # records that it ran: with the check moved in front of the pre-gate the marker must NOT exist, which
+  # is what tells a refusal-before-the-gate from a refusal-after-it.
+  $marker = Join-Path $tmp 'gate-ran.txt'
+  $gateScript = Join-Path $tmp 'gate-marker.ps1'
+  [IO.File]::WriteAllLines($gateScript, @("[IO.File]::WriteAllText('$marker','ran')", 'exit 0'), [System.Text.UTF8Encoding]::new($false))
+  Set-Cfg ('{"taskSlotsPerRepo":12,"taskSlotsMachine":20,"taskSlotsMachineFloor":2,"scratchSlots":3,"scratchSlotsMax":6,"scratchMinFreeGB":0,"minFreeCommitGB":0,"leaseIdleMin":45,"leaseOwnerIdleMin":90,"leaseScratchIdleMin":15,"leaseChatGraceMin":20,"leaseMaxIdleMin":1440,"machineCap":2,"fairShare":{"enabled":true,"slotsPerSession":1},"landGate":{"repo":"pwsh -NoProfile -File ' + $gateScript.Replace('\', '\\') + '"}}')
+  $env:AGENTQ_SESSION = 'me'
+  Reset-Journal
+  $o = AQ land -Branch main -Onto main -Purpose 'over-share land must refuse before the gate'
+  Check 'B6c a land from an over-share session is REFUSED with exit 3' ($script:code -eq 3) "code=$($script:code) :: $o"
+  Check 'B6c the pre-gate NEVER ran (the gate marker does not exist)' (-not (Test-Path -LiteralPath $marker)) $o
+  $ev = @(Ev 'land-share-refused')
+  Check 'B6c the early refusal is journaled once with stage before-pregate' ($ev.Count -eq 1 -and $ev[0].stage -eq 'before-pregate') (($ev | ConvertTo-Json -Compress))
+  Check 'B6c the refusal text says nothing was queued, gated or taken, and names the hatch' ($o -match 'REFUSED before the pre-gate' -and $o -match 'Nothing queued' -and $o -match 'AGENTQ_NO_FAIRSHARE=1') $o
+  # The whole point is the ORDER, and order is invisible to a run that fails for one reason only: pin the
+  # source positions too, so a later refactor that moves the check back behind the gate fails here.
+  $v2src = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\bin\agentq-v2.ps1') -Raw
+  $iEarly = $v2src.IndexOf("stage = 'before-pregate'")
+  $iGate = $v2src.IndexOf('Invoke-LandPregate $repo $main $pgRef')
+  Check 'B6c the early check sits BEFORE the pre-gate call in the source' ($iEarly -gt 0 -and $iGate -gt 0 -and $iEarly -lt $iGate) "early=$iEarly gate=$iGate"
 
   # =============================== B7: fairShare disabled -> no reuse, no cap (old behaviour)
   Clear-Leases; Reset-Journal

@@ -56,11 +56,20 @@ $script:AqSuiteInputMap = [ordered]@{
     'agentq v2'               = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/bin/agentq-jobs-lib.ps1', 'ps/tests/test-agentq-v2.ps1')
     'agentq v3'               = @('ps/bin/**', 'ps/tests/test-agentq-v3.ps1')
     'args'                    = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-args.ps1')
+    # a comma-containing single value binds as ONE string through `pwsh -File`; the engine's single-value
+    # parameters must refuse it. Drives the engine, so the engine's two files are inputs too.
+    'args comma'              = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-args-comma.ps1')
     'help'                    = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-help.ps1')
     'status readonly'         = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-status-readonly.ps1')
     'slot budget'             = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-slot-budget.ps1')
     'agentq slot share'       = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-slotshare.ps1')
+    # a take-over is announced per CHAT (slot-takeover-chat); the reset that destroys a slot's unsaved
+    # work runs inside Initialize-Slot (agentq-v2) reached through the agentq.ps1 dispatch.
+    'takeover chat'           = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-slot-takeover-chat.ps1')
     'lease liveness'          = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/bin/agentq-jobs-lib.ps1', 'ps/tests/test-agentq-lease-liveness.ps1')
+    # the SPAWN SHAPE of a lease (round 2/3 of the spawn cut): the repo resolution and Initialize-Slot
+    # spawns live in agentq.ps1 (Get-RepoInfo) + agentq-v2.ps1 (Initialize-Slot).
+    'lease spawns'            = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-lease-spawns.ps1')
     'prewarm verb'            = @('ps/bin/**', 'ps/tests/test-agentq-prewarm-verb.ps1')
     'prewarm cloud'           = @('ps/bin/prewarm-cloud.ps1', 'ps/bin/agentq-cloud.ps1', 'ps/tests/test-prewarm-cloud.ps1')
     'shared janitor'          = @('ps/bin/shared-clone-janitor.ps1', 'ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-shared-clone-janitor.ps1')
@@ -79,6 +88,10 @@ $script:AqSuiteInputMap = [ordered]@{
     'land precheck'           = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-precheck.ps1')
     'land pregate'            = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/devcloud/**', 'ps/tests/test-land-pregate.ps1')
     'land pregate stale ref'  = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-pregate-stale-ref.ps1')
+    # a topic whose merge RESOLUTION reverts origin content with no conflict (the spawn-round2 incident).
+    'land stale base'         = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-stale-base.ps1')
+    # two lands at once behind `landCapacity`, merge/push serialised by a bounded per-repo mutex.
+    'land capacity'           = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-capacity.ps1')
     'land batch'              = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-batch.ps1')
     'land default gate'       = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-default-gate.ps1')
     'land finalize'           = @('ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-land-finalize.ps1')
@@ -95,6 +108,14 @@ $script:AqSuiteInputMap = [ordered]@{
     'script scope'            = @('ps/**', 'ps/tests/test-script-scope.ps1')
     'install wiring'          = @('ps/install.ps1', 'ps/tests/run-all.ps1', 'ps/bin/agentq-config.json', 'ps/tests/test-install-wiring.ps1')
     'land gate pool'          = @('ps/bin/agentq-config.json', 'ps/tests/land-gate-pool.allow.json', 'ps/tests/test-land-gate-pool.ps1', 'ps/devcloud/**', 'ps/bin/agentq-v2.ps1')
+
+    # --- the gate's OWN selection + the read-back verbs (2026-11-28) -------------------------------
+    # These four were in gateSuites.agentq with NO entry here, so they could never be SKIPPED (an
+    # unknown suite always runs). Each maps to the module it drives (measured from its own suite file).
+    'gate input selection'    = @('ps/bin/agentq-suite-inputs.ps1', 'ps/tests/test-gate-input-selection.ps1')
+    'agentq timings'          = @('ps/bin/agentq-timings.ps1', 'ps/bin/agentq.ps1', 'ps/tests/test-agentq-timings.ps1')
+    'agentq reclaim'          = @('ps/bin/agentq-reclaim.ps1', 'ps/bin/agentq.ps1', 'ps/bin/agentq-v2.ps1', 'ps/tests/test-agentq-reclaim.ps1')
+    'agentq approve'          = @('ps/bin/agentq-approve.ps1', 'ps/bin/agentq-approve-gui.ps1', 'ps/tests/test-agentq-approve.ps1')
 }
 
 # --- inputs whose change invalidates the whole map -------------------------------------------------

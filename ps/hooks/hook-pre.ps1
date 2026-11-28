@@ -22,7 +22,7 @@
   by ps/install.ps1. Until 2026-11 this file existed only in the installed folder.
 
   Cost log (OQ-012): every call appends one line to <coord>/hooks/cost-yyyyMMdd.jsonl
-  ({ ts, ms, startMs, tool, deny, session }): ms = time spent in this script, startMs = from the call
+  ({ ts, ms, startMs, tool, verb, deny, session }): ms = time spent in this script, startMs = from the call
   reaching this process to the first line of the script (the part a resident daemon removes). On the
   resident path the daemon runs this script IN-PROCESS, so the process start is server UPTIME, not this
   call (2026-11-25: startMs 82 425 070 ms == the server's uptime while ms stayed ~800, and `agentq slo`
@@ -33,6 +33,12 @@
   restarts it; that staleness is why the defect outlived the first fix attempt).
   `agentq slo` sums it. Best effort: it can neither change a decision nor fail the call.
   AGENTQ_NO_HOOK_COST=1 turns it off.
+
+  `verb` (round 4, 2026-11-28): the ledger named only the VS Code TOOL, so a day file could hold
+  10 463 run_in_terminal rows and still not answer "what does one `status` cost beside one `land`".
+  The verb the command runs is now recorded for the tools that carry a command (the others' payloads
+  are not scanned). It is an empty string when that command runs no agentq, and the field is ALWAYS
+  present so every parser sees one shape.
 #>
 $ErrorActionPreference = 'Continue'
 $hookSw = [Diagnostics.Stopwatch]::StartNew()
@@ -99,6 +105,18 @@ $mS = [regex]::Match($rawIn, '"(?:session_id|sessionId)"\s*:\s*"([^"\\]{1,80})"'
 $gateReadOnly = '^(read_file|read_notebook_cell_output|copilot_getNotebookSummary|grep_search|file_search|list_dir|semantic_search|get_errors|memory|session_store_sql|fetch_webpage|codai_web_search|codai_web_fetch|vscode_websearchforcopilot_webSearch|read_page|screenshot_page|terminal_last_command|terminal_selection|vscode_listCodeUsages|resolve_memory_file_uri|get_task_output|find-skills|who-owns-file)$'
 $runGate = $toolName -notmatch $gateReadOnly
 
+# ROUND 4 (2026-11-28): only a tool that RUNS A COMMAND can name an agentq verb - the other payloads
+# (a megabyte apply_patch, a screenshot) are not worth scanning for one. These are the command-carrying
+# tool names across the harnesses seen here: VS Code's run_in_terminal, Claude Code's Bash, and the
+# generic shell names. An ALLOW list on purpose, like $gateReadOnly above: an unknown name is not
+# scanned rather than guessed at.
+$cmdTools = '^(run_in_terminal|Bash|bash|sh|shell|execute|execute_command|run_command|terminal)$'
+# The verb is the word the launcher runs: `agentq.ps1 since`, `"…\agentq.ps1" land`,
+# `node dist/cli.mjs log`. Anything after a flag (`agentq.ps1 -Purpose x land`) does not match, which
+# is deliberate: an empty verb is honest, a guessed one would not be. Bounded to 24 characters and to
+# [A-Za-z0-9-], so the value can never carry a quote or a backslash into the JSON line.
+$verbRe = [regex]::new('(?<![A-Za-z0-9])(?:agentq(?:-v2)?\.ps1|cli\.mjs)\\?"?\s{1,4}([A-Za-z][A-Za-z0-9-]{0,23})', 'IgnoreCase')
+
 # One line per call; called right before every exit of this script. Regex, not ConvertFrom-Json: the
 # payload can be megabytes (file contents) and only two short fields are needed.
 function Write-HookCost([bool]$Denied) {
@@ -107,12 +125,17 @@ function Write-HookCost([bool]$Denied) {
     $tool = ''; $sid = ''
     $m = [regex]::Match($rawIn, '"(?:tool_name|toolName)"\s*:\s*"([^"\\]{1,80})"'); if ($m.Success) { $tool = $m.Groups[1].Value }
     $m = [regex]::Match($rawIn, '"(?:session_id|sessionId)"\s*:\s*"([^"\\]{1,80})"'); if ($m.Success) { $sid = $m.Groups[1].Value }
+    # The VERB (round 4): `tool` alone could not answer what an agentq call costs - a day of this file
+    # held 10 463 run_in_terminal rows and no verb. Regex on the raw payload and no spawn: the metric of
+    # this round IS the spawn count, so instrumentation that spawns would erase its own measurement.
+    $verb = ''
+    if ($tool -match $cmdTools) { $v = $verbRe.Match($rawIn); if ($v.Success) { $verb = $v.Groups[1].Value.ToLowerInvariant() } }
     $coord = if ($env:AGENTQ_HOME) { $env:AGENTQ_HOME } else { Join-Path $HOME '.codai\coord' }
     $dir = Join-Path $coord 'hooks'
     [void][IO.Directory]::CreateDirectory($dir)
     $now = [DateTime]::UtcNow
     $start = if ($null -ne $hookStartMs) { "$hookStartMs" } else { 'null' }
-    $line = '{{"ts":"{0}","ms":{1},"startMs":{2},"tool":"{3}","deny":{4},"session":"{5}"}}' -f $now.ToString('o'), [long]$hookSw.ElapsedMilliseconds, $start, $tool, $(if ($Denied) { 'true' } else { 'false' }), $sid
+    $line = '{{"ts":"{0}","ms":{1},"startMs":{2},"tool":"{3}","verb":"{4}","deny":{5},"session":"{6}"}}' -f $now.ToString('o'), [long]$hookSw.ElapsedMilliseconds, $start, $tool, $verb, $(if ($Denied) { 'true' } else { 'false' }), $sid
     $file = Join-Path $dir ("cost-{0}.jsonl" -f $now.ToString('yyyyMMdd'))
     $enc = New-Object Text.UTF8Encoding $false
     for ($try = 0; $try -lt 3; $try++) {
