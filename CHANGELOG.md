@@ -188,6 +188,9 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
 - **A worker that dies WITHOUT asserting anything no longer reds the land gate.** The cloud pool that gates
   every land is shared, so one flaky suite stops the whole fleet: measured 2026-11-28, `guard format exit=1
 pass=53 fail=2 sec=14` where the two failures were the group's own exit code and the coverage ratchet, with
+- **A worker that dies WITHOUT asserting anything no longer reds the land gate.** The cloud pool that gates
+  every land is shared, so one flaky suite stops the whole fleet: measured 2026-11-28, `guard format exit=1
+  pass=53 fail=2 sec=14` where the two failures were the group's own exit code and the coverage ratchet, with
   **no output from the worker at all** - a process that was killed or crashed, not one that judged (the two
   pool runs either side of it were `pass=54 fail=0 sec=6`). The shape is not a spawn that never happened: the
   orchestrator re-emits worker stderr and the worker prints `N failure(s)` before exiting 1, so a throw would
