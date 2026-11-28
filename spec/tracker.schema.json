@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codwen.com/schemas/tracker.schema.json",
+  "title": "Codwen unified tracker schema",
+  "description": "One row shape for every plan/tracker on this machine. A repo keeps its native file (CSV or Markdown) and declares how to read it in .agentq/trackers.json; this schema is the superset every reader agrees on, and the status enum is the one vocabulary. No repo is forced to migrate its file - the mapping is the single source of truth for how it is read.",
+  "$defs": {
+    "status": {
+      "type": "string",
+      "description": "Canonical status. Every repo maps its own tokens onto this set (see trackerFile.status.map); a token with no mapping is a drift finding, never silently accepted.",
+      "enum": ["todo", "in-progress", "blocked", "review", "done", "dropped", "deferred"]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier, unique within one tracker. The shape is declared per tracker (trackerFile.idPattern); the unified contract only requires uniqueness and a declared shape."
+    },
+    "trackerItem": {
+      "type": "object",
+      "description": "One planned unit of work. The first six fields are the common core every tracker in the fleet already carries in some spelling; the rest are optional and repo-specific.",
+      "required": ["id", "title", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "group": {
+          "type": "string",
+          "description": "The slice / stage / category the item sits in (vitals: slice S<nn>, agentq: stage, codai: area, brivio: epic). Optional but recommended - it is what turns a flat list into a plan."
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "evidence": {
+          "type": "string",
+          "description": "How the item is proven done - the acceptance criterion or the verification note (vitals: verification, agentq: acceptance, codai: gate+evidence). A done item with no evidence is a drift finding."
+        },
+        "notes": { "type": "string" },
+        "detail": { "type": "string" },
+        "category": { "type": "string" },
+        "decision": { "type": "string" },
+        "owner": { "type": "string", "description": "Agent, person, or lane that owns the item." },
+        "priority": { "type": "string" },
+        "paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Path claims (globs) the item touches - the input to the conflict-forecast between two ready items."
+        },
+        "deps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "description": "Ids this item depends on. 'next' must never hand out an item with an open dependency."
+        },
+        "commit": { "type": "string", "description": "Short sha the item landed on, when known." },
+        "updated": { "type": "string", "format": "date-time" }
+      }
+    },
+    "columnMap": {
+      "type": "object",
+      "description": "Maps this schema's field names to the physical column names of one tracker file. A field absent from the map is not present in that file.",
+      "additionalProperties": { "type": "string" }
+    },
+    "trackerFile": {
+      "type": "object",
+      "required": ["id", "file", "format", "columns"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "Tracker id, unique within the repo." },
+        "file": { "type": "string", "description": "Path relative to the repo root." },
+        "format": { "enum": ["csv", "json"] },
+        "columns": { "$ref": "#/$defs/columnMap" },
+        "idPattern": {
+          "type": "string",
+          "description": "Regex every id must match, and that must appear in no other tracker's ids."
+        },
+        "groupPattern": { "type": "string" },
+        "status": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "map": {
+              "type": "object",
+              "description": "Native token -> canonical status. A native token not in the map is a drift finding.",
+              "additionalProperties": { "$ref": "#/$defs/status" }
+            },
+            "column": {
+              "type": "string",
+              "description": "Column holding the status, when it differs from columns.status."
+            }
+          }
+        },
+        "index": {
+          "type": "object",
+          "description": "Optional overrides for how the tracker is rendered in an index (and the Vitals page).",
+          "properties": {
+            "kind": { "type": "string", "description": "plan | audit | research | product - what the tracker is for." },
+            "order": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "trackerRegistry": {
+      "type": "object",
+      "description": "The per-repo .agentq/trackers.json. This is the single source of truth for how a repo's trackers are found and read; it is committed to git so it survives every machine, slot and clone.",
+      "required": ["version", "trackers"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "const": 1 },
+        "repo": {
+          "type": "string",
+          "description": "Folder name of the repo root; must match the git worktree common dir's parent."
+        },
+        "trackers": { "type": "array", "items": { "$ref": "#/$defs/trackerFile" } },
+        "narrative": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Narrative companions (e.g. docs/TRACKER.md). Read for drift only: every id referenced there must exist in a tracker."
+        }
+      }
+    },
+    "repoIndex": {
+      "type": "object",
+      "description": "One repo as the cross-repo scan sees it.",
+      "required": ["repo", "root", "trackers"],
+      "additionalProperties": true,
+      "properties": {
+        "repo": { "type": "string" },
+        "root": { "type": "string" },
+        "git": {
+          "type": "object",
+          "properties": {
+            "head": { "type": "string" },
+            "branch": { "type": "string" }
+          }
+        },
+        "trackers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "file": { "type": "string" },
+              "countsByStatus": { "type": "object", "additionalProperties": { "type": "integer" } },
+              "items": { "type": "array", "items": { "$ref": "#/$defs/trackerItem" } }
+            }
+          }
+        },
+        "drift": {
+          "type": "array",
+          "description": "Every drift finding for this repo: unmapped status, duplicate id, dangling reference, dangling narrative id.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "unmapped-status",
+                  "duplicate-id",
+                  "bad-id-shape",
+                  "dangling-narrative-ref",
+                  "missing-column",
+                  "arity"
+                ]
+              },
+              "tracker": { "type": "string" },
+              "ref": { "type": "string" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "trackerIndex": {
+      "type": "object",
+      "description": "The merged cross-repo index, written to the agentq state dir and consumed by 'agentq tracker' and the Vitals Tracking page. This - not any single file - is what a client reads for fleet-wide status.",
+      "required": ["version", "generatedAt", "repos"],
+      "properties": {
+        "version": { "const": 1 },
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "repos": { "type": "array", "items": { "$ref": "#/$defs/repoIndex" } }
+      }
+    }
+  },
+  "$ref": "#/$defs/trackerItem"
+}

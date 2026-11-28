@@ -1,0 +1,30 @@
+{
+  "$schema": "../spec/tracker.schema.json#/$defs/trackerRegistry",
+  "version": 1,
+  "repo": "agentq",
+  "trackers": [
+    {
+      "id": "oqt",
+      "file": "docs/TRACKER.csv",
+      "format": "csv",
+      "columns": {
+        "id": "id",
+        "group": "stage",
+        "title": "title",
+        "status": "status",
+        "evidence": "acceptance",
+        "notes": "notes"
+      },
+      "idPattern": "^OQ-\\d{3}$",
+      "status": {
+        "map": {
+          "todo": "todo",
+          "in progress": "in-progress",
+          "done": "done"
+        }
+      },
+      "index": { "kind": "plan", "order": 0 }
+    }
+  ],
+  "narrative": ["docs/orchestrator-stage-0.md"]
+}
