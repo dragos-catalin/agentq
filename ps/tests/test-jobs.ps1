@@ -278,7 +278,9 @@ $env:AGENTQ_GIT_AUTOSYNC = $fakeDaemon
 $d = (& pwsh -NoProfile -File $sync -Once -DryRun) -join ' '
 $body = Get-Content $env:AGENTQ_SYNC_DUMP -Raw | ConvertFrom-Json
 $sj = @($body.jobs | Where-Object { $_.id -eq $o.id })
-$keys = 'id,label,command,cwd,repo,host,pid,state,exitCode,expectedMin,startedAt,endedAt,lastOutputAt,log' -split ','
+# placement names where the job ran (cloud:<ws> / local / an empty string that must NOT be read as
+# local). It is part of the frozen sync contract since 2026-11-25, so the exact-field check owns it.
+$keys = 'id,label,command,cwd,repo,host,placement,pid,state,exitCode,expectedMin,startedAt,endedAt,lastOutputAt,log' -split ','
 Check 'agentq-sync -DryRun counts jobs' ($d -match 'jobs=\d+') $d
 Check 'sync jobs[] entry has exactly the contract fields' ($sj.Count -eq 1 -and -not (Compare-Object $keys @($sj[0].PSObject.Properties.Name))) (($sj | ConvertTo-Json -Compress))
 Check 'sync jobs[] carries computed state (dead/suspect)' (@($body.jobs | Where-Object { $_.id -eq $deadId -and $_.state -eq 'dead' }).Count -eq 1)
