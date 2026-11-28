@@ -51,6 +51,24 @@ Exit codes: `0` clean, `N` = N drift findings, `2` = no registry found.
 **Pass explicit roots.** `--scan --all` resolves its base from `$HOME/gh` and finds 0
 repos where the fleet actually lives on `E:` — always name the repos.
 
+Two spellings, and only one of them is a flag list:
+
+- `--root <repo>` — **repeat it**, one repo per occurrence. This is the form to use.
+- `--scan <dir> <dir> …` — the directories are **positional**, not repeated flags; it is
+  a directory walk, so it is what a discovery script uses, not what a human uses.
+
+`onboard-tracker.mjs` in the same directory is the **writer** (it emits the registry from a
+CSV); `tracker-lint.mjs` is the **judge**. Run the writer, then run the judge and quote its
+exit code. A writer that reports `wrote <file>` has proved nothing about the file.
+
+### `index.kind` is a closed vocabulary
+
+Across the whole fleet the only values in use are **`plan`**, **`audit`** and **`product`**.
+Do not invent a fourth spelling for a tracker that is really one of these — a new kind
+silently splits a view that an operator reads as one list. The same rule applies to
+`columns`: the keys seen fleet-wide are `category, decision, evidence, group, id, kind,
+notes, status, title`, and nothing else.
+
 ## `idPattern`: add one, or deliberately do not
 
 `idPattern` catches `bad-id-shape` (a truncated or pasted id) and is what makes
@@ -100,6 +118,49 @@ git -C <repo> rev-parse origin/main:.agentq/trackers.json  # landed
 - **Two files with duplicated ids are not registrable.** Where a CSV repeats one id 25×
   (and has an empty id), leave it out and say so — registering it would make every id-based
   finding meaningless.
+
+## Repairing a torn CSV source (do it in place, and fail closed)
+
+Some trackers are torn: a record whose notes field contains a newline, so the physical row
+count no longer matches the record count and a naive reader sees a header in the middle of
+the file. The linter will report it. Repair the **source** CSV, in place, rather than
+teaching the registry to tolerate it.
+
+Two rules keep that repair honest:
+
+- **A re-serialiser must refuse to write when nothing needed repair.** If it rewrites every
+  file it is pointed at, the diff is unreviewable and a no-op looks like a fix. Report
+  `already well-formed` and write nothing.
+- **Never repair from hardcoded line offsets.** A tracked file moves under you; offsets are
+  wrong the moment a sibling commits. Parse the records and re-emit them.
+- **`git status` clean is not proof of structural health.** A file can be byte-identical to
+  the index and still be torn. The linter is the measurement; `git diff` is not.
+
+## Onboarding at machine scale
+
+To find every repo that has trackers (and every one that has a registry but a stale one),
+walk one level under `E:\gh` and the nested roots (`E:\gh\frontiers\*`) rather than
+guessing names: `E:\gh\.copilot-tmp\find-registries.ps1` is the working implementation.
+It prints, per repo, whether `.agentq/trackers.json` exists.
+
+One trap cost a whole pass: the merged index lives at `<stateDir>/trackers/index.json`, and
+a discovery script that rebuilt that path with a **second** `Split-Path` ate the
+`index.json` segment — every repo then read as "no registry". Print the path you are about
+to read and `Test-Path` it before trusting an absence.
+
+## Why the pointer rollout was reverted (measured, do not retry)
+
+A repo's pre-push hook judges the **whole tree**, not the paths you staged. Two repos proved
+it end to end: `afti`'s `scripts/hooks/pre-push.mjs` runs `pnpm typecheck` over everything,
+and `marcai` had a sibling agent's **untracked** `packages/domain/src/reference.test.ts`
+that failed with TS6133. In both cases a docs-only change could not be pushed.
+
+So a cross-repo doc edit ("point every repo's agent file at its registry") **cannot be
+automated from a shared clone**. It was rolled out to 38 repos and reverted byte-exactly
+(`git show HEAD:<path>` written back with the file's own line endings, never
+`git checkout --`). The content now lives here, in the canonical doc, and the machine-level
+version is a written proposal for the owner. If you want it in a repo, land it in that repo,
+in isolation, with its own gate.
 
 ## Coverage at the time of writing (2026-11-28)
 
