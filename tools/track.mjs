@@ -31,6 +31,10 @@
 //   node track.mjs task done  --id <id> [--evidence s]
 //   node track.mjs task show  --id <id> [--json]
 //   node track.mjs task list  [--json]
+//   node track.mjs roster [--session <id>] [--json]
+//   node track.mjs export [--out <.agentq/state.json>]
+//   node track.mjs import [--in  <.agentq/state.json>] [--json]
+//   node track.mjs drift  [--repo <dir>] [--json]
 
 import {
     readFileSync,
@@ -45,6 +49,10 @@ import {
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
+// The drift computation lives in tracker-lint and is NOT re-implemented here:
+// `track drift` imports the very same scanRepo that wrote the index, so the two
+// can never disagree about what a drift finding is.
+import { scanRepo } from "./tracker-lint.mjs";
 
 const STATE = process.env.AGENTQ_HOME || join(homedir(), ".codai", "coord");
 const CHATS = join(STATE, "chats");
@@ -214,7 +222,71 @@ function hasOpenDep(task, all) {
     return false;
 }
 
+// ---- shared helpers (roster / export / import / drift) ----------------------
+
+// A claim's session, for a record written before `session` existed: the owner is
+// the best stand-in, so an old task still shows up in the roster of whoever holds
+// it. Never invents a session - falls back to the owner, then to "self".
+function taskSession(t) {
+    return t.session || t.owner || "self";
+}
+
+// The session this process acts for, unless the caller names one. `--session`
+// wins, then the environment, then "self" - the same precedence a claim uses.
+function currentSession(flags) {
+    if (flags.session && flags.session !== true) return flags.session;
+    return process.env.AGENTQ_SESSION || process.env.AGENTQ_AGENT || "self";
+}
+
+// The claim context: who owns it (`by`), which session claimed it (`session`) and,
+// for a subagent, the session it ran under (`parent`). Kept in one place so claim
+// and next cannot stamp a task differently.
+function claimContext(flags) {
+    const by = agentId(flags);
+    const session =
+        flags.session && flags.session !== true
+            ? flags.session
+            : process.env.AGENTQ_SESSION || process.env.AGENTQ_AGENT || by;
+    const parent = flags.parent && flags.parent !== true ? flags.parent : undefined;
+    return { by, session, parent };
+}
+
+// ISO timestamps compare correctly as strings; a missing one sorts oldest, so a
+// record with no updatedAt never wins a merge against one that has it.
+function compareTs(a, b) {
+    const x = a || "";
+    const y = b || "";
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+// A canonical form for equality and for deterministic export: keys sorted at
+// every depth, arrays left as the caller ordered them (the caller applies a
+// stable sort). Two records are "the same" iff their canonical forms match, so a
+// merge compares content, not key order.
+function sortKeysDeep(v) {
+    if (Array.isArray(v)) return v.map(sortKeysDeep);
+    if (v && typeof v === "object") {
+        const out = {};
+        for (const k of Object.keys(v).sort()) out[k] = sortKeysDeep(v[k]);
+        return out;
+    }
+    return v;
+}
+
+function canonical(v) {
+    return JSON.stringify(sortKeysDeep(v));
+}
+
 // ---- status -----------------------------------------------------------------
+
+// The ONE place a repo's live index entry is reduced to (items, drift). `track
+// status` and `track drift` both read the index through this, so the number a
+// drift check compares against is the same number status prints.
+function summarizeRepo(r) {
+    const items = (r.trackers || []).reduce((n, t) => n + ((t.items || []).length || 0), 0);
+    const drift = (r.drift || []).length;
+    return { items, drift };
+}
 
 function cmdStatus(flags) {
     if (!existsSync(INDEX)) {
@@ -232,8 +304,7 @@ function cmdStatus(flags) {
     let totalItems = 0;
     let totalDrift = 0;
     for (const r of repos) {
-        const items = (r.trackers || []).reduce((n, t) => n + ((t.items || []).length || 0), 0);
-        const drift = (r.drift || []).length;
+        const { items, drift } = summarizeRepo(r);
         totalItems += items;
         totalDrift += drift;
     }
@@ -243,8 +314,8 @@ function cmdStatus(flags) {
     }
     console.log(`trackers: ${repos.length} repo(s), ${totalItems} item(s)  (generated ${index.generatedAt || "?"})`);
     for (const r of repos) {
-        const items = (r.trackers || []).reduce((n, t) => n + ((t.items || []).length || 0), 0);
-        console.log(`  ${r.repo}: ${items} item(s), ${(r.drift || []).length} drift`);
+        const { items, drift } = summarizeRepo(r);
+        console.log(`  ${r.repo}: ${items} item(s), ${drift} drift`);
     }
     console.log(`total drift: ${totalDrift}`);
     return Math.min(totalDrift, 255);
@@ -321,7 +392,8 @@ function cmdPlan(sub, flags) {
 // The claim, factored so `claim` and `next` share one definition of "atomic".
 // The whole read-check-write runs inside the exclusive lock, so two agents race
 // for the lock, not for the field.
-function claimTask(id, by) {
+function claimTask(id, ctx) {
+    const { by, session, parent } = ctx;
     const file = taskFile(id);
     if (!file) return { rc: 2, task: null, reason: `bad task id '${id}'` };
     return withLock(file, () => {
@@ -330,6 +402,13 @@ function claimTask(id, by) {
         if (t.owner && t.owner !== by) return { rc: 2, task: t, reason: `already claimed by ${t.owner}` };
         if (!CLAIMABLE.includes(t.status)) return { rc: 2, task: t, reason: `status is '${t.status}'` };
         t.owner = by;
+        // The claiming session is recorded so `roster` can group claims by the
+        // session (and its children) that holds them - an agent name alone cannot
+        // tell a parent from its subagents.
+        t.session = session;
+        // A subagent records the session it ran under, so the parent's roster
+        // finds it without the parent tracking each child by hand.
+        if (parent) t.parent = parent;
         t.status = "claimed";
         t.claimedAt = iso();
         t.updatedAt = iso();
@@ -381,22 +460,25 @@ function cmdTask(sub, flags) {
             console.error(`track task claim: --id <id> is required`);
             return 2;
         }
-        const by = agentId(flags);
-        const r = claimTask(id, by);
+        const ctx = claimContext(flags);
+        const r = claimTask(id, ctx);
         if (r.rc !== 0) {
             console.error(`track: cannot claim '${id}': ${r.reason}`);
             return 2;
         }
-        console.log(`task ${id}: claimed by ${by}`);
+        console.log(
+            `task ${id}: claimed by ${ctx.by}${ctx.parent ? ` (session ${ctx.session}, under ${ctx.parent})` : ` (session ${ctx.session})`}`,
+        );
         return 0;
     }
 
     if (sub === "next") {
-        const by = agentId(flags);
+        const ctx = claimContext(flags);
+        const by = ctx.by;
         const all = loadAllTasks().sort(byCreatedThenId);
         const ready = all.filter((t) => t.status === "todo" && (!t.owner || t.owner === by) && !hasOpenDep(t, all));
         for (const cand of ready) {
-            const r = claimTask(cand.id, by);
+            const r = claimTask(cand.id, ctx);
             if (r.rc === 0) {
                 console.log(`task ${cand.id}: assigned to ${by}`);
                 console.log(`  ${cand.title}`);
@@ -514,6 +596,268 @@ function cmdTask(sub, flags) {
     return 2;
 }
 
+// ---- roster -----------------------------------------------------------------
+
+// Every claim held by a session AND by its descendants, so a parent agent sees
+// what its subagents claimed without asking each one. The link is `parent` on a
+// claim; the walk is transitive because a child may itself dispatch a child.
+function cmdRoster(flags) {
+    const root = currentSession(flags);
+    const all = loadAllTasks();
+    const sessions = new Set([root]);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const t of all) {
+            const s = taskSession(t);
+            if (t.parent && sessions.has(t.parent) && !sessions.has(s)) {
+                sessions.add(s);
+                changed = true;
+            }
+        }
+    }
+    const tasks = all.filter((t) => sessions.has(taskSession(t))).sort(byCreatedThenId);
+    if (flags.json) {
+        process.stdout.write(JSON.stringify({ session: root, sessions: [...sessions].sort(), tasks }, null, 2) + "\n");
+        return 0;
+    }
+    console.log(`roster for '${root}': ${tasks.length} claim(s) across ${sessions.size} session(s)`);
+    for (const t of tasks) {
+        console.log(`  ${String(t.status).padEnd(11)} ${t.id} @${taskSession(t)}  ${t.title}`);
+    }
+    return 0;
+}
+
+// ---- export / import --------------------------------------------------------
+
+function byId(a, b) {
+    return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+}
+
+function bySessionId(a, b) {
+    return String(a.sessionId) < String(b.sessionId) ? -1 : String(a.sessionId) > String(b.sessionId) ? 1 : 0;
+}
+
+function loadAllPlans() {
+    if (!existsSync(CHATS)) return [];
+    const out = [];
+    for (const name of readdirSync(CHATS)) {
+        if (!name.endsWith(".plan.json")) continue;
+        const p = readJson(join(CHATS, name));
+        if (p && p.sessionId) out.push(p);
+    }
+    return out;
+}
+
+// Default to a path a commit carries: inside the repo, beside the tracker
+// definition, so `git add .agentq/state.json` publishes this machine's live state.
+function defaultStatePath() {
+    return join(process.cwd(), ".agentq", "state.json");
+}
+
+// Export ONE deterministic JSON: keys sorted at every depth, arrays stably
+// ordered by id/sessionId, the only time-varying field the explicit exportedAt.
+// Two exports of the same state differ in exactly that one line, so a diff in git
+// is a real state change and nothing else.
+function cmdExport(flags) {
+    const out = flags.out && flags.out !== true ? resolve(flags.out) : defaultStatePath();
+    const tasks = loadAllTasks().sort(byId);
+    const plans = loadAllPlans().sort(bySessionId);
+    const payload = { version: 1, exportedAt: iso(), tasks, plans };
+    writeJsonAtomic(out, sortKeysDeep(payload));
+    console.log(`export: ${tasks.length} task(s), ${plans.length} plan(s) -> ${out}`);
+    return 0;
+}
+
+// Merge ONE incoming record into the local store, conservatively. The rule is
+// never to lose a local claim and never to overwrite a newer local record; when
+// neither side can be chosen safely it is a CONFLICT, reported, and the local
+// record is left untouched. Runs under the same exclusive lock a claim uses, so
+// an import cannot race a concurrent claim.
+function mergeRecord(file, incoming, key) {
+    return withLock(file, () => {
+        const local = readJson(file);
+        if (!local) {
+            writeJsonAtomic(file, incoming);
+            return { action: "added" };
+        }
+        if (canonical(local) === canonical(incoming)) return { action: "unchanged" };
+        // A local claim that the incoming record would drop or change is a
+        // conflict: another machine's state must never release a claim held here.
+        if (local.owner && local.owner !== incoming.owner) {
+            return {
+                action: "conflict",
+                conflict: {
+                    kind: "owner-divergence",
+                    id: key,
+                    local: local.owner,
+                    incoming: incoming.owner || "(none)",
+                },
+            };
+        }
+        const cmp = compareTs(local.updatedAt, incoming.updatedAt);
+        if (cmp > 0) {
+            return {
+                action: "conflict",
+                conflict: {
+                    kind: "newer-local",
+                    id: key,
+                    local: local.updatedAt,
+                    incoming: incoming.updatedAt || "(none)",
+                },
+            };
+        }
+        if (cmp < 0) {
+            writeJsonAtomic(file, incoming);
+            return { action: "updated" };
+        }
+        // Same timestamp, different content, no claim at stake: still ambiguous.
+        return { action: "conflict", conflict: { kind: "divergence", id: key } };
+    });
+}
+
+function cmdImport(flags) {
+    const inPath = flags.in && flags.in !== true ? resolve(flags.in) : defaultStatePath();
+    const data = readJson(inPath);
+    if (!data) {
+        console.error(`track import: cannot read ${inPath}`);
+        return 2;
+    }
+    const report = {
+        path: inPath,
+        source: data.exportedAt || null,
+        added: [],
+        updated: [],
+        unchanged: [],
+        conflicts: [],
+    };
+    for (const t of data.tasks || []) {
+        if (!t || !t.id) continue;
+        const file = taskFile(t.id);
+        if (!file) {
+            report.conflicts.push({ kind: "bad-id", id: t.id });
+            continue;
+        }
+        const r = mergeRecord(file, t, t.id);
+        if (r.action === "conflict") report.conflicts.push(r.conflict);
+        else report[r.action].push(t.id);
+    }
+    for (const p of data.plans || []) {
+        if (!p || !p.sessionId) continue;
+        const r = mergeRecord(planFile(p.sessionId), p, p.sessionId);
+        if (r.action === "conflict") report.conflicts.push(r.conflict);
+        else report[r.action].push(p.sessionId);
+    }
+    if (flags.json) {
+        process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    } else {
+        console.log(
+            `import ${report.path}: +${report.added.length} added, ~${report.updated.length} updated, ` +
+                `=${report.unchanged.length} unchanged, !${report.conflicts.length} conflict(s)`,
+        );
+        for (const c of report.conflicts) {
+            const extra = c.local !== undefined ? ` (local ${c.local}, incoming ${c.incoming})` : "";
+            console.log(`  conflict [${c.kind}] ${c.id}${extra}`);
+        }
+    }
+    // A conflict is unresolved by definition: exit non-zero so a script cannot
+    // mistake "merged with doubts" for "merged".
+    return report.conflicts.length > 0 ? 1 : 0;
+}
+
+// ---- drift ------------------------------------------------------------------
+
+// Does a repo's live definition still agree with the index that was built from
+// it? Recomputed with scanRepo - the very function that wrote the index - so the
+// two sides are compared against one definition of a drift finding, never a fork.
+function cmdDrift(flags) {
+    const root = flags.repo && flags.repo !== true ? resolve(flags.repo) : process.cwd();
+    let live;
+    try {
+        live = scanRepo(root);
+    } catch (e) {
+        console.error(`track drift: scan of ${root} failed: ${e.message}`);
+        return 2;
+    }
+    if (!live) {
+        console.error(`track drift: no .agentq/trackers.json under ${root}`);
+        return 2;
+    }
+    const index = existsSync(INDEX) ? readJson(INDEX) : null;
+    const repos = index && Array.isArray(index.repos) ? index.repos : [];
+    const norm = (p) => (p ? resolve(String(p)) : "");
+    const recorded = repos.find((r) => norm(r.root) === norm(live.root) || r.repo === live.repo) || null;
+    const findings = [];
+    if (!recorded) {
+        findings.push({
+            kind: "repo-not-indexed",
+            ref: live.repo,
+            detail: `no index entry for ${live.root}; rebuild with tracker-lint --scan`,
+        });
+    } else {
+        const liveT = new Map((live.trackers || []).map((t) => [t.id, t]));
+        const recT = new Map((recorded.trackers || []).map((t) => [t.id, t]));
+        for (const [id, t] of liveT) {
+            const r = recT.get(id);
+            if (!r) {
+                findings.push({
+                    kind: "tracker-not-indexed",
+                    ref: id,
+                    detail: "tracker in the definition, not in the index",
+                });
+                continue;
+            }
+            const li = (t.items || []).length;
+            const ri = (r.items || []).length;
+            if (li !== ri) findings.push({ kind: "row-count", ref: id, detail: `index ${ri}, definition ${li}` });
+            const lc = t.countsByStatus || {};
+            const rc = r.countsByStatus || {};
+            for (const s of new Set([...Object.keys(lc), ...Object.keys(rc)])) {
+                if ((lc[s] || 0) !== (rc[s] || 0))
+                    findings.push({
+                        kind: "status-count",
+                        ref: `${id}:${s}`,
+                        detail: `index ${rc[s] || 0}, definition ${lc[s] || 0}`,
+                    });
+            }
+        }
+        for (const id of recT.keys()) {
+            if (!liveT.has(id))
+                findings.push({ kind: "tracker-removed", ref: id, detail: "index tracker gone from the definition" });
+        }
+        const key = (d) => `${d.kind}|${d.tracker}|${d.ref}`;
+        const recKeys = new Set((recorded.drift || []).map(key));
+        for (const d of live.drift || []) {
+            if (!recKeys.has(key(d)))
+                findings.push({
+                    kind: "drift-not-indexed",
+                    ref: d.ref,
+                    detail: `${d.kind} (${d.tracker}) - live, absent from the index`,
+                });
+        }
+        const liveKeys = new Set((live.drift || []).map(key));
+        for (const d of recorded.drift || []) {
+            if (!liveKeys.has(key(d)))
+                findings.push({
+                    kind: "stale-drift",
+                    ref: d.ref,
+                    detail: `${d.kind} (${d.tracker}) - in the index, not in the definition`,
+                });
+        }
+    }
+    if (flags.json) {
+        process.stdout.write(
+            JSON.stringify({ repo: live.repo, root: live.root, indexed: !!recorded, findings }, null, 2) + "\n",
+        );
+    } else if (findings.length === 0) {
+        console.log(`drift ${live.repo}: clean (definition agrees with the index)`);
+    } else {
+        console.log(`drift ${live.repo}: ${findings.length} disagreement(s) with the index`);
+        for (const f of findings) console.log(`  [${f.kind}] ${f.ref} - ${f.detail}`);
+    }
+    return findings.length === 0 ? 0 : 1;
+}
+
 // ---- dispatch ---------------------------------------------------------------
 
 function usage() {
@@ -530,6 +874,10 @@ function usage() {
             `  track task done  --id <id> [--evidence s]`,
             `  track task show  --id <id> [--json]`,
             `  track task list  [--json]`,
+            `  track roster [--session <id>] [--json]`,
+            `  track export [--out <path>]      (default .agentq/state.json in the repo)`,
+            `  track import [--in  <path>] [--json]`,
+            `  track drift  [--repo <dir>] [--json]`,
         ].join("\n"),
     );
 }
@@ -544,6 +892,10 @@ export function run(argv) {
     if (cmd === "status") return cmdStatus(flags);
     if (cmd === "plan") return cmdPlan(pos[1], flags);
     if (cmd === "task") return cmdTask(pos[1], flags);
+    if (cmd === "roster") return cmdRoster(flags);
+    if (cmd === "export") return cmdExport(flags);
+    if (cmd === "import") return cmdImport(flags);
+    if (cmd === "drift") return cmdDrift(flags);
     usage();
     return 2;
 }

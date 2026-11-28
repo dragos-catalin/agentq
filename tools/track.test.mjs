@@ -194,3 +194,158 @@ test("status with an empty index reports zero and exits 0", () => {
         rmSync(s, { recursive: true, force: true });
     }
 });
+
+// Non-vacuous proof for the roster test: remove the `t.parent && sessions.has(...)`
+// branch in cmdRoster and the child's claim (t2) drops out of its parent's roster,
+// so `assert.deepEqual(roster.tasks.map(...), ["t1","t2"])` fails.
+test("roster lists a session's claims and its children's, but not an unrelated one", () => {
+    const s = makeState();
+    try {
+        assert.equal(run(s, "task", "add", "--id", "t1", "--title", "one").code, 0);
+        assert.equal(run(s, "task", "add", "--id", "t2", "--title", "two").code, 0);
+        assert.equal(run(s, "task", "add", "--id", "t3", "--title", "three").code, 0);
+        assert.equal(run(s, "task", "claim", "--id", "t1", "--by", "A", "--session", "s-parent").code, 0);
+        assert.equal(
+            run(s, "task", "claim", "--id", "t2", "--by", "B", "--session", "s-child", "--parent", "s-parent").code,
+            0,
+        );
+        assert.equal(run(s, "task", "claim", "--id", "t3", "--by", "C", "--session", "s-other").code, 0);
+        const r = run(s, "roster", "--session", "s-parent", "--json");
+        assert.equal(r.code, 0, r.stderr);
+        const roster = JSON.parse(r.stdout);
+        assert.deepEqual(roster.sessions, ["s-child", "s-parent"]);
+        assert.deepEqual(roster.tasks.map((t) => t.id).sort(), ["t1", "t2"]);
+        // a claim written before `session` existed falls back to its owner
+        writeFileSync(
+            join(s, "tasks", "t5.json"),
+            JSON.stringify({
+                version: 1,
+                id: "t5",
+                title: "five",
+                status: "claimed",
+                owner: "legacy",
+                createdAt: "2026-01-01T00:00:00Z",
+                updatedAt: "2026-01-01T00:00:00Z",
+            }),
+            "utf8",
+        );
+        const legacy = JSON.parse(run(s, "roster", "--session", "legacy", "--json").stdout);
+        assert.deepEqual(
+            legacy.tasks.map((t) => t.id),
+            ["t5"],
+        );
+    } finally {
+        rmSync(s, { recursive: true, force: true });
+    }
+});
+
+// Non-vacuous proof: drop the `plans`/`tasks` arrays from the export payload and
+// the import has nothing to add, so `t.owner === "A"` fails on the fresh state.
+test("export then import carries tasks and plans to a fresh state without loss", () => {
+    const s1 = makeState();
+    const s2 = makeState();
+    const file = join(s1, "state.json");
+    try {
+        assert.equal(run(s1, "task", "add", "--id", "t1", "--title", "one").code, 0);
+        assert.equal(run(s1, "task", "claim", "--id", "t1", "--by", "A", "--session", "s1").code, 0);
+        assert.equal(run(s1, "plan", "set", "--session", "p1", "--goal", "g").code, 0);
+        const e = run(s1, "export", "--out", file);
+        assert.equal(e.code, 0, e.stderr);
+        // deterministic: two exports of one state differ only in exportedAt
+        const file2 = join(s1, "state2.json");
+        assert.equal(run(s1, "export", "--out", file2).code, 0);
+        const strip = (p) => readFileSync(p, "utf8").replace(/"exportedAt":\s*"[^"]*"/, '"exportedAt":"X"');
+        assert.equal(strip(file), strip(file2), "two exports of one state differ only in exportedAt");
+        // import into a fresh state
+        const i = run(s2, "import", "--in", file);
+        assert.equal(i.code, 0, i.stderr);
+        const t = JSON.parse(run(s2, "task", "show", "--id", "t1", "--json").stdout);
+        assert.equal(t.owner, "A");
+        assert.equal(t.session, "s1");
+        const plan = JSON.parse(run(s2, "plan", "show", "--session", "p1", "--json").stdout);
+        assert.equal(plan.goal, "g");
+    } finally {
+        rmSync(s1, { recursive: true, force: true });
+        rmSync(s2, { recursive: true, force: true });
+    }
+});
+
+// Non-vacuous proof: delete the `if (local.owner && local.owner !== incoming.owner)`
+// line in mergeRecord and the import overwrites the local claim (exit 0), so both
+// `assert.equal(i.code, 1)` and `assert.equal(t.owner, "B")` fail.
+test("import refuses to overwrite a local claim and exits non-zero", () => {
+    const s1 = makeState();
+    const s2 = makeState();
+    const file = join(s1, "state.json");
+    try {
+        assert.equal(run(s1, "task", "add", "--id", "t1", "--title", "one").code, 0);
+        assert.equal(run(s1, "task", "claim", "--id", "t1", "--by", "A", "--session", "src").code, 0);
+        assert.equal(run(s1, "export", "--out", file).code, 0);
+        assert.equal(run(s2, "task", "add", "--id", "t1", "--title", "one").code, 0);
+        assert.equal(run(s2, "task", "claim", "--id", "t1", "--by", "B", "--session", "dst").code, 0);
+        const i = run(s2, "import", "--in", file);
+        assert.equal(i.code, 1, `a conflict must exit non-zero; got ${i.code} - ${i.stdout}`);
+        assert.match(i.stdout, /owner-divergence/);
+        const t = JSON.parse(readFileSync(join(s2, "tasks", "t1.json"), "utf8"));
+        assert.equal(t.owner, "B", "the local claim is not overwritten");
+    } finally {
+        rmSync(s1, { recursive: true, force: true });
+        rmSync(s2, { recursive: true, force: true });
+    }
+});
+
+// Non-vacuous proof: remove the `row-count` comparison in cmdDrift and the stale
+// index passes as clean, so `assert.equal(d.code, 1)` fails.
+test("drift exits non-zero on a stale index and 0 when the definition agrees", () => {
+    const s = makeState();
+    const repo = makeState();
+    try {
+        mkdirSync(join(repo, ".agentq"), { recursive: true });
+        writeFileSync(
+            join(repo, ".agentq", "trackers.json"),
+            JSON.stringify({
+                version: 1,
+                repo: "vt",
+                trackers: [
+                    {
+                        id: "t",
+                        file: "t.csv",
+                        format: "csv",
+                        columns: { id: "id", title: "title", status: "status" },
+                        status: { map: { todo: "todo", done: "done" } },
+                    },
+                ],
+            }),
+            "utf8",
+        );
+        writeFileSync(join(repo, "t.csv"), "id,title,status\nT-1,one,todo\nT-2,two,done\n", "utf8");
+        mkdirSync(join(s, "trackers"), { recursive: true });
+        const idx = (items, counts) => ({
+            version: 1,
+            generatedAt: "x",
+            repos: [
+                {
+                    repo: "vt",
+                    root: repo,
+                    trackers: [{ id: "t", file: "t.csv", countsByStatus: counts, items }],
+                    drift: [],
+                },
+            ],
+        });
+        // an index that matches the live definition -> clean
+        writeFileSync(
+            join(s, "trackers", "index.json"),
+            JSON.stringify(idx([{ id: "T-1" }, { id: "T-2" }], { todo: 1, done: 1 })),
+            "utf8",
+        );
+        assert.equal(run(s, "drift", "--repo", repo).code, 0);
+        // a stale index (one row short) -> non-zero, row-count reported
+        writeFileSync(join(s, "trackers", "index.json"), JSON.stringify(idx([{ id: "T-1" }], { todo: 2 })), "utf8");
+        const d = run(s, "drift", "--repo", repo);
+        assert.equal(d.code, 1, `a stale index must exit non-zero; got ${d.code} - ${d.stdout}`);
+        assert.match(d.stdout, /row-count/);
+    } finally {
+        rmSync(s, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+    }
+});
