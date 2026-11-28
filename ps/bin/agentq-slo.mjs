@@ -189,6 +189,7 @@ const newSlots = () => ({
     expireLiveChat: 0,
     breakLiveChat: 0,
     breakByOwnChat: 0,
+    ownerGoneExcluded: 0,
     leaseBreaks: 0,
     leaseExpires: 0,
 });
@@ -291,17 +292,27 @@ export async function compute(lines, { days = 7, now = null, home = null } = {})
         // slots lost while a chat was still alive (new optional fields: chats, chatIdleMin, byChat)
         if (ev === "lease-expire" || ev === "lease-break") {
             const sl = SL(repo);
-            const live = Number.isFinite(o.chatIdleMin) && o.chatIdleMin <= TARGETS.liveChatIdleMin;
-            if (ev === "lease-expire") {
-                sl.leaseExpires++;
-                if (live) {
+            if (ev === "lease-expire") sl.leaseExpires++;
+            else sl.leaseBreaks++;
+            // OQ-004 (2026-11-28). `chatIdleMin` is a PROXY for "the holder's chat was alive", and it is the
+            // wrong one when the end is correct by construction. Two fields carry the proof instead, and
+            // either one means no chat lost a slot it was working in:
+            //   ownerGone - the lease's recorded owner pid was already dead (pid + procStart). That is the
+            //               scheduled dead-lease reaper's own path: it proves death BEFORE it releases, so
+            //               counting it as a loss made the target of 0 unreachable while the reaper runs.
+            //   bySelf    - the session ending the lease IS the holder (a sweep inside its own agentq call),
+            //               so no other chat's context was reset.
+            // Absent on older lines, and absent means "unknown" - still counted, never silently hidden.
+            if (o.ownerGone === true || o.bySelf === true) {
+                sl.ownerGoneExcluded++;
+            } else if (ev === "lease-expire") {
+                if (Number.isFinite(o.chatIdleMin) && o.chatIdleMin <= TARGETS.liveChatIdleMin) {
                     sl.expireLiveChat++;
                     sl.lostLiveChat++;
                 }
             } else {
-                sl.leaseBreaks++;
                 if (o.byChat === true) sl.breakByOwnChat++;
-                else if (live) {
+                else if (Number.isFinite(o.chatIdleMin) && o.chatIdleMin <= TARGETS.liveChatIdleMin) {
                     sl.breakLiveChat++;
                     sl.lostLiveChat++;
                 }
@@ -977,7 +988,10 @@ export function render(rep) {
     );
     for (const d of rep.overall.lostWork.details.slice(0, 10)) out.push(`  ! ${d}`);
     out.push(
-        `\nSLOTS LOST WITH A LIVE CHAT (chat idle <= ${TARGETS.liveChatIdleMin} min; lease-break ${sl.leaseBreaks}, lease-expire ${sl.leaseExpires} in window)`,
+        `\nSLOTS LOST WITH A LIVE CHAT (chat idle <= ${TARGETS.liveChatIdleMin} min; lease-break ${sl.leaseBreaks}, lease-expire ${sl.leaseExpires} in window)` +
+            (sl.ownerGoneExcluded
+                ? ` - ${sl.ownerGoneExcluded} not counted (owner proven dead, or ended by the holder's own session)`
+                : ""),
     );
     out.push(
         table(

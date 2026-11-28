@@ -192,6 +192,7 @@ assert.deepEqual(rep.slots.byRepo.r, {
     expireLiveChat: 0,
     breakLiveChat: 0,
     breakByOwnChat: 0,
+    ownerGoneExcluded: 0,
     leaseBreaks: 1,
     leaseExpires: 2,
 });
@@ -374,6 +375,29 @@ const lines2 = [
     j({ ts: TS("04:13:00"), event: "lease-break", resource: "slot:beta:task-1", chats: 2, chatIdleMin: 10 }), // lost (byChat absent), repo from the resource
     j({ ts: TS("04:14:00"), event: "lease-break", repo: "beta", resource: "slot:beta:task-2" }), // older line, no fields
     j({ ts: TS("04:15:00"), event: "lease-break", repo: "beta", resource: "slot:beta:task-3", byChat: true }), // own chat
+    // OQ-004: an end that carries a PROOF of why it is not a loss. Both would have counted as lost under
+    // the old chatIdleMin-only rule (idle 1 and 2 min, byChat false), so these two fixtures are what pins
+    // the exclusion - drop it from compute() and rep2.slots.lostLiveChat reads 6 instead of 4.
+    j({
+        ts: TS("04:16:00"),
+        event: "lease-break",
+        repo: "alpha",
+        resource: "slot:alpha:task-4",
+        chats: 1,
+        chatIdleMin: 1,
+        byChat: false,
+        ownerGone: true,
+    }), // proven-dead owner: the reaper's own path, not a loss
+    j({
+        ts: TS("04:17:00"),
+        event: "lease-expire",
+        repo: "alpha",
+        resource: "slot:alpha:task-5",
+        chats: 1,
+        chatIdleMin: 2,
+        byChat: false,
+        bySelf: true,
+    }), // the holder ended its own lease: no other chat was interrupted
     // shared clone writes
     j({ ts: TS("05:00:00"), event: "shared-write", repo: "alpha", mode: "warn", paths: "src/a.ts" }),
     j({ ts: TS("05:01:00"), event: "shared-write", repo: "alpha", mode: "refuse", override: true, paths: "src/b.ts" }),
@@ -484,21 +508,25 @@ try {
         expireLiveChat: 2,
         breakLiveChat: 1,
         breakByOwnChat: 1,
-        leaseBreaks: 3,
-        leaseExpires: 4,
+        ownerGoneExcluded: 2,
+        leaseBreaks: 4,
+        leaseExpires: 5,
     });
     assert.deepEqual(rep2.slots.byRepo.beta, {
         lostLiveChat: 1,
         expireLiveChat: 0,
         breakLiveChat: 1,
         breakByOwnChat: 1,
+        ownerGoneExcluded: 0,
         leaseBreaks: 3,
         leaseExpires: 1,
     });
     assert.equal(rep2.slots.lostLiveChat, 4);
     assert.equal(rep2.slots.breakByOwnChat, 2);
-    assert.equal(rep2.slots.leaseBreaks, 6);
-    assert.equal(rep2.slots.leaseExpires, 5);
+    // the two proof-carrying ends are excluded, and the totals they used to inflate do not move
+    assert.equal(rep2.slots.ownerGoneExcluded, 2);
+    assert.equal(rep2.slots.leaseBreaks, 7);
+    assert.equal(rep2.slots.leaseExpires, 6);
     assert.deepEqual(rep2.slo.slotsLostLiveChat, { verdict: "FAIL", value: 4, target: "= 0" });
 
     // hook cost: cost per call = ms + startMs, day = UTC date of ts (not of the file name)
@@ -558,8 +586,8 @@ try {
         waitsOver10min: 4,
         busiestQueue: { resource: "deploy:alpha", hours: 1 },
         landFailureRate: 3 / 9,
-        leaseBreaks: 6,
-        leaseExpires: 5,
+        leaseBreaks: 7,
+        leaseExpires: 6,
         sharedCloneWrites: 1,
         sharedCloneOverrides: 1,
         hookCostHoursPerDay: 7700 / 3.6e6 / 2,
@@ -577,7 +605,7 @@ try {
     assert.match(txt2, /waits over 10 min\s+4\n/);
     assert.match(txt2, /busiest queue\s+deploy:alpha 1\.0 h/);
     assert.match(txt2, /land failure rate\s+33\.3% \(3 of 9\)/);
-    assert.match(txt2, /lease-break \/ lease-expire\s+6 \/ 5/);
+    assert.match(txt2, /lease-break \/ lease-expire\s+7 \/ 6/);
     assert.match(txt2, /shared clone writes\s+1 \(\+1 overrides\)/);
     assert.match(txt2, /hook cost\s+0\.00 h\/day/);
     assert.match(txt2, /startProbeBucketsPct\s+50\s+>= 95\s+FAIL/);
@@ -587,8 +615,9 @@ try {
     assert.match(txt2, /build:alpha\s+3\s+10\.0m\s+11\.7m\s+11\.7m\s+23\.4m\s+2\n/);
     assert.match(txt2, /LAND TICKET/);
     assert.match(txt2, /alpha\s+4\s+2\s+5\s+44\.8m\s+9\.0m\s+20\.0m\s+1\s+19\.0m\s+2\s+1\s+1\s+1\s+3\s+1\n/);
-    assert.match(txt2, /SLOTS LOST WITH A LIVE CHAT \(chat idle <= 30 min; lease-break 6, lease-expire 5 in window\)/);
-    assert.match(txt2, /ALL\s+4\s+2\s+2\s+2\s+6\s+5/);
+    assert.match(txt2, /SLOTS LOST WITH A LIVE CHAT \(chat idle <= 30 min; lease-break 7, lease-expire 6 in window\)/);
+    assert.match(txt2, /2 not counted \(owner proven dead, or ended by the holder's own session\)/);
+    assert.match(txt2, /ALL\s+4\s+2\s+2\s+2\s+7\s+6/);
     assert.match(txt2, /HOOK COST/);
     assert.match(txt2, /2026-10-17\s+5\s+0\.00\s+1000\s+3600\s+800\s+2\n/);
     assert.match(txt2, /START PROBE/);

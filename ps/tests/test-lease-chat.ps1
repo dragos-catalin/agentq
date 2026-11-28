@@ -182,7 +182,7 @@ try {
   Check '8 a long -Reason alone does not override it' ($code -eq 3 -and (Test-Path $lf)) "$code | $o"
   $o = AQ unlease -Repo $lc.path -LeaseId $lc.leaseId -Slot $la.slot -Force -Reason 'holder is dead, the chat file is stale-fresh'
   $br = Journal 'lease-break' | Select-Object -Last 1
-  Check '8 -Force -Reason breaks it and the SLO still counts it (byChat=false, chatIdleMin small)' ($code -eq 0 -and $br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1) "$code | $o | $($br | ConvertTo-Json -Compress)"
+  Check '8 -Force -Reason breaks it and the SLO still counts it (byChat=false, chatIdleMin small, owner ALIVE so ownerGone=false)' ($code -eq 0 -and $br.ticket -eq $lc.leaseId -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3 -and $br.chats -eq 1 -and $br.ownerGone -eq $false) "$code | $o | $($br | ConvertTo-Json -Compress)"
   Check '8 the slot is free after the forced break' (-not (Test-Path $lf))
 
   # 9 the release runs from a SCRIPT FILE: the command names only the script. The hook reads the script for a
@@ -207,6 +207,32 @@ try {
   $other = Join-Path $tmp 'build.ps1'; [IO.File]::WriteAllText($other, "'building'`n")
   $r = Cmd 'chat-9' "pwsh -NoProfile -File `"$other`"; pwsh -NoProfile -File `"$tmp\missing.ps1`""
   Check '9 a script without a release, and a missing script: allowed, nothing recorded' ($r.code -eq 0 -and $r.out -notmatch '"deny"' -and -not (Test-Path "$lf.release"))
+
+  # 10 OQ-004: the PROOF, not the proxy. Step 8's forced break is legitimate and MUST keep counting, so the
+  #    journal has to carry WHY an end was not a loss rather than the SLO guessing from chatIdleMin. The
+  #    scheduled dead-lease reaper runs exactly this shape: it proves the owner dead (pid gone, or a live pid
+  #    whose start time disagrees) and then releases; the chat file ages only while a call NAMES the slot, so
+  #    a chat whose host died mid-task leaves it looking fresh. Measured live 2026-11-28: every one of the
+  #    11 / 58 / 77 "slots lost with a live chat" over the 24 / 168 / 336 h windows was this path, and the
+  #    SLO's target of 0 was unreachable while the reaper did its job.
+  # freed with the shape step 8 already proves (-Force + an explicit reason). Step 9 covers the own-chat
+  # release path; this line exists only to hand the slot back so the reaper case starts from a free slot.
+  # NB the release runs through AQ (the executor): `Cmd` only puts the command through the guard.
+  $env:AGENTQ_SESSION = 'chat-9'
+  $uo = AQ unlease -Repo $le.path -LeaseId $le.leaseId -Force -Reason 'step 10 setup: free the slot'
+  Check '10 the slot is free for the reaper case' (-not (Test-Path $lf)) "code=$code out=$uo"
+  $env:AGENTQ_SESSION = 'owner-F'
+  $o = AQ lease -Slot $la.slot -Purpose 'reaper case: owner gone, chat file still fresh' -Json; $lw = $o -split "`n" | Where-Object { $_ -match '^\{.*leaseId' } | Select-Object -Last 1 | ConvertFrom-Json
+  $null = Edit 'chat-10' (Join-Path $lw.path 'a.txt')
+  # ages the lease and sets pid 999999 with procStart null (a dead owner) but does NOT touch .chat: that gap
+  # between the two clocks is the whole defect - the chat keeps looking live after its host process is gone
+  Age $lf 90
+  $l = Lease $lw.leaseId
+  Check '10 the trap: a proven-dead owner whose chat file still looks fresh' ($l.alive -eq $false -and $l.chatIdleMin -lt 3) "alive=$($l.alive) chatIdleMin=$($l.chatIdleMin)"
+  $env:AGENTQ_SESSION = 'reaper'
+  $o = AQ unlease -Repo $lw.path -LeaseId $lw.leaseId -Force -Reason 'slot owner process is gone (scheduled dead-lease reaper)'
+  $br = Journal 'lease-break' | Select-Object -Last 1
+  Check '10 a break of a PROVEN-DEAD owner says ownerGone=true, so the SLO can stop counting it' ($code -eq 0 -and $br.ticket -eq $lw.leaseId -and $br.ownerGone -eq $true -and $br.bySelf -eq $false -and $br.byChat -eq $false -and $br.chatIdleMin -lt 3) "code=$code ownerGone=$($br.ownerGone) bySelf=$($br.bySelf) byChat=$($br.byChat) chatIdleMin=$($br.chatIdleMin) | $($br | ConvertTo-Json -Compress)"
 } finally {
   Pop-Location
   foreach ($v in 'AGENTQ_HOME', 'CODAI_WT_ROOT', 'CODAI_GH_ROOT', 'AGENTQ_CONFIG', 'AGENTQ_SESSION', 'AGENTQ_NO_SIGNAL', 'AGENTQ_NO_REGISTRY', 'AGENTQ_NO_ENV_COPY', 'AGENTQ_NO_PREP', 'AGENTQ_NO_ADMISSION', 'AGENTQ_NO_PRUNE', 'AGENTQ_NO_CHAT_KEEPALIVE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
