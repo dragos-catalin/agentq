@@ -74,6 +74,51 @@ Check 'a healthy fetch still completes fast' (-not $r2.hung -and $r2.ms -lt 3000
 $ev2 = @(JournalLines | Where-Object { $_ -match 'git-net-timeout' })
 Check 'a healthy fetch is not recorded as a timeout' ($ev2.Count -eq $ev.Count) "timeout events grew from $($ev.Count) to $($ev2.Count)"
 
+# ---- 3. the OTHER half of the same defect: bin/git-autosync.ps1's G / Invoke-GitBounded ----------
+# The daemon runs every 15 min x 24 repos, so an unbounded verb there is the same wedge with a
+# 15-minute repetition trigger. G is the wrapper every call site uses: a NETWORK verb (first
+# non-dash token in fetch|push|ls-remote|clone|pull) goes through Invoke-GitBounded, every LOCAL
+# verb must stay byte-identical to `& git ...` because the callers parse ls-tree -r -z, cat-file
+# and diff-tree. The two functions are extracted with the AST by NAME, so this never runs the
+# daemon's main body and does not break when the file's line numbers move.
+$auto = Join-Path $PSScriptRoot '..\bin\git-autosync.ps1'
+$auto = (Resolve-Path $auto).Path
+$autoAst = [System.Management.Automation.Language.Parser]::ParseFile($auto, [ref]$null, [ref]$null)
+$fns = @($autoAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('G', 'Invoke-GitBounded') }, $true))
+foreach ($fn in $fns) { . ([scriptblock]::Create($fn.Extent.Text)) }
+Check 'git-autosync G and Invoke-GitBounded are extractable by AST' ($fns.Count -eq 2) "found $($fns.Count) of 2"
+
+if ($fns.Count -eq 2) {
+  # 3a. local verb: verbatim args, verbatim result (the callers parse it).
+  $sha = G $repo rev-parse HEAD
+  Check 'autosync local verb returns the sha' ("$sha" -match '^[0-9a-f]{40}$') "got '$sha'"
+  $sha2 = G $repo -c core.autocrlf=false rev-parse HEAD
+  Check 'autosync keeps arguments verbatim (a -c flag before the verb still reaches git)' ("$sha2" -match '^[0-9a-f]{40}$') "got '$sha2'"
+
+  # 3b. network verb: still works, and returns git's lines.
+  $ls = @(G $repo ls-remote origin)
+  Check 'autosync network verb returns the refs' (@($ls | Where-Object { $_ -match 'refs/heads/main' }).Count -ge 1) "got '$($ls -join '|')'"
+  Check 'autosync network verb succeeded' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+
+  # 3c. the wedge: killed at the bound, exit 124, and the diagnostic goes to the stderr a job log keeps.
+  git -C $repo remote set-url origin "ext::pwsh -NoProfile -File $hang %S"
+  $env:AGENTQ_GIT_NET_TIMEOUT_SEC = '5'
+  $errSw = [IO.StringWriter]::new(); $origErr = [Console]::Error; [Console]::SetError($errSw)
+  try {
+    $sw3 = [Diagnostics.Stopwatch]::StartNew()
+    $null = G $repo fetch -q
+    $sw3.Stop(); $killExit = $LASTEXITCODE
+  } finally {
+    [Console]::SetError($origErr); Remove-Item Env:\AGENTQ_GIT_NET_TIMEOUT_SEC -ErrorAction SilentlyContinue
+  }
+  Check 'autosync kills a wedged network verb at the bound' ($sw3.ElapsedMilliseconds -lt 40000) "took $($sw3.ElapsedMilliseconds) ms"
+  Check 'autosync reports the kill as exit 124' ($killExit -eq 124) "exit=$killExit"
+  Check 'autosync writes the kill diagnostic to stderr' ([bool]("$($errSw.ToString())" -match 'did not finish in 5s')) "stderr='$("$($errSw.ToString())".Trim())'"
+  git -C $repo remote set-url origin $bare
+  $null = G $repo fetch -q
+  Check 'autosync control: a healthy fetch is not killed' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+}
+
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Write-Host "fail=$fail"
 exit ([int]($fail -gt 0))
