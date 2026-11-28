@@ -171,7 +171,8 @@
       "agentq approve",
       "takeover chat",
       "args comma",
-      "lease spawns"
+      "lease spawns",
+      "text encoding"
     ]
   },
   "sharedCloneMode": "warn",

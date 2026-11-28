@@ -18,10 +18,14 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const TEST_FILE = String.raw`[\w@./\\-]+\.(?:test|spec)\.[cm]?[jt]sx?`;
+// The regex below is ABOUT the character set: its alternatives deliberately contain the CP437
+// re-encodings of the marks vitest/turbo emit, which is what a cloud job's stdout becomes when it is
+// decoded through the OEM code page. ps/tests/test-text-encoding.ps1 bans that class everywhere else,
+// so this one line carries its escape marker (see the tail of that regex).
 // turbo prefixes every line with "<pkg>:<task>: "; vitest projects add "|name|".
 const TURBO_PREFIX = /^([@\w./-]+):([\w:-]+): /;
 const FAIL_LINE = new RegExp(
-    String.raw`^\s*(?:FAIL|×|✗|├ù|Ôťľ)\s+(?:\|[^|]+\|\s+)?(` +
+    String.raw`^\s*(?:FAIL|×|✗|├ù|Ôťľ)\s+(?:\|[^|]+\|\s+)?(` + // encoding-guard: allow
         TEST_FILE +
         String.raw`)\s+>\s+(.+?)(?:\s+\[[^\]]*\])?(?:\s+\d+(?:\.\d+)?\s?m?s)?\s*$`,
 );

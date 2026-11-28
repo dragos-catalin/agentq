@@ -121,6 +121,39 @@ Start-Sleep -Seconds 120
   Check 'park: backup-verify failure keeps the slot' ((Test-Path "$fx\.wt\repo\task-7\a.txt") -and $o -match 'backup not proven: verify failed for blob\.bin') $o
   Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
 
+  # The same guarantee when the slot is spelled DIFFERENTLY by the process that holds it. A process
+  # records the path it was started with, and on a GitHub runner that is the 8.3 short form
+  # (`C:\Users\RUNNER~1\...`) while git reports `C:\Users\runneradmin\...`; a substring test on the full
+  # path answered "no process references this slot" and prune parked a slot with a live process in it
+  # (runner 2026-11-28) while passing on every machine whose temp path has no short alias. 8.3 cannot be
+  # produced on demand - it is a per-volume setting, disabled on E: here - so the mismatch is produced
+  # with `subst`, which needs no elevation: prune enumerates $fx\..., the sleeper holds Y:\...
+  # Which letters are taken comes from the drive table, never from Test-Path: probing an unassigned
+  # letter is cheap, but probing the root of a mapped-but-disconnected drive blocks for the SMB timeout
+  # (minutes), and this runs on every CI suite invocation.
+  $aliasDrive = @('Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M', 'L', 'K', 'J') |
+    Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } |
+    ForEach-Object { "$($_):" } | Select-Object -First 1
+  if (-not $aliasDrive) {
+    Write-Host 'NOTE alias-path park case skipped: no free drive letter for subst'
+  } else {
+    Run -File $Tool new -Repo "$fx\repo" -Name task-8 -Purpose 'alias park test' | Out-Null
+    $lid8 = (Get-Content "$fx\coord\leases\repo\task-8.json" -Raw | ConvertFrom-Json).leaseId
+    Run -File $Aq unlease -Repo "$fx\.wt\repo\task-8" -LeaseId $lid8 | Out-Null
+    Add-Content "$fx\.wt\repo\task-8\a.txt" 'd8'
+    cmd /c "subst $aliasDrive $fx" | Out-Null
+    $marker8 = "$fx\sleeper-ready8.txt"
+    $sleeper8 = Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$fx\sleeper.ps1", "$aliasDrive\.wt\repo\task-8", $marker8 -PassThru -WindowStyle Hidden
+    $dl8 = (Get-Date).AddSeconds(30)
+    do { Start-Sleep -Milliseconds 250 } while (-not (Test-Path -LiteralPath $marker8) -and -not $sleeper8.HasExited -and (Get-Date) -lt $dl8)
+    $ready8 = Test-Path -LiteralPath $marker8
+    Age-Slot "$fx\.wt\repo\task-8" 5
+    $o = Run -File $Tool prune -Repo "$fx\repo" -OlderThanHours 0 -ParkedIdleDays 3
+    Check 'park: a slot named through an aliased path (8.3 / subst) is never removed while in use' ((Test-Path "$fx\.wt\repo\task-8\a.txt") -and $ready8 -and -not $sleeper8.HasExited) ($o + "`n--- marker: " + (Get-Content -LiteralPath $marker8 -Raw -ErrorAction SilentlyContinue))
+    Stop-Process -Id $sleeper8.Id -Force -ErrorAction SilentlyContinue
+    cmd /c "subst $aliasDrive /d" 2>$null | Out-Null
+  }
+
   # deploy-clean: release slot, release run, follow loop with supersede
   $out = Run -File $Deploy -Root "$fx\repo" -NoEnvCopy -NoInstall -Target web -Command 'Write-Host "DEPLOYING $env:DEPLOY_SHA in $env:DEPLOY_WORKTREE"'
   Check 'deploy-clean runs in <root>\<repo>\release' ($code -eq 0 -and $out -match [regex]::Escape("in $fx\.wt\repo\release")) $out
@@ -150,6 +183,7 @@ $out = Run -File $Deploy -Root "$fx\repo" -NoEnvCopy -NoInstall -Target web -Com
   Pop-Location
 } finally {
   if ($sleeper) { Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue }
+    if ($aliasDrive) { cmd /c "subst $aliasDrive /d" 2>$null | Out-Null }
   foreach ($v in 'CODAI_WT_ROOT', 'AGENTQ_HOME', 'AGENTQ_SESSION', 'AGENTQ_BIN', 'AGENTQ_CONFIG', 'WORKTREE_ALLOW_ADHOC', 'AGENTQ_PARK_ROOT') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   cmd /c rmdir /s /q "`"$fx`"" 2>$null; Remove-Item "$fx-cfg.json" -ErrorAction SilentlyContinue
 }

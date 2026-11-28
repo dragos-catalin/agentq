@@ -6,6 +6,16 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 
 ### Added
 
+- **New suite `text encoding`** - registered in `run-all.ps1`, `install.ps1` and `gateSuites.agentq`, so it runs in
+  every land's pre-gate - decodes every source file in the tree strictly as UTF-8 and fails on a run of two or more
+  consecutive non-ASCII characters that contains the CP437 render of a UTF-8 lead byte. That is the shape a
+  captured-then-rewritten file takes, and it reached main inside a landed commit and survived a diff review, because
+  the terminal renders the mojibake with the shapes of the characters it replaced. The fixtures are built from
+  codepoints (an ASCII-only source, so the guard can never be the reason it fails) and the two arms against real
+  revisions are mutation controls: `2767d4c:CHANGELOG.md` is RED with 8 findings and their codepoints, this file is
+  GREEN. A line may opt out with the escape marker the suite documents; exactly one line in the tree does
+  (`agentq-flakes.mjs`, whose patterns are ABOUT the mangled marks) and that count is an assertion. The same slice
+  removes a duplicated fragment the round-4 changelog union left in the Unreleased Added section.
 - The hook cost ledger names the agentq **verb**, not only the tool: a row is now
   `{ts, ms, startMs, tool, verb, deny, session}` and `sat-report.ps1` sums the day per verb. The question a
   per-verb budget cannot answer today is "what does one `status` cost beside one `land`" - a measured day held
@@ -18,7 +28,6 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
   bounded to `[A-Za-z0-9-]{1,24}` and lowercased, so it can never carry a quote or a backslash into the JSON
   line. `sat-report.ps1` prints the per-verb table (calls, served, spawned, avg ms) plus
   `VERB COVERAGE rows=… with-verb=…` from the same single pass over the file; `agentq-slo.mjs` and
-  `VERB COVERAGE rows=ΓÇª with-verb=ΓÇª` from the same single pass over the file; `agentq-slo.mjs` and
   `agentq-prune.ps1` needed no change (`JSON.parse` by name, and a file-NAME match). Guards: `sat-report` 16/16
   with the three `status` fixture rows in three different cost classes, and `hook-pre` gains 11 cases - the six
   shapes that must be recognised (installed path, repo path, quoted path, `-v2`, the node CLI, uppercase) and
@@ -46,8 +55,8 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - Atomic multi-resource grant: a run waiting for `build:machine` no longer holds `build:<repo>`.
 - Soft slots: quick-lane burst slots; non-batch jobs run beside batch holders (batch runs at Idle priority).
 - Idle-yield watchdog: a holder whose process tree is idle stops counting against the machine cap (`idle-yield` / `idle-resume` events).
-- `agentq bump`, `agentq burst`, `agentq propose` overrides ΓÇö reason required, journaled, rate-limited.
-- `agentq metrics` (wait/hold p50/p90 per resource ├ù lane ├ù kind) and `agentq rotate` (journal archive; automatic in sweep).
+- `agentq bump`, `agentq burst`, `agentq propose` overrides — reason required, journaled, rate-limited.
+- `agentq metrics` (wait/hold p50/p90 per resource × lane × kind) and `agentq rotate` (journal archive; automatic in sweep).
 - Journal: `acquired`, `waitSec`/`holdSec`/`lane`/`kind` on done/fail, `commit-failed`, `land-push-failed`.
 - Config knobs in `agentq-config.json` (machineCap, gateMachineCap, quickBurst, agingMin, idleYieldMin, idleCpuSec, bumpMax, burstMax, burstMaxMin, overridesPerHour, journalRotateMB).
 - Post-land hook ([ADR 0008](docs/adr/0008-post-land-hook.md)): after `agentq land` has pushed, the pushed tree's `scripts/post-land.ps1` (when it exists) is started detached and hidden, once per push (a batch is one push), with `AGENTQ_POSTLAND_REPO`, `AGENTQ_POSTLAND_BRANCH` and `AGENTQ_POSTLAND_SHA`. It runs the pushed commit's copy, outlives the land's job object, and can neither fail nor delay the land. Journal: `post-land`, `post-land-failed`. `AGENTQ_NO_POSTLAND=1` turns it off.
@@ -84,7 +93,7 @@ All notable changes to `@codai/agentq`. The format follows [Keep a Changelog](ht
 - `agentq-cloud.ps1 -Status -Json`: a **read-only** JSON surface for every devcloud workspace in the
   registry (`{"v":1,"at":<ISO>,"workspaces":[{ws,vm,project,zone,state,heartbeatAt,heartbeatAgeSec,
 idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - the verb Vitals waits
-  for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md ┬º6.3). `state` folds the VM
+  for (vitals ADR 0050, `DevcloudPanel.tsx`, docs/codwen-projects-page.md §6.3). `state` folds the VM
   status (`suspended`/`stopped`/`suspending`) with the heartbeat (`idle`/`busy`); a figure that cannot be
   measured is `null`, NEVER `0`, and a workspace with no readable heartbeat is `null` there and named in
   `unavailable` with the reason. Only `gcloud compute instances describe` and `gcloud storage cat|ls` -
@@ -92,7 +101,43 @@ idleSec,queueDepth}],"unavailable":[{ws,why}]}`), on stdout and nothing else - t
   before, unchanged. New suite `tests/test-agentq-cloud-status.ps1` pins the shape, the null rule (a
   mutation that turns a missing heartbeat into `0` is red) and the `ConvertFrom-Json` round-trip.
 
+- A NETWORK git verb is now bounded by WALL CLOCK. git has no transfer timeout of its own, and on 2026-11-28 a
+  `git -C <main> fetch -q origin main` inside `agentq land` sat for 10 minutes with the child alive and ~0 CPU -
+  the same command from another shell took 2.9 s at that moment - while an earlier one sat 55 minutes. Both held
+  `land:<repo>`, so every other agent waited behind a job whose log was 126 bytes and which could not be told apart
+  from a hung one. `Invoke-GitNet` (`agentq-v2.ps1`) runs a `fetch`/`push`/`ls-remote` under `gitNetTimeoutSec`
+  (default 180 s), kills the child and its remote helper on expiry, prints the exact command that was killed,
+  journals a `git-net-timeout` event and sets `$LASTEXITCODE=124` - so a wedged fetch reads as a FAILED fetch its
+  caller already handles, never as an unbounded wait. Every network verb in `agentq.ps1`, `agentq-v2.ps1` and
+  `git-autosync.ps1` goes through it; `git-autosync` bounds ONLY the network verbs, so the local verbs whose exact
+  bytes its callers parse (`ls-tree`, `diff-tree`, `cat-file`) are untouched. `push` has its own, much larger
+  `gitPushTimeoutSec` (default 1800 s) because a pre-push hook is legitimately slow (codai `gate:platform`:
+  145-182 s per member) - it is a safety net against a wedged transport, not a performance bound. New suite
+  `tests/test-git-net-timeout.ps1` pins all of it with a deterministic wedge (an `ext::` remote whose helper
+  sleeps, so it needs no network): the kill happens at the bound, is journaled with the verb it killed, the caller
+  carries on, and a healthy fetch is neither killed nor journaled.
+
 ### Fixed
+
+- **The install gate could be held for hours by a wedge, silently.** `ps/install.ps1` took
+  `Global\agentq-install-gate` and then printed nothing: on 2026-11-28 a holder left over from a shell whose
+  lease had expired 18 h earlier (2 h 40 m of wall-clock, 2.1 s of CPU) blocked three installs at once with no
+  line from any of them, and a holder that dies mid-hold leaves the mutex abandoned - every later install then
+  waited the full 45-minute cap and failed. The gate now writes `bin/agentq-install-gate.holder.json`
+  (`{pid, at, src}`) on acquire and removes it in `finally`, prints
+  `install gate: waiting up to N min - held by pid X since Y` BEFORE it waits (or says that no holder
+  published a marker), caps the wait at **12 min** instead of 45, reports how long it actually waited, and ACQUIRES an
+  abandoned mutex with a named line instead of stalling until the cap. `ps/tests/test-install.ps1` pins the
+  protocol in 8a-8g (45 checks, was 38).
+
+- **A change to `ps/install.ps1` widened the land gate to every suite.** The pool's global-input map treated
+  every mapped path as machinery, so an edit to the installer - which runs no suite itself - forced the full
+  pooled gate instead of selecting the handful of suites that declare it. Each global input is now classified
+  **HARNESS** (the runner, the suite table, the pool half, the selection module, this gate caller: a change
+  alters which suites exist or how they run, so it still widens to every suite and the refusal NAMES the file)
+  or **SCOPED** (`ps/install.ps1`: narrows to its declarers). `ps/tests/test-gate-input-selection.ps1` pins
+  both sides with a discriminating pair - the same synthetic change classified the two ways selects
+  differently.
 
 - **A fixture that has to spawn before it can write a marker gets a window that clears one spawn.** Three
   `wait-job` checks in the `jobs` suite watch a marker a hidden child appends (`^RB_EXIT=`, `Traceback`), and
@@ -185,7 +230,7 @@ v2`** read the process table with `-ErrorAction SilentlyContinue`, so a failed o
   `exit 3` to 1 (measured: the same script gives 3 through `-File` and 1 through `-Command`, while an `exit 0`
   script gives 0 both ways), so the assertion was unfalsifiable for the one verdict it exists to accept - on a
   hosted runner, which has no scheduled task, the doctor legitimately reports FAIL. It now uses `-File`, and the
-  doctor itself wraps its report so a terminating error becomes `FAIL doctor could not complete: ΓÇª` and exit 3
+  doctor itself wraps its report so a terminating error becomes `FAIL doctor could not complete: …` and exit 3
   instead of PowerShell's default 1; new control 13g forces exactly that line to throw in a copy and requires
   `DOCTOR:` and an exit code of 0 or 3. (4) **`autosync wip snapshot`** builds its mutation baseline from
   history (`git log -S`), which `actions/checkout`'s default `fetch-depth: 1` hides, and the red blamed a
@@ -348,6 +393,13 @@ test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is 
 
 ### Changed
 
+- **`landBatchMax` defaults to 3 (was 4): one holder absorbs up to TWO waiters.** With `agentq` in
+  `landBatch`, two extra 43-suite land gates (~11 min of pool wall-clock each) now fold into the holder's
+  single gate instead of running back to back, and the batch path and `Get-LandBatchSize` finally agree on one
+  literal. An explicit `landBatchMax` in `agentq-config.json` still wins (clamped 2..4);
+  `ps/tests/test-land-wait.ps1` pins the literal default AND proves both overrides, by loading only that
+  function's definition into its own scope with `Get-Config` and `Get-JournalFor` stubbed.
+
 - `agentq lease` resolves its result with one git spawn fewer per arm: `head` is taken from the repo
   resolution's existing combined `rev-parse` (which now also asks for `--short HEAD`) instead of a second
   `rev-parse` of its own. Measured in `ps/tests/test-lease-spawns.ps1` on the same slot in the same session:
@@ -365,7 +417,7 @@ test-sat-report.ps1`, "every suite -File is a map key", "`gateSuites.agentq` is 
   CI - was red on main. Measurement trap behind the miss: prettier 3 honours `.gitignore`, so a `--check` run on
   a path under `.copilot-tmp/` prints "All matched files use Prettier code style!" for _any_ content; the verdict
   needed `--ignore-path` pointing at an empty file AND a control file that must fail.
-- run-build default `-TimeoutMin` 25 ΓåÆ 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
+- run-build default `-TimeoutMin` 25 → 240; deploy-clean release-slot lease wait follows `QueueTimeoutMin`.
 - Lease activity includes git index/HEAD writes in the slot (work from another shell no longer expires).
 - agentq-sync publishes v3 holders first so the hub's position model stays correct.
 - **One measured budget for task and scratch slots, instead of two independent ones.** `Get-SlotRoom`

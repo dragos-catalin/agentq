@@ -154,9 +154,29 @@ function Get-ProcLineMap {
 function Test-InUseByProcess([string]$p) {
   $lines = @(Get-ProcLineMap)
   if ($script:ProcListError) { return $true }
-  $needles = @($p, $p.Replace('\', '/'))
+  $needles = @($p, $p.Replace('\', '/')) + @(Get-SlotPathTail $p)
   foreach ($l in $lines) { foreach ($n in $needles) { if ($l.IndexOf($n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } } }
   return $false
+}
+
+# The last two components of a slot path, with their separator (`\repo\task-6`).
+#
+# WHY a second, shorter needle: a process records the path it was STARTED with, and that is not always
+# the spelling the slot is enumerated as. On a GitHub runner `%TEMP%` expands to
+# `C:\Users\RUNNER~1\AppData\Local\Temp\...` (8.3 short names) while git reports the same directory as
+# `C:\Users\runneradmin\AppData\Local\Temp\...`, so the substring test on the full path answered "no
+# process references this slot" and prune PARKED a slot with a live process inside it - the suite
+# "worktree v2" case `park: slot with a live process is never removed` went red on the runner for exactly
+# this reason (2026-11-28) while passing on every machine whose temp path has no short alias, which is
+# why the earlier fixes (fail-closed CIM read, sleeper readiness marker) did not catch it: the read
+# succeeded, it simply compared two spellings of one path. Matching the tail makes the test indifferent
+# to HOW the prefix is spelled (8.3, a subst drive, a mapped share), while still naming this repo and
+# this slot. A false keep costs disk; the opposite mistake deletes a slot a build is running in.
+function Get-SlotPathTail([string]$p) {
+  $leaf = Split-Path -Leaf $p
+  $parent = Split-Path -Leaf (Split-Path -Parent $p)
+  if ([string]::IsNullOrEmpty($leaf) -or [string]::IsNullOrEmpty($parent)) { return @() }
+  return @("\$parent\$leaf", "/$parent/$leaf")
 }
 # One wording for the one situation, so a report never claims to have seen a process it could not look for.
 function InUseReason([string]$base) { if ($script:ProcListError) { "the process table could not be read ($($script:ProcListError)) - treated as in use" } else { $base } }
