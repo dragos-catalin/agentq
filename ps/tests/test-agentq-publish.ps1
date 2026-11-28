@@ -62,10 +62,11 @@ try {
   $o = AQ publish -Paths b.txt -Message 'chore: noop' -Purpose 'test noop' -Onto main
   Check '3 nothing to publish' ($code -eq 0 -and $o -match 'nothing to publish') $o
 
-  # 4 deletion of a file nobody changed since base -> published as a delete
+  # 4 an INTENDED deletion needs -Force (case 10 proves the refusal without it); with -Force the old
+  #   delete semantics are kept.
   git -C $repo checkout -q -f -B main origin/main 2>$null
   Remove-Item "$repo\keep.txt"
-  $o = AQ publish -Paths keep.txt -Message 'chore: rm keep' -Purpose 'test delete' -Onto main -NoPush
+  $o = AQ publish -Paths keep.txt -Message 'chore: rm keep' -Purpose 'test delete' -Onto main -NoPush -Force
   Check '4 delete exit 0' ($code -eq 0) $o
   $sha4 = ([regex]::Match($o, 'publish: ([0-9a-f]{12})')).Groups[1].Value
   Check '4 keep.txt gone in commit' ([bool]$sha4 -and -not (git -C $repo rev-parse --verify -q "$($sha4):keep.txt" 2>$null))
@@ -124,7 +125,8 @@ try {
   Remove-Item "$repo\d.txt"
   $plist9 = @($many) + @('sp ace/a b.txt', 'many/ăîșț.txt', 'x.sh', 'd.txt')
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $o = AQ publish -Paths ($plist9 -join ',') -Message 'feat: many' -Purpose 'test batch' -Onto main -NoPush
+  # -Force: d.txt is an intended deletion (see case 10 for what happens without it)
+  $o = AQ publish -Paths ($plist9 -join ',') -Message 'feat: many' -Purpose 'test batch' -Onto main -NoPush -Force
   $sw.Stop()
   $sha9 = ([regex]::Match($o, 'publish: ([0-9a-f]{12})')).Groups[1].Value
   Check '9 exit 0' ($code -eq 0 -and [bool]$sha9) $o
@@ -141,6 +143,22 @@ try {
   Check '9 exec bit kept' ($mode9 -eq '100755') $mode9
   # Measured 2026-10-28 on a loaded box: per-path code 3638 s, batched 134 s (incl. fetch + process start).
   Check '9 154 paths batched, not per path (< 600 s; per-path code took 3638 s)' ($sw.Elapsed.TotalSeconds -lt 600) "$([int]$sw.Elapsed.TotalSeconds) s"
+
+  # 10 THE BUG (data loss 2026-11-26): -Paths names the files to publish. A listed path that is GONE
+  #    from disk must be refused (exit 4) - never silently turned into an index deletion that drops
+  #    the file from the target branch while printing PUBLISH_EXIT=0.
+  git -C $repo fetch -q origin; git -C $repo checkout -q -f -B main origin/main 2>$null
+  W "$repo\g.txt" "g`n"; git -C $repo add g.txt; git -C $repo commit -qm g; git -C $repo push -q origin main 2>$null
+  git -C $repo fetch -q origin
+  Remove-Item "$repo\g.txt"
+  $mainBefore = "$(git -C $repo rev-parse origin/main)".Trim()
+  $o = AQ publish -Paths 'g.txt' -Message 'chore: drop g' -Purpose 'test silent delete refused' -Onto main
+  Check '10 refused exit 4' ($code -eq 4) $o
+  Check '10 reason names g.txt' ($o -match 'g\.txt') $o
+  Check '10 says DELETE' ($o -match 'DELETE') $o
+  Check '10 nothing pushed' ("$(git -C $repo rev-parse origin/main)".Trim() -eq $mainBefore) $o
+  $o = AQ publish -Paths 'g.txt' -Message 'chore: drop g' -Purpose 'test delete with force' -Onto main -NoPush -Force
+  Check '10 -Force deletes (commit created)' ($code -eq 0 -and $o -match 'publish: [0-9a-f]{12}') $o
 
   # 7 journal has publish + publish-refused
   $j = Get-Content (Join-Path $env:AGENTQ_HOME 'journal.jsonl') -Raw
