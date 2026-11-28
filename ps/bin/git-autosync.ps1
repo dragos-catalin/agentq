@@ -47,7 +47,7 @@ What one pass does, per repo (only when it is provably safe):
   pass. Now: commits go to origin autosync/replay-<branch> (--no-verify, own namespace) and land via
   `agentq land` (clean slot, dedupe, hooks on the clean result). A failed land backs off -ReplayBackoffMin.
 
-  DAEMON (2026-11-19): the scheduled task runs ONE PASS PER TICK (a 2-minute repetition trigger), not a
+  DAEMON (2026-11-19): the scheduled task runs ONE PASS PER TICK (a 15-minute repetition trigger), not a
   long-lived -Loop. A -Loop process keeps the copy of this script it loaded at start, so an edit made
   mid-life is silently ignored: the per-repo status snapshot landed 2026-11-18 07:37 while the loop
   (started 05:16) was running, and for the next 20 h it kept syncing (log lines at 01:45Z) yet never
@@ -844,7 +844,8 @@ function Sync-Repo([string]$r) {
     if ($written -contains $w) { $untrackedHit += [pscustomobject]@{ p = $p; w = $w } } else { $conflict += "$p (untracked)" }
   }
   # The per-path 3-way classification costs several git spawns per path and a held repo recomputed it
-  # every 2 min (~28 min per codai pass, 2026-11-20). Reuse it for 10 min while HEAD, target and the
+  # every tick (every 15 min; the ~28 min codai pass was measured at the 2-minute tick, 2026-11-20).
+  # Reuse it for 10 min while HEAD, target and the
   # path's content are unchanged; the idle and live-owner gates below always run fresh.
   $st0 = Get-State; $rcAll = if ($st0['resolveCache']) { $st0['resolveCache'] } else { @{} }
   $rcOld = if ($rcAll[$name]) { $rcAll[$name] } else { @{} }; $rcNew = @{}; $nowU = [DateTime]::UtcNow
