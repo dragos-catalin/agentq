@@ -186,11 +186,6 @@ $RunId = $null; $OwnerPid = 0; $LeaseId = $null; $Also = @(); $Base = $null; $Do
 $To = $null; $Apply = $false
 # v3 (devcloud F1): lanes, priority, overrides, watchdog, metrics.
 $Lane = $null; $Priority = 0; $By = 0; $Minutes = 30; $TimeoutGiven = $false
-# perf (agentq-perf.ps1): the report's own flags. Every one MUST be initialised here - Show-Perf reads
-# them all and Set-StrictMode turns an unset-variable read into a throw (the 2026-11-21 `$script:MmFloors`
-# class, which took down every `agentq run`). `-Top` is ALSO a knob of the `timings` module, so its parse
-# arm below is verb-aware; see the note there.
-$Since = $null; $Top = 0; $Slow = $false; $Trend = $false; $RefreshBaseline = $false; $FailOnRegression = $false
 # devcloud F2: placement.
 $Where = $null; $Ws = $null
 # ADR 0005 (W4-2): advisory path claims.
@@ -347,25 +342,6 @@ while ($i -lt $argv.Count) {
     'ticklog' { $PrewarmTickLog = & $next }
     'off' { $PrewarmOff = $true }
     'quiet' { $Quiet = $true }
-    # perf (agentq-perf.ps1): the report's flags. `-Top` is verb-aware ON PURPOSE - the `timings` module
-    # has its OWN `-Top`, which the `default` arm below forwards verbatim (its help advertises it), so a
-    # plain `'top'` case would swallow the value and silently change `agentq timings -Top 5`. For any
-    # other verb a `-Top` stays a usage error, exactly as before.
-    'since' { $Since = & $next }
-    'top' {
-      if ("$Verb".ToLowerInvariant() -eq 'perf') { $Top = [int](& $next) }
-      elseif ("$Verb".ToLowerInvariant() -eq 'timings') { $TimingsExtra += $a; while ($i + 1 -lt $argv.Count -and "$($argv[$i + 1])" -notlike '-*') { $script:i++; $TimingsExtra += "$($argv[$i])" } }
-      else {
-        [Console]::Error.WriteLine("agentq: unknown argument '$a' (put the command after '--').")
-        [Console]::Error.WriteLine("  flags of 'agentq $Verb': agentq help $Verb")
-        [Console]::Error.WriteLine("  every verb:             agentq help")
-        exit 2
-      }
-    }
-    'slow' { $Slow = $true }
-    'trend' { $Trend = $true }
-    'refreshbaseline' { $RefreshBaseline = $true }
-    'failonregression' { $FailOnRegression = $true }
     default {
       # `agentq trackers push [...]` (agentq-trackers.ps1 §push) is the ONE positional a tracker verb
       # takes, and the flags after it (-Hub/-KeyFile/-DryRun/-Repo) belong to push, not to agentq. The
@@ -449,9 +425,7 @@ $script:DoctorExit = $null
 # report (Get-Live drops them when the flag is off) and CONSUMED the caller's own lease-loss notice. The
 # brief lists `since` under "READ-ONLY (never queue, never reap)" - this makes the code say what the docs
 # promise. Session liveness is unaffected: line ~2674 renews the session for `since` explicitly.
-# `perf` belongs here too: reading a lane's history must not reap, renew or register anything. The ONE
-# writing form is `agentq perf -RefreshBaseline`, which deliberately clears the flag in its dispatch arm.
-$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'since', 'lessons', 'metrics', 'doctor', 'help', 'timings', 'perf'
+$script:ReadOnly = $Verb.ToLowerInvariant() -in 'status', 'log', 'since', 'lessons', 'metrics', 'doctor', 'help', 'timings'
 $script:AdmCfg = $null; $script:LoadHoldSince = $null; $script:LoadOverride = $false
 
 # Two stores (ADR 0007, devbox teams). $Root = the USER store (~/.codai/coord, or AGENTQ_HOME): jobs,
@@ -752,12 +726,6 @@ function Read-Tickets([string]$res) {
 }
 
 function Remove-Ticket($t, [string]$why, [string]$kind = 'reap') {
-  # perf (agentq-perf.ps1): every reap / break / timeout / giveup ends its run HERE, and the ticket file
-  # is the recorder's input - so record BEFORE it goes. `$kind` IS the outcome (all four are abnormal
-  # ends, so the record is honest as a failure) and a ticket that was removed rather than finished has
-  # no exit code: -999 is the documented sentinel. The call cannot fail a run - the recorder swallows
-  # everything and journals one `perf-write-failed` line, once per process.
-  Complete-TicketRun $t $kind $script:PerfNoExit $why
   Remove-Item -LiteralPath $t.file, "$($t.file).hb", "$($t.file).wedged" -Force -ErrorAction SilentlyContinue
   Write-Journal @{ event = $kind; resource = $t.resource; ticket = $t.id; holderSession = $t.session; purpose = $t.purpose; reason = $why }
 }
@@ -1490,12 +1458,6 @@ function New-Ticket([string]$res, [string]$purpose, [string]$cmd, [string]$repoT
 function Drop-Ticket($t) {
   if (-not $t) { return }
   $f = (P $t 'file'); if (-not $f) { return }
-  # perf (agentq-perf.ps1): the early giveback of commit:<repo> (the index lock ends before the pre-push
-  # gates, ADR 0014 D1) and the push:<repo> ticket in Invoke-Commit's finally. No outcome is passed on
-  # purpose: the default derives it from the ticket (`ok` only when the resource was ACQUIRED, which is
-  # the sole way to reach the early drop; `giveup` otherwise). A commit that FAILED never reaches the
-  # early drop, so this call cannot dress it up as ok - Invoke-Commit's finally records it first.
-  Complete-TicketRun $t
   Remove-Item -LiteralPath $f, "$f.hb" -Force -ErrorAction SilentlyContinue
 }
 
@@ -2255,20 +2217,7 @@ function Invoke-Run {
     if ($code -ne 0) { Send-Signal 'agentq-fail' "$held failed ($code) — $Purpose" }
     exit $code
   } finally {
-    # perf (agentq-perf.ps1): every `run` lane ends here - build / install / deploy, local and -Where
-    # cloud. `$code` is read GUARDED on purpose: it is assigned inside the try, so an exception thrown
-    # before the command ran leaves it unset, and a bare read under StrictMode 3 would throw from inside
-    # a finally - the one failure mode a recorder must never cause. Unset = the -999 sentinel, and the
-    # outcome is then `ended`, not `fail`: a run that was interrupted is not a command that failed.
-    # (Locals are prefixed `pf`, never `script:Perf*`: in a script file a TOP-LEVEL `$x` IS `$script:x`,
-    # and that aliasing silently wiped flags on 2026-11-22.)
-    $pfExit = $script:PerfNoExit
-    if (Get-Variable -Name code -Scope Local -ErrorAction SilentlyContinue) { try { $pfExit = [int]$code } catch { $pfExit = $script:PerfNoExit } }
-    $pfOc = if ($pfExit -eq 0) { 'ok' } elseif ($pfExit -eq $script:PerfNoExit) { 'ended' } else { 'fail' }
-    foreach ($t in $tickets) {
-      Complete-TicketRun $t $pfOc $pfExit
-      Remove-Item -LiteralPath $t.file, "$($t.file).hb", "$($t.file).wedged" -Force -ErrorAction SilentlyContinue
-    }
+    foreach ($t in $tickets) { Remove-Item -LiteralPath $t.file, "$($t.file).hb", "$($t.file).wedged" -Force -ErrorAction SilentlyContinue }
   }
 }
 
@@ -2412,21 +2361,7 @@ function Invoke-Commit {
     $msg = "$($_.Exception.Message)"
     Write-Journal @{ event = $(if ($script:CommitDone) { 'push-failed' } else { 'commit-failed' }); resource = $res; purpose = $Purpose; reason = $msg.Substring(0, [math]::Min(400, $msg.Length)); paths = $plist; repo = $repo.Name }
     throw
-  } finally {
-    # perf (agentq-perf.ps1): a commit that FAILED threw before the early `Drop-Ticket $t` above, so its
-    # ticket file is still here and this is the only site that can record its real verdict. It must run
-    # BEFORE Drop-Ticket, which would otherwise see an acquired ticket and record it as `ok`. On the
-    # success path the early drop already wrote the record and this call finds no file - first call wins.
-    # The push ticket is read the same guarded way: `$pushed` is assigned inside the push phase's own try,
-    # so it is unset whenever that phase never ran - an unguarded read would throw under StrictMode.
-    if ($t) { Complete-TicketRun $t $(if ($script:CommitDone) { 'ok' } else { 'fail' }) }
-    if ($tPush) {
-      $pfPushed = $false
-      if (Get-Variable -Name pushed -Scope Local -ErrorAction SilentlyContinue) { try { $pfPushed = [bool]$pushed } catch { $pfPushed = $false } }
-      Complete-TicketRun $tPush $(if ($pfPushed) { 'ok' } else { 'fail' })
-    }
-    Drop-Ticket $t; Drop-Ticket $tPush
-  }
+  } finally { Drop-Ticket $t; Drop-Ticket $tPush }
 }
 
 # r7 (land ETA): an honest wait estimate for a land:<repo> waiter, from data the journal already has.
@@ -2921,11 +2856,6 @@ function Invoke-Release {
   $repo = Get-RepoInfo $Repo
   $res = Resolve-Resource $Resource $repo
   $t = @(Read-Tickets $res | Where-Object { $_.id -eq $Id })
-  # perf (agentq-perf.ps1): `release` is the NORMAL end of an `acquire` - the caller took the ticket, did
-  # its work and hands it back - so the outcome is 'done' with exit 0, exactly as the journal line below
-  # says. Recording it as an abnormal end would make every long-running acquire (a deploy, a pre-gate)
-  # count as a failure in the report's fail column.
-  foreach ($x in $t) { Complete-TicketRun $x 'done' 0 }
   foreach ($x in $t) { Remove-Item -LiteralPath $x.file, "$($x.file).hb" -Force -ErrorAction SilentlyContinue }
   Write-Journal @{ event = 'done'; resource = $res; ticket = $Id; exit = 0 }
 }
@@ -2934,13 +2864,6 @@ function Invoke-Release {
 # Directed agent-to-agent messages (ask/reply/inbox + the inbox notice below). Loaded unconditionally so the
 # notice can run on any working verb, not only on the three message verbs.
 . (Join-Path $PSScriptRoot 'agentq-msgs.ps1')
-# Per-run lane timing (agentq-perf.ps1). Loaded UNCONDITIONALLY, not only for the `perf` verb: its
-# recorder is called from six ticket-removal sites in this file and agentq-v2.ps1, and a missing
-# `Complete-TicketRun` would throw from INSIDE a `finally` - replacing the real error and breaking the
-# very run it was meant to measure. Verified no read-only verb can reach a removal (Get-Live only reaps
-# when $script:ReadOnly is off), so the conditional form would work today; the unconditional one cannot
-# break tomorrow. The module's own top level is pre-initialised for the same reason.
-. (Join-Path $PSScriptRoot 'agentq-perf.ps1')
 if (-not $script:ReadOnly -and $Verb.ToLowerInvariant() -notin 'renew', 'lease-check', 'prune', 'probe', 'slo', 'eval', 'feedback', 'who') { Renew-ForCwd }
 # Session renewal only for verbs that mean "this agent is working"; maintenance verbs (sweep, break,
 # unlease, metrics, rotate) from the same session must not keep a lease alive they are judging.
@@ -3052,10 +2975,6 @@ $script:AqHelp = [ordered]@{
   'scale' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'scale [-Json]'; d = 'why N/N is not a small pool: the machine-wide slot room, its formula and the live numbers'; e = 'agentq scale' }
   'flakes' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'flakes [-Id <test key or substring> -Reason "why"]'; d = 'quarantine report; -Id lifts a quarantine' }
   'store' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'store [-State status|sync|query|rebuild] [-Id <event>] [-Repo <name>] [-Hours N]'; d = 'SQLite index of the journal + job registry (the JSONL stays the source of truth)' }
-  # 2026-11-28: per-run lane timing. The RECORDER has no verb of its own - it is called from the six
-  # ticket-removal sites in this file and agentq-v2.ps1 - so `perf` is the READER, plus the one writing
-  # form, -RefreshBaseline. Read-only otherwise, which is why 'perf' is in $script:ReadOnly above.
-  'perf' = @{ g = 'Health (ADR 0003/0006/0009)'; u = 'perf [-Repo <name>] [-Lane <lane>] [-Since 90s|30m|48h|7d|2w] [-Top n] [-Slow] [-Trend] [-RefreshBaseline] [-FailOnRegression] [-Json]'; d = 'per-run timing from the perf store: one line per ticket removal (wait / hold / duration / exit / outcome) grouped by resource x lane, with p50/p90 against perf/baseline.json. Read-only; -Slow lists the slowest runs, -Trend compares the recent window with the older one, -RefreshBaseline is the ONLY writer of baseline.json, and -FailOnRegression exits 2 when a lane regressed (for a cron). AGENTQ_NO_PERF=1 disables recording entirely.'; e = 'agentq perf -Since 24h -Slow -Top 10' }
   # 2026-11-28: the tracking/resume verbs. Each is a ONE-LINE pass-through to tools/track.mjs, the single
   # implementation of the tracking store (the module resolves it as <root>\tools\track.mjs and never
   # reimplements a query), so `agentq trackers` prints the same bytes and returns the same exit code as
@@ -3148,17 +3067,6 @@ switch ($Verb.ToLowerInvariant()) {
     $out | ForEach-Object { Write-Output "$_" }
     if ($code -eq 3) { Write-Output 'agentq timings: nothing recorded yet (no gate log has been read back)' }
     elseif ($code -ne 0) { throw "agentq timings: exit $code" }
-  }
-  # Per-run lane timing: the READER of the perf store (bin\agentq-perf.ps1, dot-sourced at the top of this
-  # file because its recorder is called from six ticket-removal sites and a missing function would throw
-  # from inside a finally). Read-only except the ONE writing form - `-RefreshBaseline` rewrites
-  # perf\baseline.json - so that flag clears $script:ReadOnly for this call. Its other effect here is nil
-  # (a read-only verb renews no session, reaps nothing, registers nothing); clearing it makes the arm say
-  # what the flag means instead of leaving the module writing a file behind a read-only verb.
-  'perf' {
-    if ($RefreshBaseline) { $script:ReadOnly = $false }
-    Show-Perf
-    exit $script:PerfExit
   }
   # Trust-surface work. An agent CANNOT mint an edit ticket itself: `rules-ticket.ps1 -Issue` refuses a
   # redirected console, which is the point. So this asks the OWNER in a window, and the WINDOW mints it -
