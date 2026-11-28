@@ -86,6 +86,18 @@ Check 'the script caps the heal count at 3' ($src.Contains('$HealMax = 3')) ''
 Check 'the script journals a heal attempt index' ($src.Contains('attempt = $healCount')) ''
 Check 'the one-shot $healedAt guard is GONE (assignment and gate both removed)' ((-not $src.Contains('$healedAt = [DateTime]::UtcNow')) -and (-not $src.Contains('-not $healedAt'))) 'still present'
 Check 'the runner publishes and clears ws/<ws>/busy' ((Test-Path (Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')) -and ([IO.File]::ReadAllText((Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs')).Contains('ws/${cfg.ws}/busy'))) 'runner marker absent'
+# ---- the busy marker's TERM (2026-11-28): a bound, a refresh, a startup clear and a clean restart ----
+# The marker is what a peer-aware heal reads before resetting a wedged workspace, so a marker that
+# outlives its job blocks EVERY heal: the runner used `at + the job's timeoutSec` (up to 90 min), a job
+# killed with its VM left it behind, and the land that resumed ws-agentq sat unclaimed for 105 min
+# behind `skip-peer`. Pinned on SINGLE-LINE substrings on purpose - the suite reads the file as text, so
+# a multi-line anchor would fail (or pass) for line-ending reasons rather than for the fix.
+$runnerSrc = [IO.File]::ReadAllText((Join-Path (Split-Path (Split-Path $PSScriptRoot) -Parent) 'cloud\runner-agent.mjs'))
+Check '(busy) the TTL is bounded, not the job timeout' ($runnerSrc.Contains('const BUSY_TTL_SEC = 300;') -and $runnerSrc.Contains('const ttlSec = Math.min(timeoutSec, BUSY_TTL_SEC);')) 'unbounded until'
+Check '(busy) the old unbounded until (at + timeoutSec) is GONE' (-not $runnerSrc.Contains('until: new Date(Date.now() + timeoutSec * 1000).toISOString()')) 'still unbounded'
+Check '(busy) the marker is refreshed while the job runs' ($runnerSrc.Contains('const busyTimer = setInterval(() => void markBusy(spec), 60_000);') -and $runnerSrc.Contains('clearInterval(busyTimer);')) 'no refresh'
+Check '(busy) a previous agent''s marker is cleared at startup' ($runnerSrc.Contains('async function clearStaleBusyOnStart()') -and $runnerSrc.Contains('await clearStaleBusyOnStart();')) 'no startup clear'
+Check '(busy) a long wake exits so the supervisor starts a fresh agent' ($runnerSrc.Contains('if (gapSec > 300 && !inJob)') -and $runnerSrc.Contains('long wake, exiting so the supervisor starts a fresh agent')) 'no long-wake exit'
 # ---- the wake-shortened FIRST wait (2026-11-27): 180 s of dead wait per landing after a resume -----
 # The pre-filter's first interval is the base of the doubling, so the checks below pin (a) the POLICY of
 # the helper itself, driven from the production definition, (b) that the helper is WIRED into the

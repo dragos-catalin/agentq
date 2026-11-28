@@ -252,10 +252,16 @@ async function healKnownClaims() {
 // The workspace advertises WHICH job it is running, for the WHOLE duration of that job, on
 // ws/<ws>/busy. A client that is about to reset a wedged workspace reads it first, so it never reboots
 // the VM out from under a peer's run - the old client only asked whether ITS OWN job had been claimed,
-// so a reset killed a peer build (ws-codai, 2026-11-26). `until` = at + the job's own timeoutSec: a
-// marker that has outlived its deadline is a wedge, not a live peer, and a client may then reset.
+// so a reset killed a peer build (ws-codai, 2026-11-26). A marker that has outlived its deadline is a
+// wedge, not a live peer, and a client may then reset it - so the deadline is BOUNDED and REFRESHED
+// while the job really runs (2026-11-28). It used to be `at + the job's own timeoutSec` (up to 90 min):
+// a job killed together with its VM then left a marker that made every peer-aware heal answer
+// `skip-peer` for that whole window, and the land that resumed ws-agentq sat unclaimed 105 min behind
+// it (pre-gate job 20261128-133944-8f1895). The bound must stay well above the refresh interval.
+const BUSY_TTL_SEC = 300;
 async function markBusy(spec) {
     const timeoutSec = Number(spec.timeoutSec) || 3600;
+    const ttlSec = Math.min(timeoutSec, BUSY_TTL_SEC);
     await gs
         .put(
             cfg.bucket,
@@ -265,7 +271,8 @@ async function markBusy(spec) {
                 host: cfg.name,
                 at: new Date().toISOString(),
                 timeoutSec,
-                until: new Date(Date.now() + timeoutSec * 1000).toISOString(),
+                ttlSec,
+                until: new Date(Date.now() + ttlSec * 1000).toISOString(),
             }),
             "application/json",
         )
@@ -280,6 +287,23 @@ async function clearBusy(jobId) {
         await gs.del(cfg.bucket, `ws/${cfg.ws}/busy`);
     } catch (e) {
         log("busy clear", e.message);
+    }
+}
+
+// A marker whose host is THIS workspace is ours by construction (one workspace = one VM) and at startup
+// this process holds no job, so whatever is there is a leftover from a killed or restarted agent. Left
+// alone it makes every peer-aware heal answer `skip-peer` until its TTL expires, which is exactly how a
+// frozen runner kept a land waiting (2026-11-28). Cheap: one GET, and only a DEL when it is ours.
+async function clearStaleBusyOnStart() {
+    try {
+        const raw = await gs.get(cfg.bucket, `ws/${cfg.ws}/busy`);
+        if (!raw) return;
+        const m = JSON.parse(raw.toString());
+        if (m.host !== cfg.name) return;
+        await gs.del(cfg.bucket, `ws/${cfg.ws}/busy`);
+        log("cleared the previous agent's busy marker", m.job);
+    } catch (e) {
+        log("busy clear on start", e.message);
     }
 }
 
@@ -544,6 +568,8 @@ async function main() {
     await loadTurbo();
     // Startup: a VM that just came up may already hold a claim from its previous disk. Never fatal.
     await healKnownClaims().catch((e) => log("heal", e.message));
+    // Same reason, for the busy marker: a process that starts clean must not leave a peer looking busy.
+    await clearStaleBusyOnStart();
     log(
         "agent up",
         JSON.stringify({
@@ -591,10 +617,19 @@ async function main() {
         loopAt = Date.now();
         // a jump in wall time = we were suspended; restart the idle clock and refresh the token
         if (Date.now() - lastTick > 30_000) {
-            log("resumed after", Math.round((Date.now() - lastTick) / 1000), "s");
+            const gapSec = Math.round((Date.now() - lastTick) / 1000);
+            log("resumed after", gapSec, "s");
             lastWork = Date.now();
             tok.exp = 0;
             lastHb = 0;
+            // A long freeze (suspend/resume, a reset, a wedged event loop) leaves this process with a
+            // stale in-memory view of the world; exit so the supervisor (systemd Restart=always on
+            // Linux, agent-loop.ps1 on Windows) starts a clean one. 5 min is far above the 1 s loop
+            // tick, so only a real freeze qualifies, and never while a job is running.
+            if (gapSec > 300 && !inJob) {
+                log("long wake, exiting so the supervisor starts a fresh agent");
+                process.exit(0);
+            }
         }
         lastTick = Date.now();
         let items = [];
@@ -613,9 +648,14 @@ async function main() {
                 await hb("busy");
                 if (!turboToken) await loadTurbo();
                 inJob = true;
+                // The marker's TTL is short (BUSY_TTL_SEC) so a killed agent cannot wedge a peer's heal;
+                // refresh it while the job really runs, or a long job would look like a dead one.
+                const busyTimer = setInterval(() => void markBusy(spec), 60_000);
+                busyTimer.unref();
                 try {
                     await runJob(spec);
                 } finally {
+                    clearInterval(busyTimer);
                     inJob = false;
                     loopAt = Date.now();
                     await clearBusy(spec.id);
